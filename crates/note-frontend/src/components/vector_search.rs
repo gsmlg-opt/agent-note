@@ -53,7 +53,7 @@ pub fn vector_search(props: &VectorSearchProps) -> Html {
             <ul class="results">
                 { for props.results.iter().map(|r| {
                     html! {
-                        <li class="result">
+                        <li class="result" key={r.id.clone()}>
                             <div class="result-title">{ r.title.clone() }</div>
                             <div class="result-id">{ r.id.clone() }</div>
                             // Score is an RRF rank-fusion score, not a raw

@@ -11,8 +11,8 @@ fn app() -> Html {
     let app_state = use_state(AppState::default);
 
     // Task 26 wires these callbacks to the real note-server REST API. For now
-    // save is a no-op and search just clears results via the reducer so the
-    // MVU loop is exercised end to end.
+    // save is a no-op and search just flips the loading flag via the reducer
+    // (SearchStarted) so the MVU loop is exercised end to end.
     let on_submit = Callback::from(|(_title, _content, _labels): (String, String, Vec<(String, String)>)| {
         // Placeholder: Task 26 POSTs the note to /api/notes.
     });
