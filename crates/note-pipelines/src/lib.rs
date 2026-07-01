@@ -6,3 +6,6 @@ pub use label_keys::*;
 
 pub mod save_note;
 pub use save_note::*;
+
+pub mod search_notes;
+pub use search_notes::*;
