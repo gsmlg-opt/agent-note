@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0.103"
 async-trait = "0.1.89"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"] }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["full"] }
