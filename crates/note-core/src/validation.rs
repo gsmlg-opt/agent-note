@@ -7,6 +7,18 @@ pub enum ValidationError {
     UnknownLabelKey(String),
 }
 
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidationError::EmptyTitle => write!(f, "title must not be empty"),
+            ValidationError::EmptyContent => write!(f, "content must not be empty"),
+            ValidationError::UnknownLabelKey(k) => write!(f, "unknown label key: {k}"),
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
 pub struct NoteInput {
     pub title: String,
     pub content: String,

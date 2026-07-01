@@ -29,7 +29,17 @@ async fn save_note_handler(
         },
     )
     .await
-    .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    .map_err(|e| {
+        // Validation failures are the caller's fault (400); anything else (DB txn, insert,
+        // embedder) is an infra failure (500). save_note preserves the typed ValidationError
+        // in the anyhow chain, so we downcast to tell them apart.
+        let status = if e.downcast_ref::<note_core::ValidationError>().is_some() {
+            axum::http::StatusCode::BAD_REQUEST
+        } else {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, e.to_string())
+    })?;
     Ok(Json(SaveNoteResponse { id: note.id }))
 }
 
@@ -72,4 +82,100 @@ pub fn notes_router() -> Router<Arc<Context>> {
         // GET, so the Wasm frontend (gloo-net) can't call a GET-with-body search. POST-with-body is
         // the standard pattern for structured search params.
         .route("/api/notes/search", post(search_handler))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use note_embedding::StubEmbedder;
+    use note_storage::Storage;
+    use tower::ServiceExt;
+
+    // Builds the real /api/notes router over a fresh temp DB + stub embedder so tests exercise the
+    // actual HTTP surface (routing, JSON extractor, status codes, DTO serialization) via oneshot.
+    async fn test_app() -> (Router, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open_local(dir.path().join("t.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let ctx = Arc::new(Context::new(Arc::new(storage), Arc::new(StubEmbedder)));
+        (notes_router().with_state(ctx), dir)
+    }
+
+    fn post(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn save_note_returns_200_with_id() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(post("/api/notes", r#"{"title":"T","content":"C","labels":[]}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn empty_title_returns_400() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(post("/api/notes", r#"{"title":"","content":"C","labels":[]}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unknown_label_key_returns_400() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"T","content":"C","labels":[["nope","v"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn search_returns_200_json_array() {
+        let (app, _dir) = test_app().await;
+        // Seed a note, then search for it. Router is Clone, so clone for the first request since
+        // oneshot consumes the service.
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Find","content":"unique text","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(post(
+                "/api/notes/search",
+                r#"{"query":"unique text","limit":5}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(arr.is_array());
+    }
 }

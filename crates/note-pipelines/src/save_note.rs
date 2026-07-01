@@ -24,7 +24,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
         },
         &known_keys,
     )
-    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    .map_err(anyhow::Error::new)?;
 
     let (dense, sparse) = ctx.embedder.embed(&input.content).await?;
 

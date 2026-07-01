@@ -1294,6 +1294,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
+ "http-body-util",
  "note-core",
  "note-embedding",
  "note-mcp",
@@ -1303,6 +1304,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower 0.5.3",
 ]
 
 [[package]]
