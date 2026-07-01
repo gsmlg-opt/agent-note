@@ -10,6 +10,7 @@ axum = "0.8.9"
 tokio = { version = "1.52.3", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+note-core = { path = "../note-core" }
 
 [dev-dependencies]
 note-embedding = { path = "../note-embedding" }
