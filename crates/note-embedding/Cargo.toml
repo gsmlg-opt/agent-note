@@ -6,6 +6,14 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0.103"
 async-trait = "0.1.89"
+# Not yet referenced in code (OrtEmbedder is a deferred skeleton, Task 12 of the implementation
+# plan) — kept as a pre-staged dependency for the real wiring task, do not prune as unused.
+# default-features disabled + load-dynamic: this ort version has no prebuilt ONNX Runtime binary
+# for x86_64-apple-darwin, so build-time download/linking (the default) fails here; load-dynamic
+# instead loads the ONNX Runtime shared library at runtime (e.g. via ORT_DYLIB_PATH), which also
+# fits this app's "manually download the model" flow. api-24 pins the OrtApi version load-dynamic
+# needs (dropping default-features drops this gate too, so it must be re-added explicitly).
+# ndarray is needed by the real inference path (tensor I/O), added ahead of Task 12's real wiring.
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"] }
 
 [dev-dependencies]
