@@ -19,7 +19,7 @@ A 7-crate Cargo workspace under `crates/`:
 | `note-embedding` | lib | BGE-M3 inference via `ort` (ONNX Runtime): dense + sparse heads, int8 quantized (§4). `spawn_blocking` + semaphore backpressure. Exposes an `Embedder` trait so callers don't depend on the concrete ONNX backend. |
 | `note-pipelines` | lib | The shared `Context` struct (pooled DB handle + embedder instance, §6) and the `save_note` / `search_notes` pipeline contracts (§6), composed from `note-core` + `note-storage` + `note-embedding`. This is the one core both front doors call (§1, §2). |
 | `note-mcp` | lib | `save_note_tool` / `semantic_search_tool` definitions (§8), stdio transport, Streamable HTTP transport. Calls `note-pipelines` directly — no business logic of its own. |
-| `note-server` | bin | Single binary. An entrypoint flag dispatches to either the Axum HTTP server (REST `/api/notes` + `/mcp`) or the stdio MCP loop (§2) — same binary, different startup path, each constructing its own `Context`. |
+| `note-server` | bin | Single binary. An entrypoint flag dispatches to either the Axum HTTP server (REST `/api/notes` + `/api/labels` + `/mcp`) or the stdio MCP loop (§2) — same binary, different startup path, each constructing its own `Context`. |
 | `note-frontend` | bin | Yew/Wasm MVU app (§7), built with [Trunk](https://trunkrs.dev/). |
 
 Dependency direction: `note-core` has no internal deps. `note-storage` and `note-embedding` depend only on `note-core` (for shared types). `note-pipelines` depends on all three. `note-mcp` and `note-server` depend on `note-pipelines`. `note-frontend` depends on none of the native crates (wasm target — talks to `note-server` over HTTP only).
