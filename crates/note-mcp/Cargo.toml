@@ -6,7 +6,10 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0.103"
 note-pipelines = { version = "0.1.0", path = "../note-pipelines" }
+rmcp = { version = "2.0.0", features = ["server", "macros", "transport-io", "schemars"] }
+schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["io-std", "rt", "macros"] }
 
 [dev-dependencies]
 note-embedding = { path = "../note-embedding" }
