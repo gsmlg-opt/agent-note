@@ -8,3 +8,7 @@ anyhow = "1.0.103"
 note-core = { version = "0.1.0", path = "../note-core" }
 note-embedding = { version = "0.1.0", path = "../note-embedding" }
 note-storage = { version = "0.1.0", path = "../note-storage" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["full"] }

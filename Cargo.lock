@@ -1049,6 +1049,14 @@ version = "0.1.0"
 [[package]]
 name = "note-pipelines"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "note-core",
+ "note-embedding",
+ "note-storage",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "note-server"
