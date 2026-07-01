@@ -2,6 +2,8 @@ use crate::embedder::{DenseVector, Embedder, SparseVector};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+/// Wraps an `Embedder`, bounding concurrent `embed()` calls with a semaphore so queuing is
+/// visible at the app layer rather than absorbed as creeping tail latency (docs/design.md §4).
 pub struct BoundedEmbedder<E: Embedder + 'static> {
     inner: Arc<E>,
     semaphore: Arc<Semaphore>,
