@@ -14,8 +14,8 @@ A 7-crate Cargo workspace under `crates/`:
 
 | Crate | Kind | Responsibility |
 |---|---|---|
-| `note-core` | lib | Pure types (`Note`, `Tag`, `SearchResult`), input validation, RRF fusion (§5). Zero I/O — this is the "pure core" the design's philosophy (§1) calls for. |
-| `note-storage` | lib | libsql schema (§3) and all DB access: CRUD for `notes`/`tags`/`note_tags`, dense ANN query, sparse postings query, connection pooling. |
+| `note-core` | lib | Pure types (`Note`, `LabelKey`, `Label`, `SearchResult`), input validation (including "label key must be in catalog"), RRF fusion (§5). Zero I/O — this is the "pure core" the design's philosophy (§1) calls for. |
+| `note-storage` | lib | libsql schema (§3) and all DB access: CRUD for `notes`/`label_keys`/`note_labels`, dense ANN query, sparse postings query, connection pooling. |
 | `note-embedding` | lib | BGE-M3 inference via `ort` (ONNX Runtime): dense + sparse heads, int8 quantized (§4). `spawn_blocking` + semaphore backpressure. Exposes an `Embedder` trait so callers don't depend on the concrete ONNX backend. |
 | `note-pipelines` | lib | The shared `Context` struct (pooled DB handle + embedder instance, §6) and the `save_note` / `search_notes` pipeline contracts (§6), composed from `note-core` + `note-storage` + `note-embedding`. This is the one core both front doors call (§1, §2). |
 | `note-mcp` | lib | `save_note_tool` / `semantic_search_tool` definitions (§8), stdio transport, Streamable HTTP transport. Calls `note-pipelines` directly — no business logic of its own. |
@@ -60,11 +60,11 @@ Each phase is a vertical increment that compiles and has its own tests before th
 
 1. **Workspace scaffold** — all 7 crates created with stub `lib.rs`/`main.rs`, Cargo.toml deps wired, `cargo build` succeeds across the workspace. Git init, `.gitignore`, README stub. No business logic yet.
 2. **note-core** — pure types, validation, RRF fusion function (§5). Unit tests only, no I/O — TDD-friendly.
-3. **note-storage** — `schema.sql` matching §3, CRUD, ANN query, sparse postings query, against a local libsql file. Integration tests using a temp DB per test.
+3. **note-storage** — `schema.sql` matching §3 (including `label_keys`/`note_labels`), CRUD for notes and the label-key catalog, ANN query, sparse postings query, against a local libsql file. Integration tests using a temp DB per test.
 4. **note-embedding** — `Embedder` trait + `StubEmbedder`. `OrtEmbedder` implemented against the trait but only manually exercised (needs downloaded model weights, not available in-session). Unit tests use the stub.
-5. **note-pipelines** — `Context` struct + `save_note`/`search_notes` contracts (§6), composed from phases 2–4. Integration tests with `StubEmbedder` + temp DB, proving the atomic 3-table write (§3) and RRF fusion (§5) end-to-end.
+5. **note-pipelines** — `Context` struct + `define_label_key`/`list_label_keys`/`save_note`/`search_notes` contracts (§6), composed from phases 2–4. Integration tests with `StubEmbedder` + temp DB, proving the atomic 3-table write (§3), label-key validation, and RRF fusion (§5) end-to-end.
 6. **note-mcp** — tool definitions, stdio transport, Streamable HTTP transport (§8), calling `note-pipelines` directly.
-7. **note-server** — Axum REST `/api/notes` + `/mcp`, entrypoint flag dispatch (stdio vs HTTP), DB pool sizing for the Axum path (§9).
+7. **note-server** — Axum REST `/api/notes` + `/api/labels` (label-key catalog, REST/UI-only per §8) + `/mcp`, entrypoint flag dispatch (stdio vs HTTP), DB pool sizing for the Axum path (§9).
 8. **note-frontend** — Yew MVU `AppState`/reducer, `NoteEditor` + `VectorSearch` components using yew-duskmoon-ui primitives (§7), Trunk build talking to `note-server`'s REST API.
 
 ## 5. Testing Strategy
