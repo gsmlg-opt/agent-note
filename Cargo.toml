@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/note-core",
+    "crates/note-storage",
+    "crates/note-embedding",
+    "crates/note-pipelines",
+    "crates/note-mcp",
+    "crates/note-server",
+]
+exclude = ["crates/note-frontend"]
+
+[workspace.package]
+edition = "2021"

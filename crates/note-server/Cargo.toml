@@ -1,0 +1,8 @@
+[package]
+name = "note-server"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+note-pipelines = { path = "../note-pipelines" }
+note-mcp = { path = "../note-mcp" }
