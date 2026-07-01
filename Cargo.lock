@@ -1292,8 +1292,15 @@ dependencies = [
 name = "note-server"
 version = "0.1.0"
 dependencies = [
+ "axum 0.8.9",
+ "note-embedding",
  "note-mcp",
  "note-pipelines",
+ "note-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

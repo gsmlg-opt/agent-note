@@ -6,3 +6,12 @@ edition.workspace = true
 [dependencies]
 note-pipelines = { path = "../note-pipelines" }
 note-mcp = { path = "../note-mcp" }
+axum = "0.8.9"
+tokio = { version = "1.52.3", features = ["full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[dev-dependencies]
+note-embedding = { path = "../note-embedding" }
+note-storage = { path = "../note-storage" }
+tempfile = "3.27.0"
