@@ -26,3 +26,13 @@ async fn schema_applies_cleanly_to_a_fresh_db() {
         assert!(tables.contains(&expected.to_string()), "missing table {expected}");
     }
 }
+
+#[tokio::test]
+async fn schema_reapplies_to_an_existing_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let path = path.to_str().unwrap();
+
+    Storage::open_local(path).await.unwrap();
+    Storage::open_local(path).await.unwrap();
+}
