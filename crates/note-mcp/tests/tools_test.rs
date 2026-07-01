@@ -1,0 +1,57 @@
+use note_embedding::StubEmbedder;
+use note_mcp::{save_note_tool, semantic_search_tool, SaveNoteToolInput, SemanticSearchToolInput};
+use note_pipelines::Context;
+use note_storage::Storage;
+use std::sync::Arc;
+use tempfile::TempDir;
+
+async fn test_context() -> (Context, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
+        .await
+        .unwrap();
+    (Context::new(Arc::new(storage), Arc::new(StubEmbedder)), dir)
+}
+
+#[tokio::test]
+async fn save_note_tool_returns_an_id() {
+    let (ctx, _dir) = test_context().await;
+    let result = save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Title".into(),
+            content: "Content".into(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!result.id.is_empty());
+}
+
+#[tokio::test]
+async fn semantic_search_tool_finds_saved_note() {
+    let (ctx, _dir) = test_context().await;
+    save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Findable".into(),
+            content: "unique searchable content".into(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let results = semantic_search_tool(
+        &ctx,
+        SemanticSearchToolInput {
+            query: "unique searchable content".into(),
+            limit: 5,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(results.iter().any(|r| r.title == "Findable"));
+}
