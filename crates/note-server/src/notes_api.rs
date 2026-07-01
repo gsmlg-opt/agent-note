@@ -1,8 +1,4 @@
-use axum::{
-    extract::State,
-    routing::{get, post},
-    Json, Router,
-};
+use axum::{extract::State, routing::post, Json, Router};
 use note_pipelines::{save_note, search_notes, Context, SaveNoteInput};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -72,5 +68,8 @@ async fn search_handler(
 pub fn notes_router() -> Router<Arc<Context>> {
     Router::new()
         .route("/api/notes", post(save_note_handler))
-        .route("/api/notes/search", get(search_handler))
+        // POST (not GET) because search takes a JSON body: browsers' Fetch API forbids a body on
+        // GET, so the Wasm frontend (gloo-net) can't call a GET-with-body search. POST-with-body is
+        // the standard pattern for structured search params.
+        .route("/api/notes/search", post(search_handler))
 }

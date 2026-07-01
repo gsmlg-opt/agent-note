@@ -2546,7 +2546,9 @@ struct SearchResultDto {
 
 pub async fn search(query: &str, limit: usize) -> Result<Vec<SearchResultSummary>, gloo_net::Error> {
     let body = serde_json::json!({ "query": query, "limit": limit });
-    let dtos: Vec<SearchResultDto> = Request::get("/api/notes/search")
+    // POST, not GET: the browser Fetch API forbids a body on GET requests, and search params go in
+    // the JSON body. note-server's /api/notes/search is registered as POST for this reason.
+    let dtos: Vec<SearchResultDto> = Request::post("/api/notes/search")
         .json(&body)?
         .send()
         .await?
