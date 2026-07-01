@@ -176,6 +176,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(arr.is_array());
+        // The StubEmbedder is deterministic and the query equals the seeded content, so the seeded
+        // note must be found — assert a real hit so the seed step is load-bearing, not decorative.
+        let hits = arr.as_array().expect("response is a JSON array");
+        assert!(
+            hits.iter().any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Find")),
+            "expected the seeded note in results, got {arr}"
+        );
     }
 }
