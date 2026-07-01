@@ -3,7 +3,7 @@ use libsql::{Builder, Connection, Database};
 const SCHEMA: &str = include_str!("../schema.sql");
 
 pub struct Storage {
-    pub db: Database,
+    db: Database,
 }
 
 impl Storage {
@@ -14,6 +14,10 @@ impl Storage {
         Ok(Self { db })
     }
 
+    // schema.sql must stay free of embedded semicolons (no comments, no string/default literals
+    // containing `;`, no multi-statement trigger bodies) since statements are split on `;` here.
+    // All CREATE TABLE/INDEX statements must also stay IF NOT EXISTS, since open_local is called
+    // against the same persistent DB file on every note-server process start.
     async fn apply_schema(conn: &Connection) -> anyhow::Result<()> {
         for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             conn.execute(statement, ()).await?;
