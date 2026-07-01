@@ -1,5 +1,8 @@
 use libsql::Connection;
 
+// Caller's responsibility: embedding components must be finite (real embedders emit normalized,
+// finite values). NaN/Infinity aren't valid JSON number tokens and would produce a malformed
+// vector literal here rather than a clean error.
 fn vector_to_json(v: &[f32]) -> String {
     let elems: Vec<String> = v.iter().map(|x| x.to_string()).collect();
     format!("[{}]", elems.join(","))
@@ -25,6 +28,9 @@ pub async fn dense_ann_query(
     limit: usize,
 ) -> anyhow::Result<Vec<String>> {
     let json = vector_to_json(query);
+    // vector_top_k() returns rows from the vector index's shadow table, whose `id` column is the
+    // rowid of the indexed table (notes_embeddings) — not notes_embeddings' declared `note_id`
+    // TEXT PRIMARY KEY. The JOIN recovers note_id via that rowid; it isn't optional/simplifiable.
     let sql = "SELECT e.note_id FROM vector_top_k('idx_notes_embedding', ?1, ?2) AS t
                JOIN notes_embeddings e ON e.rowid = t.id";
     let mut rows = conn
