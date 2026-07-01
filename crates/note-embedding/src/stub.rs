@@ -18,6 +18,9 @@ impl Embedder for StubEmbedder {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             dense.push(((state >> 33) as f32 / u32::MAX as f32) - 0.5);
         }
+        // Not reachable with this LCG (would require hitting the exact 31-bit midpoint on all
+        // 1024 iterations), but a real model (Task 12's OrtEmbedder) could plausibly emit an
+        // all-zero vector for degenerate input, so don't copy this normalization unguarded there.
         let norm: f32 = dense.iter().map(|x| x * x).sum::<f32>().sqrt();
         for v in dense.iter_mut() {
             *v /= norm;
