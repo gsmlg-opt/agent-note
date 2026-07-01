@@ -19,6 +19,29 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+/// Validation failures for the label-key catalog (define_label_key). Kept separate from
+/// `ValidationError` (which is about note input) so each handler downcasts to the precise type it
+/// cares about. Like `ValidationError`, this is carried through the anyhow chain so the REST layer
+/// can map these caller-fault cases to 400 while genuine storage failures stay 500.
+#[derive(Debug, PartialEq)]
+pub enum LabelKeyValidationError {
+    EmptyKey,
+    EmptyDescription,
+}
+
+impl std::fmt::Display for LabelKeyValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LabelKeyValidationError::EmptyKey => write!(f, "label key must not be empty"),
+            LabelKeyValidationError::EmptyDescription => {
+                write!(f, "label key description must not be empty")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LabelKeyValidationError {}
+
 pub struct NoteInput {
     pub title: String,
     pub content: String,
