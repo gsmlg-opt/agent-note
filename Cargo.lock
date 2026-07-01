@@ -1292,7 +1292,9 @@ dependencies = [
 name = "note-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum 0.8.9",
+ "note-core",
  "note-embedding",
  "note-mcp",
  "note-pipelines",

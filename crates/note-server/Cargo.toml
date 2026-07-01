@@ -11,8 +11,9 @@ tokio = { version = "1.52.3", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 note-core = { path = "../note-core" }
+note-embedding = { version = "0.1.0", path = "../note-embedding" }
+note-storage = { version = "0.1.0", path = "../note-storage" }
+anyhow = "1.0.103"
 
 [dev-dependencies]
-note-embedding = { path = "../note-embedding" }
-note-storage = { path = "../note-storage" }
 tempfile = "3.27.0"
