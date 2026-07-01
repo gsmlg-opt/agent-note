@@ -26,6 +26,15 @@ use crate::NoteMcpServer;
 /// The service factory clones the shared [`Context`] (cheap — it is an `Arc`)
 /// into a new `NoteMcpServer` for each session, so all sessions share the same
 /// underlying storage and embedder while remaining independent MCP connections.
+///
+/// Uses `StreamableHttpServerConfig::default()`, which means: stateful sessions
+/// tracked in an in-memory [`LocalSessionManager`] (not persisted across restarts),
+/// and — importantly — a DNS-rebinding-protection `Host` allowlist of loopback only
+/// (`localhost`, `127.0.0.1`, `::1`). Any other `Host` header gets `403 Forbidden`.
+/// That's the right default for this single-process, loopback-served personal app,
+/// but if note-server is ever bound to `0.0.0.0`/a LAN address or fronted by a proxy
+/// forwarding a real `Host`, `/mcp` will 403 (while REST routes still work) until the
+/// config's allowed-hosts list is widened accordingly.
 pub fn mcp_router(ctx: Arc<Context>) -> Router {
     let service = StreamableHttpService::new(
         move || Ok(NoteMcpServer::new(ctx.clone())),
