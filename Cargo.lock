@@ -1000,6 +1000,11 @@ version = "0.1.0"
 [[package]]
 name = "note-embedding"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "tokio",
+]
 
 [[package]]
 name = "note-mcp"

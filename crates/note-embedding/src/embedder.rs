@@ -1,0 +1,11 @@
+use std::collections::HashMap;
+
+pub type DenseVector = Vec<f32>;      // 1024-d, L2-normalized
+pub type SparseVector = HashMap<i64, f32>; // token_id -> weight, thresholded
+
+#[async_trait::async_trait]
+pub trait Embedder: Send + Sync {
+    /// Dense + sparse output from a single inference call (docs/design.md §4/§6 — must not be
+    /// split into two separate calls/methods, since BGE-M3 produces both from one forward pass).
+    async fn embed(&self, text: &str) -> anyhow::Result<(DenseVector, SparseVector)>;
+}
