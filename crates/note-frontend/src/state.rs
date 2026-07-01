@@ -21,10 +21,8 @@ pub struct AppState {
 
 pub enum Action {
     SearchStarted,
-    // Constructed by Task 26's fetch callbacks once the search response lands.
-    #[allow(dead_code)]
+    // Constructed by the fetch callbacks in main.rs once the search response lands.
     SearchSucceeded(Vec<SearchResultSummary>),
-    #[allow(dead_code)]
     SearchFailed(String),
 }
 
