@@ -1051,11 +1051,14 @@ name = "note-pipelines"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "libsql",
  "note-core",
  "note-embedding",
  "note-storage",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
