@@ -45,6 +45,26 @@ pub struct SaveNoteResponse {
     pub id: String,
 }
 
+// These `From` impls are the single place that names every field of the tool-layer twins, so
+// adding a field to a `crate::tools` type forces a compile-time decision here rather than silently
+// failing to expose it over MCP (the schema types intentionally stay separate to keep the
+// transport-agnostic wrapper layer free of the schemars/JsonSchema dependency).
+impl From<SaveNoteRequest> for SaveNoteToolInput {
+    fn from(r: SaveNoteRequest) -> Self {
+        Self {
+            title: r.title,
+            content: r.content,
+            labels: r.labels,
+        }
+    }
+}
+
+impl From<SaveNoteToolOutput> for SaveNoteResponse {
+    fn from(o: SaveNoteToolOutput) -> Self {
+        Self { id: o.id }
+    }
+}
+
 /// MCP request schema for `semantic_search`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SemanticSearchRequest {
@@ -73,6 +93,25 @@ pub struct SemanticSearchResponse {
     pub results: Vec<SemanticSearchHit>,
 }
 
+impl From<SemanticSearchRequest> for SemanticSearchToolInput {
+    fn from(r: SemanticSearchRequest) -> Self {
+        Self {
+            query: r.query,
+            limit: r.limit,
+        }
+    }
+}
+
+impl From<SemanticSearchToolResult> for SemanticSearchHit {
+    fn from(r: SemanticSearchToolResult) -> Self {
+        Self {
+            id: r.id,
+            title: r.title,
+            score: r.score,
+        }
+    }
+}
+
 /// MCP server holding the shared pipeline context. Cloned per request by rmcp's
 /// router, so state lives behind an `Arc`.
 #[derive(Clone)]
@@ -99,22 +138,10 @@ impl NoteMcpServer {
         &self,
         params: Parameters<SaveNoteRequest>,
     ) -> Result<Json<SaveNoteResponse>, ErrorData> {
-        let SaveNoteRequest {
-            title,
-            content,
-            labels,
-        } = params.0;
-        let SaveNoteToolOutput { id } = save_note_tool(
-            &self.ctx,
-            SaveNoteToolInput {
-                title,
-                content,
-                labels,
-            },
-        )
-        .await
-        .map_err(to_error_data)?;
-        Ok(Json(SaveNoteResponse { id }))
+        let output = save_note_tool(&self.ctx, params.0.into())
+            .await
+            .map_err(to_error_data)?;
+        Ok(Json(output.into()))
     }
 
     /// Semantic (hybrid dense+sparse) search over saved notes.
@@ -126,18 +153,10 @@ impl NoteMcpServer {
         &self,
         params: Parameters<SemanticSearchRequest>,
     ) -> Result<Json<SemanticSearchResponse>, ErrorData> {
-        let SemanticSearchRequest { query, limit } = params.0;
-        let results = semantic_search_tool(&self.ctx, SemanticSearchToolInput { query, limit })
+        let results = semantic_search_tool(&self.ctx, params.0.into())
             .await
             .map_err(to_error_data)?;
-        let hits = results
-            .into_iter()
-            .map(|SemanticSearchToolResult { id, title, score }| SemanticSearchHit {
-                id,
-                title,
-                score,
-            })
-            .collect();
+        let hits = results.into_iter().map(Into::into).collect();
         Ok(Json(SemanticSearchResponse { results: hits }))
     }
 }
