@@ -50,7 +50,7 @@ agent-note/
 Decisions:
 - **Storage**: local libsql file (not remote Turso) — matches design's "fully offline" principle (§1). Path configurable via env/config.
 - **Model acquisition**: BGE-M3 int8 ONNX weights are **not** fetched automatically. The plan documents manual download/placement into `models/` in the README. Code is written against that expected path/format.
-- **Embedder abstraction**: `note-embedding` defines an `Embedder` trait with two implementations — `StubEmbedder` (deterministic hash-based vectors, no model needed) and `OrtEmbedder` (real BGE-M3 via `ort`). Everything above the embedding layer is built and tested against the trait, so `note-storage`, `note-pipelines`, `note-mcp`, and `note-server` don't require model weights to develop or test.
+- **Embedder abstraction**: `note-embedding` defines an `Embedder` trait with two implementations — `StubEmbedder` (deterministic hash-based vectors, no model needed) and `OrtEmbedder` (real BGE-M3 via `ort`). Everything above the embedding layer is built and tested against the trait, so `note-storage`, `note-pipelines`, `note-mcp`, and `note-server` don't require model weights to develop or test. The trait's single method returns dense + sparse output together from one call (e.g. `embed(&self, text: &str) -> (DenseVector, SparseVector)`), preserving design.md's "one inference call" requirement (§4, §6) — it must not be split into two separate trait methods.
 - **Frontend build**: Trunk (standard Yew tooling — wasm-bindgen + asset bundling + dev server).
 - **Version control**: repo is git-initialized as part of this work; first commit includes `docs/design.md` and this spec.
 
