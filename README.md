@@ -7,6 +7,39 @@ search), `note-embedding` (BGE-M3 via ONNX, with a deterministic stub for offlin
 `note-pipelines` (save/search contracts), `note-mcp` (MCP over stdio + Streamable HTTP),
 `note-server` (Axum REST + `/mcp`), and `note-frontend` (Yew/Wasm UI).
 
+## Architecture
+
+**Pure core, effectful shell.** Business logic is a pure, I/O-free core; all side effects (DB,
+inference) live at explicit boundaries and are threaded through one `Context` value rather than
+global state. The crates form a strict dependency stack — each depends only on those above it:
+
+```
+note-core        pure: Note/Label/LabelKey types, input validation, RRF rank-fusion (no I/O)
+   ▲
+   ├── note-storage     libsql: notes + k8s-style label catalog, dense-ANN + sparse-postings queries
+   ├── note-embedding   Embedder trait → StubEmbedder (offline) | OrtEmbedder (BGE-M3); semaphore backpressure
+   ▲
+note-pipelines   Context + the two contracts that compose core/storage/embedding:
+                   • save_note   — validate → embed (one call: dense+sparse) → atomic write across
+                                   notes/embeddings/sparse-weights + labels → return hydrated Note
+                   • search_notes — embed query → dense ANN + sparse postings → RRF fuse → hydrate top-k
+   ▲
+   ├── note-mcp     save_note / semantic_search tools over stdio AND Streamable HTTP (same server type)
+   └── note-server  Axum REST (/api/notes, /api/labels) + /mcp; one binary, `--stdio` flag picks the door
+                        ▲
+                   note-frontend   Yew MVU (AppState + pure reducer) → talks to note-server over REST
+```
+
+**One core, two front doors.** REST and both MCP transports call the exact same `note-pipelines`
+functions — no business logic is duplicated per transport (design.md §1–2). **Hybrid search** runs
+dense (vector) and sparse (token) retrieval independently, then fuses by *rank* via Reciprocal Rank
+Fusion (scores aren't directly comparable), so a result's `score` is a fused rank score, not a raw
+similarity — the UI labels it accordingly. **Labels** are Kubernetes-style: each key is registered
+once in a catalog with a description, and notes attach known keys with a value (at most one value
+per key); unknown keys reject the whole save.
+
+See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec and build plan.
+
 ## Setup
 
 1. Install Rust (stable), [Trunk](https://trunkrs.dev/) (`cargo install trunk`), and the
