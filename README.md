@@ -44,6 +44,10 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
 
 1. Install Rust (stable), [Trunk](https://trunkrs.dev/) (`cargo install trunk`), and the
    `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`).
+   - Note: if Rust is managed by rustup installed via Homebrew, rustup is keg-only — put
+     `/usr/local/opt/rustup/bin` (Apple Silicon: `/opt/homebrew/opt/rustup/bin`) ahead of the
+     Homebrew `rust` formula on your `PATH`, otherwise `cargo` resolves to a single-target rust
+     that can't build wasm and `trunk build` fails.
 2. (Optional, for real embeddings) Download the BGE-M3 int8-quantized ONNX model and place it at
    `models/bge-m3-int8.onnx`. The whole app runs without it using a deterministic stub embedder —
    only the real `OrtEmbedder` needs it (and wiring it into `note-server` is a one-line swap in
