@@ -6,6 +6,7 @@ use note_embedding::{BoundedEmbedder, StubEmbedder}; // swap StubEmbedder for Or
 use note_pipelines::Context;
 use note_storage::Storage;
 use std::sync::Arc;
+use tower_http::services::{ServeDir, ServeFile};
 
 /// Provisional cap on concurrent inference calls on the HTTP path. With `StubEmbedder` any value
 /// works; once the real `OrtEmbedder` lands, align this with the ONNX session's thread count so
@@ -37,13 +38,25 @@ async fn main() -> anyhow::Result<()> {
             .merge(notes_api::notes_router())
             .merge(labels_api::labels_router())
             .with_state(ctx.clone());
-        let app: Router = rest.merge(note_mcp::mcp_router(ctx));
+        let mut app: Router = rest.merge(note_mcp::mcp_router(ctx));
 
-        // Bind loopback only: this is a fully-offline, unauthenticated personal app (docs/design.md §1),
-        // and note-mcp's /mcp router defaults to a loopback-only Host allowlist — so serving REST on the
-        // LAN would both expose unauthenticated write endpoints and 403 on /mcp. LAN access, if ever
-        // wanted, should be an explicit opt-in that also widens the MCP allowed-hosts list.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+        // If NOTE_STATIC_DIR is set (e.g. the Docker image points it at the built wasm bundle),
+        // serve those static files for any path the API/MCP routes don't claim, falling back to
+        // index.html. Unset in local dev, where `trunk serve` serves the frontend and proxies here.
+        if let Ok(static_dir) = std::env::var("NOTE_STATIC_DIR") {
+            if !static_dir.is_empty() {
+                let index = ServeFile::new(format!("{static_dir}/index.html"));
+                app = app.fallback_service(ServeDir::new(&static_dir).not_found_service(index));
+            }
+        }
+
+        // Default to loopback: a fully-offline, unauthenticated personal app (docs/design.md §1),
+        // and note-mcp's /mcp router defaults to a loopback-only Host allowlist. NOTE_BIND_ADDR
+        // overrides it — the Docker image sets 0.0.0.0:8080 so the container is reachable via `-p`
+        // (container-network isolation makes that safe; exposing it to your LAN is your `-p` choice).
+        let bind_addr =
+            std::env::var("NOTE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
         axum::serve(listener, app).await?;
     }
     Ok(())

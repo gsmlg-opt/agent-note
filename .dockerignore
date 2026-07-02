@@ -1,0 +1,9 @@
+# Keep the build context small and let the image build from source cleanly.
+/target
+/crates/note-frontend/target
+/crates/note-frontend/dist
+**/*.db
+**/*.db-journal
+/models/*.onnx
+.git
+.trees
