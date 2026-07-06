@@ -62,16 +62,25 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
 
 ## Run (end to end, dev)
 
-1. Start the backend (HTTP server on `127.0.0.1:8080`, serving REST + `/mcp`):
+1. Build the frontend bundle once:
    ```
-   NOTE_DB_PATH=notes.db cargo run -p note-server
+   cd crates/note-frontend && trunk build
    ```
-2. In another terminal, serve the frontend (on `127.0.0.1:8081`, proxying `/api` + `/mcp` to the
-   backend — see `crates/note-frontend/Trunk.toml`):
+2. From the repo root, start the app (UI + REST + `/mcp` on `127.0.0.1:8080`):
+   ```
+   cargo run
+   ```
+   Then open http://127.0.0.1:8080. (`cargo run` resolves to `note-server` — the workspace's only
+   binary — and a debug build auto-serves the `dist/` bundle from step 1. Set `NOTE_DB_PATH` to
+   change the SQLite file; it defaults to `notes.db` in the working directory.)
+
+For frontend hot reload, keep the backend running and serve the frontend separately (on
+`127.0.0.1:8081`, proxying `/api` + `/mcp` to the backend — see
+`crates/note-frontend/Trunk.toml`):
    ```
    cd crates/note-frontend && trunk serve
    ```
-   Then open http://127.0.0.1:8081.
+Then open http://127.0.0.1:8081.
 
 ## MCP
 

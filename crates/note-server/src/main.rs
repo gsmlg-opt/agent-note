@@ -42,12 +42,19 @@ async fn main() -> anyhow::Result<()> {
 
         // If NOTE_STATIC_DIR is set (e.g. the Docker image points it at the built wasm bundle),
         // serve those static files for any path the API/MCP routes don't claim, falling back to
-        // index.html. Unset in local dev, where `trunk serve` serves the frontend and proxies here.
-        if let Ok(static_dir) = std::env::var("NOTE_STATIC_DIR") {
-            if !static_dir.is_empty() {
-                let index = ServeFile::new(format!("{static_dir}/index.html"));
-                app = app.fallback_service(ServeDir::new(&static_dir).not_found_service(index));
+        // index.html. In debug builds, `cargo run` also serves a previously built Trunk bundle.
+        let static_dir = match std::env::var("NOTE_STATIC_DIR") {
+            Ok(static_dir) if !static_dir.is_empty() => Some(static_dir),
+            _ if cfg!(debug_assertions)
+                && std::path::Path::new("crates/note-frontend/dist").is_dir() =>
+            {
+                Some("crates/note-frontend/dist".to_string())
             }
+            _ => None,
+        };
+        if let Some(static_dir) = &static_dir {
+            let index = ServeFile::new(format!("{static_dir}/index.html"));
+            app = app.fallback_service(ServeDir::new(static_dir).not_found_service(index));
         }
 
         // Default to loopback: a fully-offline, unauthenticated personal app (docs/design.md §1),
@@ -56,6 +63,14 @@ async fn main() -> anyhow::Result<()> {
         // (container-network isolation makes that safe; exposing it to your LAN is your `-p` choice).
         let bind_addr =
             std::env::var("NOTE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+        eprintln!("note-server listening on http://{bind_addr}");
+        if let Some(static_dir) = &static_dir {
+            eprintln!("serving frontend from {static_dir}");
+        } else {
+            eprintln!(
+                "API only — run `trunk build` then re-run for the UI, or `trunk serve` for hot reload"
+            );
+        }
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
         axum::serve(listener, app).await?;
     }
