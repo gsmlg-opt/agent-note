@@ -236,8 +236,10 @@ body {
     flex-shrink: 0;
 }
 
-/* --- Modal --- */
-.modal-backdrop {
+/* --- Modal ---
+   Namespaced as `.app-modal-*` (not `.modal-*`): duskmoon defines `.modal-backdrop::before` as a
+   full-viewport overlay that would otherwise paint over the panel and swallow its clicks. */
+.app-modal-backdrop {
     position: fixed;
     inset: 0;
     background: rgba(0, 0, 0, 0.4);
@@ -248,7 +250,7 @@ body {
     z-index: 100;
 }
 
-.modal-panel {
+.app-modal-panel {
     background: var(--color-surface, #faf8ff);
     color: var(--color-on-surface, #1b1b1f);
     border-radius: 0.9rem;
@@ -258,13 +260,13 @@ body {
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
 }
 
-.modal-panel .dialog-title {
+.app-modal-title {
     margin: 0 0 0.75rem;
     font-size: 1.15rem;
     font-weight: 700;
 }
 
-.modal-actions {
+.app-modal-actions {
     display: flex;
     justify-content: flex-end;
     gap: 0.5rem;

@@ -273,7 +273,7 @@ fn modal_actions(close: &Callback<()>, primary: Html) -> Html {
         Callback::from(move |_: MouseEvent| close.emit(()))
     };
     html! {
-        <div class="modal-actions">
+        <div class="app-modal-actions">
             <button type="button" class="btn btn-ghost" onclick={on_cancel}>{ "Cancel" }</button>
             { primary }
         </div>

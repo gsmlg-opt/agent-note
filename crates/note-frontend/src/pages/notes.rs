@@ -93,28 +93,49 @@ pub fn notes_page() -> Html {
         })
     };
 
-    let confirm_delete = {
-        let delete_target = delete_target.clone();
-        let reload = reload.clone();
-        let error = error.clone();
-        Callback::from(move |_| {
-            let id = match &*delete_target {
-                Some((id, _)) => id.clone(),
-                None => return,
+    // Build the remove-confirm modal from the current target. Capturing `id`/`title` here (rather
+    // than re-reading `delete_target` inside the click handler) keeps the confirm handler correct.
+    let delete_modal = match (*delete_target).clone() {
+        None => html! {},
+        Some((id, title)) => {
+            let on_close = {
+                let d = delete_target.clone();
+                Callback::from(move |_: ()| d.set(None))
             };
-            let delete_target = delete_target.clone();
-            let reload = reload.clone();
-            let error = error.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                match api::delete_note(&id).await {
-                    Ok(()) => {
-                        delete_target.set(None);
-                        reload.emit(());
-                    }
-                    Err(e) => error.set(Some(e)),
-                }
-            });
-        })
+            let on_cancel = {
+                let d = delete_target.clone();
+                Callback::from(move |_: MouseEvent| d.set(None))
+            };
+            let on_confirm = {
+                let d = delete_target.clone();
+                let reload = reload.clone();
+                let error = error.clone();
+                Callback::from(move |_: MouseEvent| {
+                    let d = d.clone();
+                    let reload = reload.clone();
+                    let error = error.clone();
+                    let id = id.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match api::delete_note(&id).await {
+                            Ok(()) => {
+                                d.set(None);
+                                reload.emit(());
+                            }
+                            Err(e) => error.set(Some(e)),
+                        }
+                    });
+                })
+            };
+            html! {
+                <Modal title="Remove note" on_close={on_close}>
+                    <p>{ format!("Remove the note \u{201c}{title}\u{201d}? This cannot be undone.") }</p>
+                    <div class="app-modal-actions">
+                        <button type="button" class="btn btn-ghost" onclick={on_cancel}>{ "Cancel" }</button>
+                        <button type="button" class="btn btn-error" onclick={on_confirm}>{ "Remove note" }</button>
+                    </div>
+                </Modal>
+            }
+        }
     };
 
     html! {
@@ -145,18 +166,7 @@ pub fn notes_page() -> Html {
                 { note_table(&notes, &delete_target) }
             }
 
-            if let Some((_, title)) = &*delete_target {
-                <Modal title="Remove note" on_close={let d=delete_target.clone(); Callback::from(move |_| d.set(None))}>
-                    <p>{ format!("Remove the note \u{201c}{title}\u{201d}? This cannot be undone.") }</p>
-                    <div class="modal-actions">
-                        <button type="button" class="btn btn-ghost"
-                            onclick={let d=delete_target.clone(); Callback::from(move |_| d.set(None))}>
-                            { "Cancel" }
-                        </button>
-                        <button type="button" class="btn btn-error" onclick={confirm_delete}>{ "Remove note" }</button>
-                    </div>
-                </Modal>
-            }
+            { delete_modal }
         </section>
     }
 }

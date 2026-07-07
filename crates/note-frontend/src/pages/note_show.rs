@@ -55,7 +55,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                             }) }
                         </div>
                     }
-                    <div class="modal-actions">
+                    <div class="app-modal-actions">
                         <Link<Route> to={Route::Notes} classes={classes!("btn","btn-ghost")}>
                             { "Back" }
                         </Link<Route>>

@@ -8,25 +8,28 @@ pub struct ModalProps {
     pub children: Children,
 }
 
-/// A centered overlay dialog. Styled with duskmoon's `dialog*` classes; positioning of the
-/// full-screen backdrop lives in app.css so it doesn't depend on the design system's JS behavior.
-/// Render it conditionally (only mount when open) — there is no internal open/closed state.
+/// A centered overlay dialog, styled entirely with app.css (`.app-modal-*`). The classes are
+/// deliberately namespaced away from the design system's `.modal-*` classes: duskmoon's
+/// `.modal-backdrop::before` is a full-viewport overlay that would paint over and swallow clicks to
+/// the panel's controls. Render it conditionally (mount when open).
 #[function_component(Modal)]
 pub fn modal(props: &ModalProps) -> Html {
     let on_backdrop = {
         let on_close = props.on_close.clone();
-        Callback::from(move |_| on_close.emit(()))
+        Callback::from(move |e: MouseEvent| {
+            // Only dismiss when the backdrop itself is clicked — not a click bubbling up from the
+            // panel or its buttons.
+            if e.target() == e.current_target() {
+                on_close.emit(());
+            }
+        })
     };
-    // Clicks inside the dialog must not bubble to the backdrop (which would close it).
-    let stop = Callback::from(|e: MouseEvent| e.stop_propagation());
 
     html! {
-        <div class="modal-backdrop" onclick={on_backdrop}>
-            <div class="dialog dialog-md modal-panel" onclick={stop}>
-                <div class="dialog-header">
-                    <h2 class="dialog-title">{ props.title.clone() }</h2>
-                </div>
-                <div class="dialog-body">
+        <div class="app-modal-backdrop" onclick={on_backdrop}>
+            <div class="app-modal-panel">
+                <h2 class="app-modal-title">{ props.title.clone() }</h2>
+                <div class="app-modal-body">
                     { for props.children.iter() }
                 </div>
             </div>
