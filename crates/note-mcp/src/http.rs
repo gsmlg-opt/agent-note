@@ -27,19 +27,29 @@ use crate::NoteMcpServer;
 /// into a new `NoteMcpServer` for each session, so all sessions share the same
 /// underlying storage and embedder while remaining independent MCP connections.
 ///
-/// Uses `StreamableHttpServerConfig::default()`, which means: stateful sessions
-/// tracked in an in-memory [`LocalSessionManager`] (not persisted across restarts),
-/// and — importantly — a DNS-rebinding-protection `Host` allowlist of loopback only
-/// (`localhost`, `127.0.0.1`, `::1`). Any other `Host` header gets `403 Forbidden`.
-/// That's the right default for this single-process, loopback-served personal app,
-/// but if note-server is ever bound to `0.0.0.0`/a LAN address or fronted by a proxy
-/// forwarding a real `Host`, `/mcp` will 403 (while REST routes still work) until the
-/// config's allowed-hosts list is widened accordingly.
+/// Runs the transport in **stateless mode** (`with_stateful_mode(false)`): every POST
+/// is a self-contained request/response, so clients can call `tools/list`/`tools/call`
+/// without first performing the `initialize` handshake and carrying an `Mcp-Session-Id`
+/// header on every follow-up. In the default stateful mode, a first POST that isn't an
+/// `initialize` request is rejected with `HTTP 422 "Unexpected message, expect initialize
+/// request"` — which is what non-session-tracking clients hit. Our two tools are plain
+/// request/response with no server-initiated streaming, so sessions buy us nothing here.
+/// `with_json_response(true)` returns `application/json` directly instead of an SSE stream,
+/// dropping the framing overhead (allowed by the MCP Streamable HTTP spec, 2025-06-18).
+///
+/// The default DNS-rebinding-protection `Host` allowlist (loopback only: `localhost`,
+/// `127.0.0.1`, `::1`) is kept — any other `Host` gets `403 Forbidden`. That's right for
+/// this single-process, loopback-served personal app, but if note-server is ever bound to
+/// `0.0.0.0`/a LAN address or fronted by a proxy forwarding a real `Host`, `/mcp` will 403
+/// (while REST routes still work) until the allowed-hosts list is widened.
 pub fn mcp_router(ctx: Arc<Context>) -> Router {
+    let config = StreamableHttpServerConfig::default()
+        .with_stateful_mode(false)
+        .with_json_response(true);
     let service = StreamableHttpService::new(
         move || Ok(NoteMcpServer::new(ctx.clone())),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        config,
     );
     Router::new().nest_service("/mcp", service)
 }
