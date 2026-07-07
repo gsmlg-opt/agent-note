@@ -47,6 +47,48 @@ pub async fn get_note(conn: &Connection, id: &str) -> anyhow::Result<Option<Note
     }))
 }
 
+pub async fn update_note(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    content: &str,
+    updated_at: i64,
+) -> anyhow::Result<u64> {
+    let affected = conn
+        .execute(
+            "UPDATE notes SET title = ?2, content = ?3, updated_at = ?4 WHERE id = ?1",
+            libsql::params![id, title, content, updated_at],
+        )
+        .await?;
+    Ok(affected)
+}
+
+pub async fn delete_note(conn: &Connection, id: &str) -> anyhow::Result<u64> {
+    let affected = conn
+        .execute("DELETE FROM notes WHERE id = ?1", libsql::params![id])
+        .await?;
+    Ok(affected)
+}
+
+pub async fn clear_note_derived(conn: &Connection, id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM notes_embeddings WHERE note_id = ?1",
+        libsql::params![id],
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM notes_sparse_weights WHERE note_id = ?1",
+        libsql::params![id],
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM note_labels WHERE note_id = ?1",
+        libsql::params![id],
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn list_notes(conn: &Connection) -> anyhow::Result<Vec<Note>> {
     let mut rows = conn
         .query(

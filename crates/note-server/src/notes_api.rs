@@ -1,6 +1,12 @@
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{
+    extract::{Path, State},
+    routing::{get as route_get, post},
+    Json, Router,
+};
 use note_core::Note;
-use note_pipelines::{list_notes, save_note, search_notes, Context, SaveNoteInput};
+use note_pipelines::{
+    delete_note, get_note, list_notes, save_note, search_notes, update_note, Context, SaveNoteInput,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -78,6 +84,62 @@ async fn list_notes_handler(
     Ok(Json(notes.into_iter().map(Into::into).collect()))
 }
 
+async fn get_note_handler(
+    State(ctx): State<Arc<Context>>,
+    Path(id): Path<String>,
+) -> Result<Json<NoteDto>, (axum::http::StatusCode, String)> {
+    match get_note(&ctx, &id)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        Some(note) => Ok(Json(NoteDto::from(note))),
+        None => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
+    }
+}
+
+async fn update_note_handler(
+    State(ctx): State<Arc<Context>>,
+    Path(id): Path<String>,
+    Json(req): Json<SaveNoteRequest>,
+) -> Result<Json<NoteDto>, (axum::http::StatusCode, String)> {
+    let note = update_note(
+        &ctx,
+        &id,
+        SaveNoteInput {
+            title: req.title,
+            content: req.content,
+            labels: req.labels,
+        },
+    )
+    .await
+    .map_err(|e| {
+        let status = if e.downcast_ref::<note_core::ValidationError>().is_some() {
+            axum::http::StatusCode::BAD_REQUEST
+        } else {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, e.to_string())
+    })?;
+
+    match note {
+        Some(note) => Ok(Json(NoteDto::from(note))),
+        None => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
+    }
+}
+
+async fn delete_note_handler(
+    State(ctx): State<Arc<Context>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    match delete_note(&ctx, &id)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        true => Ok(axum::http::StatusCode::NO_CONTENT),
+        false => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SearchQuery {
     pub query: String,
@@ -115,6 +177,12 @@ pub fn notes_router() -> Router<Arc<Context>> {
         .route(
             "/api/notes",
             post(save_note_handler).get(list_notes_handler),
+        )
+        .route(
+            "/api/notes/{id}",
+            route_get(get_note_handler)
+                .put(update_note_handler)
+                .delete(delete_note_handler),
         )
         // POST (not GET) because search takes a JSON body: browsers' Fetch API forbids a body on
         // GET, so the Wasm frontend (gloo-net) can't call a GET-with-body search. POST-with-body is
@@ -158,6 +226,34 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .unwrap()
+    }
+
+    fn put(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn save_note_id(app: Router, body: &str) -> String {
+        let resp = app.oneshot(post("/api/notes", body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json.get("id")
+            .and_then(|v| v.as_str())
+            .expect("response has id")
+            .to_string()
     }
 
     #[tokio::test]
@@ -237,6 +333,98 @@ mod tests {
             notes[0].get("title").and_then(|v| v.as_str()),
             Some("Second")
         );
+    }
+
+    #[tokio::test]
+    async fn get_note_by_id_returns_note_or_404() {
+        let (app, _dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Fetch Me","content":"C","labels":[]}"#,
+        )
+        .await;
+
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.get("title").and_then(|v| v.as_str()), Some("Fetch Me"));
+
+        let resp = app.oneshot(get("/api/notes/does-not-exist")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn update_note_by_id_replaces_note_or_404() {
+        let (app, _dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Old","content":"Old content","labels":[]}"#,
+        )
+        .await;
+
+        let resp = app
+            .clone()
+            .oneshot(put(
+                &format!("/api/notes/{id}"),
+                r#"{"title":"New","content":"New content","labels":[["topic","rust"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.get("title").and_then(|v| v.as_str()), Some("New"));
+
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.get("title").and_then(|v| v.as_str()), Some("New"));
+
+        let resp = app
+            .oneshot(put(
+                "/api/notes/nope",
+                r#"{"title":"New","content":"New content","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_note_by_id_removes_note_or_404() {
+        let (app, _dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Delete Me","content":"C","labels":[]}"#,
+        )
+        .await;
+
+        let resp = app
+            .clone()
+            .oneshot(delete(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = app.oneshot(delete("/api/notes/nope")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
