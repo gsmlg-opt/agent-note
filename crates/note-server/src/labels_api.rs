@@ -1,12 +1,23 @@
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{
+    extract::{Path, State},
+    routing::{post, put},
+    Json, Router,
+};
 use note_core::LabelKey;
-use note_pipelines::{define_label_key, list_label_keys, Context};
+use note_pipelines::{
+    define_label_key, delete_label_key, list_label_keys, update_label_key, Context,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct DefineLabelKeyRequest {
     pub key: String,
+    pub description: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateLabelKeyRequest {
     pub description: String,
 }
 
@@ -36,7 +47,10 @@ async fn define_label_key_handler(
             // or a duplicate-key UNIQUE violation) falls through to 500. A duplicate arguably wants
             // 409, but distinguishing it from a genuine storage error needs libsql-error inspection
             // we don't do here — noted as a minor known limitation.
-            let status = if e.downcast_ref::<note_core::LabelKeyValidationError>().is_some() {
+            let status = if e
+                .downcast_ref::<note_core::LabelKeyValidationError>()
+                .is_some()
+            {
                 axum::http::StatusCode::BAD_REQUEST
             } else {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -54,12 +68,36 @@ async fn list_label_keys_handler(
     Ok(Json(keys.into_iter().map(Into::into).collect()))
 }
 
+async fn update_label_key_handler(
+    State(ctx): State<Arc<Context>>,
+    Path(key): Path<String>,
+    Json(req): Json<UpdateLabelKeyRequest>,
+) -> Result<(), (axum::http::StatusCode, String)> {
+    update_label_key(&ctx, &key, &req.description)
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+async fn delete_label_key_handler(
+    State(ctx): State<Arc<Context>>,
+    Path(key): Path<String>,
+) -> Result<(), (axum::http::StatusCode, String)> {
+    delete_label_key(&ctx, &key)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 pub fn labels_router() -> Router<Arc<Context>> {
     // GET has no body (unlike /api/notes/search), so a browser GET is safe here.
-    Router::new().route(
-        "/api/labels",
-        post(define_label_key_handler).get(list_label_keys_handler),
-    )
+    Router::new()
+        .route(
+            "/api/labels",
+            post(define_label_key_handler).get(list_label_keys_handler),
+        )
+        .route(
+            "/api/labels/{key}",
+            put(update_label_key_handler).delete(delete_label_key_handler),
+        )
 }
 
 #[cfg(test)]
@@ -79,6 +117,40 @@ mod tests {
             .unwrap();
         let ctx = Arc::new(Context::new(Arc::new(storage), Arc::new(StubEmbedder)));
         (labels_router().with_state(ctx), dir)
+    }
+
+    fn post(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn put(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn delete(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
     }
 
     #[tokio::test]
@@ -135,5 +207,72 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_label_key_changes_description() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/api/labels",
+                r#"{"key":"status","description":"old"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(put("/api/labels/status", r#"{"description":"new"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app.oneshot(get("/api/labels")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let status = arr
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|k| k.get("key").and_then(|v| v.as_str()) == Some("status"))
+            .expect("status label key");
+        assert_eq!(
+            status.get("description").and_then(|v| v.as_str()),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_label_key_removes_it_from_list() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/api/labels",
+                r#"{"key":"status","description":"old"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(delete("/api/labels/status"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app.oneshot(get("/api/labels")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!arr
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|k| k.get("key").and_then(|v| v.as_str()) == Some("status")));
     }
 }

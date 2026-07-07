@@ -46,3 +46,31 @@ pub async fn get_note(conn: &Connection, id: &str) -> anyhow::Result<Option<Note
         updated_at,
     }))
 }
+
+pub async fn list_notes(conn: &Connection) -> anyhow::Result<Vec<Note>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, title, content, created_at, updated_at FROM notes ORDER BY created_at DESC",
+            (),
+        )
+        .await?;
+    let mut notes = vec![];
+    while let Some(row) = rows.next().await? {
+        let id = row.get::<String>(0)?;
+        let title = row.get::<String>(1)?;
+        let content = row.get::<String>(2)?;
+        let created_at = row.get::<i64>(3)?;
+        let updated_at = row.get::<i64>(4)?;
+        let labels = crate::note_labels::labels_for_note(conn, &id).await?;
+
+        notes.push(Note {
+            id,
+            title,
+            content,
+            labels,
+            created_at,
+            updated_at,
+        });
+    }
+    Ok(notes)
+}

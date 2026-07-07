@@ -1,5 +1,6 @@
 use axum::{extract::State, routing::post, Json, Router};
-use note_pipelines::{save_note, search_notes, Context, SaveNoteInput};
+use note_core::Note;
+use note_pipelines::{list_notes, save_note, search_notes, Context, SaveNoteInput};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -14,6 +15,31 @@ pub struct SaveNoteRequest {
 #[derive(Serialize)]
 pub struct SaveNoteResponse {
     pub id: String,
+}
+
+#[derive(Serialize)]
+pub struct NoteDto {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub labels: Vec<(String, String)>,
+    pub created_at: i64,
+}
+
+impl From<Note> for NoteDto {
+    fn from(note: Note) -> Self {
+        Self {
+            id: note.id,
+            title: note.title,
+            content: note.content,
+            labels: note
+                .labels
+                .iter()
+                .map(|label| (label.key.clone(), label.value.clone()))
+                .collect(),
+            created_at: note.created_at,
+        }
+    }
 }
 
 async fn save_note_handler(
@@ -41,6 +67,15 @@ async fn save_note_handler(
         (status, e.to_string())
     })?;
     Ok(Json(SaveNoteResponse { id: note.id }))
+}
+
+async fn list_notes_handler(
+    State(ctx): State<Arc<Context>>,
+) -> Result<Json<Vec<NoteDto>>, (axum::http::StatusCode, String)> {
+    let notes = list_notes(&ctx)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(notes.into_iter().map(Into::into).collect()))
 }
 
 #[derive(Deserialize)]
@@ -77,7 +112,10 @@ async fn search_handler(
 
 pub fn notes_router() -> Router<Arc<Context>> {
     Router::new()
-        .route("/api/notes", post(save_note_handler))
+        .route(
+            "/api/notes",
+            post(save_note_handler).get(list_notes_handler),
+        )
         // POST (not GET) because search takes a JSON body: browsers' Fetch API forbids a body on
         // GET, so the Wasm frontend (gloo-net) can't call a GET-with-body search. POST-with-body is
         // the standard pattern for structured search params.
@@ -114,11 +152,22 @@ mod tests {
             .unwrap()
     }
 
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn save_note_returns_200_with_id() {
         let (app, _dir) = test_app().await;
         let resp = app
-            .oneshot(post("/api/notes", r#"{"title":"T","content":"C","labels":[]}"#))
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"T","content":"C","labels":[]}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -135,7 +184,10 @@ mod tests {
     async fn empty_title_returns_400() {
         let (app, _dir) = test_app().await;
         let resp = app
-            .oneshot(post("/api/notes", r#"{"title":"","content":"C","labels":[]}"#))
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"","content":"C","labels":[]}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -154,6 +206,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn list_notes_returns_newest_first() {
+        let (app, _dir) = test_app().await;
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"First","content":"C1","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Second","content":"C2","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+
+        let resp = app.oneshot(get("/api/notes")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let notes = arr.as_array().expect("response is a JSON array");
+        assert_eq!(notes.len(), 2);
+        assert_eq!(
+            notes[0].get("title").and_then(|v| v.as_str()),
+            Some("Second")
+        );
     }
 
     #[tokio::test]
@@ -182,7 +265,8 @@ mod tests {
         // note must be found — assert a real hit so the seed step is load-bearing, not decorative.
         let hits = arr.as_array().expect("response is a JSON array");
         assert!(
-            hits.iter().any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Find")),
+            hits.iter()
+                .any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Find")),
             "expected the seeded note in results, got {arr}"
         );
     }
