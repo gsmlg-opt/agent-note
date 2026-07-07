@@ -5,7 +5,15 @@ Local-inference hybrid-search notes app. See `docs/design.md` for the full desig
 A Rust workspace: `note-core` (pure types/validation/RRF fusion), `note-storage` (libsql + vector
 search), `note-embedding` (BGE-M3 via ONNX, with a deterministic stub for offline dev),
 `note-pipelines` (save/search contracts), `note-mcp` (MCP over stdio + Streamable HTTP),
-`note-server` (Axum REST + `/mcp`), and `note-frontend` (Yew/Wasm UI).
+`note-server` (Axum REST + `/mcp`), and `note-frontend` (Yew/Wasm UI built with the
+[`yew-duskmoon`](https://crates.io/crates/yew-duskmoon) component library).
+
+The frontend styling comes from the `@duskmoon-dev/core` design system, vendored as a prebuilt
+stylesheet at `crates/note-frontend/duskmoon-core.css` (Trunk links it; no JS build step needed).
+To refresh it: `bun add @duskmoon-dev/core` in `crates/note-frontend`, copy
+`node_modules/@duskmoon-dev/core/dist/index.css` over `duskmoon-core.css`, then remove
+`node_modules`/`package.json`. The theme is selected via `data-theme` on `<html>` in `index.html`
+(`sunshine` = light, `moonlight` = dark).
 
 ## Architecture
 
@@ -48,9 +56,13 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
      `/usr/local/opt/rustup/bin` (Apple Silicon: `/opt/homebrew/opt/rustup/bin`) ahead of the
      Homebrew `rust` formula on your `PATH`, otherwise `cargo` resolves to a single-target rust
      that can't build wasm and `trunk build` fails.
-2. (Optional, for real embeddings) Download the BGE-M3 int8-quantized ONNX model and place it at
-   `models/bge-m3-int8.onnx`. The whole app runs without it using a deterministic stub embedder —
-   only the real `OrtEmbedder` needs it (and wiring it into `note-server` is a one-line swap in
+2. (Optional, for real embeddings) Download the BGE-M3 int8-quantized ONNX model into the
+   expected local path:
+   ```
+   hf download gpahal/bge-m3-onnx-int8 --local-dir ./models/bge-m3-int8.onnx
+   ```
+   The whole app runs without it using a deterministic stub embedder — only the real
+   `OrtEmbedder` needs it (and wiring it into `note-server` is a one-line swap in
    `crates/note-server/src/main.rs`, marked with a comment).
 
 ## Build & test

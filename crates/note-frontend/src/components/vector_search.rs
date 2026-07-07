@@ -1,5 +1,6 @@
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
+use yew_duskmoon::{Button, Card};
 
 use crate::state::SearchResultSummary;
 
@@ -33,17 +34,16 @@ pub fn vector_search(props: &VectorSearchProps) -> Html {
     };
 
     html! {
-        <div class="card vector-search">
-            <h2>{ "Search" }</h2>
+        <Card title={Some(html! { "Search" })} classes={classes!("vector-search")}>
             <form class="search-bar" onsubmit={on_search}>
                 <input
-                    class="input"
+                    class="input input-primary"
                     type="text"
                     placeholder="Search notes"
                     value={(*query).clone()}
                     oninput={on_input}
                 />
-                <button type="submit" class="button button-primary">{ "Search" }</button>
+                <Button variant={Some("primary".to_string())}>{ "Search" }</Button>
             </form>
 
             if props.loading {
@@ -66,6 +66,6 @@ pub fn vector_search(props: &VectorSearchProps) -> Html {
                     }
                 }) }
             </ul>
-        </div>
+        </Card>
     }
 }

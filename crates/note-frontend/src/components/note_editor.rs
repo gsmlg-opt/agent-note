@@ -1,5 +1,6 @@
 use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 use yew::prelude::*;
+use yew_duskmoon::{Button, Card, Chip};
 
 #[derive(Properties, PartialEq)]
 pub struct NoteEditorProps {
@@ -88,63 +89,68 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         .map(|(_, desc)| desc.clone());
 
     html! {
-        <form class="card note-editor" onsubmit={on_submit}>
-            <h2>{ "New Note" }</h2>
-            <label class="field">
-                <span>{ "Title" }</span>
-                <input
-                    class="input"
-                    type="text"
-                    value={(*title).clone()}
-                    oninput={on_title_input}
-                />
-            </label>
-            <label class="field">
-                <span>{ "Content" }</span>
-                <textarea
-                    class="textarea"
-                    value={(*content).clone()}
-                    oninput={on_content_input}
-                />
-            </label>
+        <Card title={Some(html! { "New note" })} classes={classes!("note-editor")}>
+            <form class="stack" onsubmit={on_submit}>
+                <label class="field">
+                    <span>{ "Title" }</span>
+                    <input
+                        class="input input-primary"
+                        type="text"
+                        value={(*title).clone()}
+                        oninput={on_title_input}
+                    />
+                </label>
+                <label class="field">
+                    <span>{ "Content" }</span>
+                    <textarea
+                        class="textarea textarea-primary"
+                        value={(*content).clone()}
+                        oninput={on_content_input}
+                    />
+                </label>
 
-            <fieldset class="label-picker">
-                <legend>{ "Labels" }</legend>
-                <div class="label-picker-row">
-                    <select class="input" onchange={on_key_change}>
-                        <option value="" selected={picker_key.is_empty()}>{ "Select a label" }</option>
-                        { for props.available_labels.iter().map(|(key, desc)| {
+                <fieldset class="label-picker">
+                    <legend>{ "Labels" }</legend>
+                    <div class="label-picker-row">
+                        <select class="select" onchange={on_key_change}>
+                            <option value="" selected={picker_key.is_empty()}>{ "Select a label" }</option>
+                            { for props.available_labels.iter().map(|(key, desc)| {
+                                html! {
+                                    <option value={key.clone()} title={desc.clone()}>
+                                        { key.clone() }
+                                    </option>
+                                }
+                            }) }
+                        </select>
+                        <input
+                            class="input"
+                            type="text"
+                            placeholder="value"
+                            value={(*picker_value).clone()}
+                            oninput={on_value_input}
+                        />
+                        // Native <button type="button"> so it never submits the form
+                        // (yew-duskmoon's Button renders a submit-type <button>).
+                        <button type="button" class="btn btn-outline" onclick={on_add_label}>
+                            { "Add label" }
+                        </button>
+                    </div>
+                    if let Some(hint) = selected_hint {
+                        <p class="label-hint">{ hint }</p>
+                    }
+                    <div class="applied-labels">
+                        { for labels.iter().map(|(key, value)| {
                             html! {
-                                <option value={key.clone()} title={desc.clone()}>
-                                    { key.clone() }
-                                </option>
+                                <Chip variant={Some("primary".to_string())}>
+                                    <span>{ format!("{key}: {value}") }</span>
+                                </Chip>
                             }
                         }) }
-                    </select>
-                    <input
-                        class="input"
-                        type="text"
-                        placeholder="value"
-                        value={(*picker_value).clone()}
-                        oninput={on_value_input}
-                    />
-                    <button type="button" class="button" onclick={on_add_label}>
-                        { "Add label" }
-                    </button>
-                </div>
-                if let Some(hint) = selected_hint {
-                    <p class="label-hint">{ hint }</p>
-                }
-                <div class="applied-labels">
-                    { for labels.iter().map(|(key, value)| {
-                        html! {
-                            <span class="tag">{ format!("{key}: {value}") }</span>
-                        }
-                    }) }
-                </div>
-            </fieldset>
+                    </div>
+                </fieldset>
 
-            <button type="submit" class="button button-primary">{ "Save note" }</button>
-        </form>
+                <Button variant={Some("primary".to_string())}>{ "Save note" }</Button>
+            </form>
+        </Card>
     }
 }

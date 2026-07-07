@@ -3,6 +3,7 @@ mod components;
 mod state;
 
 use yew::prelude::*;
+use yew_duskmoon::Alert;
 
 use components::{NoteEditor, VectorSearch};
 use state::{reduce, Action, AppState};
@@ -49,9 +50,9 @@ fn app() -> Html {
 
     html! {
         <main class="app">
-            <h1>{ "agent-note" }</h1>
+            <h1 class="app-title">{ "agent-note" }</h1>
             if let Some(err) = &app_state.error {
-                <p class="error">{ err }</p>
+                <Alert variant={Some("error".to_string())}><span>{ err }</span></Alert>
             }
             <NoteEditor {available_labels} {on_submit} />
             <VectorSearch

@@ -1,6 +1,7 @@
 /target
 /crates/note-frontend/target
 /crates/note-frontend/dist
+/crates/note-frontend/node_modules
 /models/*.onnx
 !/models/.gitkeep
 *.db

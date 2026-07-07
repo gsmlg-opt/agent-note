@@ -1,0 +1,138 @@
+/* Page-shell layout only. Component look (card/btn/input/chip/alert) comes from
+   @duskmoon-dev/core; these rules arrange the single-page app and use the design
+   system's CSS custom properties (with fallbacks) so they track the active theme. */
+
+body {
+    margin: 0;
+    background: var(--color-surface, #faf8ff);
+    color: var(--color-on-surface, #1b1b1f);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.app {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 2rem 1rem 4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.app-title {
+    margin: 0;
+    font-size: 1.75rem;
+    font-weight: 700;
+    color: var(--color-primary, #6750a4);
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-bottom: 1rem;
+}
+
+.field > span {
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: var(--color-on-surface-variant, #46464f);
+}
+
+.field .input,
+.field .textarea,
+.field .select {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.field .textarea {
+    min-height: 6rem;
+    resize: vertical;
+}
+
+.label-picker {
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.6rem;
+    padding: 0.75rem;
+    margin: 0;
+}
+
+.label-picker > legend {
+    font-weight: 600;
+    font-size: 0.85rem;
+    padding: 0 0.35rem;
+}
+
+.label-picker-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.label-hint {
+    font-size: 0.8rem;
+    color: var(--color-on-surface-variant, #46464f);
+    margin: 0.4rem 0 0;
+}
+
+.applied-labels {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+    margin-top: 0.6rem;
+}
+
+.search-bar {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.search-bar .input {
+    flex: 1;
+}
+
+.results {
+    list-style: none;
+    padding: 0;
+    margin: 0.75rem 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.result {
+    padding: 0.6rem 0.8rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.5rem;
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.result-title {
+    font-weight: 600;
+}
+
+.result-id {
+    font-size: 0.72rem;
+    opacity: 0.6;
+    word-break: break-all;
+}
+
+.result-score {
+    font-size: 0.8rem;
+    color: var(--color-primary, #6750a4);
+    margin-top: 0.15rem;
+}
+
+.loading {
+    color: var(--color-on-surface-variant, #46464f);
+    font-style: italic;
+}
+
+/* Space the form controls a touch inside the duskmoon cards. */
+.stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
