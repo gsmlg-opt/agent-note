@@ -15,6 +15,7 @@ async-trait = "0.1.89"
 # needs (dropping default-features drops this gate too, so it must be re-added explicitly).
 # ndarray is needed by the real inference path (tensor I/O), added ahead of Task 12's real wiring.
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"] }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 # BoundedEmbedder uses tokio::sync::Semaphore in production code (not just tests), so tokio is a
 # regular dependency, not dev-only.
 tokio = { version = "1.52.3", features = ["full"] }

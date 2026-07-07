@@ -2,9 +2,9 @@ mod labels_api;
 mod notes_api;
 
 use axum::Router;
-use note_embedding::{BoundedEmbedder, StubEmbedder}; // swap StubEmbedder for OrtEmbedder once model weights are available
-use note_pipelines::Context;
 use axum::response::IntoResponse;
+use note_embedding::{BoundedEmbedder, StubEmbedder};
+use note_pipelines::Context;
 use note_storage::Storage;
 use std::sync::Arc;
 
@@ -12,6 +12,20 @@ use std::sync::Arc;
 /// works; once the real `OrtEmbedder` lands, align this with the ONNX session's thread count so
 /// the semaphore actually bounds inference rather than guessing (docs/design.md §4/§5).
 const HTTP_INFERENCE_CONCURRENCY: usize = 4;
+
+fn build_embedder(concurrency: usize) -> anyhow::Result<Arc<dyn note_embedding::Embedder>> {
+    match std::env::var("NOTE_MODEL_PATH") {
+        Ok(p) if !p.is_empty() => {
+            eprintln!("embedder: ONNX ({p})");
+            let ort = note_embedding::OrtEmbedder::load(std::path::Path::new(&p))?;
+            Ok(Arc::new(BoundedEmbedder::new(ort, concurrency)))
+        }
+        _ => {
+            eprintln!("embedder: stub");
+            Ok(Arc::new(BoundedEmbedder::new(StubEmbedder, concurrency)))
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -21,16 +35,16 @@ async fn main() -> anyhow::Result<()> {
     if stdio_mode {
         // stdio is single-client — no connection pool needed (docs/design.md §9).
         let storage = Storage::open_local(&db_path).await?;
-        let embedder = BoundedEmbedder::new(StubEmbedder, 1);
-        let ctx = Context::new(Arc::new(storage), Arc::new(embedder));
+        let embedder = build_embedder(1)?;
+        let ctx = Context::new(Arc::new(storage), embedder);
         note_mcp::run_stdio(ctx).await?;
     } else {
         // Axum is the only process that needs connection pooling (docs/design.md §2).
         // TODO: size the pool deliberately once concurrency requirements are clearer (docs/design.md §9
         // open decision) — starting with a single shared Storage handle is a placeholder, not a final answer.
         let storage = Storage::open_local(&db_path).await?;
-        let embedder = BoundedEmbedder::new(StubEmbedder, HTTP_INFERENCE_CONCURRENCY);
-        let ctx = Arc::new(Context::new(Arc::new(storage), Arc::new(embedder)));
+        let embedder = build_embedder(HTTP_INFERENCE_CONCURRENCY)?;
+        let ctx = Arc::new(Context::new(Arc::new(storage), embedder));
 
         // notes_router()/labels_router() are Router<Arc<Context>> — applying .with_state converts them
         // to Router<()>, which can then merge with mcp_router() (already Router<()>, self-stated).
