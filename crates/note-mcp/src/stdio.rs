@@ -4,7 +4,9 @@
 //! traffic, so anything we want logged must go to stderr (docs/design.md §8).
 //! Both this transport and the Streamable HTTP transport (Task 20) delegate to
 //! the same plain-async wrappers in [`crate::tools`] — no MCP-specific logic
-//! lives here beyond request/response marshalling.
+//! lives here beyond request/response marshalling. The stdio tool surface
+//! includes whole-note tools plus `read_note_lines`/`edit_note` for tagged,
+//! line-anchored body editing.
 
 use std::sync::Arc;
 
@@ -20,9 +22,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::tools::{
-    delete_note_tool, get_note_tool, list_notes_tool, save_note_tool, semantic_search_tool,
-    update_note_tool, LabelData, NoteData, SaveNoteToolInput, SaveNoteToolOutput,
-    SemanticSearchToolInput, SemanticSearchToolResult, UpdateNoteToolInput,
+    delete_note_tool, edit_note_tool, get_note_tool, list_notes_tool, read_note_lines_tool,
+    save_note_tool, semantic_search_tool, update_note_tool, LabelData, NoteData, NoteLine,
+    NoteLinesData, SaveNoteToolInput, SaveNoteToolOutput, SemanticSearchToolInput,
+    SemanticSearchToolResult, UpdateNoteToolInput,
 };
 
 /// MCP request schema for `save_note`. Mirrors [`SaveNoteToolInput`] but derives
@@ -122,6 +125,122 @@ impl From<NoteData> for NoteResponse {
             updated_at: n.updated_at,
         }
     }
+}
+
+/// MCP request schema for `read_note_lines`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadNoteLinesRequest {
+    /// Note id.
+    pub id: String,
+}
+
+/// One numbered line in a note body.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct NoteLineSchema {
+    /// 1-indexed line number.
+    pub n: usize,
+    /// Line text without the line separator.
+    pub text: String,
+}
+
+/// MCP response schema for line-editing reads and edits.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct NoteLinesResponse {
+    /// Note id.
+    pub id: String,
+    /// Content hash tag used to guard subsequent `edit_note` calls.
+    pub tag: String,
+    /// Numbered note body lines.
+    pub lines: Vec<NoteLineSchema>,
+}
+
+impl From<NoteLine> for NoteLineSchema {
+    fn from(l: NoteLine) -> Self {
+        Self {
+            n: l.n,
+            text: l.text,
+        }
+    }
+}
+
+impl From<NoteLinesData> for NoteLinesResponse {
+    fn from(n: NoteLinesData) -> Self {
+        Self {
+            id: n.id,
+            tag: n.tag,
+            lines: n.lines.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// MCP edit operation schema for `edit_note`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum EditOpSchema {
+    /// Replace an original line range with zero or more lines.
+    Swap {
+        /// First original line to replace, 1-indexed.
+        from: usize,
+        /// Last original line to replace, inclusive.
+        to: usize,
+        /// Replacement lines.
+        lines: Vec<String>,
+    },
+    /// Delete an original line range.
+    Delete {
+        /// First original line to delete, 1-indexed.
+        from: usize,
+        /// Last original line to delete, inclusive.
+        to: usize,
+    },
+    /// Insert lines before an original line.
+    InsertBefore {
+        /// Original anchor line, 1-indexed.
+        line: usize,
+        /// Lines to insert.
+        lines: Vec<String>,
+    },
+    /// Insert lines after an original line.
+    InsertAfter {
+        /// Original anchor line, 1-indexed.
+        line: usize,
+        /// Lines to insert.
+        lines: Vec<String>,
+    },
+    /// Insert lines at the start of the note body.
+    InsertHead {
+        /// Lines to insert.
+        lines: Vec<String>,
+    },
+    /// Insert lines at the end of the note body.
+    InsertTail {
+        /// Lines to insert.
+        lines: Vec<String>,
+    },
+}
+
+impl From<EditOpSchema> for note_pipelines::EditOp {
+    fn from(op: EditOpSchema) -> Self {
+        match op {
+            EditOpSchema::Swap { from, to, lines } => Self::Swap { from, to, lines },
+            EditOpSchema::Delete { from, to } => Self::Delete { from, to },
+            EditOpSchema::InsertBefore { line, lines } => Self::InsertBefore { line, lines },
+            EditOpSchema::InsertAfter { line, lines } => Self::InsertAfter { line, lines },
+            EditOpSchema::InsertHead { lines } => Self::InsertHead { lines },
+            EditOpSchema::InsertTail { lines } => Self::InsertTail { lines },
+        }
+    }
+}
+
+/// MCP request schema for `edit_note`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EditNoteRequest {
+    /// Note id.
+    pub id: String,
+    /// Tag from `read_note_lines`.
+    pub tag: String,
+    /// Line edit operations, anchored to the ORIGINAL line numbers.
+    pub edits: Vec<EditOpSchema>,
 }
 
 /// MCP request schema for `update_note`.
@@ -281,6 +400,44 @@ impl NoteMcpServer {
         Ok(Json(note.into()))
     }
 
+    /// Read a note's body as numbered lines with a content tag.
+    #[tool(
+        name = "read_note_lines",
+        description = "Read a note's body as numbered lines with a content tag for editing."
+    )]
+    pub async fn read_note_lines(
+        &self,
+        params: Parameters<ReadNoteLinesRequest>,
+    ) -> Result<Json<NoteLinesResponse>, ErrorData> {
+        let id = params.0.id;
+        let output = read_note_lines_tool(&self.ctx, &id)
+            .await
+            .map_err(to_error_data)?;
+        let note =
+            output.ok_or_else(|| to_error_data(anyhow::anyhow!("note not found: {}", id)))?;
+        Ok(Json(note.into()))
+    }
+
+    /// Edit a note's body with line-range operations guarded by a content tag.
+    #[tool(
+        name = "edit_note",
+        description = "Edit a note's body with line-range operations (swap/delete/insert) anchored by a content tag; rejects if the note changed since it was read."
+    )]
+    pub async fn edit_note(
+        &self,
+        params: Parameters<EditNoteRequest>,
+    ) -> Result<Json<NoteLinesResponse>, ErrorData> {
+        let req = params.0;
+        let id = req.id;
+        let edits = req.edits.into_iter().map(Into::into).collect();
+        let output = edit_note_tool(&self.ctx, &id, &req.tag, edits)
+            .await
+            .map_err(to_error_data)?;
+        let note =
+            output.ok_or_else(|| to_error_data(anyhow::anyhow!("note not found: {}", id)))?;
+        Ok(Json(note.into()))
+    }
+
     /// Update an existing note's title, body, and labels.
     #[tool(
         name = "update_note",
@@ -356,7 +513,7 @@ impl ServerHandler for NoteMcpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
         info.instructions = Some(
-            "Note server exposing save_note, get_note, update_note, delete_note, list_notes, and semantic_search over MCP."
+            "Note server exposing save_note, get_note, read_note_lines, edit_note, update_note, delete_note, list_notes, and semantic_search over MCP."
                 .to_string(),
         );
         info
@@ -403,6 +560,11 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"save_note"), "save_note missing: {names:?}");
         assert!(names.contains(&"get_note"), "get_note missing: {names:?}");
+        assert!(
+            names.contains(&"read_note_lines"),
+            "read_note_lines missing: {names:?}"
+        );
+        assert!(names.contains(&"edit_note"), "edit_note missing: {names:?}");
         assert!(
             names.contains(&"update_note"),
             "update_note missing: {names:?}"

@@ -18,3 +18,6 @@ pub use search_notes::*;
 
 pub mod update_note;
 pub use update_note::*;
+
+pub mod edit_note;
+pub use edit_note::*;

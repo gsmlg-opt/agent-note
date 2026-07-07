@@ -70,6 +70,61 @@ pub async fn get_note_tool(ctx: &Context, id: &str) -> anyhow::Result<Option<Not
     }))
 }
 
+#[derive(Debug, Serialize)]
+pub struct NoteLine {
+    pub n: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NoteLinesData {
+    pub id: String,
+    pub tag: String,
+    pub lines: Vec<NoteLine>,
+}
+
+pub async fn read_note_lines_tool(
+    ctx: &Context,
+    id: &str,
+) -> anyhow::Result<Option<NoteLinesData>> {
+    let note = get_note(ctx, id).await?;
+    Ok(note.map(|note| NoteLinesData {
+        id: note.id,
+        tag: note_pipelines::compute_tag(&note.content),
+        lines: note
+            .content
+            .split('\n')
+            .enumerate()
+            .map(|(idx, text)| NoteLine {
+                n: idx + 1,
+                text: text.to_string(),
+            })
+            .collect(),
+    }))
+}
+
+pub async fn edit_note_tool(
+    ctx: &Context,
+    id: &str,
+    tag: &str,
+    ops: Vec<note_pipelines::EditOp>,
+) -> anyhow::Result<Option<NoteLinesData>> {
+    let note = note_pipelines::edit_note(ctx, id, tag, &ops).await?;
+    Ok(note.map(|note| NoteLinesData {
+        id: note.id,
+        tag: note_pipelines::compute_tag(&note.content),
+        lines: note
+            .content
+            .split('\n')
+            .enumerate()
+            .map(|(idx, text)| NoteLine {
+                n: idx + 1,
+                text: text.to_string(),
+            })
+            .collect(),
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateNoteToolInput {
     pub id: String,
