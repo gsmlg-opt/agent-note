@@ -20,17 +20,25 @@ body {
 
 /* --- App bar --- */
 .app-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 0 max(1rem, calc((100% - 760px) / 2 + 1rem));
-    height: 60px;
+    box-sizing: border-box;
+    width: 100%;
     background: var(--color-surface-container-high, #ece7f2);
     border-bottom: 1px solid var(--color-outline-variant, #c7c5d0);
     position: sticky;
     top: 0;
     z-index: 10;
+}
+
+.app-bar-inner {
+    box-sizing: border-box;
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 0 1rem;
+    height: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
 }
 
 .app-brand {

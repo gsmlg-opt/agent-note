@@ -3,22 +3,22 @@ use yew_router::prelude::*;
 
 use crate::routes::Route;
 
-/// Top navigation bar shown on every page. Uses duskmoon's `navbar` styling; the wordmark links
-/// home and the three destinations map to the app's routes.
+/// Top navigation bar shown on every page: a full-width surface with a centered inner row (matching
+/// the page content column). The wordmark links home; the three links map to the app's routes.
 #[function_component(AppBar)]
 pub fn app_bar() -> Html {
     html! {
-        <header class="navbar app-bar">
-            <div class="navbar-start">
+        <header class="app-bar">
+            <div class="app-bar-inner">
                 <Link<Route> to={Route::Notes} classes={classes!("app-brand")}>
                     { "agent-note" }
                 </Link<Route>>
+                <nav class="app-nav">
+                    <Link<Route> to={Route::Notes} classes={classes!("nav-link")}>{ "Notes" }</Link<Route>>
+                    <Link<Route> to={Route::NewNote} classes={classes!("nav-link")}>{ "New note" }</Link<Route>>
+                    <Link<Route> to={Route::Labels} classes={classes!("nav-link")}>{ "Labels" }</Link<Route>>
+                </nav>
             </div>
-            <nav class="navbar-end app-nav">
-                <Link<Route> to={Route::Notes} classes={classes!("nav-link")}>{ "Notes" }</Link<Route>>
-                <Link<Route> to={Route::NewNote} classes={classes!("nav-link")}>{ "New note" }</Link<Route>>
-                <Link<Route> to={Route::Labels} classes={classes!("nav-link")}>{ "Labels" }</Link<Route>>
-            </nav>
         </header>
     }
 }
