@@ -1,28 +1,36 @@
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew_router::prelude::*;
-use yew_duskmoon::{Alert, Button, Card, Chip};
+use yew_duskmoon::{Alert, Button, Chip};
 
 use crate::api;
+use crate::components::icons;
+use crate::components::Modal;
 use crate::routes::Route;
 use crate::state::{NoteSummary, SearchResultSummary};
 
-/// Default page: the note list, with a search bar that swaps the list for ranked results.
+/// Default page: a table of all notes (title, labels, per-row view/edit/remove actions), with a
+/// search bar that swaps the table for ranked results.
 #[function_component(NotesPage)]
 pub fn notes_page() -> Html {
     let notes = use_state(Vec::<NoteSummary>::new);
-    // `Some` while a search is active; `None` shows the full list.
+    // `Some` while a search is active; `None` shows the full table.
     let results = use_state(|| None::<Vec<SearchResultSummary>>);
     let query = use_state(String::new);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
+    // The note pending deletion (id, title) — drives the confirm modal.
+    let delete_target = use_state(|| None::<(String, String)>);
 
-    // Load all notes on first render.
-    {
+    let reload = {
         let notes = notes.clone();
         let loading = loading.clone();
         let error = error.clone();
-        use_effect_with((), move |_| {
+        Callback::from(move |_: ()| {
+            let notes = notes.clone();
+            let loading = loading.clone();
+            let error = error.clone();
+            loading.set(true);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::list_notes().await {
                     Ok(list) => notes.set(list),
@@ -30,6 +38,13 @@ pub fn notes_page() -> Html {
                 }
                 loading.set(false);
             });
+        })
+    };
+
+    {
+        let reload = reload.clone();
+        use_effect_with((), move |_| {
+            reload.emit(());
             || ()
         });
     }
@@ -78,6 +93,30 @@ pub fn notes_page() -> Html {
         })
     };
 
+    let confirm_delete = {
+        let delete_target = delete_target.clone();
+        let reload = reload.clone();
+        let error = error.clone();
+        Callback::from(move |_| {
+            let id = match &*delete_target {
+                Some((id, _)) => id.clone(),
+                None => return,
+            };
+            let delete_target = delete_target.clone();
+            let reload = reload.clone();
+            let error = error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match api::delete_note(&id).await {
+                    Ok(()) => {
+                        delete_target.set(None);
+                        reload.emit(());
+                    }
+                    Err(e) => error.set(Some(e)),
+                }
+            });
+        })
+    };
+
     html! {
         <section class="stack">
             <form class="search-bar" onsubmit={on_search}>
@@ -103,31 +142,26 @@ pub fn notes_page() -> Html {
             } else if let Some(hits) = &*results {
                 { search_results_view(hits) }
             } else {
-                { note_list_view(&notes) }
+                { note_table(&notes, &delete_target) }
+            }
+
+            if let Some((_, title)) = &*delete_target {
+                <Modal title="Remove note" on_close={let d=delete_target.clone(); Callback::from(move |_| d.set(None))}>
+                    <p>{ format!("Remove the note \u{201c}{title}\u{201d}? This cannot be undone.") }</p>
+                    <div class="modal-actions">
+                        <button type="button" class="btn btn-ghost"
+                            onclick={let d=delete_target.clone(); Callback::from(move |_| d.set(None))}>
+                            { "Cancel" }
+                        </button>
+                        <button type="button" class="btn btn-error" onclick={confirm_delete}>{ "Remove note" }</button>
+                    </div>
+                </Modal>
             }
         </section>
     }
 }
 
-fn search_results_view(hits: &[SearchResultSummary]) -> Html {
-    if hits.is_empty() {
-        return html! { <p class="empty">{ "No matches. Try different words." }</p> };
-    }
-    html! {
-        <ul class="results">
-            { for hits.iter().map(|r| html! {
-                <li class="result" key={r.id.clone()}>
-                    <div class="result-title">{ r.title.clone() }</div>
-                    <div class="result-id">{ r.id.clone() }</div>
-                    // RRF rank-fusion score, not a raw similarity/distance (docs/design.md §7).
-                    <div class="result-score">{ format!("fused score: {:.4}", r.score) }</div>
-                </li>
-            }) }
-        </ul>
-    }
-}
-
-fn note_list_view(notes: &[NoteSummary]) -> Html {
+fn note_table(notes: &[NoteSummary], delete_target: &UseStateHandle<Option<(String, String)>>) -> Html {
     if notes.is_empty() {
         return html! {
             <div class="empty">
@@ -139,32 +173,74 @@ fn note_list_view(notes: &[NoteSummary]) -> Html {
         };
     }
     html! {
-        <div class="note-grid">
-            { for notes.iter().map(|note| html! {
-                <Card key={note.id.clone()} classes={classes!("note-card")}>
-                    <h3 class="note-title">{ note.title.clone() }</h3>
-                    <p class="note-snippet">{ snippet(&note.content) }</p>
-                    if !note.labels.is_empty() {
-                        <div class="applied-labels">
-                            { for note.labels.iter().map(|(k, v)| html! {
-                                <Chip variant={Some("primary".to_string())}>
-                                    <span>{ format!("{k}: {v}") }</span>
-                                </Chip>
-                            }) }
-                        </div>
+        <table class="table note-table">
+            <thead>
+                <tr>
+                    <th>{ "Title" }</th>
+                    <th>{ "Labels" }</th>
+                    <th class="col-actions">{ "Actions" }</th>
+                </tr>
+            </thead>
+            <tbody>
+                { for notes.iter().map(|note| {
+                    let id = note.id.clone();
+                    let on_remove = {
+                        let delete_target = delete_target.clone();
+                        let id = note.id.clone();
+                        let title = note.title.clone();
+                        Callback::from(move |_| delete_target.set(Some((id.clone(), title.clone()))))
+                    };
+                    html! {
+                        <tr key={note.id.clone()}>
+                            <td class="col-title">{ note.title.clone() }</td>
+                            <td>
+                                <div class="applied-labels">
+                                    { for note.labels.iter().map(|(k, v)| html! {
+                                        <Chip variant={Some("primary".to_string())}>
+                                            <span>{ format!("{k}: {v}") }</span>
+                                        </Chip>
+                                    }) }
+                                </div>
+                            </td>
+                            <td class="col-actions">
+                                <div class="row-actions">
+                                    <Link<Route> to={Route::NoteShow { id: id.clone() }}
+                                        classes={classes!("btn","btn-ghost","btn-icon")}>
+                                        { icons::eye() }<span class="sr-only">{ "View" }</span>
+                                    </Link<Route>>
+                                    <Link<Route> to={Route::NoteEdit { id: id.clone() }}
+                                        classes={classes!("btn","btn-ghost","btn-icon")}>
+                                        { icons::pencil() }<span class="sr-only">{ "Edit" }</span>
+                                    </Link<Route>>
+                                    <button type="button" class="btn btn-ghost btn-icon icon-danger"
+                                        onclick={on_remove}>
+                                        { icons::trash() }<span class="sr-only">{ "Remove" }</span>
+                                    </button>
+                                </div>
+                            </td>
+                        </tr>
                     }
-                </Card>
-            }) }
-        </div>
+                }) }
+            </tbody>
+        </table>
     }
 }
 
-fn snippet(content: &str) -> String {
-    const MAX: usize = 140;
-    if content.chars().count() <= MAX {
-        content.to_string()
-    } else {
-        let truncated: String = content.chars().take(MAX).collect();
-        format!("{truncated}…")
+fn search_results_view(hits: &[SearchResultSummary]) -> Html {
+    if hits.is_empty() {
+        return html! { <p class="empty">{ "No matches. Try different words." }</p> };
+    }
+    html! {
+        <ul class="results">
+            { for hits.iter().map(|r| html! {
+                <li class="result" key={r.id.clone()}>
+                    <Link<Route> to={Route::NoteShow { id: r.id.clone() }} classes={classes!("result-title-link")}>
+                        <div class="result-title">{ r.title.clone() }</div>
+                    </Link<Route>>
+                    // RRF rank-fusion score, not a raw similarity/distance (docs/design.md §7).
+                    <div class="result-score">{ format!("fused score: {:.4}", r.score) }</div>
+                </li>
+            }) }
+        </ul>
     }
 }

@@ -105,6 +105,48 @@ pub async fn list_notes() -> Result<Vec<NoteSummary>, String> {
         .collect())
 }
 
+pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
+    let resp = Request::get(&format!("/api/notes/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let d: NoteDto = ok_or_body_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(NoteSummary {
+        id: d.id,
+        title: d.title,
+        content: d.content,
+        labels: d.labels,
+    })
+}
+
+pub async fn update_note(
+    id: &str,
+    title: &str,
+    content: &str,
+    labels: &[(String, String)],
+) -> Result<(), String> {
+    let body = serde_json::json!({ "title": title, "content": content, "labels": labels });
+    let resp = Request::put(&format!("/api/notes/{id}"))
+        .json(&body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    ok_or_body_error(resp).await.map(|_| ())
+}
+
+pub async fn delete_note(id: &str) -> Result<(), String> {
+    let resp = Request::delete(&format!("/api/notes/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    ok_or_body_error(resp).await.map(|_| ())
+}
+
 // ---- Labels ----
 
 #[derive(Deserialize)]

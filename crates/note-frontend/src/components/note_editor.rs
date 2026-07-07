@@ -9,14 +9,25 @@ pub struct NoteEditorProps {
     pub available_labels: Vec<(String, String)>,
     /// Emits (title, content, labels) where labels is a Vec of (key, value).
     pub on_submit: Callback<(String, String, Vec<(String, String)>)>,
+    /// Prefill values (used when editing an existing note). Read once at mount.
+    #[prop_or_default]
+    pub initial_title: String,
+    #[prop_or_default]
+    pub initial_content: String,
+    #[prop_or_default]
+    pub initial_labels: Vec<(String, String)>,
+    #[prop_or_else(|| "New note".to_string())]
+    pub card_title: String,
+    #[prop_or_else(|| "Save note".to_string())]
+    pub submit_label: String,
 }
 
 #[function_component(NoteEditor)]
 pub fn note_editor(props: &NoteEditorProps) -> Html {
-    let title = use_state(String::new);
-    let content = use_state(String::new);
+    let title = use_state(|| props.initial_title.clone());
+    let content = use_state(|| props.initial_content.clone());
     // Applied labels the user has added, as (key, value) pairs.
-    let labels = use_state(Vec::<(String, String)>::new);
+    let labels = use_state(|| props.initial_labels.clone());
     // The currently-selected label key and value being staged in the picker.
     let picker_key = use_state(String::new);
     let picker_value = use_state(String::new);
@@ -89,7 +100,7 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         .map(|(_, desc)| desc.clone());
 
     html! {
-        <Card title={Some(html! { "New note" })} classes={classes!("note-editor")}>
+        <Card title={Some(html! { <span>{ props.card_title.clone() }</span> })} classes={classes!("note-editor")}>
             <form class="stack" onsubmit={on_submit}>
                 <label class="field">
                     <span>{ "Title" }</span>
@@ -153,7 +164,9 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                     </div>
                 </fieldset>
 
-                <Button variant={Some("primary".to_string())}>{ "Save note" }</Button>
+                <Button variant={Some("primary".to_string())}>
+                    <span>{ props.submit_label.clone() }</span>
+                </Button>
             </form>
         </Card>
     }

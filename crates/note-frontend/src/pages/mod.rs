@@ -1,7 +1,11 @@
 pub mod labels;
 pub mod new_note;
+pub mod note_edit;
+pub mod note_show;
 pub mod notes;
 
 pub use labels::LabelsPage;
 pub use new_note::NewNotePage;
+pub use note_edit::NoteEditPage;
+pub use note_show::NoteShowPage;
 pub use notes::NotesPage;
