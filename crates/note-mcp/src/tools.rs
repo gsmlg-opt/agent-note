@@ -1,5 +1,25 @@
-use note_pipelines::{save_note, search_notes, Context, SaveNoteInput as PipelineSaveNoteInput};
+use note_pipelines::{
+    delete_note, get_note, list_notes, save_note, search_notes, update_note, Context,
+    SaveNoteInput as PipelineSaveNoteInput,
+};
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize)]
+pub struct LabelData {
+    pub key: String,
+    pub value: String,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NoteData {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub labels: Vec<LabelData>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SaveNoteToolInput {
@@ -28,6 +48,94 @@ pub async fn save_note_tool(
     )
     .await?;
     Ok(SaveNoteToolOutput { id: note.id })
+}
+
+pub async fn get_note_tool(ctx: &Context, id: &str) -> anyhow::Result<Option<NoteData>> {
+    let note = get_note(ctx, id).await?;
+    Ok(note.map(|note| NoteData {
+        id: note.id,
+        title: note.title,
+        content: note.content,
+        labels: note
+            .labels
+            .into_iter()
+            .map(|label| LabelData {
+                key: label.key,
+                value: label.value,
+                description: label.description,
+            })
+            .collect(),
+        created_at: note.created_at,
+        updated_at: note.updated_at,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateNoteToolInput {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub labels: Vec<(String, String)>,
+}
+
+pub async fn update_note_tool(
+    ctx: &Context,
+    input: UpdateNoteToolInput,
+) -> anyhow::Result<Option<NoteData>> {
+    let note = update_note(
+        ctx,
+        &input.id,
+        PipelineSaveNoteInput {
+            title: input.title,
+            content: input.content,
+            labels: input.labels,
+        },
+    )
+    .await?;
+    Ok(note.map(|note| NoteData {
+        id: note.id,
+        title: note.title,
+        content: note.content,
+        labels: note
+            .labels
+            .into_iter()
+            .map(|label| LabelData {
+                key: label.key,
+                value: label.value,
+                description: label.description,
+            })
+            .collect(),
+        created_at: note.created_at,
+        updated_at: note.updated_at,
+    }))
+}
+
+pub async fn delete_note_tool(ctx: &Context, id: &str) -> anyhow::Result<bool> {
+    delete_note(ctx, id).await
+}
+
+pub async fn list_notes_tool(ctx: &Context) -> anyhow::Result<Vec<NoteData>> {
+    let notes = list_notes(ctx).await?;
+    Ok(notes
+        .into_iter()
+        .map(|note| NoteData {
+            id: note.id,
+            title: note.title,
+            content: note.content,
+            labels: note
+                .labels
+                .into_iter()
+                .map(|label| LabelData {
+                    key: label.key,
+                    value: label.value,
+                    description: label.description,
+                })
+                .collect(),
+            created_at: note.created_at,
+            updated_at: note.updated_at,
+        })
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,4 +1,4 @@
-//! MCP server exposing the two note tools over a stdio transport.
+//! MCP server exposing the note tools over a stdio transport.
 //!
 //! JSON-RPC is spoken on stdin/stdout; rmcp keeps stdout clean for protocol
 //! traffic, so anything we want logged must go to stderr (docs/design.md §8).
@@ -20,8 +20,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::tools::{
-    save_note_tool, semantic_search_tool, SaveNoteToolInput, SaveNoteToolOutput,
-    SemanticSearchToolInput, SemanticSearchToolResult,
+    delete_note_tool, get_note_tool, list_notes_tool, save_note_tool, semantic_search_tool,
+    update_note_tool, LabelData, NoteData, SaveNoteToolInput, SaveNoteToolOutput,
+    SemanticSearchToolInput, SemanticSearchToolResult, UpdateNoteToolInput,
 };
 
 /// MCP request schema for `save_note`. Mirrors [`SaveNoteToolInput`] but derives
@@ -63,6 +64,116 @@ impl From<SaveNoteToolOutput> for SaveNoteResponse {
     fn from(o: SaveNoteToolOutput) -> Self {
         Self { id: o.id }
     }
+}
+
+/// MCP request schema for `get_note`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetNoteRequest {
+    /// Note id.
+    pub id: String,
+}
+
+/// MCP label schema embedded in note responses.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LabelSchema {
+    /// Label key.
+    pub key: String,
+    /// Label value attached to the note.
+    pub value: String,
+    /// Label key description.
+    pub description: String,
+}
+
+/// MCP response schema for note-returning tools.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct NoteResponse {
+    /// Note id.
+    pub id: String,
+    /// Note title.
+    pub title: String,
+    /// Note body.
+    pub content: String,
+    /// Labels attached to the note.
+    pub labels: Vec<LabelSchema>,
+    /// Unix timestamp when the note was created.
+    pub created_at: i64,
+    /// Unix timestamp when the note was last updated.
+    pub updated_at: i64,
+}
+
+impl From<LabelData> for LabelSchema {
+    fn from(l: LabelData) -> Self {
+        Self {
+            key: l.key,
+            value: l.value,
+            description: l.description,
+        }
+    }
+}
+
+impl From<NoteData> for NoteResponse {
+    fn from(n: NoteData) -> Self {
+        Self {
+            id: n.id,
+            title: n.title,
+            content: n.content,
+            labels: n.labels.into_iter().map(Into::into).collect(),
+            created_at: n.created_at,
+            updated_at: n.updated_at,
+        }
+    }
+}
+
+/// MCP request schema for `update_note`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateNoteRequest {
+    /// Note id.
+    pub id: String,
+    /// New note title.
+    pub title: String,
+    /// New note body.
+    pub content: String,
+    /// Existing label keys to attach, as `(key, value)` pairs. Cannot create new
+    /// label keys — that is REST/UI-only (docs/design.md §8).
+    #[serde(default)]
+    pub labels: Vec<(String, String)>,
+}
+
+impl From<UpdateNoteRequest> for UpdateNoteToolInput {
+    fn from(r: UpdateNoteRequest) -> Self {
+        Self {
+            id: r.id,
+            title: r.title,
+            content: r.content,
+            labels: r.labels,
+        }
+    }
+}
+
+/// MCP request schema for `delete_note`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteNoteRequest {
+    /// Note id.
+    pub id: String,
+}
+
+/// MCP response schema for `delete_note`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DeleteNoteResponse {
+    /// Whether a note was deleted.
+    pub deleted: bool,
+}
+
+/// MCP request schema for `list_notes`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListNotesRequest {}
+
+/// MCP response schema for `list_notes`. Wraps the notes in an object so the
+/// tool's output schema has an `object` root, as the MCP spec requires.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct NoteListResponse {
+    /// Saved notes.
+    pub notes: Vec<NoteResponse>,
 }
 
 /// MCP request schema for `semantic_search`.
@@ -133,7 +244,10 @@ impl NoteMcpServer {
 #[tool_router(router = tool_router)]
 impl NoteMcpServer {
     /// Save a note with a title, body, and optional existing label keys.
-    #[tool(name = "save_note", description = "Save a note with a title, content, and optional labels.")]
+    #[tool(
+        name = "save_note",
+        description = "Save a note with a title, content, and optional labels."
+    )]
     pub async fn save_note(
         &self,
         params: Parameters<SaveNoteRequest>,
@@ -142,6 +256,61 @@ impl NoteMcpServer {
             .await
             .map_err(to_error_data)?;
         Ok(Json(output.into()))
+    }
+
+    /// Fetch a single note by id.
+    #[tool(name = "get_note", description = "Fetch a single note by id.")]
+    pub async fn get_note(
+        &self,
+        params: Parameters<GetNoteRequest>,
+    ) -> Result<Json<NoteResponse>, ErrorData> {
+        let id = params.0.id;
+        let output = get_note_tool(&self.ctx, &id).await.map_err(to_error_data)?;
+        let note =
+            output.ok_or_else(|| to_error_data(anyhow::anyhow!("note not found: {}", id)))?;
+        Ok(Json(note.into()))
+    }
+
+    /// Update an existing note's title, body, and labels.
+    #[tool(
+        name = "update_note",
+        description = "Update an existing note's title, content, and labels by id."
+    )]
+    pub async fn update_note(
+        &self,
+        params: Parameters<UpdateNoteRequest>,
+    ) -> Result<Json<NoteResponse>, ErrorData> {
+        let id = params.0.id.clone();
+        let output = update_note_tool(&self.ctx, params.0.into())
+            .await
+            .map_err(to_error_data)?;
+        let note =
+            output.ok_or_else(|| to_error_data(anyhow::anyhow!("note not found: {}", id)))?;
+        Ok(Json(note.into()))
+    }
+
+    /// Delete a note by id.
+    #[tool(name = "delete_note", description = "Delete a note by id.")]
+    pub async fn delete_note(
+        &self,
+        params: Parameters<DeleteNoteRequest>,
+    ) -> Result<Json<DeleteNoteResponse>, ErrorData> {
+        let deleted = delete_note_tool(&self.ctx, &params.0.id)
+            .await
+            .map_err(to_error_data)?;
+        Ok(Json(DeleteNoteResponse { deleted }))
+    }
+
+    /// List all saved notes.
+    #[tool(name = "list_notes", description = "List all saved notes.")]
+    pub async fn list_notes(
+        &self,
+        _params: Parameters<ListNotesRequest>,
+    ) -> Result<Json<NoteListResponse>, ErrorData> {
+        let notes = list_notes_tool(&self.ctx).await.map_err(to_error_data)?;
+        Ok(Json(NoteListResponse {
+            notes: notes.into_iter().map(Into::into).collect(),
+        }))
     }
 
     /// Semantic (hybrid dense+sparse) search over saved notes.
@@ -165,8 +334,10 @@ impl NoteMcpServer {
 impl ServerHandler for NoteMcpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
-        info.instructions =
-            Some("Note server exposing save_note and semantic_search over MCP.".to_string());
+        info.instructions = Some(
+            "Note server exposing save_note, get_note, update_note, delete_note, list_notes, and semantic_search over MCP."
+                .to_string(),
+        );
         info
     }
 }
@@ -176,7 +347,7 @@ fn to_error_data(err: anyhow::Error) -> ErrorData {
     ErrorData::internal_error(err.to_string(), None)
 }
 
-/// Serve the two note tools as an MCP server over stdio until the client
+/// Serve the note tools as an MCP server over stdio until the client
 /// disconnects. JSON-RPC flows on stdin/stdout; keep logs on stderr.
 pub async fn run_stdio(ctx: Context) -> anyhow::Result<()> {
     let server = NoteMcpServer::new(Arc::new(ctx));
@@ -204,12 +375,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_builds_and_lists_both_tools() {
+    async fn server_builds_and_lists_all_tools() {
         let (ctx, _dir) = test_context().await;
         let server = NoteMcpServer::new(Arc::new(ctx));
         let tools = server.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(names.contains(&"save_note"), "save_note missing: {names:?}");
+        assert!(names.contains(&"get_note"), "get_note missing: {names:?}");
+        assert!(
+            names.contains(&"update_note"),
+            "update_note missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"delete_note"),
+            "delete_note missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"list_notes"),
+            "list_notes missing: {names:?}"
+        );
         assert!(
             names.contains(&"semantic_search"),
             "semantic_search missing: {names:?}"
