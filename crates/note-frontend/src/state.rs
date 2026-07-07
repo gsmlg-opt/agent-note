@@ -1,65 +1,25 @@
-#[derive(Debug, Clone, PartialEq, Default)]
+//! Plain view-model types shared across pages. (The app is now multi-page via yew-router, so
+//! state lives locally in each page rather than in one global reducer.)
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct NoteSummary {
     pub id: String,
     pub title: String,
+    pub content: String,
+    /// Attached labels as (key, value) pairs.
+    pub labels: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchResultSummary {
     pub id: String,
     pub title: String,
-    pub score: f32, // fused RRF score, label as such (docs/design.md §7) — not "similarity"
+    /// Fused RRF rank-fusion score — label it as such in the UI, not "similarity" (docs/design.md §7).
+    pub score: f32,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct AppState {
-    pub notes: Vec<NoteSummary>,
-    pub search_results: Vec<SearchResultSummary>,
-    pub loading: bool,
-    pub error: Option<String>,
-}
-
-pub enum Action {
-    SearchStarted,
-    // Constructed by the fetch callbacks in main.rs once the search response lands.
-    SearchSucceeded(Vec<SearchResultSummary>),
-    SearchFailed(String),
-}
-
-pub fn reduce(state: &AppState, action: Action) -> AppState {
-    match action {
-        Action::SearchStarted => AppState { loading: true, error: None, ..state.clone() },
-        Action::SearchSucceeded(results) => AppState { loading: false, search_results: results, ..state.clone() },
-        Action::SearchFailed(err) => AppState { loading: false, error: Some(err), ..state.clone() },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn search_started_sets_loading_and_clears_error() {
-        let state = AppState { error: Some("old error".into()), ..Default::default() };
-        let next = reduce(&state, Action::SearchStarted);
-        assert!(next.loading);
-        assert_eq!(next.error, None);
-    }
-
-    #[test]
-    fn search_succeeded_stores_results_and_clears_loading() {
-        let state = AppState { loading: true, ..Default::default() };
-        let results = vec![SearchResultSummary { id: "1".into(), title: "T".into(), score: 0.5 }];
-        let next = reduce(&state, Action::SearchSucceeded(results.clone()));
-        assert!(!next.loading);
-        assert_eq!(next.search_results, results);
-    }
-
-    #[test]
-    fn search_failed_stores_error_and_clears_loading() {
-        let state = AppState { loading: true, ..Default::default() };
-        let next = reduce(&state, Action::SearchFailed("boom".into()));
-        assert!(!next.loading);
-        assert_eq!(next.error, Some("boom".into()));
-    }
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelKey {
+    pub key: String,
+    pub description: String,
 }

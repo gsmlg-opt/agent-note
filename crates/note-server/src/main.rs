@@ -4,9 +4,9 @@ mod notes_api;
 use axum::Router;
 use note_embedding::{BoundedEmbedder, StubEmbedder}; // swap StubEmbedder for OrtEmbedder once model weights are available
 use note_pipelines::Context;
+use axum::response::IntoResponse;
 use note_storage::Storage;
 use std::sync::Arc;
-use tower_http::services::{ServeDir, ServeFile};
 
 /// Provisional cap on concurrent inference calls on the HTTP path. With `StubEmbedder` any value
 /// works; once the real `OrtEmbedder` lands, align this with the ONNX session's thread count so
@@ -53,8 +53,40 @@ async fn main() -> anyhow::Result<()> {
             _ => None,
         };
         if let Some(static_dir) = &static_dir {
-            let index = ServeFile::new(format!("{static_dir}/index.html"));
-            app = app.fallback_service(ServeDir::new(static_dir).not_found_service(index));
+            // SPA fallback for any path the API/MCP routes don't claim: serve a real static asset
+            // when one exists at that path, otherwise return index.html (200) so client-side routes
+            // like /new and /labels boot on a direct load or refresh. (ServeDir's not_found_service
+            // would serve index.html but with a 404 status, wrong for a valid SPA route.)
+            let static_dir = static_dir.clone();
+            let index_html =
+                std::fs::read_to_string(format!("{static_dir}/index.html")).unwrap_or_default();
+            app = app.fallback(move |uri: axum::http::Uri| {
+                let static_dir = static_dir.clone();
+                let index_html = index_html.clone();
+                async move {
+                    let path = uri.path().trim_start_matches('/');
+                    if !path.is_empty() && !path.contains("..") {
+                        if let Ok(bytes) = tokio::fs::read(format!("{static_dir}/{path}")).await {
+                            let content_type = match path.rsplit('.').next() {
+                                Some("js") => "text/javascript",
+                                Some("wasm") => "application/wasm",
+                                Some("css") => "text/css",
+                                Some("html") => "text/html; charset=utf-8",
+                                Some("json") => "application/json",
+                                Some("svg") => "image/svg+xml",
+                                Some("ico") => "image/x-icon",
+                                _ => "application/octet-stream",
+                            };
+                            return (
+                                [(axum::http::header::CONTENT_TYPE, content_type)],
+                                bytes,
+                            )
+                                .into_response();
+                        }
+                    }
+                    axum::response::Html(index_html).into_response()
+                }
+            });
         }
 
         // Default to loopback: a fully-offline, unauthenticated personal app (docs/design.md §1),

@@ -1,4 +1,4 @@
-use web_sys::{HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
+use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 use yew_duskmoon::{Button, Card, Chip};
 
@@ -37,11 +37,11 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         })
     };
 
-    let on_key_change = {
+    let on_key_input = {
         let picker_key = picker_key.clone();
-        Callback::from(move |e: Event| {
-            let select: HtmlSelectElement = e.target_unchecked_into();
-            picker_key.set(select.value());
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            picker_key.set(input.value());
         })
     };
 
@@ -112,16 +112,20 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                 <fieldset class="label-picker">
                     <legend>{ "Labels" }</legend>
                     <div class="label-picker-row">
-                        <select class="select" onchange={on_key_change}>
-                            <option value="" selected={picker_key.is_empty()}>{ "Select a label" }</option>
-                            { for props.available_labels.iter().map(|(key, desc)| {
-                                html! {
-                                    <option value={key.clone()} title={desc.clone()}>
-                                        { key.clone() }
-                                    </option>
-                                }
+                        // Type a key or pick a registered one — unknown keys are created on save.
+                        <input
+                            class="input"
+                            type="text"
+                            list="label-key-options"
+                            placeholder="key"
+                            value={(*picker_key).clone()}
+                            oninput={on_key_input}
+                        />
+                        <datalist id="label-key-options">
+                            { for props.available_labels.iter().map(|(key, _)| html! {
+                                <option value={key.clone()} />
                             }) }
-                        </select>
+                        </datalist>
                         <input
                             class="input"
                             type="text"

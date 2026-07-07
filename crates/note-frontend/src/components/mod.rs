@@ -1,5 +1,7 @@
+pub mod app_bar;
+pub mod modal;
 pub mod note_editor;
-pub mod vector_search;
 
+pub use app_bar::AppBar;
+pub use modal::Modal;
 pub use note_editor::NoteEditor;
-pub use vector_search::VectorSearch;

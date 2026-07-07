@@ -482,6 +482,7 @@ dependencies = [
  "web-sys",
  "yew",
  "yew-duskmoon",
+ "yew-router",
 ]
 
 [[package]]

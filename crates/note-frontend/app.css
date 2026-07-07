@@ -10,19 +10,194 @@ body {
 }
 
 .app {
-    max-width: 720px;
+    max-width: 760px;
     margin: 0 auto;
-    padding: 2rem 1rem 4rem;
+    padding: 1.5rem 1rem 4rem;
     display: flex;
     flex-direction: column;
     gap: 1.5rem;
 }
 
-.app-title {
-    margin: 0;
-    font-size: 1.75rem;
-    font-weight: 700;
+/* --- App bar --- */
+.app-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0 max(1rem, calc((100% - 760px) / 2 + 1rem));
+    height: 60px;
+    background: var(--color-surface-container-high, #ece7f2);
+    border-bottom: 1px solid var(--color-outline-variant, #c7c5d0);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.app-brand {
+    font-size: 1.25rem;
+    font-weight: 800;
+    letter-spacing: -0.01em;
     color: var(--color-primary, #6750a4);
+    text-decoration: none;
+}
+
+.app-nav {
+    display: flex;
+    gap: 0.35rem;
+}
+
+.app-nav .nav-link {
+    padding: 0.4rem 0.7rem;
+    border-radius: 999px;
+    text-decoration: none;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--color-on-surface-variant, #46464f);
+}
+
+.app-nav .nav-link:hover {
+    background: var(--color-surface-container-highest, #e5e0ec);
+    color: var(--color-on-surface, #1b1b1f);
+}
+
+/* Active route (yew-router adds no class, so highlight on aria-current if present). */
+.app-nav .nav-link[aria-current] {
+    background: var(--color-primary, #6750a4);
+    color: var(--color-on-primary, #fff);
+}
+
+/* --- Page heads --- */
+.page-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.page-title {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 700;
+}
+
+.page-hint {
+    margin: 0;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.9rem;
+}
+
+/* --- Note list --- */
+.note-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+}
+
+.note-title {
+    margin: 0 0 0.3rem;
+    font-size: 1.05rem;
+    font-weight: 700;
+}
+
+.note-snippet {
+    margin: 0 0 0.5rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.9rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+}
+
+.empty {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 2rem 0;
+    color: var(--color-on-surface-variant, #46464f);
+}
+
+/* --- Labels list --- */
+.label-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.6rem;
+    overflow: hidden;
+}
+
+.label-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.7rem 0.9rem;
+    border-top: 1px solid var(--color-outline-variant, #c7c5d0);
+}
+
+.label-row:first-child {
+    border-top: none;
+}
+
+.label-row-main {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+}
+
+.label-key {
+    font-weight: 700;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--color-primary, #6750a4);
+}
+
+.label-desc {
+    font-size: 0.85rem;
+    color: var(--color-on-surface-variant, #46464f);
+}
+
+.label-row-actions {
+    display: flex;
+    gap: 0.25rem;
+    flex-shrink: 0;
+}
+
+/* --- Modal --- */
+.modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+    z-index: 100;
+}
+
+.modal-panel {
+    background: var(--color-surface, #faf8ff);
+    color: var(--color-on-surface, #1b1b1f);
+    border-radius: 0.9rem;
+    padding: 1.25rem;
+    width: 100%;
+    max-width: 420px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+
+.modal-panel .dialog-title {
+    margin: 0 0 0.75rem;
+    font-size: 1.15rem;
+    font-weight: 700;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
 }
 
 .field {
