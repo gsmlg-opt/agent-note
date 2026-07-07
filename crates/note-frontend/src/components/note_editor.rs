@@ -125,7 +125,7 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                     <div class="label-picker-row">
                         // Type a key or pick a registered one — unknown keys are created on save.
                         <input
-                            class="input"
+                            class="input label-key-input"
                             type="text"
                             list="label-key-options"
                             placeholder="key"
@@ -137,8 +137,9 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                                 <option value={key.clone()} />
                             }) }
                         </datalist>
+                        <span class="label-eq">{ "=" }</span>
                         <input
-                            class="input"
+                            class="input label-value-input"
                             type="text"
                             placeholder="value"
                             value={(*picker_value).clone()}

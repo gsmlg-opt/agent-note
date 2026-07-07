@@ -315,7 +315,18 @@ body {
     display: flex;
     gap: 0.5rem;
     align-items: center;
-    flex-wrap: wrap;
+}
+
+/* key = value share the row; the Add button keeps its intrinsic width. */
+.label-picker-row .label-key-input,
+.label-picker-row .label-value-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.label-eq {
+    color: var(--color-on-surface-variant, #46464f);
+    font-weight: 600;
 }
 
 .label-hint {
