@@ -1,5 +1,5 @@
 use libsql::Connection;
-use note_core::Note;
+use note_core::{LabelSelector, Note};
 
 pub async fn insert_note(
     conn: &Connection,
@@ -89,13 +89,46 @@ pub async fn clear_note_derived(conn: &Connection, id: &str) -> anyhow::Result<(
     Ok(())
 }
 
-pub async fn list_notes(conn: &Connection) -> anyhow::Result<Vec<Note>> {
-    let mut rows = conn
-        .query(
-            "SELECT id, title, content, created_at, updated_at FROM notes ORDER BY created_at DESC",
-            (),
-        )
-        .await?;
+pub async fn list_notes(
+    conn: &Connection,
+    selectors: &[LabelSelector],
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> anyhow::Result<Vec<Note>> {
+    let mut sql = "SELECT id, title, content, created_at, updated_at FROM notes".to_string();
+    let mut params = Vec::<libsql::Value>::new();
+
+    if !selectors.is_empty() {
+        sql.push_str(" WHERE ");
+        for (idx, selector) in selectors.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(" AND ");
+            }
+            sql.push_str(
+                "EXISTS (
+                    SELECT 1
+                    FROM note_labels nl
+                    JOIN label_keys lk ON lk.id = nl.label_key_id
+                    WHERE nl.note_id = notes.id AND lk.key = ?",
+            );
+            params.push(selector.key.clone().into());
+            if let Some(value) = &selector.value {
+                sql.push_str(" AND nl.value = ?");
+                params.push(value.clone().into());
+            }
+            sql.push(')');
+        }
+    }
+
+    sql.push_str(" ORDER BY created_at DESC");
+
+    if limit.is_some() || offset.is_some() {
+        sql.push_str(" LIMIT ? OFFSET ?");
+        params.push(limit.unwrap_or(-1).into());
+        params.push(offset.unwrap_or(0).into());
+    }
+
+    let mut rows = conn.query(&sql, libsql::params_from_iter(params)).await?;
     let mut notes = vec![];
     while let Some(row) = rows.next().await? {
         let id = row.get::<String>(0)?;

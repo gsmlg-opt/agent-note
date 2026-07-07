@@ -5,7 +5,8 @@ use axum::{
 };
 use note_core::Note;
 use note_pipelines::{
-    delete_note, get_note, list_notes, save_note, search_notes, update_note, Context, SaveNoteInput,
+    delete_note, get_note, list_notes, save_note, search_notes, update_note, Context,
+    ListNotesParams, SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -78,7 +79,7 @@ async fn save_note_handler(
 async fn list_notes_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Json<Vec<NoteDto>>, (axum::http::StatusCode, String)> {
-    let notes = list_notes(&ctx)
+    let notes = list_notes(&ctx, ListNotesParams::default())
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(notes.into_iter().map(Into::into).collect()))

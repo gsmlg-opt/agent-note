@@ -1,6 +1,6 @@
 use note_pipelines::{
     delete_note, get_note, list_notes, save_note, search_notes, update_note, Context,
-    SaveNoteInput as PipelineSaveNoteInput,
+    ListNotesParams, SaveNoteInput as PipelineSaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,8 +115,21 @@ pub async fn delete_note_tool(ctx: &Context, id: &str) -> anyhow::Result<bool> {
     delete_note(ctx, id).await
 }
 
-pub async fn list_notes_tool(ctx: &Context) -> anyhow::Result<Vec<NoteData>> {
-    let notes = list_notes(ctx).await?;
+pub async fn list_notes_tool(
+    ctx: &Context,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    label: Option<String>,
+) -> anyhow::Result<Vec<NoteData>> {
+    let notes = list_notes(
+        ctx,
+        ListNotesParams {
+            limit,
+            offset,
+            label,
+        },
+    )
+    .await?;
     Ok(notes
         .into_iter()
         .map(|note| NoteData {

@@ -166,7 +166,17 @@ pub struct DeleteNoteResponse {
 
 /// MCP request schema for `list_notes`.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ListNotesRequest {}
+pub struct ListNotesRequest {
+    /// Max notes to return.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Number of notes to skip.
+    #[serde(default)]
+    pub offset: Option<u32>,
+    /// Label selector, `&`-separated terms ANDed: `key=value` or bare `key` (any value). e.g. `env=prod&team=core`.
+    #[serde(default)]
+    pub label: Option<String>,
+}
 
 /// MCP response schema for `list_notes`. Wraps the notes in an object so the
 /// tool's output schema has an `object` root, as the MCP spec requires.
@@ -301,13 +311,24 @@ impl NoteMcpServer {
         Ok(Json(DeleteNoteResponse { deleted }))
     }
 
-    /// List all saved notes.
-    #[tool(name = "list_notes", description = "List all saved notes.")]
+    /// List saved notes.
+    #[tool(
+        name = "list_notes",
+        description = "List saved notes with optional limit, offset, and label selector filters."
+    )]
     pub async fn list_notes(
         &self,
-        _params: Parameters<ListNotesRequest>,
+        params: Parameters<ListNotesRequest>,
     ) -> Result<Json<NoteListResponse>, ErrorData> {
-        let notes = list_notes_tool(&self.ctx).await.map_err(to_error_data)?;
+        let req = params.0;
+        let notes = list_notes_tool(
+            &self.ctx,
+            req.limit.map(i64::from),
+            req.offset.map(i64::from),
+            req.label,
+        )
+        .await
+        .map_err(to_error_data)?;
         Ok(Json(NoteListResponse {
             notes: notes.into_iter().map(Into::into).collect(),
         }))
