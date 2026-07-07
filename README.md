@@ -78,11 +78,11 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
    ```
    cd crates/note-frontend && trunk build
    ```
-2. From the repo root, start the app (UI + REST + `/mcp` on `127.0.0.1:8080`):
+2. From the repo root, start the app (UI + REST + `/mcp` on `127.0.0.1:6222`):
    ```
    cargo run
    ```
-   Then open http://127.0.0.1:8080. (`cargo run` resolves to `note-server` — the workspace's only
+   Then open http://127.0.0.1:6222. (`cargo run` resolves to `note-server` — the workspace's only
    binary — and a debug build auto-serves the `dist/` bundle from step 1. Set `NOTE_DB_PATH` to
    change the SQLite file; it defaults to `notes.db` in the working directory.)
 

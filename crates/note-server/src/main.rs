@@ -91,10 +91,10 @@ async fn main() -> anyhow::Result<()> {
 
         // Default to loopback: a fully-offline, unauthenticated personal app (docs/design.md §1),
         // and note-mcp's /mcp router defaults to a loopback-only Host allowlist. NOTE_BIND_ADDR
-        // overrides it — the Docker image sets 0.0.0.0:8080 so the container is reachable via `-p`
+        // overrides it — the Docker image sets 0.0.0.0:6222 so the container is reachable via `-p`
         // (container-network isolation makes that safe; exposing it to your LAN is your `-p` choice).
         let bind_addr =
-            std::env::var("NOTE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+            std::env::var("NOTE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:6222".to_string());
         eprintln!("note-server listening on http://{bind_addr}");
         if let Some(static_dir) = &static_dir {
             eprintln!("serving frontend from {static_dir}");

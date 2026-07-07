@@ -1,7 +1,7 @@
 [build]
 target = "index.html"
 
-# Serve the frontend on a different port than note-server (which binds 127.0.0.1:8080), then
+# Serve the frontend on a different port than note-server (which binds 127.0.0.1:6222), then
 # forward API + MCP calls to it so the frontend's same-origin relative URLs (/api/..., /mcp) work
 # in dev without CORS. Run `note-server` first, then `trunk serve` in this crate.
 [serve]
@@ -9,8 +9,8 @@ port = 8081
 
 [[proxy]]
 rewrite = "/api/"
-backend = "http://127.0.0.1:8080/api/"
+backend = "http://127.0.0.1:6222/api/"
 
 [[proxy]]
 rewrite = "/mcp"
-backend = "http://127.0.0.1:8080/mcp"
+backend = "http://127.0.0.1:6222/mcp"

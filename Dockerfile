@@ -32,10 +32,10 @@ COPY --from=backend /build/target/release/note-server /usr/local/bin/note-server
 COPY --from=frontend /build/crates/note-frontend/dist /app/static
 # 0.0.0.0 so the container is reachable via `docker run -p`; the DB lives on a volume so notes
 # survive container restarts.
-ENV NOTE_BIND_ADDR=0.0.0.0:8080 \
+ENV NOTE_BIND_ADDR=0.0.0.0:6222 \
     NOTE_STATIC_DIR=/app/static \
     NOTE_DB_PATH=/app/data/notes.db
 RUN mkdir -p /app/data
-EXPOSE 8080
+EXPOSE 6222
 VOLUME ["/app/data"]
 CMD ["note-server"]
