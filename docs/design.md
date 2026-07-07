@@ -98,7 +98,7 @@ If dense results consistently drown out obvious exact-term matches (or vice vers
 
 **list_label_keys**: read-only → return the full label-key catalog (`key` + `description`), used by clients/UI to populate label pickers and to validate keys before submission.
 
-**save_note**: validate input, including that every attached label's key already exists in the `label_keys` catalog (§3) — any unknown key rejects the whole request (no partial save, no auto-create) → embed content (dense + sparse, one inference call) → atomic write across the three core tables (§3: `notes`, `notes_embeddings`, `notes_sparse_weights`) → attach `note_labels` rows → return persisted `Note` with labels resolved to `{key, value, description}`.
+**save_note**: validate input (non-empty title/content) → embed content (dense + sparse, one inference call) → atomic write across the three core tables (§3: `notes`, `notes_embeddings`, `notes_sparse_weights`) → attach `note_labels` rows → return persisted `Note` with labels resolved to `{key, value, description}`. Label keys are **auto-created**: any attached label whose key isn't yet in the `label_keys` catalog (§3) is inserted (with an empty description) as part of the same transaction rather than rejected. (This supersedes the earlier "unknown key rejects the request" rule — descriptions for auto-created keys can be filled in later via `define_label_key`/the labels API.)
 
 **search_notes**: embed query (dense + sparse) → dense ANN query + sparse postings query (parallel, both against Turso) → RRF fusion (pure function, no I/O) → hydrate labels/metadata for top-k → return `Vec<(Note, f32)>` where the score is the fused RRF score, not raw cosine.
 

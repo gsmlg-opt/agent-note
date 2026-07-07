@@ -141,8 +141,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    // An unknown label key is auto-created on save (docs/design.md §6), so this succeeds (200)
+    // rather than 400 — only genuinely invalid input (e.g. empty title) is a 400.
     #[tokio::test]
-    async fn unknown_label_key_returns_400() {
+    async fn unknown_label_key_is_auto_created_returns_200() {
         let (app, _dir) = test_app().await;
         let resp = app
             .oneshot(post(
@@ -151,7 +153,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

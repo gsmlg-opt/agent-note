@@ -1,5 +1,5 @@
 use note_embedding::StubEmbedder;
-use note_pipelines::{define_label_key, save_note, Context, SaveNoteInput};
+use note_pipelines::{define_label_key, list_label_keys, save_note, Context, SaveNoteInput};
 use note_storage::Storage;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -37,19 +37,29 @@ async fn saves_and_returns_a_persisted_note() {
     assert!(!note.id.is_empty());
 }
 
+// Auto-create: a label key that isn't in the catalog yet is created on save (docs/design.md §6),
+// not rejected. The save succeeds and the key afterwards exists in the catalog.
 #[tokio::test]
-async fn unknown_label_key_rejects_the_whole_request() {
+async fn unknown_label_key_is_auto_created() {
     let (ctx, _dir) = test_context().await;
-    let result = save_note(
+    let note = save_note(
         &ctx,
         SaveNoteInput {
             title: "My note".into(),
             content: "Some content".into(),
-            labels: vec![("nonexistent".into(), "value".into())],
+            labels: vec![("project".into(), "alpha".into())],
         },
     )
-    .await;
-    assert!(result.is_err());
+    .await
+    .unwrap();
+
+    assert_eq!(note.labels.len(), 1);
+    assert_eq!(note.labels[0].key, "project");
+    assert_eq!(note.labels[0].value, "alpha");
+
+    // The previously-unknown key now exists in the catalog (auto-created, empty description).
+    let keys = list_label_keys(&ctx).await.unwrap();
+    assert!(keys.iter().any(|k| k.key == "project"));
 }
 
 #[tokio::test]
