@@ -9,6 +9,9 @@ use crate::components::Modal;
 use crate::routes::Route;
 use crate::state::{NoteSummary, SearchResultSummary};
 
+/// Notes shown per page in the list view.
+const PAGE_SIZE: usize = 10;
+
 /// Default page: a table of all notes (title, labels, per-row view/edit/remove actions), with a
 /// search bar that swaps the table for ranked results.
 #[function_component(NotesPage)]
@@ -21,19 +24,26 @@ pub fn notes_page() -> Html {
     let error = use_state(|| None::<String>);
     // The note pending deletion (id, title) — drives the confirm modal.
     let delete_target = use_state(|| None::<(String, String)>);
+    // Current list-view page (0-based).
+    let page = use_state(|| 0usize);
 
     let reload = {
         let notes = notes.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let page = page.clone();
         Callback::from(move |_: ()| {
             let notes = notes.clone();
             let loading = loading.clone();
             let error = error.clone();
+            let page = page.clone();
             loading.set(true);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::list_notes().await {
-                    Ok(list) => notes.set(list),
+                    Ok(list) => {
+                        notes.set(list);
+                        page.set(0);
+                    }
                     Err(e) => error.set(Some(e)),
                 }
                 loading.set(false);
@@ -138,6 +148,11 @@ pub fn notes_page() -> Html {
         }
     };
 
+    let on_refresh = {
+        let reload = reload.clone();
+        Callback::from(move |_: MouseEvent| reload.emit(()))
+    };
+
     html! {
         <section class="stack">
             <form class="search-bar" onsubmit={on_search}>
@@ -152,6 +167,9 @@ pub fn notes_page() -> Html {
                 if results.is_some() {
                     <button type="button" class="btn btn-ghost" onclick={on_clear}>{ "Clear" }</button>
                 }
+                <button type="button" class="btn btn-ghost btn-icon" title="Refresh" onclick={on_refresh}>
+                    { icons::refresh() }<span class="sr-only">{ "Refresh" }</span>
+                </button>
             </form>
 
             if let Some(err) = &*error {
@@ -163,11 +181,64 @@ pub fn notes_page() -> Html {
             } else if let Some(hits) = &*results {
                 { search_results_view(hits) }
             } else {
-                { note_table(&notes, &delete_target) }
+                { list_view(&notes, &page, &delete_target) }
             }
 
             { delete_modal }
         </section>
+    }
+}
+
+/// Full-list view: the current page of notes plus the pagination bar.
+fn list_view(
+    notes: &[NoteSummary],
+    page: &UseStateHandle<usize>,
+    delete_target: &UseStateHandle<Option<(String, String)>>,
+) -> Html {
+    let total = notes.len();
+    if total == 0 {
+        return note_table(notes, delete_target);
+    }
+    let total_pages = total.div_ceil(PAGE_SIZE);
+    let current = (**page).min(total_pages - 1);
+    let start = current * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(total);
+
+    html! {
+        <>
+            { note_table(&notes[start..end], delete_target) }
+            { pagination_bar(current, total_pages, total, page) }
+        </>
+    }
+}
+
+/// `Prev [1] [2] … [N] Next` pagination controls; hidden when everything fits on one page.
+fn pagination_bar(current: usize, total_pages: usize, total: usize, page: &UseStateHandle<usize>) -> Html {
+    if total_pages <= 1 {
+        return html! {};
+    }
+    let set_page = |target: usize| {
+        let page = page.clone();
+        Callback::from(move |_: MouseEvent| page.set(target))
+    };
+    html! {
+        <nav class="pagination" aria-label="Notes pages">
+            <span class="pagination-info">{ format!("{total} notes") }</span>
+            <button type="button" class="btn btn-ghost pagination-prev"
+                disabled={current == 0} onclick={set_page(current.saturating_sub(1))}>
+                { "Prev" }
+            </button>
+            { for (0..total_pages).map(|p| {
+                let classes = if p == current { "btn btn-primary pagination-item" } else { "btn btn-ghost pagination-item" };
+                html! {
+                    <button type="button" class={classes} onclick={set_page(p)}>{ p + 1 }</button>
+                }
+            }) }
+            <button type="button" class="btn btn-ghost pagination-next"
+                disabled={current + 1 >= total_pages} onclick={set_page(current + 1)}>
+                { "Next" }
+            </button>
+        </nav>
     }
 }
 
