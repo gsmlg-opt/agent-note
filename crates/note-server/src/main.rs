@@ -6,6 +6,7 @@ use axum::Router;
 use note_embedding::{BoundedEmbedder, StubEmbedder};
 use note_pipelines::Context;
 use note_storage::Storage;
+use std::io::Read;
 use std::sync::Arc;
 
 /// Provisional cap on concurrent inference calls on the HTTP path. With `StubEmbedder` any value
@@ -31,6 +32,29 @@ fn build_embedder(concurrency: usize) -> anyhow::Result<Arc<dyn note_embedding::
 async fn main() -> anyhow::Result<()> {
     let stdio_mode = std::env::args().any(|a| a == "--stdio");
     let db_path = std::env::var("NOTE_DB_PATH").unwrap_or_else(|_| "notes.db".to_string());
+    let export_mode = std::env::args().any(|a| a == "--export");
+    let import_mode = std::env::args().any(|a| a == "--import");
+
+    if export_mode {
+        let storage = Storage::open_local(&db_path).await?;
+        let ctx = Context::new(Arc::new(storage), Arc::new(StubEmbedder));
+        println!("{}", note_pipelines::export_json(&ctx).await?);
+        return Ok(());
+    }
+
+    if import_mode {
+        let storage = Storage::open_local(&db_path).await?;
+        let embedder = build_embedder(1)?;
+        let ctx = Context::new(Arc::new(storage), embedder);
+        let mut input = String::new();
+        std::io::stdin().lock().read_to_string(&mut input)?;
+        let stats = note_pipelines::import_json(&ctx, &input).await?;
+        eprintln!(
+            "import: {} notes added, {} skipped, {} label keys added, {} notes embedded",
+            stats.notes_added, stats.notes_skipped, stats.label_keys_added, stats.embedded
+        );
+        return Ok(());
+    }
 
     if stdio_mode {
         // stdio is single-client — no connection pool needed (docs/design.md §9).
