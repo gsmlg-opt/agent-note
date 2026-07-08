@@ -37,15 +37,16 @@ use crate::NoteMcpServer;
 /// `with_json_response(true)` returns `application/json` directly instead of an SSE stream,
 /// dropping the framing overhead (allowed by the MCP Streamable HTTP spec, 2025-06-18).
 ///
-/// The default DNS-rebinding-protection `Host` allowlist (loopback only: `localhost`,
-/// `127.0.0.1`, `::1`) is kept — any other `Host` gets `403 Forbidden`. That's right for
-/// this single-process, loopback-served personal app, but if note-server is ever bound to
-/// `0.0.0.0`/a LAN address or fronted by a proxy forwarding a real `Host`, `/mcp` will 403
-/// (while REST routes still work) until the allowed-hosts list is widened.
+/// `disable_allowed_hosts()` clears rmcp's default DNS-rebinding-protection `Host` allowlist
+/// (loopback only: `localhost`, `127.0.0.1`, `::1`), which otherwise `403`s any other `Host`.
+/// This app is meant to be served behind a reverse proxy (e.g. Caddy at `notes.web-dev.zdns.cn`)
+/// that forwards a real public `Host` and owns access control / TLS; keeping the allowlist here
+/// would reject every proxied `/mcp` request. Host/origin gating is delegated to the proxy.
 pub fn mcp_router(ctx: Arc<Context>) -> Router {
     let config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
-        .with_json_response(true);
+        .with_json_response(true)
+        .disable_allowed_hosts();
     let service = StreamableHttpService::new(
         move || Ok(NoteMcpServer::new(ctx.clone())),
         Arc::new(LocalSessionManager::default()),
