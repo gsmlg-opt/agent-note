@@ -39,8 +39,8 @@ mod tests {
 
         assert!((get("a") - (1.0 / 61.0 + 1.0 / 62.0)).abs() < 1e-6); // rank1 dense + rank2 sparse
         assert!((get("b") - (1.0 / 62.0 + 1.0 / 61.0)).abs() < 1e-6); // rank2 dense + rank1 sparse
-        assert!((get("c") - (1.0 / 63.0)).abs() < 1e-6);              // rank3 dense only
-        assert!((get("d") - (1.0 / 63.0)).abs() < 1e-6);              // rank3 sparse only
+        assert!((get("c") - (1.0 / 63.0)).abs() < 1e-6); // rank3 dense only
+        assert!((get("d") - (1.0 / 63.0)).abs() < 1e-6); // rank3 sparse only
         assert_eq!(result.len(), 4);
     }
 

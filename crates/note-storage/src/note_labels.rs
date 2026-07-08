@@ -1,10 +1,23 @@
 use libsql::Connection;
 use note_core::Label;
 
-pub async fn attach_label(conn: &Connection, note_id: &str, key: &str, value: &str) -> anyhow::Result<()> {
+pub async fn attach_label(
+    conn: &Connection,
+    note_id: &str,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
     let label_key_id: i64 = {
-        let mut rows = conn.query("SELECT id FROM label_keys WHERE key = ?1", libsql::params![key]).await?;
-        let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("unknown label key: {key}"))?;
+        let mut rows = conn
+            .query(
+                "SELECT id FROM label_keys WHERE key = ?1",
+                libsql::params![key],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown label key: {key}"))?;
         row.get::<i64>(0)?
     };
     conn.execute(

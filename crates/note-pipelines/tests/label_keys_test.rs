@@ -18,7 +18,9 @@ async fn test_context() -> (Context, TempDir) {
 #[tokio::test]
 async fn define_then_list_roundtrips() {
     let (ctx, _dir) = test_context().await;
-    define_label_key(&ctx, "status", "Workflow status").await.unwrap();
+    define_label_key(&ctx, "status", "Workflow status")
+        .await
+        .unwrap();
     let keys = list_label_keys(&ctx).await.unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].key, "status");

@@ -74,7 +74,10 @@ mod tests {
         NoteInput {
             title: title.to_string(),
             content: content.to_string(),
-            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         }
     }
 
@@ -96,7 +99,10 @@ mod tests {
             &input("title", "content", &[("status", "done")]),
             &[], // no known keys registered
         );
-        assert_eq!(result, Err(ValidationError::UnknownLabelKey("status".to_string())));
+        assert_eq!(
+            result,
+            Err(ValidationError::UnknownLabelKey("status".to_string()))
+        );
     }
 
     #[test]

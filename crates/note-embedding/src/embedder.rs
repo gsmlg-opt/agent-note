@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-pub type DenseVector = Vec<f32>;      // 1024-d, L2-normalized
+pub type DenseVector = Vec<f32>; // 1024-d, L2-normalized
 pub type SparseVector = HashMap<i64, f32>; // token_id -> weight, thresholded
 
 /// A single dense+sparse inference call. Do not add a second method to this trait that splits
