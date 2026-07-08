@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, State},
+    response::Html,
     routing::{get as route_get, post},
     Json, Router,
 };
@@ -22,6 +23,11 @@ pub struct SaveNoteRequest {
 #[derive(Serialize)]
 pub struct SaveNoteResponse {
     pub id: String,
+}
+
+#[derive(Deserialize)]
+pub struct RenderRequest {
+    pub content: String,
 }
 
 #[derive(Serialize)]
@@ -173,6 +179,10 @@ async fn search_handler(
     ))
 }
 
+async fn render_handler(Json(req): Json<RenderRequest>) -> Html<String> {
+    Html(crate::render::render_markdown_html(&req.content))
+}
+
 pub fn notes_router() -> Router<Arc<Context>> {
     Router::new()
         .route(
@@ -189,6 +199,7 @@ pub fn notes_router() -> Router<Arc<Context>> {
         // GET, so the Wasm frontend (gloo-net) can't call a GET-with-body search. POST-with-body is
         // the standard pattern for structured search params.
         .route("/api/notes/search", post(search_handler))
+        .route("/api/render", post(render_handler))
 }
 
 #[cfg(test)]

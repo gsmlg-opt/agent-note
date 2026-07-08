@@ -1,5 +1,6 @@
 mod labels_api;
 mod notes_api;
+mod render;
 
 use axum::response::IntoResponse;
 use axum::Router;

@@ -153,6 +153,30 @@ body {
     color: var(--color-error, #ba1a1a);
 }
 
+/* --- Markdown code + mermaid --- */
+/* syntect emits <pre> with inline fg/bg colors; add box treatment + horizontal scroll. */
+.markdown-body pre {
+    padding: 0.85rem 1rem;
+    border-radius: 0.5rem;
+    overflow-x: auto;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+}
+
+.mermaid-diagram {
+    display: flex;
+    justify-content: center;
+    margin: 1rem 0;
+}
+
+.mermaid-diagram svg {
+    max-width: 100%;
+    height: auto;
+}
+
+.mermaid-error {
+    color: var(--color-error, #ba1a1a);
+}
+
 /* --- Pagination --- */
 .pagination {
     display: flex;

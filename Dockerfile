@@ -37,8 +37,10 @@ RUN apt-get update \
 
 # ---- Stage 3: slim runtime ----
 FROM debian:bookworm-slim AS runtime
+# fonts-dejavu-core gives mermaid-rs-renderer a font for diagram text metrics (the slim base has
+# none, which would break server-side mermaid rendering).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=backend /build/target/release/note-server /usr/local/bin/note-server
