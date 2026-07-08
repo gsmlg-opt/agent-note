@@ -49,13 +49,18 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
         }
     }
 
-    let (dense, sparse) = ctx.embedder.embed(&input.content).await?;
+    let chunks = crate::chunk::chunk_content(&input.content);
+    let mut embeddings = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        let (dense, sparse) = ctx.embedder.embed(chunk).await?;
+        let weights: Vec<(i64, f64)> = sparse.into_iter().map(|(k, v)| (k, v as f64)).collect();
+        embeddings.push((dense, weights));
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
-    let weights: Vec<(i64, f64)> = sparse.into_iter().map(|(k, v)| (k, v as f64)).collect();
 
-    // docs/design.md §3: notes, notes_embeddings and notes_sparse_weights (plus label attachments)
+    // docs/design.md §3: notes, chunk embeddings/sparse weights (plus label attachments)
     // must be written in one atomic transaction — a partial write silently degrades recall and is a
     // correctness bug. libsql's `Transaction` derefs to `Connection`, so we pass `&tx` straight into
     // the existing `&Connection`-taking storage functions and only `commit()` after every write
@@ -66,8 +71,10 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
         note_storage::insert_label_key(&tx, key, "").await?;
     }
     note_storage::insert_note(&tx, &id, &input.title, &input.content, now, now).await?;
-    note_storage::insert_embedding(&tx, &id, &dense).await?;
-    note_storage::insert_sparse_weights(&tx, &id, &weights).await?;
+    for (idx, (dense, weights)) in embeddings.iter().enumerate() {
+        note_storage::insert_chunk_embedding(&tx, &id, idx as i64, dense).await?;
+        note_storage::insert_chunk_sparse_weights(&tx, &id, idx as i64, weights).await?;
+    }
     for (key, value) in &input.labels {
         note_storage::attach_label(&tx, &id, key, value).await?;
     }

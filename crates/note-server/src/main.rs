@@ -1,8 +1,8 @@
 mod labels_api;
 mod notes_api;
 
-use axum::Router;
 use axum::response::IntoResponse;
+use axum::Router;
 use note_embedding::{BoundedEmbedder, StubEmbedder};
 use note_pipelines::Context;
 use note_storage::Storage;
@@ -37,6 +37,10 @@ async fn main() -> anyhow::Result<()> {
         let storage = Storage::open_local(&db_path).await?;
         let embedder = build_embedder(1)?;
         let ctx = Context::new(Arc::new(storage), embedder);
+        let n = note_pipelines::backfill_chunk_embeddings(&ctx).await?;
+        if n > 0 {
+            eprintln!("backfilled chunk embeddings for {n} notes");
+        }
         note_mcp::run_stdio(ctx).await?;
     } else {
         // Axum is the only process that needs connection pooling (docs/design.md §2).
@@ -45,6 +49,10 @@ async fn main() -> anyhow::Result<()> {
         let storage = Storage::open_local(&db_path).await?;
         let embedder = build_embedder(HTTP_INFERENCE_CONCURRENCY)?;
         let ctx = Arc::new(Context::new(Arc::new(storage), embedder));
+        let n = note_pipelines::backfill_chunk_embeddings(&ctx).await?;
+        if n > 0 {
+            eprintln!("backfilled chunk embeddings for {n} notes");
+        }
 
         // notes_router()/labels_router() are Router<Arc<Context>> — applying .with_state converts them
         // to Router<()>, which can then merge with mcp_router() (already Router<()>, self-stated).
@@ -91,10 +99,7 @@ async fn main() -> anyhow::Result<()> {
                                 Some("ico") => "image/x-icon",
                                 _ => "application/octet-stream",
                             };
-                            return (
-                                [(axum::http::header::CONTENT_TYPE, content_type)],
-                                bytes,
-                            )
+                            return ([(axum::http::header::CONTENT_TYPE, content_type)], bytes)
                                 .into_response();
                         }
                     }

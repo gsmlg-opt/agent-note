@@ -72,12 +72,12 @@ pub async fn delete_note(conn: &Connection, id: &str) -> anyhow::Result<u64> {
 
 pub async fn clear_note_derived(conn: &Connection, id: &str) -> anyhow::Result<()> {
     conn.execute(
-        "DELETE FROM notes_embeddings WHERE note_id = ?1",
+        "DELETE FROM note_chunk_embeddings WHERE note_id = ?1",
         libsql::params![id],
     )
     .await?;
     conn.execute(
-        "DELETE FROM notes_sparse_weights WHERE note_id = ?1",
+        "DELETE FROM note_chunk_sparse WHERE note_id = ?1",
         libsql::params![id],
     )
     .await?;

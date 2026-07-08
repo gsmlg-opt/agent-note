@@ -1,6 +1,12 @@
 pub mod context;
 pub use context::*;
 
+pub mod chunk;
+pub use chunk::*;
+
+pub mod backfill;
+pub use backfill::*;
+
 pub mod label_keys;
 pub use label_keys::*;
 

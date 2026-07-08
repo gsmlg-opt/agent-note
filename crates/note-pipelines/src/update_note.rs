@@ -46,9 +46,14 @@ pub async fn update_note(
         }
     }
 
-    let (dense, sparse) = ctx.embedder.embed(&input.content).await?;
+    let chunks = crate::chunk::chunk_content(&input.content);
+    let mut embeddings = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        let (dense, sparse) = ctx.embedder.embed(chunk).await?;
+        let weights: Vec<(i64, f64)> = sparse.into_iter().map(|(k, v)| (k, v as f64)).collect();
+        embeddings.push((dense, weights));
+    }
     let now = chrono::Utc::now().timestamp();
-    let weights: Vec<(i64, f64)> = sparse.into_iter().map(|(k, v)| (k, v as f64)).collect();
 
     let tx = conn.transaction().await?;
     let affected = note_storage::update_note(&tx, id, &input.title, &input.content, now).await?;
@@ -59,8 +64,10 @@ pub async fn update_note(
         note_storage::insert_label_key(&tx, key, "").await?;
     }
     note_storage::clear_note_derived(&tx, id).await?;
-    note_storage::insert_embedding(&tx, id, &dense).await?;
-    note_storage::insert_sparse_weights(&tx, id, &weights).await?;
+    for (idx, (dense, weights)) in embeddings.iter().enumerate() {
+        note_storage::insert_chunk_embedding(&tx, id, idx as i64, dense).await?;
+        note_storage::insert_chunk_sparse_weights(&tx, id, idx as i64, weights).await?;
+    }
     for (key, value) in &input.labels {
         note_storage::attach_label(&tx, id, key, value).await?;
     }

@@ -20,10 +20,13 @@ async fn schema_applies_cleanly_to_a_fresh_db() {
         "notes",
         "label_keys",
         "note_labels",
-        "notes_embeddings",
-        "notes_sparse_weights",
+        "note_chunk_embeddings",
+        "note_chunk_sparse",
     ] {
-        assert!(tables.contains(&expected.to_string()), "missing table {expected}");
+        assert!(
+            tables.contains(&expected.to_string()),
+            "missing table {expected}"
+        );
     }
 }
 

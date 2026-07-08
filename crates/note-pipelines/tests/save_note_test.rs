@@ -18,7 +18,9 @@ async fn test_context() -> (Context, TempDir) {
 #[tokio::test]
 async fn saves_and_returns_a_persisted_note() {
     let (ctx, _dir) = test_context().await;
-    define_label_key(&ctx, "status", "Workflow status").await.unwrap();
+    define_label_key(&ctx, "status", "Workflow status")
+        .await
+        .unwrap();
 
     let note = save_note(
         &ctx,
@@ -77,13 +79,15 @@ async fn empty_title_is_rejected() {
     assert!(result.is_err());
 }
 
-// A successful save must populate all three recall tables consistently (docs/design.md §3):
-// notes, notes_embeddings, notes_sparse_weights. A note present in `notes` but missing from
-// the embedding or sparse table silently degrades recall, so we assert all three hold rows.
+// A successful save must populate recall tables consistently (docs/design.md §3): notes plus
+// per-chunk dense/sparse rows. A note present in `notes` but missing chunk rows silently degrades
+// recall, so we assert all three hold rows.
 #[tokio::test]
 async fn successful_save_populates_all_three_tables() {
     let (ctx, _dir) = test_context().await;
-    define_label_key(&ctx, "status", "Workflow status").await.unwrap();
+    define_label_key(&ctx, "status", "Workflow status")
+        .await
+        .unwrap();
 
     let note = save_note(
         &ctx,
@@ -99,15 +103,17 @@ async fn successful_save_populates_all_three_tables() {
     let conn = ctx.storage.connect().unwrap();
 
     // notes row + hydrated labels
-    let stored = note_storage::get_note(&conn, &note.id).await.unwrap().unwrap();
+    let stored = note_storage::get_note(&conn, &note.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.title, "My note");
     assert_eq!(stored.labels.len(), 1);
     assert_eq!(stored.labels[0].key, "status");
 
-    // notes_embeddings row
-    assert_eq!(count_rows(&conn, "notes_embeddings", &note.id).await, 1);
-    // notes_sparse_weights rows (StubEmbedder emits at least one sparse term for this content)
-    assert!(count_rows(&conn, "notes_sparse_weights", &note.id).await >= 1);
+    assert!(count_rows(&conn, "note_chunk_embeddings", &note.id).await >= 1);
+    // StubEmbedder emits at least one sparse term for this content.
+    assert!(count_rows(&conn, "note_chunk_sparse", &note.id).await >= 1);
 }
 
 // Atomicity (docs/design.md §3): a partial write is a correctness bug, not a soft failure.
@@ -119,7 +125,9 @@ async fn successful_save_populates_all_three_tables() {
 #[tokio::test]
 async fn failed_write_rolls_back_all_tables() {
     let (ctx, _dir) = test_context().await;
-    define_label_key(&ctx, "status", "Workflow status").await.unwrap();
+    define_label_key(&ctx, "status", "Workflow status")
+        .await
+        .unwrap();
 
     let result = save_note(
         &ctx,
@@ -138,8 +146,8 @@ async fn failed_write_rolls_back_all_tables() {
     let conn = ctx.storage.connect().unwrap();
     // Nothing partial persisted: no note row, and no orphan embedding/sparse rows.
     assert_eq!(total_rows(&conn, "notes").await, 0);
-    assert_eq!(total_rows(&conn, "notes_embeddings").await, 0);
-    assert_eq!(total_rows(&conn, "notes_sparse_weights").await, 0);
+    assert_eq!(total_rows(&conn, "note_chunk_embeddings").await, 0);
+    assert_eq!(total_rows(&conn, "note_chunk_sparse").await, 0);
     assert_eq!(total_rows(&conn, "note_labels").await, 0);
 }
 
