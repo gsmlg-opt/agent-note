@@ -1,3 +1,4 @@
+use pulldown_cmark::{Event, Options, Parser};
 use yew::prelude::*;
 use yew_router::prelude::*;
 use yew_duskmoon::{Alert, Card, Chip};
@@ -5,6 +6,22 @@ use yew_duskmoon::{Alert, Card, Chip};
 use crate::api;
 use crate::routes::Route;
 use crate::state::NoteSummary;
+
+/// Render a note's Markdown body to HTML for display. Raw HTML embedded in the Markdown is
+/// dropped (not passed through), so note content — which can be written by any MCP client on the
+/// unauthenticated endpoint — cannot inject arbitrary markup/scripts. Standard Markdown formatting
+/// (headings, lists, code, tables, task lists, strikethrough) still renders.
+fn render_markdown(md: &str) -> Html {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let parser = Parser::new_ext(md, options)
+        .filter(|ev| !matches!(ev, Event::Html(_) | Event::InlineHtml(_)));
+    let mut html_out = String::new();
+    pulldown_cmark::html::push_html(&mut html_out, parser);
+    Html::from_html_unchecked(AttrValue::from(html_out))
+}
 
 #[derive(Properties, PartialEq)]
 pub struct NoteShowProps {
@@ -45,7 +62,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                 <p class="loading">{ "Loading…" }</p>
             } else if let Some(n) = &*note {
                 <Card title={Some(html! { <span>{ n.title.clone() }</span> })}>
-                    <p class="note-content">{ n.content.clone() }</p>
+                    <div class="markdown-body">{ render_markdown(&n.content) }</div>
                     if !n.labels.is_empty() {
                         <div class="applied-labels">
                             { for n.labels.iter().map(|(k, v)| html! {

@@ -34,7 +34,7 @@ use crate::tools::{
 pub struct SaveNoteRequest {
     /// Note title.
     pub title: String,
-    /// Note body.
+    /// Note body, formatted as Markdown.
     pub content: String,
     /// Existing label keys to attach, as `(key, value)` pairs. Cannot create new
     /// label keys — that is REST/UI-only (docs/design.md §8).
@@ -94,7 +94,7 @@ pub struct NoteResponse {
     pub id: String,
     /// Note title.
     pub title: String,
-    /// Note body.
+    /// Note body, formatted as Markdown.
     pub content: String,
     /// Labels attached to the note.
     pub labels: Vec<LabelSchema>,
@@ -250,7 +250,7 @@ pub struct UpdateNoteRequest {
     pub id: String,
     /// New note title.
     pub title: String,
-    /// New note body.
+    /// New note body, formatted as Markdown.
     pub content: String,
     /// Existing label keys to attach, as `(key, value)` pairs. Cannot create new
     /// label keys — that is REST/UI-only (docs/design.md §8).
@@ -375,7 +375,7 @@ impl NoteMcpServer {
     /// Save a note with a title, body, and optional existing label keys.
     #[tool(
         name = "save_note",
-        description = "Save a note with a title, content, and optional labels."
+        description = "Save a note with a title, Markdown content, and optional labels."
     )]
     pub async fn save_note(
         &self,
@@ -403,7 +403,7 @@ impl NoteMcpServer {
     /// Read a note's body as numbered lines with a content tag.
     #[tool(
         name = "read_note_lines",
-        description = "Read a note's body as numbered lines with a content tag for editing."
+        description = "Read a note's Markdown body as numbered lines with a content tag for editing."
     )]
     pub async fn read_note_lines(
         &self,
@@ -421,7 +421,7 @@ impl NoteMcpServer {
     /// Edit a note's body with line-range operations guarded by a content tag.
     #[tool(
         name = "edit_note",
-        description = "Edit a note's body with line-range operations (swap/delete/insert) anchored by a content tag; rejects if the note changed since it was read."
+        description = "Edit a note's Markdown body with line-range operations (swap/delete/insert) anchored by a content tag; rejects if the note changed since it was read."
     )]
     pub async fn edit_note(
         &self,
@@ -441,7 +441,7 @@ impl NoteMcpServer {
     /// Update an existing note's title, body, and labels.
     #[tool(
         name = "update_note",
-        description = "Update an existing note's title, content, and labels by id."
+        description = "Update an existing note's title, Markdown content, and labels by id."
     )]
     pub async fn update_note(
         &self,
