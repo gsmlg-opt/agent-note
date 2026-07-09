@@ -76,10 +76,6 @@ async fn main() -> anyhow::Result<()> {
         let storage = Storage::open_local(&db_path).await?;
         let embedder = build_embedder(HTTP_INFERENCE_CONCURRENCY)?;
         let ctx = Arc::new(Context::new(Arc::new(storage), embedder));
-        let n = note_pipelines::enqueue_missing_chunk_embeddings(&ctx).await?;
-        if n > 0 {
-            eprintln!("queued {n} missing chunk embeddings");
-        }
 
         // notes_router()/labels_router() are Router<Arc<Context>> — applying .with_state converts them
         // to Router<()>, which can then merge with mcp_router() (already Router<()>, self-stated).
