@@ -30,6 +30,16 @@ async fn schema_applies_cleanly_to_a_fresh_db() {
             "missing table {expected}"
         );
     }
+
+    let mut rows = conn
+        .query("PRAGMA table_info(label_keys)", ())
+        .await
+        .unwrap();
+    let mut columns = vec![];
+    while let Some(row) = rows.next().await.unwrap() {
+        columns.push(row.get::<String>(1).unwrap());
+    }
+    assert!(columns.contains(&"value_type".to_string()));
 }
 
 #[tokio::test]

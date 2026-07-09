@@ -1,11 +1,11 @@
 use yew::prelude::*;
-use yew_router::prelude::*;
 use yew_duskmoon::Alert;
+use yew_router::prelude::*;
 
 use crate::api;
 use crate::components::NoteEditor;
 use crate::routes::Route;
-use crate::state::NoteSummary;
+use crate::state::{LabelKey, NoteSummary};
 
 #[derive(Properties, PartialEq)]
 pub struct NoteEditProps {
@@ -17,9 +17,10 @@ pub struct NoteEditProps {
 pub fn note_edit_page(props: &NoteEditProps) -> Html {
     let navigator = use_navigator().expect("router navigator");
     let note = use_state(|| None::<NoteSummary>);
-    let available_labels = use_state(Vec::<(String, String)>::new);
+    let available_labels = use_state(Vec::<LabelKey>::new);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
+    let submitting = use_state(|| false);
 
     {
         let note = note.clone();
@@ -36,7 +37,7 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
                     Err(e) => error.set(Some(e)),
                 }
                 if let Ok(keys) = api::list_labels().await {
-                    available_labels.set(keys.into_iter().map(|k| (k.key, k.description)).collect());
+                    available_labels.set(keys);
                 }
                 loading.set(false);
             });
@@ -48,15 +49,25 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
         let navigator = navigator.clone();
         let error = error.clone();
         let id = props.id.clone();
+        let submitting = submitting.clone();
         Callback::from(
             move |(title, content, labels): (String, String, Vec<(String, String)>)| {
+                if *submitting {
+                    return;
+                }
+                submitting.set(true);
+                error.set(None);
                 let navigator = navigator.clone();
                 let error = error.clone();
                 let id = id.clone();
+                let submitting = submitting.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     match api::update_note(&id, &title, &content, &labels).await {
                         Ok(()) => navigator.push(&Route::NoteShow { id }),
-                        Err(e) => error.set(Some(e)),
+                        Err(e) => {
+                            error.set(Some(e));
+                            submitting.set(false);
+                        }
                     }
                 });
             },
@@ -78,6 +89,7 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
                     initial_labels={n.labels.clone()}
                     card_title="Edit note"
                     submit_label="Save changes"
+                    submitting={*submitting}
                     {on_submit}
                 />
             } else {

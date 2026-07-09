@@ -25,7 +25,32 @@ impl Storage {
         for statement in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             conn.execute(statement, ()).await?;
         }
+        Self::apply_migrations(conn).await?;
         Ok(())
+    }
+
+    async fn apply_migrations(conn: &Connection) -> anyhow::Result<()> {
+        if !Self::column_exists(conn, "label_keys", "value_type").await? {
+            conn.execute(
+                "ALTER TABLE label_keys ADD COLUMN value_type TEXT NOT NULL DEFAULT 'text'",
+                (),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+        let mut rows = conn
+            .query(&format!("PRAGMA table_info({table})"), ())
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let name = row.get::<String>(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn connect(&self) -> anyhow::Result<Connection> {

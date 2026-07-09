@@ -3,11 +3,13 @@ use yew::prelude::*;
 use yew::virtual_dom::AttrValue;
 use yew_duskmoon::{Button, Card, Chip, MarkdownInput};
 
+use crate::state::LabelKey;
+
 #[derive(Properties, PartialEq)]
 pub struct NoteEditorProps {
-    /// Registered (key, description) pairs, shown in the label picker so the
-    /// user can see what each label is for (docs/design.md §7).
-    pub available_labels: Vec<(String, String)>,
+    /// Registered label keys, shown in the label picker so the user can see what each label is for
+    /// (docs/design.md §7).
+    pub available_labels: Vec<LabelKey>,
     /// Emits (title, content, labels) where labels is a Vec of (key, value).
     pub on_submit: Callback<(String, String, Vec<(String, String)>)>,
     /// Prefill values (used when editing an existing note). Read once at mount.
@@ -21,6 +23,8 @@ pub struct NoteEditorProps {
     pub card_title: String,
     #[prop_or_else(|| "Save note".to_string())]
     pub submit_label: String,
+    #[prop_or_default]
+    pub submitting: bool,
 }
 
 #[function_component(NoteEditor)]
@@ -29,6 +33,8 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
     let content = use_state(|| props.initial_content.clone());
     // Applied labels the user has added, as (key, value) pairs.
     let labels = use_state(|| props.initial_labels.clone());
+    let submit_debounce = use_state(|| false);
+    let submit_locked = use_mut_ref(|| false);
     // The currently-selected label key and value being staged in the picker.
     let picker_key = use_state(String::new);
     let picker_value = use_state(String::new);
@@ -86,18 +92,53 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         let title = title.clone();
         let content = content.clone();
         let labels = labels.clone();
+        let submit_debounce = submit_debounce.clone();
+        let submit_locked = submit_locked.clone();
+        let submitting = props.submitting;
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
+            if submitting || *submit_locked.borrow() {
+                return;
+            }
+            *submit_locked.borrow_mut() = true;
+            submit_debounce.set(true);
             on_submit.emit(((*title).clone(), (*content).clone(), (*labels).clone()));
         })
     };
+
+    {
+        let submit_debounce = submit_debounce.clone();
+        let submit_locked = submit_locked.clone();
+        let submitting = props.submitting;
+        use_effect_with(submitting, move |is_submitting| {
+            if !*is_submitting {
+                *submit_locked.borrow_mut() = false;
+                submit_debounce.set(false);
+            }
+            || ()
+        });
+    }
+
+    let submit_disabled = props.submitting || *submit_debounce;
 
     // Description for the currently-selected key, shown as hint text.
     let selected_hint = props
         .available_labels
         .iter()
-        .find(|(k, _)| k == &*picker_key)
-        .map(|(_, desc)| desc.clone());
+        .find(|label| label.key.as_str() == (*picker_key).as_str())
+        .map(|label| {
+            if label.description.is_empty() {
+                label.value_type.clone()
+            } else {
+                format!("{} - {}", label.description, label.value_type)
+            }
+        });
+    let selected_value_type = props
+        .available_labels
+        .iter()
+        .find(|label| label.key.as_str() == (*picker_key).as_str())
+        .map(|label| label.value_type.as_str())
+        .unwrap_or("text");
 
     html! {
         <Card title={Some(html! { <span>{ props.card_title.clone() }</span> })} classes={classes!("note-editor")}>
@@ -135,14 +176,14 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                             oninput={on_key_input}
                         />
                         <datalist id="label-key-options">
-                            { for props.available_labels.iter().map(|(key, _)| html! {
-                                <option value={key.clone()} />
+                            { for props.available_labels.iter().map(|label| html! {
+                                <option value={label.key.clone()} />
                             }) }
                         </datalist>
                         <span class="label-eq">{ "=" }</span>
                         <input
                             class="input label-value-input"
-                            type="text"
+                            type={label_value_input_type(selected_value_type)}
                             placeholder="value"
                             value={(*picker_value).clone()}
                             oninput={on_value_input}
@@ -167,10 +208,30 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                     </div>
                 </fieldset>
 
-                <Button variant={Some("primary".to_string())}>
-                    <span>{ props.submit_label.clone() }</span>
+                <Button
+                    variant={Some("primary".to_string())}
+                    disabled={submit_disabled}
+                    loading={submit_disabled}
+                >
+                    <span>{
+                        if submit_disabled {
+                            "Saving...".to_string()
+                        } else {
+                            props.submit_label.clone()
+                        }
+                    }</span>
                 </Button>
             </form>
         </Card>
+    }
+}
+
+fn label_value_input_type(value_type: &str) -> &'static str {
+    match value_type {
+        "number" => "number",
+        "date" => "date",
+        "datetime" => "datetime-local",
+        "time" => "time",
+        _ => "text",
     }
 }

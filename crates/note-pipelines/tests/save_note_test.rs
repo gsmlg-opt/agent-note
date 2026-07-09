@@ -1,7 +1,8 @@
+use note_core::LabelValueType;
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    define_label_key, drain_embedding_jobs, list_label_keys, save_note, update_note, Context,
-    SaveNoteInput,
+    define_label_key, define_label_key_with_type, drain_embedding_jobs, list_label_keys, save_note,
+    update_note, Context, SaveNoteInput,
 };
 use note_storage::Storage;
 use std::sync::Arc;
@@ -65,6 +66,26 @@ async fn unknown_label_key_is_auto_created() {
     // The previously-unknown key now exists in the catalog (auto-created, empty description).
     let keys = list_label_keys(&ctx).await.unwrap();
     assert!(keys.iter().any(|k| k.key == "project"));
+}
+
+#[tokio::test]
+async fn typed_label_value_is_validated_on_save() {
+    let (ctx, _dir) = test_context().await;
+    define_label_key_with_type(&ctx, "priority", "Priority score", LabelValueType::Number)
+        .await
+        .unwrap();
+
+    let result = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "My note".into(),
+            content: "Some content".into(),
+            labels: vec![("priority".into(), "high".into())],
+        },
+    )
+    .await;
+
+    assert!(result.is_err());
 }
 
 #[tokio::test]

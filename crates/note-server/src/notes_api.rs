@@ -1,12 +1,12 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::Html,
     routing::{get as route_get, post},
     Json, Router,
 };
 use note_core::Note;
 use note_pipelines::{
-    delete_note, get_note, list_notes, save_note, search_notes, update_note, Context,
+    delete_note, get_note, list_notes, save_note, search_notes_filtered, update_note, Context,
     ListNotesParams, SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
@@ -82,12 +82,30 @@ async fn save_note_handler(
     Ok(Json(SaveNoteResponse { id: note.id }))
 }
 
+#[derive(Deserialize, Default)]
+pub struct ListNotesQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
 async fn list_notes_handler(
     State(ctx): State<Arc<Context>>,
+    Query(req): Query<ListNotesQuery>,
 ) -> Result<Json<Vec<NoteDto>>, (axum::http::StatusCode, String)> {
-    let notes = list_notes(&ctx, ListNotesParams::default())
-        .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let notes = list_notes(
+        &ctx,
+        ListNotesParams {
+            limit: req.limit,
+            offset: req.offset,
+            label: req.label,
+        },
+    )
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(notes.into_iter().map(Into::into).collect()))
 }
 
@@ -151,6 +169,8 @@ async fn delete_note_handler(
 pub struct SearchQuery {
     pub query: String,
     pub limit: usize,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -164,7 +184,7 @@ async fn search_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<SearchQuery>,
 ) -> Result<Json<Vec<SearchResultDto>>, (axum::http::StatusCode, String)> {
-    let results = search_notes(&ctx, &req.query, req.limit)
+    let results = search_notes_filtered(&ctx, &req.query, req.limit, req.label)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(
@@ -348,6 +368,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_notes_filters_by_multiple_labels() {
+        let (app, _ctx, _dir) = test_app().await;
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Prod Tech","content":"C1","labels":[["type","tech"],["env","prod"]]}"#,
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Prod Note","content":"C2","labels":[["type","note"],["env","prod"]]}"#,
+            ))
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(get("/api/notes?label=type%3Dtech%26env%3Dprod"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let notes = arr.as_array().expect("response is a JSON array");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].get("title").and_then(|v| v.as_str()),
+            Some("Prod Tech")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_notes_filters_by_typed_comparison() {
+        let (app, ctx, _dir) = test_app().await;
+        note_pipelines::define_label_key_with_type(
+            &ctx,
+            "version",
+            "Release version",
+            note_core::LabelValueType::Version,
+        )
+        .await
+        .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Old","content":"C1","labels":[["version","1.2.0"]]}"#,
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"New","content":"C2","labels":[["version","1.10.0"]]}"#,
+            ))
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(get("/api/notes?label=version%3E%3D1.10.0"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let notes = arr.as_array().expect("response is a JSON array");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].get("title").and_then(|v| v.as_str()), Some("New"));
+    }
+
+    #[tokio::test]
     async fn get_note_by_id_returns_note_or_404() {
         let (app, _ctx, _dir) = test_app().await;
         let id = save_note_id(
@@ -471,6 +562,104 @@ mod tests {
             hits.iter()
                 .any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Find")),
             "expected the seeded note in results, got {arr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_filters_by_label() {
+        let (app, ctx, _dir) = test_app().await;
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Rust","content":"shared searchable content","labels":[["topic","rust"]]}"#,
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Ops","content":"shared searchable content","labels":[["topic","ops"]]}"#,
+            ))
+            .await
+            .unwrap();
+        note_pipelines::drain_embedding_jobs(&ctx, 10)
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(post(
+                "/api/notes/search",
+                r#"{"query":"shared searchable content","limit":5,"label":"topic=rust"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let hits = arr.as_array().expect("response is a JSON array");
+        assert!(
+            hits.iter()
+                .any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Rust")),
+            "expected Rust in filtered results, got {arr}"
+        );
+        assert!(
+            !hits
+                .iter()
+                .any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Ops")),
+            "expected Ops to be filtered out, got {arr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_filters_by_typed_comparison() {
+        let (app, ctx, _dir) = test_app().await;
+        note_pipelines::define_label_key_with_type(
+            &ctx,
+            "priority",
+            "Priority score",
+            note_core::LabelValueType::Number,
+        )
+        .await
+        .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Low","content":"shared searchable content","labels":[["priority","2"]]}"#,
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"High","content":"shared searchable content","labels":[["priority","10"]]}"#,
+            ))
+            .await
+            .unwrap();
+        note_pipelines::drain_embedding_jobs(&ctx, 10)
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(post(
+                "/api/notes/search",
+                r#"{"query":"shared searchable content","limit":5,"label":"priority>5"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let arr: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let hits = arr.as_array().expect("response is a JSON array");
+        assert!(
+            hits.iter()
+                .any(|r| r.get("title").and_then(|v| v.as_str()) == Some("High")),
+            "expected High in filtered results, got {arr}"
+        );
+        assert!(
+            !hits
+                .iter()
+                .any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Low")),
+            "expected Low to be filtered out, got {arr}"
         );
     }
 }

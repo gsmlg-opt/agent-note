@@ -49,10 +49,51 @@ async fn semantic_search_tool_finds_saved_note() {
         SemanticSearchToolInput {
             query: "unique searchable content".into(),
             limit: 5,
+            label: None,
         },
     )
     .await
     .unwrap();
 
     assert!(results.iter().any(|r| r.title == "Findable"));
+}
+
+#[tokio::test]
+async fn semantic_search_tool_filters_by_label() {
+    let (ctx, _dir) = test_context().await;
+    save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Rust".into(),
+            content: "shared searchable content".into(),
+            labels: vec![("topic".into(), "rust".into())],
+        },
+    )
+    .await
+    .unwrap();
+    save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Ops".into(),
+            content: "shared searchable content".into(),
+            labels: vec![("topic".into(), "ops".into())],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
+
+    let results = semantic_search_tool(
+        &ctx,
+        SemanticSearchToolInput {
+            query: "shared searchable content".into(),
+            limit: 5,
+            label: Some("topic=rust".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(results.iter().any(|r| r.title == "Rust"));
+    assert!(!results.iter().any(|r| r.title == "Ops"));
 }

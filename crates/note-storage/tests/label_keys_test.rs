@@ -16,6 +16,7 @@ async fn insert_then_list_returns_the_key() {
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].key, "status");
     assert_eq!(keys[0].description, "Workflow status of the note");
+    assert_eq!(keys[0].value_type.as_str(), "text");
 }
 
 #[tokio::test]

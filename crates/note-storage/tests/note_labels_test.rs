@@ -23,6 +23,7 @@ async fn attach_and_fetch_labels_for_a_note() {
     assert_eq!(labels[0].key, "status");
     assert_eq!(labels[0].value, "done");
     assert_eq!(labels[0].description, "Workflow status");
+    assert_eq!(labels[0].value_type.as_str(), "text");
 }
 
 #[tokio::test]

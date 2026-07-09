@@ -1,13 +1,14 @@
-use web_sys::HtmlInputElement;
+use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
+use yew::virtual_dom::AttrValue;
+use yew_duskmoon::{Alert, Button, Popover, PopoverTrigger};
 use yew_router::prelude::*;
-use yew_duskmoon::{Alert, Button, Chip};
 
 use crate::api;
 use crate::components::icons;
 use crate::components::Modal;
 use crate::routes::Route;
-use crate::state::{NoteSummary, SearchResultSummary};
+use crate::state::{LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
 
 /// Notes shown per page in the list view.
 const PAGE_SIZE: usize = 10;
@@ -17,6 +18,7 @@ const PAGE_SIZE: usize = 10;
 #[function_component(NotesPage)]
 pub fn notes_page() -> Html {
     let notes = use_state(Vec::<NoteSummary>::new);
+    let label_keys = use_state(Vec::<LabelKey>::new);
     // `Some` while a search is active; `None` shows the full table.
     let results = use_state(|| None::<Vec<SearchResultSummary>>);
     let query = use_state(String::new);
@@ -26,35 +28,73 @@ pub fn notes_page() -> Html {
     let delete_target = use_state(|| None::<(String, String)>);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
+    let label_filters = use_state(Vec::<LabelFilter>::new);
+    let filter_key = use_state(String::new);
+    let filter_operator = use_state(|| "=".to_string());
+    let filter_value = use_state(String::new);
 
-    let reload = {
+    let run_query = {
+        let query = query.clone();
         let notes = notes.clone();
+        let results = results.clone();
         let loading = loading.clone();
         let error = error.clone();
         let page = page.clone();
-        Callback::from(move |_: ()| {
+        Callback::from(move |(raw_query, filters): (String, Vec<LabelFilter>)| {
             let notes = notes.clone();
+            let results = results.clone();
             let loading = loading.clone();
             let error = error.clone();
             let page = page.clone();
+            let query = query.clone();
+            let q = raw_query.trim().to_string();
             loading.set(true);
+            error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
-                match api::list_notes().await {
-                    Ok(list) => {
-                        notes.set(list);
-                        page.set(0);
+                if q.is_empty() {
+                    match api::list_notes_filtered(&filters).await {
+                        Ok(list) => {
+                            notes.set(list);
+                            results.set(None);
+                            page.set(0);
+                        }
+                        Err(e) => error.set(Some(e)),
                     }
-                    Err(e) => error.set(Some(e)),
+                } else {
+                    match api::search_filtered(&q, 20, &filters).await {
+                        Ok(r) => results.set(Some(r)),
+                        Err(e) => error.set(Some(e)),
+                    }
                 }
+                query.set(raw_query);
                 loading.set(false);
             });
         })
     };
 
+    let reload = {
+        let run_query = run_query.clone();
+        let query = query.clone();
+        let label_filters = label_filters.clone();
+        Callback::from(move |_: ()| run_query.emit(((*query).clone(), (*label_filters).clone())))
+    };
+
     {
-        let reload = reload.clone();
+        let run_query = run_query.clone();
         use_effect_with((), move |_| {
-            reload.emit(());
+            run_query.emit((String::new(), Vec::new()));
+            || ()
+        });
+    }
+
+    {
+        let label_keys = label_keys.clone();
+        use_effect_with((), move |_| {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(keys) = api::list_labels().await {
+                    label_keys.set(keys);
+                }
+            });
             || ()
         });
     }
@@ -66,40 +106,54 @@ pub fn notes_page() -> Html {
             query.set(input.value());
         })
     };
+    let on_filter_key_input = {
+        let filter_key = filter_key.clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            filter_key.set(input.value());
+        })
+    };
+    let on_filter_operator_change = {
+        let filter_operator = filter_operator.clone();
+        Callback::from(move |e: Event| {
+            let select: HtmlSelectElement = e.target_unchecked_into();
+            filter_operator.set(select.value());
+        })
+    };
+    let on_filter_value_input = {
+        let filter_value = filter_value.clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            filter_value.set(input.value());
+        })
+    };
 
     let on_search = {
         let query = query.clone();
-        let results = results.clone();
-        let loading = loading.clone();
-        let error = error.clone();
+        let label_filters = label_filters.clone();
+        let run_query = run_query.clone();
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
-            let q = (*query).trim().to_string();
-            if q.is_empty() {
-                results.set(None);
-                return;
-            }
-            let results = results.clone();
-            let loading = loading.clone();
-            let error = error.clone();
-            loading.set(true);
-            error.set(None);
-            wasm_bindgen_futures::spawn_local(async move {
-                match api::search(&q, 20).await {
-                    Ok(r) => results.set(Some(r)),
-                    Err(e) => error.set(Some(e)),
-                }
-                loading.set(false);
-            });
+            run_query.emit(((*query).clone(), (*label_filters).clone()));
         })
     };
 
     let on_clear = {
         let query = query.clone();
         let results = results.clone();
+        let label_filters = label_filters.clone();
+        let filter_key = filter_key.clone();
+        let filter_operator = filter_operator.clone();
+        let filter_value = filter_value.clone();
+        let run_query = run_query.clone();
         Callback::from(move |_| {
             query.set(String::new());
             results.set(None);
+            label_filters.set(Vec::new());
+            filter_key.set(String::new());
+            filter_operator.set("=".to_string());
+            filter_value.set(String::new());
+            run_query.emit((String::new(), Vec::new()));
         })
     };
 
@@ -153,24 +207,80 @@ pub fn notes_page() -> Html {
         Callback::from(move |_: MouseEvent| reload.emit(()))
     };
 
+    let on_add_filter = {
+        let label_filters = label_filters.clone();
+        let filter_key = filter_key.clone();
+        let filter_operator = filter_operator.clone();
+        let filter_value = filter_value.clone();
+        let query = query.clone();
+        let run_query = run_query.clone();
+        Callback::from(move |_: MouseEvent| {
+            let key = (*filter_key).trim().to_string();
+            let value = (*filter_value).trim().to_string();
+            if key.is_empty() {
+                return;
+            }
+            let filter = LabelFilter {
+                key,
+                operator: (*filter_operator).clone(),
+                value,
+            };
+            let mut filters = (*label_filters).clone();
+            if !filters.iter().any(|item| item == &filter) {
+                filters.push(filter);
+            }
+            label_filters.set(filters.clone());
+            filter_value.set(String::new());
+            run_query.emit(((*query).clone(), filters));
+        })
+    };
+
+    let on_remove_filter = {
+        let label_filters = label_filters.clone();
+        let query = query.clone();
+        let run_query = run_query.clone();
+        Callback::from(move |idx: usize| {
+            let mut filters = (*label_filters).clone();
+            if idx < filters.len() {
+                filters.remove(idx);
+                label_filters.set(filters.clone());
+                run_query.emit(((*query).clone(), filters));
+            }
+        })
+    };
+
     html! {
         <section class="stack">
-            <form class="search-bar" onsubmit={on_search}>
-                <input
-                    class="input input-primary"
-                    type="text"
-                    placeholder="Search your notes"
-                    value={(*query).clone()}
-                    oninput={on_query_input}
-                />
-                <Button variant={Some("primary".to_string())}>{ "Search" }</Button>
-                if results.is_some() {
-                    <button type="button" class="btn btn-ghost" onclick={on_clear}>{ "Clear" }</button>
-                }
-                <button type="button" class="btn btn-ghost btn-icon" title="Refresh" onclick={on_refresh}>
-                    { icons::refresh() }<span class="sr-only">{ "Refresh" }</span>
-                </button>
-            </form>
+            <div class="search-panel">
+                <form class="search-bar" onsubmit={on_search}>
+                    <input
+                        class="input input-primary"
+                        type="text"
+                        placeholder="Search your notes"
+                        value={(*query).clone()}
+                        oninput={on_query_input}
+                    />
+                    <Button variant={Some("primary".to_string())}>{ "Search" }</Button>
+                    if results.is_some() || !(*label_filters).is_empty() || !(*query).is_empty() {
+                        <button type="button" class="btn btn-ghost" onclick={on_clear}>{ "Clear" }</button>
+                    }
+                    <button type="button" class="btn btn-ghost btn-icon" title="Refresh" onclick={on_refresh}>
+                        { icons::refresh() }<span class="sr-only">{ "Refresh" }</span>
+                    </button>
+                </form>
+                { label_filter_bar(
+                    (*label_keys).as_slice(),
+                    (*label_filters).as_slice(),
+                    (*filter_key).as_str(),
+                    (*filter_operator).as_str(),
+                    (*filter_value).as_str(),
+                    on_filter_key_input,
+                    on_filter_operator_change,
+                    on_filter_value_input,
+                    on_add_filter,
+                    on_remove_filter,
+                ) }
+            </div>
 
             if let Some(err) = &*error {
                 <Alert variant={Some("error".to_string())}><span>{ err.clone() }</span></Alert>
@@ -186,6 +296,95 @@ pub fn notes_page() -> Html {
 
             { delete_modal }
         </section>
+    }
+}
+
+fn label_filter_bar(
+    label_keys: &[LabelKey],
+    filters: &[LabelFilter],
+    filter_key: &str,
+    filter_operator: &str,
+    filter_value: &str,
+    on_key_input: Callback<InputEvent>,
+    on_operator_change: Callback<Event>,
+    on_value_input: Callback<InputEvent>,
+    on_add: Callback<MouseEvent>,
+    on_remove: Callback<usize>,
+) -> Html {
+    let value_type = label_keys
+        .iter()
+        .find(|label| label.key == filter_key)
+        .map(|label| label.value_type.as_str())
+        .unwrap_or("text");
+
+    html! {
+        <div class="label-filter-panel">
+            <div class="label-filter-builder">
+                <input
+                    class="input label-filter-key"
+                    type="text"
+                    list="label-filter-key-options"
+                    placeholder="label"
+                    value={filter_key.to_string()}
+                    oninput={on_key_input}
+                />
+                <datalist id="label-filter-key-options">
+                    { for label_keys.iter().map(|label| html! {
+                        <option value={label.key.clone()} />
+                    }) }
+                </datalist>
+                <select class="input label-filter-operator" onchange={on_operator_change} value={filter_operator.to_string()}>
+                    { for ["=", "!=", ">", ">=", "<", "<="].iter().map(|operator| html! {
+                        <option value={(*operator).to_string()}>{ *operator }</option>
+                    }) }
+                </select>
+                <input
+                    class="input label-filter-value"
+                    type={label_value_input_type(value_type)}
+                    placeholder="value"
+                    value={filter_value.to_string()}
+                    oninput={on_value_input}
+                />
+                <button type="button" class="btn btn-outline" onclick={on_add}>{ "Add filter" }</button>
+            </div>
+            if !filters.is_empty() {
+                <div class="active-label-filters">
+                    { for filters.iter().enumerate().map(|(idx, filter)| {
+                        let on_remove = on_remove.clone();
+                        let label = label_filter_label(filter);
+                        html! {
+                            <button
+                                type="button"
+                                class="chip chip-primary active-label-filter"
+                                title="Remove filter"
+                                onclick={Callback::from(move |_: MouseEvent| on_remove.emit(idx))}
+                            >
+                                <span>{ label }</span>
+                                <span aria-hidden="true">{ "x" }</span>
+                            </button>
+                        }
+                    }) }
+                </div>
+            }
+        </div>
+    }
+}
+
+fn label_filter_label(filter: &LabelFilter) -> String {
+    if filter.value.is_empty() {
+        filter.key.clone()
+    } else {
+        format!("{}{}{}", filter.key, filter.operator, filter.value)
+    }
+}
+
+fn label_value_input_type(value_type: &str) -> &'static str {
+    match value_type {
+        "number" => "number",
+        "date" => "date",
+        "datetime" => "datetime-local",
+        "time" => "time",
+        _ => "text",
     }
 }
 
@@ -213,7 +412,12 @@ fn list_view(
 }
 
 /// `Prev [1] [2] … [N] Next` pagination controls; hidden when everything fits on one page.
-fn pagination_bar(current: usize, total_pages: usize, total: usize, page: &UseStateHandle<usize>) -> Html {
+fn pagination_bar(
+    current: usize,
+    total_pages: usize,
+    total: usize,
+    page: &UseStateHandle<usize>,
+) -> Html {
     if total_pages <= 1 {
         return html! {};
     }
@@ -242,7 +446,10 @@ fn pagination_bar(current: usize, total_pages: usize, total: usize, page: &UseSt
     }
 }
 
-fn note_table(notes: &[NoteSummary], delete_target: &UseStateHandle<Option<(String, String)>>) -> Html {
+fn note_table(
+    notes: &[NoteSummary],
+    delete_target: &UseStateHandle<Option<(String, String)>>,
+) -> Html {
     if notes.is_empty() {
         return html! {
             <div class="empty">
@@ -277,9 +484,7 @@ fn note_table(notes: &[NoteSummary], delete_target: &UseStateHandle<Option<(Stri
                             <td>
                                 <div class="applied-labels">
                                     { for note.labels.iter().map(|(k, v)| html! {
-                                        <Chip variant={Some("primary".to_string())}>
-                                            <span>{ format!("{k}: {v}") }</span>
-                                        </Chip>
+                                        { label_chip(k, v) }
                                     }) }
                                 </div>
                             </td>
@@ -304,6 +509,30 @@ fn note_table(notes: &[NoteSummary], delete_target: &UseStateHandle<Option<(Stri
                 }) }
             </tbody>
         </table>
+    }
+}
+
+fn label_chip(key: &str, value: &str) -> Html {
+    let label = format!("{key}: {value}");
+    html! {
+        <Popover
+            class={classes!("note-label-popover", "popover-bottom")}
+            variant={Some("primary".to_string())}
+            trigger={PopoverTrigger::Hover}
+            trigger_class={classes!("chip", "chip-primary", "note-label-chip")}
+            trigger_label={AttrValue::from(label.clone())}
+        >
+            <dl class="note-label-popover-body">
+                <div class="note-label-popover-row">
+                    <dt>{ "name" }</dt>
+                    <dd>{ key.to_string() }</dd>
+                </div>
+                <div class="note-label-popover-row">
+                    <dt>{ "value" }</dt>
+                    <dd>{ value.to_string() }</dd>
+                </div>
+            </dl>
+        </Popover>
     }
 }
 

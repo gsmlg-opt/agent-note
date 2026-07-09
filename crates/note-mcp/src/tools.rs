@@ -1,5 +1,5 @@
 use note_pipelines::{
-    delete_note, get_note, list_notes, save_note, search_notes, update_note, Context,
+    delete_note, get_note, list_notes, save_note, search_notes_filtered, update_note, Context,
     ListNotesParams, SaveNoteInput as PipelineSaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ pub struct LabelData {
     pub key: String,
     pub value: String,
     pub description: String,
+    pub value_type: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +64,7 @@ pub async fn get_note_tool(ctx: &Context, id: &str) -> anyhow::Result<Option<Not
                 key: label.key,
                 value: label.value,
                 description: label.description,
+                value_type: label.value_type.as_str().to_string(),
             })
             .collect(),
         created_at: note.created_at,
@@ -159,6 +161,7 @@ pub async fn update_note_tool(
                 key: label.key,
                 value: label.value,
                 description: label.description,
+                value_type: label.value_type.as_str().to_string(),
             })
             .collect(),
         created_at: note.created_at,
@@ -198,6 +201,7 @@ pub async fn list_notes_tool(
                     key: label.key,
                     value: label.value,
                     description: label.description,
+                    value_type: label.value_type.as_str().to_string(),
                 })
                 .collect(),
             created_at: note.created_at,
@@ -210,6 +214,8 @@ pub async fn list_notes_tool(
 pub struct SemanticSearchToolInput {
     pub query: String,
     pub limit: usize,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,7 +229,7 @@ pub async fn semantic_search_tool(
     ctx: &Context,
     input: SemanticSearchToolInput,
 ) -> anyhow::Result<Vec<SemanticSearchToolResult>> {
-    let results = search_notes(ctx, &input.query, input.limit).await?;
+    let results = search_notes_filtered(ctx, &input.query, input.limit, input.label).await?;
     Ok(results
         .into_iter()
         .map(|r| SemanticSearchToolResult {

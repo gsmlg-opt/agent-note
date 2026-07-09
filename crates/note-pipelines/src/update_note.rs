@@ -1,5 +1,9 @@
 use crate::{context::Context, SaveNoteInput};
-use note_core::{validate_note_input, Label, Note, NoteInput};
+use note_core::{
+    validate_label_value, validate_note_input, Label, LabelValueType, Note, NoteInput,
+    ValidationError,
+};
+use std::collections::HashMap;
 
 pub async fn update_note(
     ctx: &Context,
@@ -13,10 +17,11 @@ pub async fn update_note(
         None => return Ok(None),
     };
 
-    let existing_keys: Vec<String> = note_storage::list_label_keys(&conn)
-        .await?
+    let existing_label_keys = note_storage::list_label_keys(&conn).await?;
+    let existing_keys: Vec<String> = existing_label_keys.iter().map(|k| k.key.clone()).collect();
+    let label_value_types: HashMap<String, LabelValueType> = existing_label_keys
         .into_iter()
-        .map(|k| k.key)
+        .map(|label_key| (label_key.key, label_key.value_type))
         .collect();
 
     let mut known_for_validation = existing_keys.clone();
@@ -35,6 +40,20 @@ pub async fn update_note(
         &known_for_validation,
     )
     .map_err(anyhow::Error::new)?;
+
+    for (key, value) in &input.labels {
+        let value_type = label_value_types
+            .get(key)
+            .copied()
+            .unwrap_or(LabelValueType::Text);
+        if !validate_label_value(value_type, value) {
+            return Err(anyhow::Error::new(ValidationError::InvalidLabelValue {
+                key: key.clone(),
+                value: value.clone(),
+                value_type,
+            }));
+        }
+    }
 
     let mut missing_keys: Vec<String> = Vec::new();
     for (key, _) in &input.labels {

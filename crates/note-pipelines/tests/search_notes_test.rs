@@ -1,5 +1,7 @@
 use note_embedding::StubEmbedder;
-use note_pipelines::{drain_embedding_jobs, save_note, search_notes, Context, SaveNoteInput};
+use note_pipelines::{
+    drain_embedding_jobs, save_note, search_notes, search_notes_filtered, Context, SaveNoteInput,
+};
 use note_storage::Storage;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -48,4 +50,42 @@ async fn search_returns_saved_notes_with_fused_scores() {
     for r in &results {
         assert!(r.score > 0.0);
     }
+}
+
+#[tokio::test]
+async fn search_filters_results_by_label() {
+    let (ctx, _dir) = test_context().await;
+    save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Rust ownership".into(),
+            content: "Shared searchable content".into(),
+            labels: vec![("topic".into(), "rust".into())],
+        },
+    )
+    .await
+    .unwrap();
+    save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Ops checklist".into(),
+            content: "Shared searchable content".into(),
+            labels: vec![("topic".into(), "ops".into())],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
+
+    let results = search_notes_filtered(
+        &ctx,
+        "Shared searchable content",
+        10,
+        Some("topic=rust".into()),
+    )
+    .await
+    .unwrap();
+
+    assert!(results.iter().any(|r| r.note.title == "Rust ownership"));
+    assert!(!results.iter().any(|r| r.note.title == "Ops checklist"));
 }

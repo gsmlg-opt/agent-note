@@ -493,6 +493,7 @@ dependencies = [
  "gloo-net 0.7.0",
  "serde",
  "serde_json",
+ "urlencoding",
  "wasm-bindgen-futures",
  "web-sys",
  "yew",

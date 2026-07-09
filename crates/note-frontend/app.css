@@ -100,7 +100,7 @@ body {
     border-collapse: collapse;
     border: 1px solid var(--color-outline-variant, #c7c5d0);
     border-radius: 0.6rem;
-    overflow: hidden;
+    overflow: visible;
 }
 
 .note-table th,
@@ -128,6 +128,64 @@ body {
     width: 1%;
     white-space: nowrap;
     text-align: right;
+}
+
+.note-table .applied-labels {
+    margin-top: 0;
+}
+
+.note-label-chip {
+    display: inline-block;
+    max-width: min(18rem, 100%);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border: 0;
+    cursor: default;
+    text-align: left;
+    vertical-align: middle;
+}
+
+.note-label-popover .popover-content {
+    max-width: min(42rem, calc(100vw - 2rem));
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
+}
+
+.note-label-popover-body {
+    display: grid;
+    gap: 0.45rem;
+    max-height: 18rem;
+    overflow: auto;
+    padding: 0.75rem 0.9rem;
+    margin: 0;
+    font-size: 0.85rem;
+    line-height: 1.4;
+}
+
+.note-label-popover-row {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 0.7rem;
+    align-items: start;
+}
+
+.note-label-popover-row dt {
+    margin: 0;
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: 0.68rem;
+    color: inherit;
+    opacity: 0.78;
+}
+
+.note-label-popover-row dd {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-weight: 700;
 }
 
 .row-actions {
@@ -388,6 +446,16 @@ body {
     color: var(--color-primary, #6750a4);
 }
 
+.label-type {
+    width: fit-content;
+    padding: 0.1rem 0.35rem;
+    border-radius: 0.35rem;
+    background: var(--color-secondary-container, #e8def8);
+    color: var(--color-on-secondary-container, #1d192b);
+    font-size: 0.72rem;
+    font-weight: 700;
+}
+
 .label-desc {
     font-size: 0.85rem;
     color: var(--color-on-surface-variant, #46464f);
@@ -579,14 +647,80 @@ body {
     margin-top: 0.6rem;
 }
 
+.search-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    width: 100%;
+}
+
 .search-bar {
     display: flex;
     gap: 0.5rem;
     align-items: center;
+    width: 100%;
 }
 
 .search-bar .input {
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.search-bar .btn {
+    flex: 0 0 auto;
+}
+
+.label-filter-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+}
+
+.label-filter-builder {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 0.45rem;
+    align-items: center;
+    width: 100%;
+}
+
+.label-filter-key,
+.label-filter-value {
+    flex: 1 1 14rem;
+    min-width: 0;
+}
+
+.label-filter-operator {
+    flex: 0 0 5rem;
+    min-width: 5rem;
+}
+
+.label-filter-builder .btn {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+.active-label-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+}
+
+.active-label-filter {
+    display: inline-flex;
+    max-width: 18rem;
+    min-width: 0;
+    align-items: center;
+    gap: 0.35rem;
+    border: 0;
+    cursor: pointer;
+}
+
+.active-label-filter span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .results {
@@ -631,4 +765,19 @@ body {
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
+}
+
+@media (max-width: 640px) {
+    .search-bar,
+    .label-filter-builder {
+        grid-template-columns: 1fr;
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .search-bar .btn,
+    .label-filter-builder .btn,
+    .label-filter-builder .input {
+        width: 100%;
+    }
 }

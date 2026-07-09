@@ -1,4 +1,6 @@
-use crate::{enqueue_missing_chunk_embeddings, list_notes, Context, ListNotesParams};
+use crate::{
+    enqueue_missing_chunk_embeddings, list_notes, parse_label_value_type, Context, ListNotesParams,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -13,6 +15,8 @@ pub struct ExportData {
 pub struct ExportLabelKey {
     pub key: String,
     pub description: String,
+    #[serde(default = "default_label_value_type")]
+    pub value_type: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,6 +45,7 @@ pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
         .map(|label_key| ExportLabelKey {
             key: label_key.key,
             description: label_key.description,
+            value_type: label_key.value_type.as_str().to_string(),
         })
         .collect();
     let notes = list_notes(ctx, ListNotesParams::default())
@@ -79,7 +84,14 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
     let tx = conn.transaction().await?;
     for label_key in data.label_keys {
         if known_keys.insert(label_key.key.clone()) {
-            note_storage::insert_label_key(&tx, &label_key.key, &label_key.description).await?;
+            let value_type = parse_label_value_type(&label_key.value_type)?;
+            note_storage::insert_label_key_with_type(
+                &tx,
+                &label_key.key,
+                &label_key.description,
+                value_type,
+            )
+            .await?;
             stats.label_keys_added += 1;
         }
     }
@@ -125,4 +137,8 @@ pub async fn export_json(ctx: &Context) -> anyhow::Result<String> {
 pub async fn import_json(ctx: &Context, input: &str) -> anyhow::Result<ImportStats> {
     let data: ExportData = serde_json::from_str(input)?;
     import_data(ctx, data).await
+}
+
+fn default_label_value_type() -> String {
+    "text".to_string()
 }

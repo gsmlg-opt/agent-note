@@ -22,4 +22,12 @@ pub struct SearchResultSummary {
 pub struct LabelKey {
     pub key: String,
     pub description: String,
+    pub value_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelFilter {
+    pub key: String,
+    pub operator: String,
+    pub value: String,
 }

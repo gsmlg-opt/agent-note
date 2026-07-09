@@ -1,10 +1,17 @@
 // crates/note-core/src/validation.rs
 
+use crate::LabelValueType;
+
 #[derive(Debug, PartialEq)]
 pub enum ValidationError {
     EmptyTitle,
     EmptyContent,
     UnknownLabelKey(String),
+    InvalidLabelValue {
+        key: String,
+        value: String,
+        value_type: LabelValueType,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -13,6 +20,14 @@ impl std::fmt::Display for ValidationError {
             ValidationError::EmptyTitle => write!(f, "title must not be empty"),
             ValidationError::EmptyContent => write!(f, "content must not be empty"),
             ValidationError::UnknownLabelKey(k) => write!(f, "unknown label key: {k}"),
+            ValidationError::InvalidLabelValue {
+                key,
+                value,
+                value_type,
+            } => write!(
+                f,
+                "invalid value for label {key}: {value} is not {value_type}"
+            ),
         }
     }
 }
@@ -26,15 +41,15 @@ impl std::error::Error for ValidationError {}
 #[derive(Debug, PartialEq)]
 pub enum LabelKeyValidationError {
     EmptyKey,
-    EmptyDescription,
+    InvalidValueType(String),
 }
 
 impl std::fmt::Display for LabelKeyValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LabelKeyValidationError::EmptyKey => write!(f, "label key must not be empty"),
-            LabelKeyValidationError::EmptyDescription => {
-                write!(f, "label key description must not be empty")
+            LabelKeyValidationError::InvalidValueType(value_type) => {
+                write!(f, "invalid label value type: {value_type}")
             }
         }
     }

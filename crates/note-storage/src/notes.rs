@@ -1,5 +1,5 @@
 use libsql::Connection;
-use note_core::{LabelSelector, Note};
+use note_core::{label_matches_selector, LabelSelector, Note};
 
 pub async fn insert_note(
     conn: &Connection,
@@ -143,31 +143,9 @@ pub async fn list_notes(
     let mut sql = "SELECT id, title, content, created_at, updated_at FROM notes".to_string();
     let mut params = Vec::<libsql::Value>::new();
 
-    if !selectors.is_empty() {
-        sql.push_str(" WHERE ");
-        for (idx, selector) in selectors.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(" AND ");
-            }
-            sql.push_str(
-                "EXISTS (
-                    SELECT 1
-                    FROM note_labels nl
-                    JOIN label_keys lk ON lk.id = nl.label_key_id
-                    WHERE nl.note_id = notes.id AND lk.key = ?",
-            );
-            params.push(selector.key.clone().into());
-            if let Some(value) = &selector.value {
-                sql.push_str(" AND nl.value = ?");
-                params.push(value.clone().into());
-            }
-            sql.push(')');
-        }
-    }
-
     sql.push_str(" ORDER BY created_at DESC");
 
-    if limit.is_some() || offset.is_some() {
+    if selectors.is_empty() && (limit.is_some() || offset.is_some()) {
         sql.push_str(" LIMIT ? OFFSET ?");
         params.push(limit.unwrap_or(-1).into());
         params.push(offset.unwrap_or(0).into());
@@ -191,6 +169,31 @@ pub async fn list_notes(
             created_at,
             updated_at,
         });
+    }
+    if !selectors.is_empty() {
+        notes.retain(|note| {
+            selectors.iter().all(|selector| {
+                note.labels
+                    .iter()
+                    .any(|label| label_matches_selector(label, selector))
+            })
+        });
+        let start = offset.unwrap_or(0).max(0) as usize;
+        let end = limit
+            .and_then(|limit| {
+                if limit < 0 {
+                    None
+                } else {
+                    Some(start.saturating_add(limit as usize))
+                }
+            })
+            .unwrap_or(notes.len())
+            .min(notes.len());
+        notes = if start >= notes.len() {
+            Vec::new()
+        } else {
+            notes[start..end].to_vec()
+        };
     }
     Ok(notes)
 }

@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS notes (
 CREATE TABLE IF NOT EXISTS label_keys (
     id INTEGER PRIMARY KEY,
     key TEXT NOT NULL UNIQUE,
-    description TEXT NOT NULL
+    description TEXT NOT NULL,
+    value_type TEXT NOT NULL DEFAULT 'text'
 );
 
 CREATE TABLE IF NOT EXISTS note_labels (

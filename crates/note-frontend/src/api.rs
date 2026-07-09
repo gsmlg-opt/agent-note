@@ -1,4 +1,4 @@
-use crate::state::{LabelKey, NoteSummary, SearchResultSummary};
+use crate::state::{LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
 use gloo_net::http::{Request, Response};
 use serde::Deserialize;
 
@@ -26,8 +26,33 @@ struct SearchResultDto {
     score: f32,
 }
 
-pub async fn search(query: &str, limit: usize) -> Result<Vec<SearchResultSummary>, String> {
-    let body = serde_json::json!({ "query": query, "limit": limit });
+fn label_filter_selector(filters: &[LabelFilter]) -> Option<String> {
+    let terms = filters
+        .iter()
+        .filter(|filter| !filter.key.trim().is_empty())
+        .map(|filter| match filter.value.trim() {
+            "" => filter.key.trim().to_string(),
+            value => {
+                format!("{}{}{}", filter.key.trim(), filter.operator.trim(), value)
+            }
+        })
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join("&"))
+    }
+}
+
+pub async fn search_filtered(
+    query: &str,
+    limit: usize,
+    filters: &[LabelFilter],
+) -> Result<Vec<SearchResultSummary>, String> {
+    let mut body = serde_json::json!({ "query": query, "limit": limit });
+    if let Some(selector) = label_filter_selector(filters) {
+        body["label"] = serde_json::Value::String(selector);
+    }
     // POST, not GET: the browser Fetch API forbids a body on GET requests, and search params go in
     // the JSON body. note-server's /api/notes/search is registered as POST for this reason.
     let resp = Request::post("/api/notes/search")
@@ -84,11 +109,12 @@ struct NoteDto {
     labels: Vec<(String, String)>,
 }
 
-pub async fn list_notes() -> Result<Vec<NoteSummary>, String> {
-    let resp = Request::get("/api/notes")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+pub async fn list_notes_filtered(filters: &[LabelFilter]) -> Result<Vec<NoteSummary>, String> {
+    let url = match label_filter_selector(filters) {
+        Some(selector) => format!("/api/notes?label={}", urlencoding::encode(&selector)),
+        None => "/api/notes".to_string(),
+    };
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
     let dtos: Vec<NoteDto> = ok_or_body_error(resp)
         .await?
         .json()
@@ -153,6 +179,7 @@ pub async fn delete_note(id: &str) -> Result<(), String> {
 struct LabelKeyDto {
     key: String,
     description: String,
+    value_type: String,
 }
 
 pub async fn list_labels() -> Result<Vec<LabelKey>, String> {
@@ -170,12 +197,17 @@ pub async fn list_labels() -> Result<Vec<LabelKey>, String> {
         .map(|d| LabelKey {
             key: d.key,
             description: d.description,
+            value_type: d.value_type,
         })
         .collect())
 }
 
-pub async fn create_label(key: &str, description: &str) -> Result<(), String> {
-    let body = serde_json::json!({ "key": key, "description": description });
+pub async fn create_label(key: &str, description: &str, value_type: &str) -> Result<(), String> {
+    let body = serde_json::json!({
+        "key": key,
+        "description": description,
+        "value_type": value_type
+    });
     let resp = Request::post("/api/labels")
         .json(&body)
         .map_err(|e| e.to_string())?
@@ -185,8 +217,8 @@ pub async fn create_label(key: &str, description: &str) -> Result<(), String> {
     ok_or_body_error(resp).await.map(|_| ())
 }
 
-pub async fn update_label(key: &str, description: &str) -> Result<(), String> {
-    let body = serde_json::json!({ "description": description });
+pub async fn update_label(key: &str, description: &str, value_type: &str) -> Result<(), String> {
+    let body = serde_json::json!({ "description": description, "value_type": value_type });
     let resp = Request::put(&format!("/api/labels/{key}"))
         .json(&body)
         .map_err(|e| e.to_string())?

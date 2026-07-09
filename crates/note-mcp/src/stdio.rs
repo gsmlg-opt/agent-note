@@ -85,6 +85,8 @@ pub struct LabelSchema {
     pub value: String,
     /// Label key description.
     pub description: String,
+    /// Label value type used for comparisons.
+    pub value_type: String,
 }
 
 /// MCP response schema for note-returning tools.
@@ -110,6 +112,7 @@ impl From<LabelData> for LabelSchema {
             key: l.key,
             value: l.value,
             description: l.description,
+            value_type: l.value_type,
         }
     }
 }
@@ -292,7 +295,7 @@ pub struct ListNotesRequest {
     /// Number of notes to skip.
     #[serde(default)]
     pub offset: Option<u32>,
-    /// Label selector, `&`-separated terms ANDed: `key=value` or bare `key` (any value). e.g. `env=prod&team=core`.
+    /// Label selector, `&`-separated terms ANDed: `key=value`, `key>=value`, or bare `key` (any value). e.g. `env=prod&version>=1.2.0`.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -312,6 +315,9 @@ pub struct SemanticSearchRequest {
     pub query: String,
     /// Maximum number of results to return.
     pub limit: usize,
+    /// Label selector, `&`-separated terms ANDed: `key=value`, `key>=value`, or bare `key` (any value). e.g. `env=prod&version>=1.2.0`.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// A single `semantic_search` hit.
@@ -338,6 +344,7 @@ impl From<SemanticSearchRequest> for SemanticSearchToolInput {
         Self {
             query: r.query,
             limit: r.limit,
+            label: r.label,
         }
     }
 }
@@ -494,7 +501,7 @@ impl NoteMcpServer {
     /// Semantic (hybrid dense+sparse) search over saved notes.
     #[tool(
         name = "semantic_search",
-        description = "Search saved notes semantically and return the top matches."
+        description = "Search saved notes semantically with an optional label selector filter and return the top matches."
     )]
     pub async fn semantic_search(
         &self,

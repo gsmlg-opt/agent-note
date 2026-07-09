@@ -1,5 +1,6 @@
 use libsql::Connection;
-use note_core::Label;
+use note_core::{Label, LabelValueType};
+use std::str::FromStr;
 
 pub async fn attach_label(
     conn: &Connection,
@@ -31,7 +32,7 @@ pub async fn attach_label(
 pub async fn labels_for_note(conn: &Connection, note_id: &str) -> anyhow::Result<Vec<Label>> {
     let mut rows = conn
         .query(
-            "SELECT lk.key, nl.value, lk.description
+            "SELECT lk.key, nl.value, lk.description, lk.value_type
              FROM note_labels nl JOIN label_keys lk ON lk.id = nl.label_key_id
              WHERE nl.note_id = ?1",
             libsql::params![note_id],
@@ -39,10 +40,13 @@ pub async fn labels_for_note(conn: &Connection, note_id: &str) -> anyhow::Result
         .await?;
     let mut labels = vec![];
     while let Some(row) = rows.next().await? {
+        let value_type = row.get::<String>(3)?;
         labels.push(Label {
             key: row.get::<String>(0)?,
             value: row.get::<String>(1)?,
             description: row.get::<String>(2)?,
+            value_type: LabelValueType::from_str(&value_type)
+                .map_err(|err| anyhow::anyhow!(err))?,
         });
     }
     Ok(labels)

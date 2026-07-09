@@ -58,6 +58,7 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].key, "status");
     assert_eq!(keys[0].description, "Workflow status");
+    assert_eq!(keys[0].value_type.as_str(), "text");
 
     let conn = target.storage.connect().unwrap();
     let restored_labeled = note_storage::get_note(&conn, &labeled.id)
@@ -72,6 +73,7 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     assert_eq!(restored_labeled.labels[0].key, "status");
     assert_eq!(restored_labeled.labels[0].value, "done");
     assert_eq!(restored_labeled.labels[0].description, "Workflow status");
+    assert_eq!(restored_labeled.labels[0].value_type.as_str(), "text");
 
     let restored_plain = note_storage::get_note(&conn, &plain.id)
         .await
