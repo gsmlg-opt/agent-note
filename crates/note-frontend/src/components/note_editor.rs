@@ -1,6 +1,7 @@
-use web_sys::{HtmlInputElement, HtmlTextAreaElement};
+use web_sys::HtmlInputElement;
 use yew::prelude::*;
-use yew_duskmoon::{Button, Card, Chip};
+use yew::virtual_dom::AttrValue;
+use yew_duskmoon::{Button, Card, Chip, MarkdownInput};
 
 #[derive(Properties, PartialEq)]
 pub struct NoteEditorProps {
@@ -40,11 +41,10 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         })
     };
 
-    let on_content_input = {
+    let on_content_change = {
         let content = content.clone();
-        Callback::from(move |e: InputEvent| {
-            let area: HtmlTextAreaElement = e.target_unchecked_into();
-            content.set(area.value());
+        Callback::from(move |next: AttrValue| {
+            content.set(next.to_string());
         })
     };
 
@@ -111,14 +111,16 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                         oninput={on_title_input}
                     />
                 </label>
-                <label class="field">
+                <div class="field">
                     <span>{ "Content" }</span>
-                    <textarea
-                        class="textarea textarea-primary"
-                        value={(*content).clone()}
-                        oninput={on_content_input}
+                    <MarkdownInput
+                        class="note-content-input"
+                        variant={Some("primary".to_string())}
+                        value={Some(AttrValue::from((*content).clone()))}
+                        placeholder="Write markdown..."
+                        on_change={on_content_change}
                     />
-                </label>
+                </div>
 
                 <fieldset class="label-picker">
                     <legend>{ "Labels" }</legend>

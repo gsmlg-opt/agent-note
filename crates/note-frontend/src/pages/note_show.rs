@@ -1,5 +1,5 @@
 use yew::prelude::*;
-use yew_duskmoon::{Alert, Card, Chip};
+use yew_duskmoon::{Alert, Card, Chip, DmMarkdown};
 use yew_router::prelude::*;
 
 use crate::api;
@@ -15,13 +15,11 @@ pub struct NoteShowProps {
 #[function_component(NoteShowPage)]
 pub fn note_show_page(props: &NoteShowProps) -> Html {
     let note = use_state(|| None::<NoteSummary>);
-    let rendered = use_state(String::new);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
 
     {
         let note = note.clone();
-        let rendered = rendered.clone();
         let loading = loading.clone();
         let error = error.clone();
         let id = props.id.clone();
@@ -29,11 +27,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             loading.set(true);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::get_note(&id).await {
-                    Ok(n) => {
-                        let html = api::render_markdown(&n.content).await.unwrap_or_default();
-                        rendered.set(html);
-                        note.set(Some(n));
-                    }
+                    Ok(n) => note.set(Some(n)),
                     Err(e) => error.set(Some(e)),
                 }
                 loading.set(false);
@@ -51,7 +45,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                 <p class="loading">{ "Loading…" }</p>
             } else if let Some(n) = &*note {
                 <Card title={Some(html! { <span>{ n.title.clone() }</span> })}>
-                    <div class="markdown-body">{ Html::from_html_unchecked(AttrValue::from((*rendered).clone())) }</div>
+                    <DmMarkdown markdown={AttrValue::from(n.content.clone())} />
                     if !n.labels.is_empty() {
                         <div class="applied-labels">
                             { for n.labels.iter().map(|(k, v)| html! {
