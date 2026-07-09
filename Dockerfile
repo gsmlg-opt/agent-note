@@ -5,6 +5,12 @@
 
 # ---- Stage 1: build the Yew/Wasm frontend into a static bundle ----
 FROM rust:1-bookworm AS frontend
+ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup \
+    RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup \
+    CARGO_HTTP_TIMEOUT=600 \
+    CARGO_NET_RETRY=5
+RUN mkdir -p /usr/local/cargo \
+    && printf '[source.crates-io]\nreplace-with = "rsproxy"\n\n[source.rsproxy]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[net]\nretry = 5\n' > /usr/local/cargo/config.toml
 RUN rustup target add wasm32-unknown-unknown \
     && cargo install --locked trunk
 WORKDIR /build
@@ -15,6 +21,10 @@ RUN cd crates/note-frontend && trunk build --release
 
 # ---- Stage 2: build the note-server binary (release) ----
 FROM rust:1-bookworm AS backend
+ENV CARGO_HTTP_TIMEOUT=600 \
+    CARGO_NET_RETRY=5
+RUN mkdir -p /usr/local/cargo \
+    && printf '[source.crates-io]\nreplace-with = "rsproxy"\n\n[source.rsproxy]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[net]\nretry = 5\n' > /usr/local/cargo/config.toml
 WORKDIR /build
 COPY . .
 # ort uses load-dynamic, so no ONNX Runtime lib is needed at build time.
@@ -26,9 +36,13 @@ RUN cargo build --release -p note-server --bins
 # (load-dynamic). Baked in so the real OrtEmbedder works as soon as NOTE_MODEL_PATH is set.
 FROM debian:bookworm-slim AS onnxruntime
 ARG ORT_VERSION=1.24.2
-RUN apt-get update \
+RUN sed -i \
+        -e 's|http://deb.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
-    && curl -fsSL -o /tmp/ort.tgz \
+    && curl --retry 5 --retry-delay 3 --connect-timeout 30 -fsSL -o /tmp/ort.tgz \
         "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
     && mkdir -p /opt/ort \
     && tar -xzf /tmp/ort.tgz -C /opt/ort --strip-components=1 \
@@ -39,7 +53,11 @@ RUN apt-get update \
 FROM debian:bookworm-slim AS runtime
 # fonts-dejavu-core gives mermaid-rs-renderer a font for diagram text metrics (the slim base has
 # none, which would break server-side mermaid rendering).
-RUN apt-get update \
+RUN sed -i \
+        -e 's|http://deb.debian.org/debian-security|http://mirrors.tuna.tsinghua.edu.cn/debian-security|g' \
+        -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update \
     && apt-get install -y --no-install-recommends ca-certificates fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
