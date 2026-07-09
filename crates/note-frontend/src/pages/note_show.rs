@@ -1,5 +1,5 @@
 use yew::prelude::*;
-use yew_duskmoon::{Alert, Card, Chip, DmMarkdown};
+use yew_duskmoon::{Alert, Card, Chip};
 use yew_router::prelude::*;
 
 use crate::api;
@@ -15,19 +15,30 @@ pub struct NoteShowProps {
 #[function_component(NoteShowPage)]
 pub fn note_show_page(props: &NoteShowProps) -> Html {
     let note = use_state(|| None::<NoteSummary>);
+    let rendered_content = use_state(|| None::<String>);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
 
     {
         let note = note.clone();
+        let rendered_content = rendered_content.clone();
         let loading = loading.clone();
         let error = error.clone();
         let id = props.id.clone();
         use_effect_with(props.id.clone(), move |_| {
             loading.set(true);
+            note.set(None);
+            rendered_content.set(None);
+            error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::get_note(&id).await {
-                    Ok(n) => note.set(Some(n)),
+                    Ok(n) => match api::render_markdown(&n.content).await {
+                        Ok(html) => {
+                            rendered_content.set(Some(html));
+                            note.set(Some(n));
+                        }
+                        Err(e) => error.set(Some(e)),
+                    },
                     Err(e) => error.set(Some(e)),
                 }
                 loading.set(false);
@@ -43,9 +54,11 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             }
             if *loading {
                 <p class="loading">{ "Loading…" }</p>
-            } else if let Some(n) = &*note {
+            } else if let (Some(n), Some(rendered)) = (&*note, &*rendered_content) {
                 <Card title={Some(html! { <span>{ n.title.clone() }</span> })}>
-                    <DmMarkdown markdown={AttrValue::from(n.content.clone())} />
+                    <div class="markdown-body">
+                        { Html::from_html_unchecked(AttrValue::from(rendered.clone())) }
+                    </div>
                     if !n.labels.is_empty() {
                         <div class="applied-labels">
                             { for n.labels.iter().map(|(k, v)| html! {

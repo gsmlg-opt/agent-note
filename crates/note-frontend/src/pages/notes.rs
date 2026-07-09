@@ -480,7 +480,14 @@ fn note_table(
                     };
                     html! {
                         <tr key={note.id.clone()}>
-                            <td class="col-title">{ note.title.clone() }</td>
+                            <td class="col-title">
+                                <Link<Route>
+                                    to={Route::NoteShow { id: id.clone() }}
+                                    classes={classes!("note-title-link")}
+                                >
+                                    { note.title.clone() }
+                                </Link<Route>>
+                            </td>
                             <td>
                                 <div class="applied-labels">
                                     { for note.labels.iter().map(|(k, v)| html! {

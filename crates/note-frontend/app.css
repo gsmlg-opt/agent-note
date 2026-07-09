@@ -10,7 +10,7 @@ body {
 }
 
 .app {
-    max-width: 64rem; /* tailwind 5xl */
+    max-width: 72rem; /* tailwind 6xl */
     margin: 0 auto;
     padding: 1.5rem 1rem 4rem;
     display: flex;
@@ -31,7 +31,7 @@ body {
 
 .app-bar-inner {
     box-sizing: border-box;
-    max-width: 64rem; /* tailwind 5xl — align with .app */
+    max-width: 72rem; /* tailwind 6xl — align with .app */
     margin: 0 auto;
     padding: 0 1rem;
     height: 60px;
@@ -97,6 +97,9 @@ body {
 /* --- Note table --- */
 .note-table {
     width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    table-layout: fixed;
     border-collapse: collapse;
     border: 1px solid var(--color-outline-variant, #c7c5d0);
     border-radius: 0.6rem;
@@ -121,13 +124,29 @@ body {
 }
 
 .note-table .col-title {
+    width: 7rem;
     font-weight: 600;
 }
 
+.note-table th:first-child {
+    width: 7rem;
+}
+
 .note-table .col-actions {
-    width: 1%;
+    width: 7rem;
     white-space: nowrap;
     text-align: right;
+}
+
+.note-title-link {
+    color: inherit;
+    text-decoration: none;
+    overflow-wrap: anywhere;
+}
+
+.note-title-link:hover {
+    color: var(--color-primary, #6750a4);
+    text-decoration: underline;
 }
 
 .note-table .applied-labels {

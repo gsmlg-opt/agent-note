@@ -149,6 +149,17 @@ pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
     })
 }
 
+pub async fn render_markdown(content: &str) -> Result<String, String> {
+    let body = serde_json::json!({ "content": content });
+    let resp = Request::post("/api/render")
+        .json(&body)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    ok_or_body_error(resp).await?.text().await.map_err(|e| e.to_string())
+}
+
 pub async fn update_note(
     id: &str,
     title: &str,

@@ -4,8 +4,8 @@ use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd}
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
-/// Render Markdown to sanitized HTML: syntect-highlighted code blocks, mermaid-rendered diagrams,
-/// and raw HTML dropped so note content cannot inject arbitrary markup/scripts.
+/// Render Markdown to HTML: syntect-highlighted code blocks, mermaid-rendered diagrams, and
+/// markdown raw HTML preserved for imported documents that use anchor tags.
 pub fn render_markdown_html(md: &str) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -39,7 +39,6 @@ pub fn render_markdown_html(md: &str) -> String {
                 events.push(Event::Html(CowStr::from(html)));
             }
             Event::Text(t) if in_code => code_buf.push_str(&t),
-            Event::Html(_) | Event::InlineHtml(_) => {}
             other => events.push(other),
         }
     }
@@ -80,4 +79,17 @@ fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_markdown_html;
+
+    #[test]
+    fn preserves_raw_html_anchors() {
+        let html = render_markdown_html("<a id=\"abstract\"></a>\n\n## Abstract");
+
+        assert!(html.contains("<a id=\"abstract\"></a>"));
+        assert!(!html.contains("&lt;a id=&quot;abstract&quot;&gt;"));
+    }
 }
