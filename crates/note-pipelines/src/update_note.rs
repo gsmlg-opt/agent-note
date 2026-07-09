@@ -46,14 +46,8 @@ pub async fn update_note(
         }
     }
 
-    let chunks = crate::chunk::chunk_content(&input.content);
-    let mut embeddings = Vec::with_capacity(chunks.len());
-    for chunk in &chunks {
-        let (dense, sparse) = ctx.embedder.embed(chunk).await?;
-        let weights: Vec<(i64, f64)> = sparse.into_iter().map(|(k, v)| (k, v as f64)).collect();
-        embeddings.push((dense, weights));
-    }
     let now = chrono::Utc::now().timestamp();
+    let chunks = crate::chunk::chunk_content(&input.content);
 
     let tx = conn.transaction().await?;
     let affected = note_storage::update_note(&tx, id, &input.title, &input.content, now).await?;
@@ -63,11 +57,8 @@ pub async fn update_note(
     for key in &missing_keys {
         note_storage::insert_label_key(&tx, key, "").await?;
     }
-    note_storage::clear_note_derived(&tx, id).await?;
-    for (idx, (dense, weights)) in embeddings.iter().enumerate() {
-        note_storage::insert_chunk_embedding(&tx, id, idx as i64, dense).await?;
-        note_storage::insert_chunk_sparse_weights(&tx, id, idx as i64, weights).await?;
-    }
+    note_storage::clear_note_labels(&tx, id).await?;
+    crate::sync_note_embedding_jobs(&tx, id, &chunks, now).await?;
     for (key, value) in &input.labels {
         note_storage::attach_label(&tx, id, key, value).await?;
     }

@@ -10,5 +10,8 @@ pub use label_keys::*;
 pub mod note_labels;
 pub use note_labels::*;
 
+pub mod embedding_jobs;
+pub use embedding_jobs::*;
+
 pub mod retrieval;
 pub use retrieval::*;

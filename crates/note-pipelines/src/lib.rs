@@ -4,8 +4,8 @@ pub use context::*;
 pub mod chunk;
 pub use chunk::*;
 
-pub mod backfill;
-pub use backfill::*;
+pub mod embedding_queue;
+pub use embedding_queue::*;
 
 pub mod label_keys;
 pub use label_keys::*;

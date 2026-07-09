@@ -1,6 +1,8 @@
 use libsql::{Builder, Connection, Database};
+use std::time::Duration;
 
 const SCHEMA: &str = include_str!("../schema.sql");
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Storage {
     db: Database,
@@ -10,6 +12,7 @@ impl Storage {
     pub async fn open_local(path: &str) -> anyhow::Result<Self> {
         let db = Builder::new_local(path).build().await?;
         let conn = db.connect()?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         Self::apply_schema(&conn).await?;
         Ok(Self { db })
     }
@@ -26,6 +29,8 @@ impl Storage {
     }
 
     pub fn connect(&self) -> anyhow::Result<Connection> {
-        Ok(self.db.connect()?)
+        let conn = self.db.connect()?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(conn)
     }
 }

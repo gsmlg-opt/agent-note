@@ -1,4 +1,4 @@
-use crate::{backfill_chunk_embeddings, list_notes, Context, ListNotesParams};
+use crate::{enqueue_missing_chunk_embeddings, list_notes, Context, ListNotesParams};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -30,7 +30,7 @@ pub struct ImportStats {
     pub notes_added: usize,
     pub notes_skipped: usize,
     pub label_keys_added: usize,
-    pub embedded: usize,
+    pub embedding_jobs_queued: usize,
 }
 
 pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
@@ -113,7 +113,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
     }
     tx.commit().await?;
 
-    stats.embedded = backfill_chunk_embeddings(ctx).await?;
+    stats.embedding_jobs_queued = enqueue_missing_chunk_embeddings(ctx).await?;
     Ok(stats)
 }
 

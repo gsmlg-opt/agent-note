@@ -1,5 +1,5 @@
 use note_embedding::StubEmbedder;
-use note_pipelines::{save_note, search_notes, Context, SaveNoteInput};
+use note_pipelines::{drain_embedding_jobs, save_note, search_notes, Context, SaveNoteInput};
 use note_storage::Storage;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -25,6 +25,7 @@ async fn saved_note_is_findable_via_pipelines_directly() {
     )
     .await
     .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
     let results = search_notes(&ctx, "C unique", 5).await.unwrap();
     assert!(!results.is_empty());
 }

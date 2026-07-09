@@ -1,6 +1,6 @@
 use note_embedding::StubEmbedder;
 use note_mcp::{save_note_tool, semantic_search_tool, SaveNoteToolInput, SemanticSearchToolInput};
-use note_pipelines::Context;
+use note_pipelines::{drain_embedding_jobs, Context};
 use note_storage::Storage;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -42,6 +42,7 @@ async fn semantic_search_tool_finds_saved_note() {
     )
     .await
     .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
 
     let results = semantic_search_tool(
         &ctx,

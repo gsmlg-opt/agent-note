@@ -70,7 +70,7 @@ async fn save_note_handler(
     .await
     .map_err(|e| {
         // Validation failures are the caller's fault (400); anything else (DB txn, insert,
-        // embedder) is an infra failure (500). save_note preserves the typed ValidationError
+        // enqueue) is an infra failure (500). save_note preserves the typed ValidationError
         // in the anyhow chain, so we downcast to tell them apart.
         let status = if e.downcast_ref::<note_core::ValidationError>().is_some() {
             axum::http::StatusCode::BAD_REQUEST
@@ -214,13 +214,13 @@ mod tests {
 
     // Builds the real /api/notes router over a fresh temp DB + stub embedder so tests exercise the
     // actual HTTP surface (routing, JSON extractor, status codes, DTO serialization) via oneshot.
-    async fn test_app() -> (Router, tempfile::TempDir) {
+    async fn test_app() -> (Router, Arc<Context>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open_local(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
         let ctx = Arc::new(Context::new(Arc::new(storage), Arc::new(StubEmbedder)));
-        (notes_router().with_state(ctx), dir)
+        (notes_router().with_state(ctx.clone()), ctx, dir)
     }
 
     fn post(uri: &str, body: &str) -> Request<Body> {
@@ -270,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_note_returns_200_with_id() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let resp = app
             .oneshot(post(
                 "/api/notes",
@@ -290,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_title_returns_400() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let resp = app
             .oneshot(post(
                 "/api/notes",
@@ -305,7 +305,7 @@ mod tests {
     // rather than 400 — only genuinely invalid input (e.g. empty title) is a 400.
     #[tokio::test]
     async fn unknown_label_key_is_auto_created_returns_200() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let resp = app
             .oneshot(post(
                 "/api/notes",
@@ -318,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_notes_returns_newest_first() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         app.clone()
             .oneshot(post(
                 "/api/notes",
@@ -349,7 +349,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_note_by_id_returns_note_or_404() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
             r#"{"title":"Fetch Me","content":"C","labels":[]}"#,
@@ -372,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_note_by_id_replaces_note_or_404() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
             r#"{"title":"Old","content":"Old content","labels":[]}"#,
@@ -414,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_note_by_id_removes_note_or_404() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
             r#"{"title":"Delete Me","content":"C","labels":[]}"#,
@@ -441,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_200_json_array() {
-        let (app, _dir) = test_app().await;
+        let (app, ctx, _dir) = test_app().await;
         // Seed a note, then search for it. Router is Clone, so clone for the first request since
         // oneshot consumes the service.
         app.clone()
@@ -449,6 +449,9 @@ mod tests {
                 "/api/notes",
                 r#"{"title":"Find","content":"unique text","labels":[]}"#,
             ))
+            .await
+            .unwrap();
+        note_pipelines::drain_embedding_jobs(&ctx, 10)
             .await
             .unwrap();
         let resp = app

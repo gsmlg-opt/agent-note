@@ -1,5 +1,8 @@
 use note_embedding::StubEmbedder;
-use note_pipelines::{define_label_key, list_label_keys, save_note, Context, SaveNoteInput};
+use note_pipelines::{
+    define_label_key, drain_embedding_jobs, list_label_keys, save_note, update_note, Context,
+    SaveNoteInput,
+};
 use note_storage::Storage;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -79,11 +82,8 @@ async fn empty_title_is_rejected() {
     assert!(result.is_err());
 }
 
-// A successful save must populate recall tables consistently (docs/design.md §3): notes plus
-// per-chunk dense/sparse rows. A note present in `notes` but missing chunk rows silently degrades
-// recall, so we assert all three hold rows.
 #[tokio::test]
-async fn successful_save_populates_all_three_tables() {
+async fn successful_save_persists_note_chunks_and_embedding_jobs() {
     let (ctx, _dir) = test_context().await;
     define_label_key(&ctx, "status", "Workflow status")
         .await
@@ -111,9 +111,87 @@ async fn successful_save_populates_all_three_tables() {
     assert_eq!(stored.labels.len(), 1);
     assert_eq!(stored.labels[0].key, "status");
 
+    assert!(count_rows(&conn, "note_chunks", &note.id).await >= 1);
+    assert!(count_rows(&conn, "embedding_jobs", &note.id).await >= 1);
+    assert_eq!(
+        count_rows(&conn, "note_chunk_embeddings", &note.id).await,
+        0
+    );
+    assert_eq!(count_rows(&conn, "note_chunk_sparse", &note.id).await, 0);
+}
+
+#[tokio::test]
+async fn embedding_worker_populates_recall_tables_from_queue() {
+    let (ctx, _dir) = test_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "My note".into(),
+            content: "Some content".into(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(drain_embedding_jobs(&ctx, 10).await.unwrap(), 1);
+
+    let conn = ctx.storage.connect().unwrap();
     assert!(count_rows(&conn, "note_chunk_embeddings", &note.id).await >= 1);
-    // StubEmbedder emits at least one sparse term for this content.
     assert!(count_rows(&conn, "note_chunk_sparse", &note.id).await >= 1);
+    assert_eq!(count_rows(&conn, "embedding_jobs", &note.id).await, 0);
+}
+
+#[tokio::test]
+async fn update_only_queues_embedding_when_content_hash_changes() {
+    let (ctx, _dir) = test_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "My note".into(),
+            content: "Stable content".into(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
+
+    update_note(
+        &ctx,
+        &note.id,
+        SaveNoteInput {
+            title: "Renamed".into(),
+            content: "Stable content".into(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let conn = ctx.storage.connect().unwrap();
+    assert_eq!(count_rows(&conn, "embedding_jobs", &note.id).await, 0);
+    assert!(count_rows(&conn, "note_chunk_embeddings", &note.id).await >= 1);
+
+    update_note(
+        &ctx,
+        &note.id,
+        SaveNoteInput {
+            title: "Renamed".into(),
+            content: "Changed content".into(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(count_rows(&conn, "embedding_jobs", &note.id).await, 1);
+    assert_eq!(
+        count_rows(&conn, "note_chunk_embeddings", &note.id).await,
+        0
+    );
 }
 
 // Atomicity (docs/design.md §3): a partial write is a correctness bug, not a soft failure.
@@ -146,6 +224,8 @@ async fn failed_write_rolls_back_all_tables() {
     let conn = ctx.storage.connect().unwrap();
     // Nothing partial persisted: no note row, and no orphan embedding/sparse rows.
     assert_eq!(total_rows(&conn, "notes").await, 0);
+    assert_eq!(total_rows(&conn, "note_chunks").await, 0);
+    assert_eq!(total_rows(&conn, "embedding_jobs").await, 0);
     assert_eq!(total_rows(&conn, "note_chunk_embeddings").await, 0);
     assert_eq!(total_rows(&conn, "note_chunk_sparse").await, 0);
     assert_eq!(total_rows(&conn, "note_labels").await, 0);

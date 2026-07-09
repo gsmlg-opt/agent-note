@@ -45,14 +45,16 @@ async fn main() -> anyhow::Result<()> {
 
     if import_mode {
         let storage = Storage::open_local(&db_path).await?;
-        let embedder = build_embedder(1)?;
-        let ctx = Context::new(Arc::new(storage), embedder);
+        let ctx = Context::new(Arc::new(storage), Arc::new(StubEmbedder));
         let mut input = String::new();
         std::io::stdin().lock().read_to_string(&mut input)?;
         let stats = note_pipelines::import_json(&ctx, &input).await?;
         eprintln!(
-            "import: {} notes added, {} skipped, {} label keys added, {} notes embedded",
-            stats.notes_added, stats.notes_skipped, stats.label_keys_added, stats.embedded
+            "import: {} notes added, {} skipped, {} label keys added, {} embedding jobs queued",
+            stats.notes_added,
+            stats.notes_skipped,
+            stats.label_keys_added,
+            stats.embedding_jobs_queued
         );
         return Ok(());
     }
@@ -62,9 +64,9 @@ async fn main() -> anyhow::Result<()> {
         let storage = Storage::open_local(&db_path).await?;
         let embedder = build_embedder(1)?;
         let ctx = Context::new(Arc::new(storage), embedder);
-        let n = note_pipelines::backfill_chunk_embeddings(&ctx).await?;
+        let n = note_pipelines::enqueue_missing_chunk_embeddings(&ctx).await?;
         if n > 0 {
-            eprintln!("backfilled chunk embeddings for {n} notes");
+            eprintln!("queued {n} missing chunk embeddings");
         }
         note_mcp::run_stdio(ctx).await?;
     } else {
@@ -74,9 +76,9 @@ async fn main() -> anyhow::Result<()> {
         let storage = Storage::open_local(&db_path).await?;
         let embedder = build_embedder(HTTP_INFERENCE_CONCURRENCY)?;
         let ctx = Arc::new(Context::new(Arc::new(storage), embedder));
-        let n = note_pipelines::backfill_chunk_embeddings(&ctx).await?;
+        let n = note_pipelines::enqueue_missing_chunk_embeddings(&ctx).await?;
         if n > 0 {
-            eprintln!("backfilled chunk embeddings for {n} notes");
+            eprintln!("queued {n} missing chunk embeddings");
         }
 
         // notes_router()/labels_router() are Router<Arc<Context>> — applying .with_state converts them

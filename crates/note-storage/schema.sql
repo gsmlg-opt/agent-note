@@ -20,6 +20,33 @@ CREATE TABLE IF NOT EXISTS note_labels (
 );
 CREATE INDEX IF NOT EXISTS idx_note_labels_key_value ON note_labels(label_key_id, value);
 
+CREATE TABLE IF NOT EXISTS note_chunks (
+    note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    chunk_idx INTEGER NOT NULL,
+    chunk_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (note_id, chunk_idx)
+);
+CREATE INDEX IF NOT EXISTS idx_note_chunks_hash ON note_chunks(chunk_hash);
+CREATE INDEX IF NOT EXISTS idx_note_chunks_status ON note_chunks(status);
+
+CREATE TABLE IF NOT EXISTS embedding_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    chunk_idx INTEGER NOT NULL,
+    chunk_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(note_id, chunk_idx, chunk_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_embedding_jobs_status ON embedding_jobs(status, created_at);
+
 CREATE TABLE IF NOT EXISTS note_chunk_embeddings (
     note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
     chunk_idx INTEGER NOT NULL,

@@ -1,5 +1,5 @@
 use note_embedding::StubEmbedder;
-use note_pipelines::{save_note, search_notes, Context, SaveNoteInput};
+use note_pipelines::{drain_embedding_jobs, save_note, search_notes, Context, SaveNoteInput};
 use note_storage::Storage;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -37,6 +37,7 @@ async fn search_returns_saved_notes_with_fused_scores() {
     )
     .await
     .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
 
     let results = search_notes(&ctx, "Ownership and borrowing in Rust", 10)
         .await

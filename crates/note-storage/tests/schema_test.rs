@@ -20,6 +20,8 @@ async fn schema_applies_cleanly_to_a_fresh_db() {
         "notes",
         "label_keys",
         "note_labels",
+        "note_chunks",
+        "embedding_jobs",
         "note_chunk_embeddings",
         "note_chunk_sparse",
     ] {

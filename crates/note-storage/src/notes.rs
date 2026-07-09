@@ -89,6 +89,51 @@ pub async fn clear_note_derived(conn: &Connection, id: &str) -> anyhow::Result<(
     Ok(())
 }
 
+pub async fn clear_note_labels(conn: &Connection, id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM note_labels WHERE note_id = ?1",
+        libsql::params![id],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_note_chunk_derived(
+    conn: &Connection,
+    id: &str,
+    chunk_idx: i64,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM note_chunk_embeddings WHERE note_id = ?1 AND chunk_idx = ?2",
+        libsql::params![id, chunk_idx],
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM note_chunk_sparse WHERE note_id = ?1 AND chunk_idx = ?2",
+        libsql::params![id, chunk_idx],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_note_chunks_from_derived(
+    conn: &Connection,
+    id: &str,
+    min_chunk_idx: i64,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM note_chunk_embeddings WHERE note_id = ?1 AND chunk_idx >= ?2",
+        libsql::params![id, min_chunk_idx],
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM note_chunk_sparse WHERE note_id = ?1 AND chunk_idx >= ?2",
+        libsql::params![id, min_chunk_idx],
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn list_notes(
     conn: &Connection,
     selectors: &[LabelSelector],

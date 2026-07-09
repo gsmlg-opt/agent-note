@@ -52,7 +52,7 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     assert_eq!(stats.notes_added, 2);
     assert_eq!(stats.notes_skipped, 0);
     assert_eq!(stats.label_keys_added, 1);
-    assert!(stats.embedded > 0);
+    assert!(stats.embedding_jobs_queued > 0);
 
     let keys = list_label_keys(&target).await.unwrap();
     assert_eq!(keys.len(), 1);
