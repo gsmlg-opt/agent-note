@@ -8,6 +8,8 @@ pub struct NoteSummary {
     pub content: String,
     /// Attached labels as (key, value) pairs.
     pub labels: Vec<(String, String)>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

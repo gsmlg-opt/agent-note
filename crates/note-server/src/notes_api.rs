@@ -37,6 +37,7 @@ pub struct NoteDto {
     pub content: String,
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
+    pub updated_at: i64,
 }
 
 impl From<Note> for NoteDto {
@@ -51,6 +52,7 @@ impl From<Note> for NoteDto {
                 .map(|label| (label.key.clone(), label.value.clone()))
                 .collect(),
             created_at: note.created_at,
+            updated_at: note.updated_at,
         }
     }
 }

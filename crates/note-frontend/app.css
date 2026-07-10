@@ -44,7 +44,7 @@ body {
 .app-brand {
     font-size: 1.25rem;
     font-weight: 800;
-    letter-spacing: -0.01em;
+    letter-spacing: 0;
     color: var(--color-primary, #6750a4);
     text-decoration: none;
 }
@@ -94,6 +94,123 @@ body {
     font-size: 0.9rem;
 }
 
+/* --- Dashboard --- */
+.dashboard-metrics {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.75rem;
+}
+
+.dashboard-metric {
+    display: grid;
+    gap: 0.35rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.5rem;
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.dashboard-metric-label {
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.dashboard-metric strong {
+    font-size: 1.45rem;
+    line-height: 1.15;
+}
+
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 1rem;
+}
+
+.dashboard-panel {
+    min-width: 0;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.5rem;
+    background: var(--color-surface, #faf8ff);
+}
+
+.dashboard-panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.8rem 0.9rem;
+    border-bottom: 1px solid var(--color-outline-variant, #c7c5d0);
+}
+
+.dashboard-panel-head h3 {
+    margin: 0;
+    font-size: 0.95rem;
+}
+
+.dashboard-labels,
+.dashboard-updates {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.dashboard-label-row,
+.dashboard-update-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.9rem;
+    padding: 0.75rem 0.9rem;
+    border-top: 1px solid var(--color-outline-variant, #c7c5d0);
+}
+
+.dashboard-label-row:first-child,
+.dashboard-update-row:first-child {
+    border-top: 0;
+}
+
+.dashboard-label-main {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+}
+
+.dashboard-label-desc {
+    flex-basis: 100%;
+    min-width: 0;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.82rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.dashboard-label-count,
+.dashboard-update-row span {
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.82rem;
+    white-space: nowrap;
+}
+
+.dashboard-update-title {
+    min-width: 0;
+    color: inherit;
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.dashboard-update-title:hover {
+    color: var(--color-primary, #6750a4);
+    text-decoration: underline;
+}
+
 /* --- Note table --- */
 .note-table {
     width: 100%;
@@ -118,7 +235,7 @@ body {
     border-top: none;
     font-size: 0.72rem;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
     color: var(--color-on-surface-variant, #46464f);
     background: var(--color-surface-container-low, #f3f0f9);
 }
@@ -372,25 +489,74 @@ body {
 /* --- Pagination --- */
 .pagination {
     display: flex;
-    flex-wrap: wrap;
     align-items: center;
-    gap: 0.35rem;
-    margin-top: 0.5rem;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+    min-height: 2.25rem;
+    white-space: nowrap;
 }
 
 .pagination .pagination-info {
-    margin-right: auto;
-    font-size: 0.85rem;
+    font-size: 0.9rem;
     color: var(--color-on-surface-variant, #46464f);
 }
 
-.pagination .pagination-item {
-    min-width: 2.25rem;
+.pagination .btn-icon {
+    width: 2rem;
+    min-width: 2rem;
+    height: 2rem;
+}
+
+.pagination-page-input {
+    width: 3.25rem;
+    height: 2rem;
+    padding: 0 0.5rem;
+    text-align: center;
+}
+
+.pagination-page-input::-webkit-outer-spin-button,
+.pagination-page-input::-webkit-inner-spin-button {
+    margin: 0;
+}
+
+.pagination-pages-total {
+    color: var(--color-on-surface, #1b1b1f);
+}
+
+.pagination-page-size {
+    width: 6rem;
+    height: 2rem;
+    padding: 0 1.75rem 0 0.6rem;
 }
 
 .pagination .btn[disabled] {
     opacity: 0.5;
     pointer-events: none;
+}
+
+@media (max-width: 520px) {
+    .dashboard-metrics,
+    .dashboard-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .dashboard-label-row,
+    .dashboard-update-row {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 0.35rem;
+    }
+
+    .pagination {
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        white-space: normal;
+    }
+
+    .pagination .pagination-info {
+        flex-basis: 100%;
+    }
 }
 
 /* Single-note view. */

@@ -1,11 +1,13 @@
 use yew::prelude::*;
 use yew_router::prelude::*;
 
-use crate::pages::{LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage};
+use crate::pages::{DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage};
 
 #[derive(Clone, Routable, PartialEq)]
 pub enum Route {
     #[at("/")]
+    Home,
+    #[at("/notes")]
     Notes,
     #[at("/new")]
     NewNote,
@@ -22,6 +24,7 @@ pub enum Route {
 
 pub fn switch(route: Route) -> Html {
     match route {
+        Route::Home => html! { <DashboardPage /> },
         Route::Notes => html! { <NotesPage /> },
         Route::NewNote => html! { <NewNotePage /> },
         Route::NoteShow { id } => html! { <NoteShowPage {id} /> },

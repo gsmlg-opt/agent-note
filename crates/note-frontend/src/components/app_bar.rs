@@ -10,10 +10,11 @@ pub fn app_bar() -> Html {
     html! {
         <header class="app-bar">
             <div class="app-bar-inner">
-                <Link<Route> to={Route::Notes} classes={classes!("app-brand")}>
+                <Link<Route> to={Route::Home} classes={classes!("app-brand")}>
                     { "agent-note" }
                 </Link<Route>>
                 <nav class="app-nav">
+                    <Link<Route> to={Route::Home} classes={classes!("nav-link")}>{ "Home" }</Link<Route>>
                     <Link<Route> to={Route::Notes} classes={classes!("nav-link")}>{ "Notes" }</Link<Route>>
                     <Link<Route> to={Route::NewNote} classes={classes!("nav-link")}>{ "New note" }</Link<Route>>
                     <Link<Route> to={Route::Labels} classes={classes!("nav-link")}>{ "Labels" }</Link<Route>>

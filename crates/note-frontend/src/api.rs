@@ -26,7 +26,7 @@ struct SearchResultDto {
     score: f32,
 }
 
-fn label_filter_selector(filters: &[LabelFilter]) -> Option<String> {
+pub fn label_filter_selector(filters: &[LabelFilter]) -> Option<String> {
     let terms = filters
         .iter()
         .filter(|filter| !filter.key.trim().is_empty())
@@ -107,6 +107,10 @@ struct NoteDto {
     title: String,
     content: String,
     labels: Vec<(String, String)>,
+    #[serde(default)]
+    created_at: i64,
+    #[serde(default)]
+    updated_at: i64,
 }
 
 pub async fn list_notes_filtered(filters: &[LabelFilter]) -> Result<Vec<NoteSummary>, String> {
@@ -127,6 +131,8 @@ pub async fn list_notes_filtered(filters: &[LabelFilter]) -> Result<Vec<NoteSumm
             title: d.title,
             content: d.content,
             labels: d.labels,
+            created_at: d.created_at,
+            updated_at: d.updated_at,
         })
         .collect())
 }
@@ -146,6 +152,8 @@ pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
         title: d.title,
         content: d.content,
         labels: d.labels,
+        created_at: d.created_at,
+        updated_at: d.updated_at,
     })
 }
 
