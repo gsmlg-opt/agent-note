@@ -4,13 +4,16 @@ use axum::{
     routing::{get as route_get, post},
     Json, Router,
 };
-use note_core::Note;
+use note_core::{Note, NoteListItem};
 use note_pipelines::{
-    delete_note, get_note, list_notes, save_note, search_notes_filtered, update_note, Context,
-    ListNotesParams, SaveNoteInput,
+    count_notes, delete_note, get_note, list_note_summaries, save_note, search_notes_filtered,
+    update_note, Context, ListNotesParams, SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+const DEFAULT_LIST_LIMIT: i64 = 10;
+const MAX_LIST_LIMIT: i64 = 1000;
 
 #[derive(Deserialize)]
 pub struct SaveNoteRequest {
@@ -46,6 +49,31 @@ impl From<Note> for NoteDto {
             id: note.id,
             title: note.title,
             content: note.content,
+            labels: note
+                .labels
+                .iter()
+                .map(|label| (label.key.clone(), label.value.clone()))
+                .collect(),
+            created_at: note.created_at,
+            updated_at: note.updated_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct NoteListDto {
+    pub id: String,
+    pub title: String,
+    pub labels: Vec<(String, String)>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl From<NoteListItem> for NoteListDto {
+    fn from(note: NoteListItem) -> Self {
+        Self {
+            id: note.id,
+            title: note.title,
             labels: note
                 .labels
                 .iter()
@@ -94,21 +122,44 @@ pub struct ListNotesQuery {
     pub label: Option<String>,
 }
 
+fn normalized_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(0, MAX_LIST_LIMIT)
+}
+
+fn normalized_offset(offset: Option<i64>) -> i64 {
+    offset.unwrap_or(0).max(0)
+}
+
 async fn list_notes_handler(
     State(ctx): State<Arc<Context>>,
     Query(req): Query<ListNotesQuery>,
-) -> Result<Json<Vec<NoteDto>>, (axum::http::StatusCode, String)> {
-    let notes = list_notes(
+) -> Result<Json<Vec<NoteListDto>>, (axum::http::StatusCode, String)> {
+    let notes = list_note_summaries(
         &ctx,
         ListNotesParams {
-            limit: req.limit,
-            offset: req.offset,
+            limit: Some(normalized_limit(req.limit)),
+            offset: Some(normalized_offset(req.offset)),
             label: req.label,
         },
     )
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(notes.into_iter().map(Into::into).collect()))
+}
+
+#[derive(Serialize)]
+pub struct CountNotesResponse {
+    pub total: usize,
+}
+
+async fn count_notes_handler(
+    State(ctx): State<Arc<Context>>,
+    Query(req): Query<ListNotesQuery>,
+) -> Result<Json<CountNotesResponse>, (axum::http::StatusCode, String)> {
+    let total = count_notes(&ctx, req.label)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(CountNotesResponse { total }))
 }
 
 async fn get_note_handler(
@@ -211,6 +262,7 @@ pub fn notes_router() -> Router<Arc<Context>> {
             "/api/notes",
             post(save_note_handler).get(list_notes_handler),
         )
+        .route("/api/notes/count", route_get(count_notes_handler))
         .route(
             "/api/notes/{id}",
             route_get(get_note_handler)
@@ -367,6 +419,59 @@ mod tests {
             notes[0].get("title").and_then(|v| v.as_str()),
             Some("Second")
         );
+        assert!(notes[0].get("content").is_none());
+    }
+
+    #[tokio::test]
+    async fn list_notes_defaults_to_ten_and_counts_total() {
+        let (app, _ctx, _dir) = test_app().await;
+        for idx in 0..12 {
+            app.clone()
+                .oneshot(post(
+                    "/api/notes",
+                    &format!(r#"{{"title":"N{idx}","content":"C{idx}","labels":[]}}"#),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let resp = app.clone().oneshot(get("/api/notes")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let notes: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(notes.len(), 10);
+        assert!(notes.iter().all(|note| note.get("content").is_none()));
+
+        let resp = app.oneshot(get("/api/notes/count")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.get("total").and_then(|v| v.as_u64()), Some(12));
+    }
+
+    #[tokio::test]
+    async fn list_notes_clamps_limit_to_one_thousand() {
+        let (app, ctx, _dir) = test_app().await;
+        let conn = ctx.storage.connect().unwrap();
+        for idx in 0..1002 {
+            note_storage::insert_note(
+                &conn,
+                &format!("note-{idx}"),
+                &format!("N{idx}"),
+                &format!("C{idx}"),
+                idx,
+                idx,
+                1,
+            )
+            .await
+            .unwrap();
+        }
+
+        let resp = app.oneshot(get("/api/notes?limit=2000")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let notes: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(notes.len(), 1000);
     }
 
     #[tokio::test]

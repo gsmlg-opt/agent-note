@@ -12,7 +12,8 @@ use crate::state::{LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
 
 /// Notes shown per page in the list view.
 const DEFAULT_PAGE_SIZE: usize = 30;
-const PAGE_SIZE_OPTIONS: [usize; 4] = [10, 30, 50, 100];
+const MAX_PAGE_SIZE: usize = 1000;
+const PAGE_SIZE_OPTIONS: [usize; 5] = [10, 30, 50, 100, 1000];
 
 #[derive(Clone, PartialEq)]
 struct NotesUrlState {
@@ -88,10 +89,10 @@ fn non_empty_param(value: &str) -> Option<String> {
 }
 
 fn normalize_page_size(page_size: usize) -> usize {
-    if PAGE_SIZE_OPTIONS.contains(&page_size) {
-        page_size
-    } else {
+    if page_size == 0 {
         DEFAULT_PAGE_SIZE
+    } else {
+        page_size.min(MAX_PAGE_SIZE)
     }
 }
 
@@ -138,6 +139,7 @@ fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
 #[function_component(NotesPage)]
 pub fn notes_page() -> Html {
     let notes = use_state(Vec::<NoteSummary>::new);
+    let total_notes = use_state(|| 0usize);
     let label_keys = use_state(Vec::<LabelKey>::new);
     // `Some` while a search is active; `None` shows the full table.
     let results = use_state(|| None::<Vec<SearchResultSummary>>);
@@ -173,6 +175,7 @@ pub fn notes_page() -> Html {
 
     {
         let notes = notes.clone();
+        let total_notes = total_notes.clone();
         let results = results.clone();
         let query = query.clone();
         let page = page.clone();
@@ -183,6 +186,7 @@ pub fn notes_page() -> Html {
         use_effect_with((url_state.clone(), *refresh_tick), move |(state, _)| {
             let state = state.clone();
             notes.set(Vec::new());
+            total_notes.set(0);
             results.set(None);
             query.set(state.search.clone());
             page.set(state.current.saturating_sub(1));
@@ -193,8 +197,15 @@ pub fn notes_page() -> Html {
             wasm_bindgen_futures::spawn_local(async move {
                 let search = state.search.trim().to_string();
                 if search.is_empty() {
-                    match api::list_notes_filtered(&state.labels).await {
-                        Ok(list) => notes.set(list),
+                    let offset = state
+                        .current
+                        .saturating_sub(1)
+                        .saturating_mul(state.page_size);
+                    match api::list_notes_page(&state.labels, state.page_size, offset).await {
+                        Ok(page) => {
+                            notes.set(page.notes);
+                            total_notes.set(page.total);
+                        }
                         Err(e) => error.set(Some(e)),
                     }
                 } else {
@@ -463,7 +474,7 @@ pub fn notes_page() -> Html {
             } else if let Some(hits) = &*results {
                 { search_results_view(hits, &page, &page_size, on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
             } else {
-                { list_view(&notes, &page, &page_size, &delete_target, on_page_change, on_page_size_change, on_refresh) }
+                { list_view(&notes, *total_notes, &page, &page_size, &delete_target, on_page_change, on_page_size_change, on_refresh) }
             }
 
             { delete_modal }
@@ -563,6 +574,7 @@ fn label_value_input_type(value_type: &str) -> &'static str {
 /// Full-list view: the current page of notes plus the pagination bar.
 fn list_view(
     notes: &[NoteSummary],
+    total: usize,
     page: &UseStateHandle<usize>,
     page_size: &UseStateHandle<usize>,
     delete_target: &UseStateHandle<Option<(String, String)>>,
@@ -570,7 +582,6 @@ fn list_view(
     on_page_size_change: Callback<usize>,
     on_refresh: Callback<MouseEvent>,
 ) -> Html {
-    let total = notes.len();
     if total == 0 {
         return note_table(notes, delete_target);
     }
@@ -578,11 +589,11 @@ fn list_view(
     let total_pages = total.div_ceil(per_page);
     let current = (**page).min(total_pages - 1);
     let start = current * per_page;
-    let end = (start + per_page).min(total);
+    let end = (start + notes.len()).min(total);
 
     html! {
         <>
-            { note_table(&notes[start..end], delete_target) }
+            { note_table(notes, delete_target) }
             { pagination_bar(current, total_pages, total, start, end, **page_size, on_page_change, on_page_size_change, on_refresh) }
         </>
     }

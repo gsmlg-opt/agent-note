@@ -113,13 +113,60 @@ struct NoteDto {
     updated_at: i64,
 }
 
-pub async fn list_notes_filtered(filters: &[LabelFilter]) -> Result<Vec<NoteSummary>, String> {
-    let url = match label_filter_selector(filters) {
-        Some(selector) => format!("/api/notes?label={}", urlencoding::encode(&selector)),
-        None => "/api/notes".to_string(),
-    };
+#[derive(Deserialize)]
+struct NoteListDto {
+    id: String,
+    title: String,
+    labels: Vec<(String, String)>,
+    #[serde(default)]
+    created_at: i64,
+    #[serde(default)]
+    updated_at: i64,
+}
+
+pub struct NotesPage {
+    pub notes: Vec<NoteSummary>,
+    pub total: usize,
+}
+
+#[derive(Deserialize)]
+struct CountNotesDto {
+    total: usize,
+}
+
+fn notes_list_url(filters: &[LabelFilter], limit: Option<usize>, offset: Option<usize>) -> String {
+    let mut params = Vec::new();
+    if let Some(selector) = label_filter_selector(filters) {
+        params.push(format!("label={}", urlencoding::encode(&selector)));
+    }
+    if let Some(limit) = limit {
+        params.push(format!("limit={limit}"));
+    }
+    if let Some(offset) = offset {
+        params.push(format!("offset={offset}"));
+    }
+    if params.is_empty() {
+        "/api/notes".to_string()
+    } else {
+        format!("/api/notes?{}", params.join("&"))
+    }
+}
+
+fn notes_count_url(filters: &[LabelFilter]) -> String {
+    match label_filter_selector(filters) {
+        Some(selector) => format!("/api/notes/count?label={}", urlencoding::encode(&selector)),
+        None => "/api/notes/count".to_string(),
+    }
+}
+
+async fn fetch_note_summaries(
+    filters: &[LabelFilter],
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<NoteSummary>, String> {
+    let url = notes_list_url(filters, Some(limit), Some(offset));
     let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
-    let dtos: Vec<NoteDto> = ok_or_body_error(resp)
+    let dtos: Vec<NoteListDto> = ok_or_body_error(resp)
         .await?
         .json()
         .await
@@ -129,12 +176,53 @@ pub async fn list_notes_filtered(filters: &[LabelFilter]) -> Result<Vec<NoteSumm
         .map(|d| NoteSummary {
             id: d.id,
             title: d.title,
-            content: d.content,
+            content: String::new(),
             labels: d.labels,
             created_at: d.created_at,
             updated_at: d.updated_at,
         })
         .collect())
+}
+
+pub async fn count_notes_filtered(filters: &[LabelFilter]) -> Result<usize, String> {
+    let resp = Request::get(&notes_count_url(filters))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let count: CountNotesDto = ok_or_body_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(count.total)
+}
+
+pub async fn list_notes_page(
+    filters: &[LabelFilter],
+    limit: usize,
+    offset: usize,
+) -> Result<NotesPage, String> {
+    let notes = fetch_note_summaries(filters, limit, offset).await?;
+    let total = count_notes_filtered(filters).await?;
+
+    Ok(NotesPage { notes, total })
+}
+
+pub async fn list_notes_filtered(filters: &[LabelFilter]) -> Result<Vec<NoteSummary>, String> {
+    const PAGE_LIMIT: usize = 1000;
+
+    let total = count_notes_filtered(filters).await?;
+    let mut notes = Vec::with_capacity(total.min(PAGE_LIMIT));
+    let mut offset = 0usize;
+    while offset < total {
+        let page = fetch_note_summaries(filters, PAGE_LIMIT, offset).await?;
+        if page.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(page.len());
+        notes.extend(page);
+    }
+    Ok(notes)
 }
 
 pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
