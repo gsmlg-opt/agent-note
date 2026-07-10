@@ -1,8 +1,14 @@
 pub mod bounded;
 pub mod embedder;
 pub mod ort_embedder;
+pub mod process;
+pub mod rpc;
 pub mod stub;
+pub mod worker;
 pub use bounded::*;
 pub use embedder::*;
 pub use ort_embedder::*;
+pub use process::*;
+pub use rpc::*;
 pub use stub::*;
+pub use worker::*;

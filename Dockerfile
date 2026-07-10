@@ -29,7 +29,7 @@ WORKDIR /build
 COPY . .
 # ort uses load-dynamic, so no ONNX Runtime lib is needed at build time.
 RUN cargo build --release -p note-server --bins
-# -> /build/target/release/note-server and /build/target/release/embedding-service
+# -> /build/target/release/note-server
 
 # ---- Stage 2b: fetch the ONNX Runtime shared library (CPU) ----
 # ort 2.0.0-rc.12 targets ONNX Runtime 1.24.x and loads it at runtime via ORT_DYLIB_PATH
@@ -62,7 +62,6 @@ RUN sed -i \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=backend /build/target/release/note-server /usr/local/bin/note-server
-COPY --from=backend /build/target/release/embedding-service /usr/local/bin/embedding-service
 COPY --from=frontend /build/crates/note-frontend/dist /app/static
 COPY --from=onnxruntime /opt/ort/lib/libonnxruntime.so.1.24.2 /usr/local/lib/libonnxruntime.so
 # 0.0.0.0 so the container is reachable via `docker run -p`; the DB lives on a volume so notes

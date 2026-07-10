@@ -40,6 +40,23 @@ async fn schema_applies_cleanly_to_a_fresh_db() {
         columns.push(row.get::<String>(1).unwrap());
     }
     assert!(columns.contains(&"value_type".to_string()));
+
+    let mut rows = conn.query("PRAGMA table_info(notes)", ()).await.unwrap();
+    let mut note_columns = vec![];
+    while let Some(row) = rows.next().await.unwrap() {
+        note_columns.push(row.get::<String>(1).unwrap());
+    }
+    assert!(note_columns.contains(&"note_revision".to_string()));
+
+    let mut rows = conn
+        .query("PRAGMA table_info(embedding_jobs)", ())
+        .await
+        .unwrap();
+    let mut job_columns = vec![];
+    while let Some(row) = rows.next().await.unwrap() {
+        job_columns.push(row.get::<String>(1).unwrap());
+    }
+    assert!(job_columns.contains(&"note_revision".to_string()));
 }
 
 #[tokio::test]

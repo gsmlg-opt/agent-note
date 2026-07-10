@@ -8,7 +8,7 @@ async fn attach_and_fetch_labels_for_a_note() {
         .unwrap();
     let conn = storage.connect().unwrap();
 
-    insert_note(&conn, "note-1", "Title", "Content", 1000, 1000)
+    insert_note(&conn, "note-1", "Title", "Content", 1000, 1000, 1)
         .await
         .unwrap();
     insert_label_key(&conn, "status", "Workflow status")
@@ -34,7 +34,7 @@ async fn attaching_unknown_key_fails() {
         .unwrap();
     let conn = storage.connect().unwrap();
 
-    insert_note(&conn, "note-1", "Title", "Content", 1000, 1000)
+    insert_note(&conn, "note-1", "Title", "Content", 1000, 1000, 1)
         .await
         .unwrap();
     let result = attach_label(&conn, "note-1", "does-not-exist", "value").await;

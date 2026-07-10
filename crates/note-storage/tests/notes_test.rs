@@ -8,7 +8,7 @@ async fn insert_then_get_returns_the_same_note() {
         .unwrap();
     let conn = storage.connect().unwrap();
 
-    insert_note(&conn, "note-1", "Title", "Content", 1000, 1000)
+    insert_note(&conn, "note-1", "Title", "Content", 1000, 1000, 1)
         .await
         .unwrap();
     let fetched = get_note(&conn, "note-1")

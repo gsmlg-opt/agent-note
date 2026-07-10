@@ -1,7 +1,8 @@
 pub type NoteId = String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LabelValueType {
+    #[default]
     Text,
     Number,
     Version,
@@ -20,12 +21,6 @@ impl LabelValueType {
             LabelValueType::DateTime => "datetime",
             LabelValueType::Time => "time",
         }
-    }
-}
-
-impl Default for LabelValueType {
-    fn default() -> Self {
-        Self::Text
     }
 }
 
@@ -271,6 +266,15 @@ pub struct Note {
     pub id: NoteId,
     pub title: String,
     pub content: String,
+    pub labels: Vec<Label>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoteListItem {
+    pub id: NoteId,
+    pub title: String,
     pub labels: Vec<Label>,
     pub created_at: i64,
     pub updated_at: i64,

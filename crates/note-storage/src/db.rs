@@ -37,6 +37,27 @@ impl Storage {
             )
             .await?;
         }
+        if !Self::column_exists(conn, "notes", "note_revision").await? {
+            conn.execute(
+                "ALTER TABLE notes ADD COLUMN note_revision INTEGER NOT NULL DEFAULT 1",
+                (),
+            )
+            .await?;
+        }
+        if !Self::column_exists(conn, "note_chunks", "note_revision").await? {
+            conn.execute(
+                "ALTER TABLE note_chunks ADD COLUMN note_revision INTEGER NOT NULL DEFAULT 1",
+                (),
+            )
+            .await?;
+        }
+        if !Self::column_exists(conn, "embedding_jobs", "note_revision").await? {
+            conn.execute(
+                "ALTER TABLE embedding_jobs ADD COLUMN note_revision INTEGER NOT NULL DEFAULT 1",
+                (),
+            )
+            .await?;
+        }
         Ok(())
     }
 

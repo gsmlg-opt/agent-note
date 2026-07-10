@@ -66,10 +66,16 @@ pub async fn update_note(
     }
 
     let now = chrono::Utc::now().timestamp();
+    let note_revision = note_storage::get_note_revision(&conn, id)
+        .await?
+        .unwrap_or(1)
+        + 1;
     let chunks = crate::chunk::chunk_content(&input.content);
 
     let tx = conn.transaction().await?;
-    let affected = note_storage::update_note(&tx, id, &input.title, &input.content, now).await?;
+    let affected =
+        note_storage::update_note(&tx, id, &input.title, &input.content, now, note_revision)
+            .await?;
     if affected == 0 {
         return Ok(None);
     }
@@ -77,12 +83,15 @@ pub async fn update_note(
         note_storage::insert_label_key(&tx, key, "").await?;
     }
     note_storage::clear_note_labels(&tx, id).await?;
-    crate::sync_note_embedding_jobs(&tx, id, &chunks, now).await?;
+    let queued = crate::sync_note_embedding_jobs(&tx, id, &chunks, note_revision, now).await?;
     for (key, value) in &input.labels {
         note_storage::attach_label(&tx, id, key, value).await?;
     }
     let resolved_labels: Vec<Label> = note_storage::labels_for_note(&tx, id).await?;
     tx.commit().await?;
+    if queued > 0 {
+        ctx.wake_embedding_jobs();
+    }
 
     Ok(Some(Note {
         id: id.to_string(),

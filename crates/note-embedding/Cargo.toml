@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0.103"
 async-trait = "0.1.89"
+futures = "0.3"
+interprocess = { version = "2.4.2", features = ["tokio"] }
 # Not yet referenced in code (OrtEmbedder is a deferred skeleton, Task 12 of the implementation
 # plan) — kept as a pre-staged dependency for the real wiring task, do not prune as unused.
 # default-features disabled + load-dynamic: this ort version has no prebuilt ONNX Runtime binary
@@ -16,6 +18,12 @@ async-trait = "0.1.89"
 # ndarray is needed by the real inference path (tensor I/O), added ahead of Task 12's real wiring.
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-24"] }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tarpc = { version = "0.37.0", features = ["serde1", "tokio1", "serde-transport", "serde-transport-bincode"] }
 # BoundedEmbedder uses tokio::sync::Semaphore in production code (not just tests), so tokio is a
 # regular dependency, not dev-only.
 tokio = { version = "1.52.3", features = ["full"] }
+
+[dev-dependencies]
+bincode = "1.3"
+tempfile = "3.27.0"

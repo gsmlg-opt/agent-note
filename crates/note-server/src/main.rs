@@ -4,37 +4,150 @@ mod render;
 
 use axum::response::IntoResponse;
 use axum::Router;
-use note_embedding::{BoundedEmbedder, StubEmbedder};
-use note_pipelines::Context;
+use note_embedding::{ProcessWorkerConfig, ProcessWorkerRuntime, StubEmbedder, WorkerConfig};
+use note_pipelines::{Context, EmbeddingJobNotifier, ProcessEmbeddingJobStatus};
 use note_storage::Storage;
 use std::io::Read;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{watch, Notify};
 
-/// Provisional cap on concurrent inference calls on the HTTP path. With `StubEmbedder` any value
-/// works; once the real `OrtEmbedder` lands, align this with the ONNX session's thread count so
-/// the semaphore actually bounds inference rather than guessing (docs/design.md §4/§5).
-const HTTP_INFERENCE_CONCURRENCY: usize = 4;
+const DEFAULT_EMBEDDING_POLL_MS: u64 = 1000;
 
-fn build_embedder(concurrency: usize) -> anyhow::Result<Arc<dyn note_embedding::Embedder>> {
-    match std::env::var("NOTE_MODEL_PATH") {
-        Ok(p) if !p.is_empty() => {
-            eprintln!("embedder: ONNX ({p})");
-            let ort = note_embedding::OrtEmbedder::load(std::path::Path::new(&p))?;
-            Ok(Arc::new(BoundedEmbedder::new(ort, concurrency)))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingExecutionMode {
+    Process,
+    Thread,
+    Remote,
+}
+
+impl EmbeddingExecutionMode {
+    fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("NOTE_EMBEDDING_MODE")
+            .unwrap_or_else(|_| "process".to_string())
+            .as_str()
+        {
+            "process" => Ok(Self::Process),
+            "thread" => Ok(Self::Thread),
+            "remote" => Ok(Self::Remote),
+            other => anyhow::bail!("unknown NOTE_EMBEDDING_MODE={other}"),
         }
-        _ => {
-            eprintln!("embedder: stub");
-            Ok(Arc::new(BoundedEmbedder::new(StubEmbedder, concurrency)))
+    }
+}
+
+struct NotifyEmbeddingJobs {
+    notify: Arc<Notify>,
+}
+
+impl EmbeddingJobNotifier for NotifyEmbeddingJobs {
+    fn wake(&self) {
+        self.notify.notify_one();
+    }
+}
+
+struct RunningEmbedding {
+    embedder: Arc<dyn note_embedding::Embedder>,
+    process_runtime: Option<ProcessWorkerRuntime>,
+    wake: Arc<Notify>,
+}
+
+async fn start_embedding_runtime() -> anyhow::Result<RunningEmbedding> {
+    match EmbeddingExecutionMode::from_env()? {
+        EmbeddingExecutionMode::Process => {
+            let process_runtime =
+                ProcessWorkerRuntime::start(ProcessWorkerConfig::from_env()?).await?;
+            Ok(RunningEmbedding {
+                embedder: process_runtime.embedder(),
+                process_runtime: Some(process_runtime),
+                wake: Arc::new(Notify::new()),
+            })
+        }
+        EmbeddingExecutionMode::Thread => {
+            anyhow::bail!("NOTE_EMBEDDING_MODE=thread is reserved but not implemented yet")
+        }
+        EmbeddingExecutionMode::Remote => {
+            anyhow::bail!("NOTE_EMBEDDING_MODE=remote is reserved but not implemented yet")
+        }
+    }
+}
+
+fn arg_value(args: &[String], name: &str) -> Option<String> {
+    args.windows(2)
+        .find_map(|window| (window[0] == name).then(|| window[1].clone()))
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+async fn run_embedding_scheduler(
+    ctx: Arc<Context>,
+    wake: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    match note_pipelines::requeue_processing_embedding_jobs(&ctx).await {
+        Ok(count) if count > 0 => eprintln!("requeued {count} interrupted embedding jobs"),
+        Ok(_) => {}
+        Err(error) => eprintln!("requeue embedding jobs failed: {error:#}"),
+    }
+    match note_pipelines::enqueue_missing_chunk_embeddings(&ctx).await {
+        Ok(count) if count > 0 => eprintln!("queued {count} missing chunk embeddings"),
+        Ok(_) => {}
+        Err(error) => eprintln!("enqueue missing embedding jobs failed: {error:#}"),
+    }
+
+    let poll_interval =
+        Duration::from_millis(env_u64("NOTE_EMBEDDING_POLL_MS", DEFAULT_EMBEDDING_POLL_MS));
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        match note_pipelines::process_next_embedding_job(&ctx).await {
+            Ok(Some(job)) => {
+                match job.status {
+                    ProcessEmbeddingJobStatus::Completed => {
+                        eprintln!("embedded note {} chunk {}", job.note_id, job.chunk_idx)
+                    }
+                    ProcessEmbeddingJobStatus::Stale => eprintln!(
+                        "discarded stale embedding job {} for note {} chunk {}",
+                        job.job_id, job.note_id, job.chunk_idx
+                    ),
+                    ProcessEmbeddingJobStatus::Failed => eprintln!(
+                        "embedding job {} failed for note {} chunk {}",
+                        job.job_id, job.note_id, job.chunk_idx
+                    ),
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("embedding scheduler error: {error:#}"),
+        }
+
+        tokio::select! {
+            _ = shutdown.changed() => {},
+            _ = wake.notified() => {},
+            _ = tokio::time::sleep(poll_interval) => {},
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let stdio_mode = std::env::args().any(|a| a == "--stdio");
+    let args = std::env::args().collect::<Vec<_>>();
+    if arg_value(&args, "--internal-role").as_deref() == Some("embedding-worker") {
+        let ipc_name = arg_value(&args, "--ipc-name")
+            .ok_or_else(|| anyhow::anyhow!("missing --ipc-name for embedding worker"))?;
+        return note_embedding::run_embedding_worker(WorkerConfig::new(ipc_name)).await;
+    }
+
+    let stdio_mode = args.iter().any(|a| a == "--stdio");
     let db_path = std::env::var("NOTE_DB_PATH").unwrap_or_else(|_| "notes.db".to_string());
-    let export_mode = std::env::args().any(|a| a == "--export");
-    let import_mode = std::env::args().any(|a| a == "--import");
+    let export_mode = args.iter().any(|a| a == "--export");
+    let import_mode = args.iter().any(|a| a == "--import");
 
     if export_mode {
         let storage = Storage::open_local(&db_path).await?;
@@ -62,20 +175,47 @@ async fn main() -> anyhow::Result<()> {
     if stdio_mode {
         // stdio is single-client — no connection pool needed (docs/design.md §9).
         let storage = Storage::open_local(&db_path).await?;
-        let embedder = build_embedder(1)?;
-        let ctx = Context::new(Arc::new(storage), embedder);
-        let n = note_pipelines::enqueue_missing_chunk_embeddings(&ctx).await?;
-        if n > 0 {
-            eprintln!("queued {n} missing chunk embeddings");
-        }
+        let embedding = start_embedding_runtime().await?;
+        let notifier = Arc::new(NotifyEmbeddingJobs {
+            notify: embedding.wake.clone(),
+        });
+        let ctx = Arc::new(Context::with_embedding_job_notifier(
+            Arc::new(storage),
+            embedding.embedder.clone(),
+            notifier,
+        ));
+        let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
+        let scheduler = tokio::spawn(run_embedding_scheduler(
+            ctx.clone(),
+            embedding.wake.clone(),
+            scheduler_shutdown_rx,
+        ));
         note_mcp::run_stdio(ctx).await?;
+        let _ = scheduler_shutdown_tx.send(true);
+        let _ = scheduler.await;
+        if let Some(process_runtime) = embedding.process_runtime {
+            process_runtime.shutdown().await;
+        }
     } else {
         // Axum is the only process that needs connection pooling (docs/design.md §2).
         // TODO: size the pool deliberately once concurrency requirements are clearer (docs/design.md §9
         // open decision) — starting with a single shared Storage handle is a placeholder, not a final answer.
         let storage = Storage::open_local(&db_path).await?;
-        let embedder = build_embedder(HTTP_INFERENCE_CONCURRENCY)?;
-        let ctx = Arc::new(Context::new(Arc::new(storage), embedder));
+        let embedding = start_embedding_runtime().await?;
+        let notifier = Arc::new(NotifyEmbeddingJobs {
+            notify: embedding.wake.clone(),
+        });
+        let ctx = Arc::new(Context::with_embedding_job_notifier(
+            Arc::new(storage),
+            embedding.embedder.clone(),
+            notifier,
+        ));
+        let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
+        let scheduler = tokio::spawn(run_embedding_scheduler(
+            ctx.clone(),
+            embedding.wake.clone(),
+            scheduler_shutdown_rx,
+        ));
 
         // notes_router()/labels_router() are Router<Arc<Context>> — applying .with_state converts them
         // to Router<()>, which can then merge with mcp_router() (already Router<()>, self-stated).
@@ -146,7 +286,21 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-        axum::serve(listener, app).await?;
+        let server = axum::serve(listener, app);
+        tokio::select! {
+            result = server => result?,
+            signal = tokio::signal::ctrl_c() => {
+                if let Err(error) = signal {
+                    eprintln!("failed to listen for shutdown signal: {error}");
+                }
+                eprintln!("shutting down note-server");
+            }
+        }
+        let _ = scheduler_shutdown_tx.send(true);
+        let _ = scheduler.await;
+        if let Some(process_runtime) = embedding.process_runtime {
+            process_runtime.shutdown().await;
+        }
     }
     Ok(())
 }

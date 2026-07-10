@@ -4,8 +4,9 @@ use libsql::Connection;
 pub struct NoteChunk {
     pub note_id: String,
     pub chunk_idx: i64,
-    pub chunk_hash: String,
+    pub content_hash: String,
     pub content: String,
+    pub note_revision: i64,
     pub status: String,
     pub updated_at: i64,
 }
@@ -15,15 +16,26 @@ pub struct EmbeddingJob {
     pub id: i64,
     pub note_id: String,
     pub chunk_idx: i64,
-    pub chunk_hash: String,
+    pub content_hash: String,
     pub content: String,
+    pub note_revision: i64,
     pub attempts: i64,
+}
+
+pub struct UpsertNoteChunk<'a> {
+    pub note_id: &'a str,
+    pub chunk_idx: i64,
+    pub content_hash: &'a str,
+    pub content: &'a str,
+    pub note_revision: i64,
+    pub status: &'a str,
+    pub updated_at: i64,
 }
 
 pub async fn list_note_chunks(conn: &Connection, note_id: &str) -> anyhow::Result<Vec<NoteChunk>> {
     let mut rows = conn
         .query(
-            "SELECT note_id, chunk_idx, chunk_hash, content, status, updated_at
+            "SELECT note_id, chunk_idx, chunk_hash, content, note_revision, status, updated_at
              FROM note_chunks
              WHERE note_id = ?1
              ORDER BY chunk_idx",
@@ -35,10 +47,11 @@ pub async fn list_note_chunks(conn: &Connection, note_id: &str) -> anyhow::Resul
         chunks.push(NoteChunk {
             note_id: row.get::<String>(0)?,
             chunk_idx: row.get::<i64>(1)?,
-            chunk_hash: row.get::<String>(2)?,
+            content_hash: row.get::<String>(2)?,
             content: row.get::<String>(3)?,
-            status: row.get::<String>(4)?,
-            updated_at: row.get::<i64>(5)?,
+            note_revision: row.get::<i64>(4)?,
+            status: row.get::<String>(5)?,
+            updated_at: row.get::<i64>(6)?,
         });
     }
     Ok(chunks)
@@ -51,7 +64,7 @@ pub async fn get_note_chunk(
 ) -> anyhow::Result<Option<NoteChunk>> {
     let mut rows = conn
         .query(
-            "SELECT note_id, chunk_idx, chunk_hash, content, status, updated_at
+            "SELECT note_id, chunk_idx, chunk_hash, content, note_revision, status, updated_at
              FROM note_chunks
              WHERE note_id = ?1 AND chunk_idx = ?2",
             libsql::params![note_id, chunk_idx],
@@ -64,31 +77,36 @@ pub async fn get_note_chunk(
     Ok(Some(NoteChunk {
         note_id: row.get::<String>(0)?,
         chunk_idx: row.get::<i64>(1)?,
-        chunk_hash: row.get::<String>(2)?,
+        content_hash: row.get::<String>(2)?,
         content: row.get::<String>(3)?,
-        status: row.get::<String>(4)?,
-        updated_at: row.get::<i64>(5)?,
+        note_revision: row.get::<i64>(4)?,
+        status: row.get::<String>(5)?,
+        updated_at: row.get::<i64>(6)?,
     }))
 }
 
 pub async fn upsert_note_chunk(
     conn: &Connection,
-    note_id: &str,
-    chunk_idx: i64,
-    chunk_hash: &str,
-    content: &str,
-    status: &str,
-    updated_at: i64,
+    chunk: UpsertNoteChunk<'_>,
 ) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO note_chunks (note_id, chunk_idx, chunk_hash, content, status, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO note_chunks (note_id, chunk_idx, chunk_hash, content, note_revision, status, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(note_id, chunk_idx) DO UPDATE SET
              chunk_hash = excluded.chunk_hash,
              content = excluded.content,
+             note_revision = excluded.note_revision,
              status = excluded.status,
              updated_at = excluded.updated_at",
-        libsql::params![note_id, chunk_idx, chunk_hash, content, status, updated_at],
+        libsql::params![
+            chunk.note_id,
+            chunk.chunk_idx,
+            chunk.content_hash,
+            chunk.content,
+            chunk.note_revision,
+            chunk.status,
+            chunk.updated_at
+        ],
     )
     .await?;
     Ok(())
@@ -98,7 +116,8 @@ pub async fn mark_note_chunk_status(
     conn: &Connection,
     note_id: &str,
     chunk_idx: i64,
-    chunk_hash: &str,
+    content_hash: &str,
+    note_revision: i64,
     status: &str,
     updated_at: i64,
 ) -> anyhow::Result<u64> {
@@ -106,8 +125,15 @@ pub async fn mark_note_chunk_status(
         .execute(
             "UPDATE note_chunks
              SET status = ?4, updated_at = ?5
-             WHERE note_id = ?1 AND chunk_idx = ?2 AND chunk_hash = ?3",
-            libsql::params![note_id, chunk_idx, chunk_hash, status, updated_at],
+             WHERE note_id = ?1 AND chunk_idx = ?2 AND chunk_hash = ?3 AND note_revision = ?6",
+            libsql::params![
+                note_id,
+                chunk_idx,
+                content_hash,
+                status,
+                updated_at,
+                note_revision
+            ],
         )
         .await?;
     Ok(affected)
@@ -145,22 +171,31 @@ pub async fn enqueue_embedding_job(
     conn: &Connection,
     note_id: &str,
     chunk_idx: i64,
-    chunk_hash: &str,
+    content_hash: &str,
     content: &str,
+    note_revision: i64,
     now: i64,
 ) -> anyhow::Result<()> {
     conn.execute(
         "INSERT INTO embedding_jobs (
-             note_id, chunk_idx, chunk_hash, content, status, attempts, error, created_at, updated_at
+             note_id, chunk_idx, chunk_hash, content, note_revision, status, attempts, error, created_at, updated_at
          )
-         VALUES (?1, ?2, ?3, ?4, 'pending', 0, NULL, ?5, ?5)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, NULL, ?6, ?6)
          ON CONFLICT(note_id, chunk_idx, chunk_hash) DO UPDATE SET
              content = excluded.content,
+             note_revision = excluded.note_revision,
              status = 'pending',
              error = NULL,
              updated_at = excluded.updated_at
          WHERE embedding_jobs.status != 'processing'",
-        libsql::params![note_id, chunk_idx, chunk_hash, content, now],
+        libsql::params![
+            note_id,
+            chunk_idx,
+            content_hash,
+            content,
+            note_revision,
+            now
+        ],
     )
     .await?;
     Ok(())
@@ -207,7 +242,7 @@ pub async fn claim_pending_embedding_jobs(
 ) -> anyhow::Result<Vec<EmbeddingJob>> {
     let mut rows = conn
         .query(
-            "SELECT id, note_id, chunk_idx, chunk_hash, content, attempts
+            "SELECT id, note_id, chunk_idx, chunk_hash, content, note_revision, attempts
              FROM embedding_jobs
              WHERE status = 'pending'
              ORDER BY created_at, id
@@ -221,9 +256,10 @@ pub async fn claim_pending_embedding_jobs(
             id: row.get::<i64>(0)?,
             note_id: row.get::<String>(1)?,
             chunk_idx: row.get::<i64>(2)?,
-            chunk_hash: row.get::<String>(3)?,
+            content_hash: row.get::<String>(3)?,
             content: row.get::<String>(4)?,
-            attempts: row.get::<i64>(5)?,
+            note_revision: row.get::<i64>(5)?,
+            attempts: row.get::<i64>(6)?,
         });
     }
     drop(rows);

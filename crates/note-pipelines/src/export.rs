@@ -116,6 +116,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
             &note.content,
             note.created_at,
             note.updated_at,
+            1,
         )
         .await?;
         for (key, value) in &note.labels {

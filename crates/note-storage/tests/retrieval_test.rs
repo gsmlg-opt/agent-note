@@ -8,10 +8,10 @@ async fn sparse_query_ranks_by_matching_token_weight() {
         .unwrap();
     let conn = storage.connect().unwrap();
 
-    insert_note(&conn, "note-1", "A", "content", 1000, 1000)
+    insert_note(&conn, "note-1", "A", "content", 1000, 1000, 1)
         .await
         .unwrap();
-    insert_note(&conn, "note-2", "B", "content", 1000, 1000)
+    insert_note(&conn, "note-2", "B", "content", 1000, 1000, 1)
         .await
         .unwrap();
     insert_chunk_sparse_weights(&conn, "note-1", 0, &[(42, 0.9)])
@@ -33,10 +33,10 @@ async fn sparse_query_ranks_by_best_matching_chunk_per_note() {
         .unwrap();
     let conn = storage.connect().unwrap();
 
-    insert_note(&conn, "note-1", "A", "content", 1000, 1000)
+    insert_note(&conn, "note-1", "A", "content", 1000, 1000, 1)
         .await
         .unwrap();
-    insert_note(&conn, "note-2", "B", "content", 1000, 1000)
+    insert_note(&conn, "note-2", "B", "content", 1000, 1000, 1)
         .await
         .unwrap();
     insert_chunk_sparse_weights(&conn, "note-1", 0, &[(42, 0.2)])
@@ -63,10 +63,10 @@ async fn dense_query_returns_nearest_neighbors() {
         .unwrap();
     let conn = storage.connect().unwrap();
 
-    insert_note(&conn, "note-1", "A", "content", 1000, 1000)
+    insert_note(&conn, "note-1", "A", "content", 1000, 1000, 1)
         .await
         .unwrap();
-    insert_note(&conn, "note-2", "B", "content", 1000, 1000)
+    insert_note(&conn, "note-2", "B", "content", 1000, 1000, 1)
         .await
         .unwrap();
 
@@ -95,7 +95,7 @@ async fn dense_query_deduplicates_chunks_to_note_ids() {
         .unwrap();
     let conn = storage.connect().unwrap();
 
-    insert_note(&conn, "note-1", "A", "content", 1000, 1000)
+    insert_note(&conn, "note-1", "A", "content", 1000, 1000, 1)
         .await
         .unwrap();
 

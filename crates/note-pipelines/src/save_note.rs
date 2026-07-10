@@ -70,6 +70,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
+    let note_revision = 1;
     let chunks = crate::chunk::chunk_content(&input.content);
 
     // The note row, labels, chunk hashes, and embedding jobs are committed atomically. Actual
@@ -78,13 +79,25 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     for key in &missing_keys {
         note_storage::insert_label_key(&tx, key, "").await?;
     }
-    note_storage::insert_note(&tx, &id, &input.title, &input.content, now, now).await?;
-    crate::sync_note_embedding_jobs(&tx, &id, &chunks, now).await?;
+    note_storage::insert_note(
+        &tx,
+        &id,
+        &input.title,
+        &input.content,
+        now,
+        now,
+        note_revision,
+    )
+    .await?;
+    let queued = crate::sync_note_embedding_jobs(&tx, &id, &chunks, note_revision, now).await?;
     for (key, value) in &input.labels {
         note_storage::attach_label(&tx, &id, key, value).await?;
     }
     let resolved_labels: Vec<Label> = note_storage::labels_for_note(&tx, &id).await?;
     tx.commit().await?;
+    if queued > 0 {
+        ctx.wake_embedding_jobs();
+    }
 
     Ok(Note {
         id,

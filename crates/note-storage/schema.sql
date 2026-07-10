@@ -3,7 +3,8 @@ CREATE TABLE IF NOT EXISTS notes (
     title TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    note_revision INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS label_keys (
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS note_chunks (
     chunk_idx INTEGER NOT NULL,
     chunk_hash TEXT NOT NULL,
     content TEXT NOT NULL,
+    note_revision INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (note_id, chunk_idx)
@@ -39,6 +41,7 @@ CREATE TABLE IF NOT EXISTS embedding_jobs (
     chunk_idx INTEGER NOT NULL,
     chunk_hash TEXT NOT NULL,
     content TEXT NOT NULL,
+    note_revision INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL,
     error TEXT,

@@ -90,7 +90,7 @@ impl Embedder for OrtEmbedder {
             let mut sparse = HashMap::new();
             for i in 0..seq {
                 let id = ids[i];
-                if matches!(id, 0 | 1 | 2 | 3) {
+                if matches!(id, 0..=3) {
                     continue;
                 }
                 let w = weights[i];

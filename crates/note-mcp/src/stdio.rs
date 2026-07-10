@@ -534,8 +534,8 @@ fn to_error_data(err: anyhow::Error) -> ErrorData {
 
 /// Serve the note tools as an MCP server over stdio until the client
 /// disconnects. JSON-RPC flows on stdin/stdout; keep logs on stderr.
-pub async fn run_stdio(ctx: Context) -> anyhow::Result<()> {
-    let server = NoteMcpServer::new(Arc::new(ctx));
+pub async fn run_stdio(ctx: Arc<Context>) -> anyhow::Result<()> {
+    let server = NoteMcpServer::new(ctx);
     let running = server.serve(stdio()).await?;
     running.waiting().await?;
     Ok(())
