@@ -5,9 +5,7 @@
 
 # ---- Stage 1: build the Yew/Wasm frontend into a static bundle ----
 FROM rust:1-bookworm AS frontend
-ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup \
-    RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup \
-    CARGO_HTTP_TIMEOUT=600 \
+ENV CARGO_HTTP_TIMEOUT=600 \
     CARGO_NET_RETRY=5
 RUN mkdir -p /usr/local/cargo \
     && printf '[source.crates-io]\nreplace-with = "rsproxy"\n\n[source.rsproxy]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[net]\nretry = 5\n' > /usr/local/cargo/config.toml
