@@ -74,7 +74,9 @@ async fn define_label_key_handler(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             };
             (status, e.to_string())
-        })
+        })?;
+    crate::notes_api::invalidate_dashboard_cache();
+    Ok(())
 }
 
 async fn list_label_keys_handler(
@@ -97,11 +99,17 @@ async fn update_label_key_handler(
                 .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
             update_label_key_with_type(&ctx, &key, &req.description, value_type)
                 .await
-                .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))
+                .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+            crate::notes_api::invalidate_dashboard_cache();
+            Ok(())
         }
-        None => update_label_key(&ctx, &key, &req.description)
-            .await
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string())),
+        None => {
+            update_label_key(&ctx, &key, &req.description)
+                .await
+                .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+            crate::notes_api::invalidate_dashboard_cache();
+            Ok(())
+        }
     }
 }
 
@@ -111,7 +119,9 @@ async fn delete_label_key_handler(
 ) -> Result<(), (axum::http::StatusCode, String)> {
     delete_label_key(&ctx, &key)
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::notes_api::invalidate_dashboard_cache();
+    Ok(())
 }
 
 fn default_label_value_type() -> String {

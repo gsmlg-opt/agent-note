@@ -6,14 +6,20 @@ use axum::{
 };
 use note_core::{Note, NoteListItem};
 use note_pipelines::{
-    count_notes, delete_note, get_note, list_note_summaries, save_note, search_notes_filtered,
-    update_note, Context, ListNotesParams, SaveNoteInput,
+    count_notes, delete_note, get_note, label_note_counts, list_label_keys, list_note_summaries,
+    save_note, search_notes_filtered, update_note, Context, ListNotesParams, SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
+use tokio::sync::RwLock;
 
 const DEFAULT_LIST_LIMIT: i64 = 10;
 const MAX_LIST_LIMIT: i64 = 1000;
+const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 pub struct SaveNoteRequest {
@@ -85,6 +91,117 @@ impl From<NoteListItem> for NoteListDto {
     }
 }
 
+#[derive(Clone, Serialize)]
+pub struct DashboardLabelDto {
+    pub key: String,
+    pub description: String,
+    pub value_type: String,
+    pub count: usize,
+}
+
+#[derive(Clone, Serialize)]
+pub struct DashboardNoteDto {
+    pub id: String,
+    pub title: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Serialize)]
+pub struct DashboardDto {
+    pub note_count: usize,
+    pub label_count: usize,
+    pub last_updated_at: Option<i64>,
+    pub labels: Vec<DashboardLabelDto>,
+    pub recent_updates: Vec<DashboardNoteDto>,
+}
+
+#[derive(Clone)]
+struct DashboardCacheEntry {
+    expires_at: Instant,
+    value: DashboardDto,
+}
+
+static DASHBOARD_CACHE: OnceLock<RwLock<Option<DashboardCacheEntry>>> = OnceLock::new();
+
+fn dashboard_cache() -> &'static RwLock<Option<DashboardCacheEntry>> {
+    DASHBOARD_CACHE.get_or_init(|| RwLock::new(None))
+}
+
+pub(crate) fn invalidate_dashboard_cache() {
+    if let Some(cache) = DASHBOARD_CACHE.get() {
+        if let Ok(mut guard) = cache.try_write() {
+            *guard = None;
+        }
+    }
+}
+
+async fn load_dashboard(ctx: &Context) -> anyhow::Result<DashboardDto> {
+    let note_count = count_notes(ctx, None).await?;
+    let labels = list_label_keys(ctx).await?;
+    let label_count = labels.len();
+    let label_counts = label_note_counts(ctx)
+        .await?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let mut labels = labels
+        .into_iter()
+        .map(|label| DashboardLabelDto {
+            count: *label_counts.get(&label.key).unwrap_or(&0),
+            key: label.key,
+            description: label.description,
+            value_type: label.value_type.as_str().to_string(),
+        })
+        .collect::<Vec<_>>();
+    labels.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+
+    let recent = list_note_summaries(
+        ctx,
+        ListNotesParams {
+            limit: Some(5),
+            offset: Some(0),
+            label: None,
+        },
+    )
+    .await?;
+    let recent_updates = recent
+        .into_iter()
+        .map(|note| DashboardNoteDto {
+            id: note.id,
+            title: note.title,
+            updated_at: note.updated_at,
+        })
+        .collect::<Vec<_>>();
+    let last_updated_at = recent_updates.first().map(|note| note.updated_at);
+
+    Ok(DashboardDto {
+        note_count,
+        label_count,
+        last_updated_at,
+        labels,
+        recent_updates,
+    })
+}
+
+async fn dashboard_handler(
+    State(ctx): State<Arc<Context>>,
+) -> Result<Json<DashboardDto>, (axum::http::StatusCode, String)> {
+    let now = Instant::now();
+    if let Some(cached) = dashboard_cache().read().await.clone() {
+        if cached.expires_at > now {
+            return Ok(Json(cached.value));
+        }
+    }
+
+    let value = load_dashboard(&ctx)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    *dashboard_cache().write().await = Some(DashboardCacheEntry {
+        expires_at: Instant::now() + DASHBOARD_CACHE_TTL,
+        value: value.clone(),
+    });
+    Ok(Json(value))
+}
+
 async fn save_note_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<SaveNoteRequest>,
@@ -109,6 +226,7 @@ async fn save_note_handler(
         };
         (status, e.to_string())
     })?;
+    invalidate_dashboard_cache();
     Ok(Json(SaveNoteResponse { id: note.id }))
 }
 
@@ -200,7 +318,10 @@ async fn update_note_handler(
     })?;
 
     match note {
-        Some(note) => Ok(Json(NoteDto::from(note))),
+        Some(note) => {
+            invalidate_dashboard_cache();
+            Ok(Json(NoteDto::from(note)))
+        }
         None => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
     }
 }
@@ -213,7 +334,10 @@ async fn delete_note_handler(
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
-        true => Ok(axum::http::StatusCode::NO_CONTENT),
+        true => {
+            invalidate_dashboard_cache();
+            Ok(axum::http::StatusCode::NO_CONTENT)
+        }
         false => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
     }
 }
@@ -263,6 +387,7 @@ pub fn notes_router() -> Router<Arc<Context>> {
             post(save_note_handler).get(list_notes_handler),
         )
         .route("/api/notes/count", route_get(count_notes_handler))
+        .route("/api/dashboard", route_get(dashboard_handler))
         .route(
             "/api/notes/{id}",
             route_get(get_note_handler)
@@ -472,6 +597,51 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let notes: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(notes.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn dashboard_uses_summary_data_and_invalidates_after_note_write() {
+        invalidate_dashboard_cache();
+        let (app, _ctx, _dir) = test_app().await;
+
+        let resp = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.get("note_count").and_then(|v| v.as_u64()), Some(0));
+
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Dashboard","content":"C","labels":[["type","note"]]}"#,
+            ))
+            .await
+            .unwrap();
+
+        let resp = app.oneshot(get("/api/dashboard")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json.get("note_count").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(json.get("label_count").and_then(|v| v.as_u64()), Some(1));
+        let labels = json
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .expect("labels array");
+        let label = labels
+            .iter()
+            .find(|label| label.get("key").and_then(|v| v.as_str()) == Some("type"))
+            .expect("type label");
+        assert_eq!(label.get("count").and_then(|v| v.as_u64()), Some(1));
+        let recent = json
+            .get("recent_updates")
+            .and_then(|v| v.as_array())
+            .expect("recent updates");
+        assert_eq!(
+            recent[0].get("title").and_then(|v| v.as_str()),
+            Some("Dashboard")
+        );
+        invalidate_dashboard_cache();
     }
 
     #[tokio::test]

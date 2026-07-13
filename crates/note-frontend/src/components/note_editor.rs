@@ -143,6 +143,21 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
     html! {
         <Card title={Some(html! { <span>{ props.card_title.clone() }</span> })} classes={classes!("note-editor")}>
             <form class="stack" onsubmit={on_submit}>
+                <div class="note-page-actions">
+                    <Button
+                        variant={Some("primary".to_string())}
+                        disabled={submit_disabled}
+                        loading={submit_disabled}
+                    >
+                        <span>{
+                            if submit_disabled {
+                                "Saving...".to_string()
+                            } else {
+                                props.submit_label.clone()
+                            }
+                        }</span>
+                    </Button>
+                </div>
                 <label class="field">
                     <span>{ "Title" }</span>
                     <input
@@ -152,16 +167,6 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                         oninput={on_title_input}
                     />
                 </label>
-                <div class="field">
-                    <span>{ "Content" }</span>
-                    <MarkdownInput
-                        class="note-content-input"
-                        variant={Some("primary".to_string())}
-                        value={Some(AttrValue::from((*content).clone()))}
-                        placeholder="Write markdown..."
-                        on_change={on_content_change}
-                    />
-                </div>
 
                 <fieldset class="label-picker">
                     <legend>{ "Labels" }</legend>
@@ -208,19 +213,16 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                     </div>
                 </fieldset>
 
-                <Button
-                    variant={Some("primary".to_string())}
-                    disabled={submit_disabled}
-                    loading={submit_disabled}
-                >
-                    <span>{
-                        if submit_disabled {
-                            "Saving...".to_string()
-                        } else {
-                            props.submit_label.clone()
-                        }
-                    }</span>
-                </Button>
+                <div class="field">
+                    <span>{ "Content" }</span>
+                    <MarkdownInput
+                        class="note-content-input"
+                        variant={Some("primary".to_string())}
+                        value={Some(AttrValue::from((*content).clone()))}
+                        placeholder="Write markdown..."
+                        on_change={on_content_change}
+                    />
+                </div>
             </form>
         </Card>
     }

@@ -1,71 +1,33 @@
-use std::collections::HashMap;
-
 use yew::prelude::*;
 use yew_duskmoon::Alert;
 use yew_router::prelude::*;
 
 use crate::api;
 use crate::routes::Route;
-use crate::state::{LabelKey, NoteSummary};
 
 #[function_component(DashboardPage)]
 pub fn dashboard_page() -> Html {
-    let notes = use_state(Vec::<NoteSummary>::new);
-    let labels = use_state(Vec::<LabelKey>::new);
+    let summary = use_state(|| None::<api::DashboardSummary>);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
 
     {
-        let notes = notes.clone();
-        let labels = labels.clone();
+        let summary = summary.clone();
         let loading = loading.clone();
         let error = error.clone();
         use_effect_with((), move |_| {
             wasm_bindgen_futures::spawn_local(async move {
                 loading.set(true);
                 error.set(None);
-                let loaded_notes = api::list_notes_filtered(&[]).await;
-                let loaded_labels = api::list_labels().await;
-                match (loaded_notes, loaded_labels) {
-                    (Ok(note_list), Ok(label_list)) => {
-                        notes.set(note_list);
-                        labels.set(label_list);
-                    }
-                    (Err(e), _) | (_, Err(e)) => error.set(Some(e)),
+                match api::dashboard().await {
+                    Ok(next) => summary.set(Some(next)),
+                    Err(e) => error.set(Some(e)),
                 }
                 loading.set(false);
             });
             || ()
         });
     }
-
-    let mut label_counts = HashMap::<String, usize>::new();
-    for note in notes.iter() {
-        for (key, _) in &note.labels {
-            *label_counts.entry(key.clone()).or_insert(0) += 1;
-        }
-    }
-    let mut label_rows = labels
-        .iter()
-        .map(|label| {
-            (
-                label.key.clone(),
-                label.value_type.clone(),
-                label.description.clone(),
-                *label_counts.get(&label.key).unwrap_or(&0),
-            )
-        })
-        .collect::<Vec<_>>();
-    label_rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
-
-    let mut recent = (*notes).clone();
-    recent.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    recent.truncate(5);
-
-    let latest_update = recent
-        .first()
-        .map(|note| format_timestamp(note.updated_at))
-        .unwrap_or_else(|| "-".to_string());
 
     html! {
         <section class="stack dashboard">
@@ -83,19 +45,19 @@ pub fn dashboard_page() -> Html {
 
             if *loading {
                 <p class="loading">{ "Loading..." }</p>
-            } else {
+            } else if let Some(summary) = &*summary {
                 <div class="dashboard-metrics">
                     <div class="dashboard-metric">
                         <span class="dashboard-metric-label">{ "Notes" }</span>
-                        <strong>{ notes.len() }</strong>
+                        <strong>{ summary.note_count }</strong>
                     </div>
                     <div class="dashboard-metric">
                         <span class="dashboard-metric-label">{ "Labels" }</span>
-                        <strong>{ labels.len() }</strong>
+                        <strong>{ summary.label_count }</strong>
                     </div>
                     <div class="dashboard-metric">
                         <span class="dashboard-metric-label">{ "Last update" }</span>
-                        <strong>{ latest_update }</strong>
+                        <strong>{ summary.last_updated_at.map(format_timestamp).unwrap_or_else(|| "-".to_string()) }</strong>
                     </div>
                 </div>
 
@@ -105,20 +67,20 @@ pub fn dashboard_page() -> Html {
                             <h3>{ "Labels" }</h3>
                             <Link<Route> to={Route::Labels} classes={classes!("btn", "btn-ghost", "btn-sm")}>{ "Manage" }</Link<Route>>
                         </div>
-                        if label_rows.is_empty() {
+                        if summary.labels.is_empty() {
                             <p class="empty compact">{ "No labels yet." }</p>
                         } else {
                             <ul class="dashboard-labels">
-                                { for label_rows.iter().take(12).map(|(key, value_type, description, count)| html! {
-                                    <li class="dashboard-label-row" key={key.clone()}>
+                                { for summary.labels.iter().take(12).map(|label| html! {
+                                    <li class="dashboard-label-row" key={label.key.clone()}>
                                         <div class="dashboard-label-main">
-                                            <span class="label-key">{ key.clone() }</span>
-                                            <span class="label-type">{ value_type.clone() }</span>
-                                            if !description.is_empty() {
-                                                <span class="dashboard-label-desc">{ description.clone() }</span>
+                                            <span class="label-key">{ label.key.clone() }</span>
+                                            <span class="label-type">{ label.value_type.clone() }</span>
+                                            if !label.description.is_empty() {
+                                                <span class="dashboard-label-desc">{ label.description.clone() }</span>
                                             }
                                         </div>
-                                        <span class="dashboard-label-count">{ format!("{count} notes") }</span>
+                                        <span class="dashboard-label-count">{ format!("{} notes", label.count) }</span>
                                     </li>
                                 }) }
                             </ul>
@@ -130,11 +92,11 @@ pub fn dashboard_page() -> Html {
                             <h3>{ "Recent Updates" }</h3>
                             <Link<Route> to={Route::Notes} classes={classes!("btn", "btn-ghost", "btn-sm")}>{ "View all" }</Link<Route>>
                         </div>
-                        if recent.is_empty() {
+                        if summary.recent_updates.is_empty() {
                             <p class="empty compact">{ "No notes yet." }</p>
                         } else {
                             <ul class="dashboard-updates">
-                                { for recent.iter().map(|note| html! {
+                                { for summary.recent_updates.iter().map(|note| html! {
                                     <li class="dashboard-update-row" key={note.id.clone()}>
                                         <Link<Route> to={Route::NoteShow { id: note.id.clone() }} classes={classes!("dashboard-update-title")}>
                                             { note.title.clone() }
@@ -146,6 +108,8 @@ pub fn dashboard_page() -> Html {
                         }
                     </section>
                 </div>
+            } else {
+                <p class="empty">{ "Dashboard is unavailable." }</p>
             }
         </section>
     }

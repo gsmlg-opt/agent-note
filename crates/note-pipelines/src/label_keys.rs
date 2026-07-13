@@ -26,6 +26,11 @@ pub async fn list_label_keys(ctx: &Context) -> anyhow::Result<Vec<LabelKey>> {
     note_storage::list_label_keys(&conn).await
 }
 
+pub async fn label_note_counts(ctx: &Context) -> anyhow::Result<Vec<(String, usize)>> {
+    let conn = ctx.storage.connect()?;
+    note_storage::label_note_counts(&conn).await
+}
+
 pub async fn update_label_key(ctx: &Context, key: &str, description: &str) -> anyhow::Result<()> {
     let conn = ctx.storage.connect()?;
     note_storage::update_label_key(&conn, key, description).await

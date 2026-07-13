@@ -134,6 +134,30 @@ struct CountNotesDto {
     total: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DashboardLabel {
+    pub key: String,
+    pub description: String,
+    pub value_type: String,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DashboardNote {
+    pub id: String,
+    pub title: String,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DashboardSummary {
+    pub note_count: usize,
+    pub label_count: usize,
+    pub last_updated_at: Option<i64>,
+    pub labels: Vec<DashboardLabel>,
+    pub recent_updates: Vec<DashboardNote>,
+}
+
 fn notes_list_url(filters: &[LabelFilter], limit: Option<usize>, offset: Option<usize>) -> String {
     let mut params = Vec::new();
     if let Some(selector) = label_filter_selector(filters) {
@@ -197,6 +221,18 @@ pub async fn count_notes_filtered(filters: &[LabelFilter]) -> Result<usize, Stri
     Ok(count.total)
 }
 
+pub async fn dashboard() -> Result<DashboardSummary, String> {
+    let resp = Request::get("/api/dashboard")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    ok_or_body_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 pub async fn list_notes_page(
     filters: &[LabelFilter],
     limit: usize,
@@ -206,23 +242,6 @@ pub async fn list_notes_page(
     let total = count_notes_filtered(filters).await?;
 
     Ok(NotesPage { notes, total })
-}
-
-pub async fn list_notes_filtered(filters: &[LabelFilter]) -> Result<Vec<NoteSummary>, String> {
-    const PAGE_LIMIT: usize = 1000;
-
-    let total = count_notes_filtered(filters).await?;
-    let mut notes = Vec::with_capacity(total.min(PAGE_LIMIT));
-    let mut offset = 0usize;
-    while offset < total {
-        let page = fetch_note_summaries(filters, PAGE_LIMIT, offset).await?;
-        if page.is_empty() {
-            break;
-        }
-        offset = offset.saturating_add(page.len());
-        notes.extend(page);
-    }
-    Ok(notes)
 }
 
 pub async fn get_note(id: &str) -> Result<NoteSummary, String> {

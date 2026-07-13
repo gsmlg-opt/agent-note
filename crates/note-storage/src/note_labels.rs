@@ -51,3 +51,21 @@ pub async fn labels_for_note(conn: &Connection, note_id: &str) -> anyhow::Result
     }
     Ok(labels)
 }
+
+pub async fn label_note_counts(conn: &Connection) -> anyhow::Result<Vec<(String, usize)>> {
+    let mut rows = conn
+        .query(
+            "SELECT lk.key, COUNT(nl.note_id)
+             FROM label_keys lk
+             LEFT JOIN note_labels nl ON nl.label_key_id = lk.id
+             GROUP BY lk.id, lk.key
+             ORDER BY lk.key",
+            (),
+        )
+        .await?;
+    let mut counts = Vec::new();
+    while let Some(row) = rows.next().await? {
+        counts.push((row.get::<String>(0)?, row.get::<i64>(1)?.max(0) as usize));
+    }
+    Ok(counts)
+}

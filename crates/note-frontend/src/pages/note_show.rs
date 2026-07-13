@@ -56,8 +56,14 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                 <p class="loading">{ "Loading…" }</p>
             } else if let (Some(n), Some(rendered)) = (&*note, &*rendered_content) {
                 <Card title={Some(html! { <span>{ n.title.clone() }</span> })}>
-                    <div class="markdown-body">
-                        { Html::from_html_unchecked(AttrValue::from(rendered.clone())) }
+                    <div class="note-page-actions">
+                        <Link<Route> to={Route::Notes} classes={classes!("btn","btn-ghost")}>
+                            { "Back" }
+                        </Link<Route>>
+                        <Link<Route> to={Route::NoteEdit { id: n.id.clone() }}
+                            classes={classes!("btn","btn-primary")}>
+                            { "Edit note" }
+                        </Link<Route>>
                     </div>
                     if !n.labels.is_empty() {
                         <div class="applied-labels">
@@ -68,14 +74,8 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                             }) }
                         </div>
                     }
-                    <div class="app-modal-actions">
-                        <Link<Route> to={Route::Notes} classes={classes!("btn","btn-ghost")}>
-                            { "Back" }
-                        </Link<Route>>
-                        <Link<Route> to={Route::NoteEdit { id: n.id.clone() }}
-                            classes={classes!("btn","btn-primary")}>
-                            { "Edit note" }
-                        </Link<Route>>
+                    <div class="markdown-body">
+                        { Html::from_html_unchecked(AttrValue::from(rendered.clone())) }
                     </div>
                 </Card>
             } else {

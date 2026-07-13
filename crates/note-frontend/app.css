@@ -241,12 +241,15 @@ body {
 }
 
 .note-table .col-title {
-    width: 7rem;
+    width: 8rem;
     font-weight: 600;
 }
 
-.note-table th:first-child {
-    width: 7rem;
+.note-table .col-time {
+    width: 8.75rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.82rem;
+    white-space: nowrap;
 }
 
 .note-table .col-actions {
@@ -328,6 +331,13 @@ body {
     display: flex;
     gap: 0.15rem;
     justify-content: flex-end;
+}
+
+.note-page-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-bottom: 0.9rem;
 }
 
 /* Icon buttons (view/edit/remove). */
@@ -694,6 +704,10 @@ body {
     flex-direction: column;
     gap: 0.35rem;
     margin-bottom: 1rem;
+}
+
+.label-picker {
+    margin: 0 0 1rem;
 }
 
 .field > span {

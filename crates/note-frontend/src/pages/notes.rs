@@ -11,7 +11,7 @@ use crate::routes::Route;
 use crate::state::{LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
 
 /// Notes shown per page in the list view.
-const DEFAULT_PAGE_SIZE: usize = 30;
+const DEFAULT_PAGE_SIZE: usize = 10;
 const MAX_PAGE_SIZE: usize = 1000;
 const PAGE_SIZE_OPTIONS: [usize; 5] = [10, 30, 50, 100, 1000];
 
@@ -89,10 +89,12 @@ fn non_empty_param(value: &str) -> Option<String> {
 }
 
 fn normalize_page_size(page_size: usize) -> usize {
-    if page_size == 0 {
-        DEFAULT_PAGE_SIZE
+    if PAGE_SIZE_OPTIONS.contains(&page_size) {
+        page_size
+    } else if page_size > MAX_PAGE_SIZE {
+        MAX_PAGE_SIZE
     } else {
-        page_size.min(MAX_PAGE_SIZE)
+        DEFAULT_PAGE_SIZE
     }
 }
 
@@ -517,8 +519,11 @@ fn label_filter_bar(
                     }) }
                 </datalist>
                 <select class="input label-filter-operator" onchange={on_operator_change} value={filter_operator.to_string()}>
-                    { for ["=", "!=", ">", ">=", "<", "<="].iter().map(|operator| html! {
-                        <option value={(*operator).to_string()}>{ *operator }</option>
+                    { for ["=", "!=", ">", ">=", "<", "<="].iter().map(|operator| {
+                        let selected = *operator == filter_operator;
+                        html! {
+                            <option value={(*operator).to_string()} selected={selected}>{ *operator }</option>
+                        }
                     }) }
                 </select>
                 <input
@@ -569,6 +574,16 @@ fn label_value_input_type(value_type: &str) -> &'static str {
         "time" => "time",
         _ => "text",
     }
+}
+
+fn format_timestamp(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "-".to_string();
+    }
+    let Some(datetime) = chrono::DateTime::from_timestamp(timestamp, 0) else {
+        return "-".to_string();
+    };
+    datetime.format("%Y-%m-%d %H:%M").to_string()
 }
 
 /// Full-list view: the current page of notes plus the pagination bar.
@@ -660,8 +675,11 @@ fn pagination_bar(
                 <span aria-hidden="true">{ ">" }</span><span class="sr-only">{ "Next page" }</span>
             </button>
             <select class="input pagination-page-size" onchange={on_page_size_select} value={page_size.to_string()} aria-label="Notes per page">
-                { for PAGE_SIZE_OPTIONS.iter().map(|size| html! {
-                    <option value={size.to_string()}>{ format!("{size}条/页") }</option>
+                { for PAGE_SIZE_OPTIONS.iter().map(|size| {
+                    let selected = *size == page_size;
+                    html! {
+                        <option value={size.to_string()} selected={selected}>{ format!("{size}条/页") }</option>
+                    }
                 }) }
             </select>
             <button type="button" class="btn btn-ghost btn-icon pagination-refresh" title="Refresh" onclick={on_refresh}>
@@ -689,8 +707,10 @@ fn note_table(
         <table class="table note-table">
             <thead>
                 <tr>
-                    <th>{ "Title" }</th>
+                    <th class="col-title">{ "Title" }</th>
                     <th>{ "Labels" }</th>
+                    <th class="col-time">{ "Created" }</th>
+                    <th class="col-time">{ "Updated" }</th>
                     <th class="col-actions">{ "Actions" }</th>
                 </tr>
             </thead>
@@ -720,6 +740,8 @@ fn note_table(
                                     }) }
                                 </div>
                             </td>
+                            <td class="col-time">{ format_timestamp(note.created_at) }</td>
+                            <td class="col-time">{ format_timestamp(note.updated_at) }</td>
                             <td class="col-actions">
                                 <div class="row-actions">
                                     <Link<Route> to={Route::NoteShow { id: id.clone() }}
