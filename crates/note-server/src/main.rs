@@ -8,6 +8,7 @@ use note_embedding::{ProcessWorkerConfig, ProcessWorkerRuntime, StubEmbedder, Wo
 use note_pipelines::{Context, EmbeddingJobNotifier, ProcessEmbeddingJobStatus};
 use note_storage::Storage;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
@@ -84,6 +85,18 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn attachments_dir_from_env(db_path: &str) -> PathBuf {
+    std::env::var("NOTE_ATTACHMENTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            Path::new(db_path)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .join("attachments")
+        })
+}
+
 async fn run_embedding_scheduler(
     ctx: Arc<Context>,
     wake: Arc<Notify>,
@@ -146,19 +159,28 @@ async fn main() -> anyhow::Result<()> {
 
     let stdio_mode = args.iter().any(|a| a == "--stdio");
     let db_path = std::env::var("NOTE_DB_PATH").unwrap_or_else(|_| "notes.db".to_string());
+    let attachments_dir = attachments_dir_from_env(&db_path);
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
 
     if export_mode {
         let storage = Storage::open_local(&db_path).await?;
-        let ctx = Context::new(Arc::new(storage), Arc::new(StubEmbedder));
+        let ctx = Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            attachments_dir,
+        );
         println!("{}", note_pipelines::export_json(&ctx).await?);
         return Ok(());
     }
 
     if import_mode {
         let storage = Storage::open_local(&db_path).await?;
-        let ctx = Context::new(Arc::new(storage), Arc::new(StubEmbedder));
+        let ctx = Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            attachments_dir,
+        );
         let mut input = String::new();
         std::io::stdin().lock().read_to_string(&mut input)?;
         let stats = note_pipelines::import_json(&ctx, &input).await?;
@@ -179,10 +201,11 @@ async fn main() -> anyhow::Result<()> {
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
-        let ctx = Arc::new(Context::with_embedding_job_notifier(
+        let ctx = Arc::new(Context::with_embedding_job_notifier_and_attachment_dir(
             Arc::new(storage),
             embedding.embedder.clone(),
             notifier,
+            attachments_dir.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
         let scheduler = tokio::spawn(run_embedding_scheduler(
@@ -205,10 +228,11 @@ async fn main() -> anyhow::Result<()> {
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
-        let ctx = Arc::new(Context::with_embedding_job_notifier(
+        let ctx = Arc::new(Context::with_embedding_job_notifier_and_attachment_dir(
             Arc::new(storage),
             embedding.embedder.clone(),
             notifier,
+            attachments_dir.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
         let scheduler = tokio::spawn(run_embedding_scheduler(

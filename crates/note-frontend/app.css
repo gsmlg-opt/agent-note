@@ -706,7 +706,8 @@ body {
     margin-bottom: 1rem;
 }
 
-.label-picker {
+.label-picker,
+.attachment-picker {
     margin: 0 0 1rem;
 }
 
@@ -802,14 +803,16 @@ body {
     background: var(--color-surface, #faf8ff);
 }
 
-.label-picker {
+.label-picker,
+.attachment-picker {
     border: 1px solid var(--color-outline-variant, #c7c5d0);
     border-radius: 0.6rem;
     padding: 0.75rem;
     margin: 0;
 }
 
-.label-picker > legend {
+.label-picker > legend,
+.attachment-picker > legend {
     font-weight: 600;
     font-size: 0.85rem;
     padding: 0 0.35rem;
@@ -844,6 +847,85 @@ body {
     gap: 0.4rem;
     flex-wrap: wrap;
     margin-top: 0.6rem;
+}
+
+.attachment-picker-grid,
+.attachment-item-grid {
+    display: grid;
+    grid-template-columns: minmax(7rem, 0.8fr) minmax(10rem, 1.2fr) minmax(8rem, 1fr) minmax(10rem, 1.2fr) auto;
+    gap: 0.5rem;
+    align-items: start;
+}
+
+.attachment-picker-grid .attachment-content-input {
+    grid-column: 1 / -2;
+}
+
+.attachment-list,
+.attachment-view-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+}
+
+.attachment-view-section {
+    margin-top: 1rem;
+}
+
+.attachment-view-section h3 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+.attachment-item,
+.attachment-view-item {
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.attachment-content-input {
+    min-height: 5rem;
+    resize: vertical;
+}
+
+.attachment-view-header {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: baseline;
+}
+
+.attachment-view-header span,
+.attachment-description {
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.85rem;
+}
+
+.attachment-description {
+    margin: 0.35rem 0 0;
+}
+
+.attachment-view-item pre {
+    max-height: 16rem;
+    overflow: auto;
+    margin: 0.6rem 0 0;
+    padding: 0.75rem;
+    border-radius: 0.4rem;
+    background: var(--color-surface, #faf8ff);
+}
+
+@media (max-width: 900px) {
+    .attachment-picker-grid,
+    .attachment-item-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .attachment-picker-grid .attachment-content-input {
+        grid-column: auto;
+    }
 }
 
 .search-panel {

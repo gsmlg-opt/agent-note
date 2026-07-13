@@ -35,6 +35,7 @@ pub async fn update_note(
         &NoteInput {
             title: input.title.clone(),
             content: input.content.clone(),
+            attachments: input.attachments.clone(),
             labels: input.labels.clone(),
         },
         &known_for_validation,
@@ -71,24 +72,49 @@ pub async fn update_note(
         .unwrap_or(1)
         + 1;
     let chunks = crate::chunk::chunk_content(&input.content);
+    let prepared_attachments =
+        crate::attachment_files::prepare_note_attachments(ctx, id, &input.attachments)?;
 
-    let tx = conn.transaction().await?;
-    let affected =
-        note_storage::update_note(&tx, id, &input.title, &input.content, now, note_revision)
-            .await?;
-    if affected == 0 {
+    let tx_result = async {
+        let tx = conn.transaction().await?;
+        let affected = note_storage::update_note_with_attachments(
+            &tx,
+            id,
+            &input.title,
+            &input.content,
+            prepared_attachments.metadata(),
+            now,
+            note_revision,
+        )
+        .await?;
+        if affected == 0 {
+            return anyhow::Ok(None);
+        }
+        for key in &missing_keys {
+            note_storage::insert_label_key(&tx, key, "").await?;
+        }
+        note_storage::clear_note_labels(&tx, id).await?;
+        let queued = crate::sync_note_embedding_jobs(&tx, id, &chunks, note_revision, now).await?;
+        for (key, value) in &input.labels {
+            note_storage::attach_label(&tx, id, key, value).await?;
+        }
+        let resolved_labels: Vec<Label> = note_storage::labels_for_note(&tx, id).await?;
+        tx.commit().await?;
+        anyhow::Ok(Some((queued, resolved_labels)))
+    }
+    .await;
+
+    let Some((queued, resolved_labels)) = (match tx_result {
+        Ok(result) => result,
+        Err(error) => {
+            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
+            return Err(error);
+        }
+    }) else {
+        crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
         return Ok(None);
-    }
-    for key in &missing_keys {
-        note_storage::insert_label_key(&tx, key, "").await?;
-    }
-    note_storage::clear_note_labels(&tx, id).await?;
-    let queued = crate::sync_note_embedding_jobs(&tx, id, &chunks, note_revision, now).await?;
-    for (key, value) in &input.labels {
-        note_storage::attach_label(&tx, id, key, value).await?;
-    }
-    let resolved_labels: Vec<Label> = note_storage::labels_for_note(&tx, id).await?;
-    tx.commit().await?;
+    };
+    crate::attachment_files::commit_note_attachments(prepared_attachments)?;
     if queued > 0 {
         ctx.wake_embedding_jobs();
     }
@@ -97,6 +123,7 @@ pub async fn update_note(
         id: id.to_string(),
         title: input.title,
         content: input.content,
+        attachments: input.attachments,
         labels: resolved_labels,
         created_at: existing.created_at,
         updated_at: now,
@@ -105,5 +132,9 @@ pub async fn update_note(
 
 pub async fn delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
     let conn = ctx.storage.connect()?;
-    Ok(note_storage::delete_note(&conn, id).await? > 0)
+    let deleted = note_storage::delete_note(&conn, id).await? > 0;
+    if deleted {
+        crate::attachment_files::remove_note_attachments(ctx, id)?;
+    }
+    Ok(deleted)
 }

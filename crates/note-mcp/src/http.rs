@@ -69,7 +69,11 @@ mod tests {
         let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
             .await
             .unwrap();
-        let ctx = Context::new(Arc::new(storage), Arc::new(StubEmbedder));
+        let ctx = Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            dir.path().join("attachments"),
+        );
         (ctx, dir)
     }
 

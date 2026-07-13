@@ -78,7 +78,8 @@ pub async fn search_notes_filtered(
         // A None here means an index row (dense/sparse) outlived its note row. save_note writes all
         // three tables in one atomic transaction (see save_note.rs), so this is unreachable today;
         // it would only occur under index/note divergence (e.g. a future delete path with a bug).
-        if let Some(note) = note_storage::get_note(&conn, &note_id).await? {
+        if let Some(mut note) = note_storage::get_note(&conn, &note_id).await? {
+            crate::attachment_files::hydrate_note_attachments(ctx, &mut note)?;
             results.push(SearchResult { note, score });
             if results.len() >= limit {
                 break;

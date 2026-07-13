@@ -1786,6 +1786,7 @@ name = "note-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "serde",
 ]
 
 [[package]]
@@ -1811,6 +1812,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
+ "note-core",
  "note-embedding",
  "note-pipelines",
  "note-storage",
@@ -1872,6 +1874,7 @@ dependencies = [
  "anyhow",
  "libsql",
  "note-core",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

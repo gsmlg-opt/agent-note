@@ -1,4 +1,4 @@
-use crate::state::{LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
+use crate::state::{LabelFilter, LabelKey, NoteAttachment, NoteSummary, SearchResultSummary};
 use gloo_net::http::{Request, Response};
 use serde::Deserialize;
 
@@ -80,9 +80,15 @@ pub async fn search_filtered(
 pub async fn save_note(
     title: &str,
     content: &str,
+    attachments: &[NoteAttachment],
     labels: &[(String, String)],
 ) -> Result<String, String> {
-    let body = serde_json::json!({ "title": title, "content": content, "labels": labels });
+    let body = serde_json::json!({
+        "title": title,
+        "content": content,
+        "attachments": attachments,
+        "labels": labels
+    });
     #[derive(Deserialize)]
     struct SaveResp {
         id: String,
@@ -106,6 +112,8 @@ struct NoteDto {
     id: String,
     title: String,
     content: String,
+    #[serde(default)]
+    attachments: Vec<NoteAttachment>,
     labels: Vec<(String, String)>,
     #[serde(default)]
     created_at: i64,
@@ -201,6 +209,7 @@ async fn fetch_note_summaries(
             id: d.id,
             title: d.title,
             content: String::new(),
+            attachments: vec![],
             labels: d.labels,
             created_at: d.created_at,
             updated_at: d.updated_at,
@@ -258,14 +267,18 @@ pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
         id: d.id,
         title: d.title,
         content: d.content,
+        attachments: d.attachments,
         labels: d.labels,
         created_at: d.created_at,
         updated_at: d.updated_at,
     })
 }
 
-pub async fn render_markdown(content: &str) -> Result<String, String> {
-    let body = serde_json::json!({ "content": content });
+pub async fn render_markdown(content: &str, attachment_base: Option<&str>) -> Result<String, String> {
+    let mut body = serde_json::json!({ "content": content });
+    if let Some(attachment_base) = attachment_base {
+        body["attachment_base"] = serde_json::Value::String(attachment_base.to_string());
+    }
     let resp = Request::post("/api/render")
         .json(&body)
         .map_err(|e| e.to_string())?
@@ -279,9 +292,15 @@ pub async fn update_note(
     id: &str,
     title: &str,
     content: &str,
+    attachments: &[NoteAttachment],
     labels: &[(String, String)],
 ) -> Result<(), String> {
-    let body = serde_json::json!({ "title": title, "content": content, "labels": labels });
+    let body = serde_json::json!({
+        "title": title,
+        "content": content,
+        "attachments": attachments,
+        "labels": labels
+    });
     let resp = Request::put(&format!("/api/notes/{id}"))
         .json(&body)
         .map_err(|e| e.to_string())?

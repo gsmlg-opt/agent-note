@@ -1,13 +1,14 @@
 use crate::context::Context;
 use note_core::{
-    validate_label_value, validate_note_input, Label, LabelValueType, Note, NoteInput,
-    ValidationError,
+    validate_label_value, validate_note_input, Label, LabelValueType, Note, NoteAttachment,
+    NoteInput, ValidationError,
 };
 use std::collections::HashMap;
 
 pub struct SaveNoteInput {
     pub title: String,
     pub content: String,
+    pub attachments: Vec<NoteAttachment>,
     pub labels: Vec<(String, String)>,
 }
 
@@ -37,6 +38,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
         &NoteInput {
             title: input.title.clone(),
             content: input.content.clone(),
+            attachments: input.attachments.clone(),
             labels: input.labels.clone(),
         },
         &known_for_validation,
@@ -72,29 +74,45 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     let now = chrono::Utc::now().timestamp();
     let note_revision = 1;
     let chunks = crate::chunk::chunk_content(&input.content);
+    let prepared_attachments =
+        crate::attachment_files::prepare_note_attachments(ctx, &id, &input.attachments)?;
 
     // The note row, labels, chunk hashes, and embedding jobs are committed atomically. Actual
     // embedding is deliberately out-of-process: save returns once the durable queue request exists.
-    let tx = conn.transaction().await?;
-    for key in &missing_keys {
-        note_storage::insert_label_key(&tx, key, "").await?;
+    let tx_result = async {
+        let tx = conn.transaction().await?;
+        for key in &missing_keys {
+            note_storage::insert_label_key(&tx, key, "").await?;
+        }
+        note_storage::insert_note_with_attachments(
+            &tx,
+            &id,
+            &input.title,
+            &input.content,
+            prepared_attachments.metadata(),
+            now,
+            now,
+            note_revision,
+        )
+        .await?;
+        let queued = crate::sync_note_embedding_jobs(&tx, &id, &chunks, note_revision, now).await?;
+        for (key, value) in &input.labels {
+            note_storage::attach_label(&tx, &id, key, value).await?;
+        }
+        let resolved_labels: Vec<Label> = note_storage::labels_for_note(&tx, &id).await?;
+        tx.commit().await?;
+        anyhow::Ok((queued, resolved_labels))
     }
-    note_storage::insert_note(
-        &tx,
-        &id,
-        &input.title,
-        &input.content,
-        now,
-        now,
-        note_revision,
-    )
-    .await?;
-    let queued = crate::sync_note_embedding_jobs(&tx, &id, &chunks, note_revision, now).await?;
-    for (key, value) in &input.labels {
-        note_storage::attach_label(&tx, &id, key, value).await?;
-    }
-    let resolved_labels: Vec<Label> = note_storage::labels_for_note(&tx, &id).await?;
-    tx.commit().await?;
+    .await;
+
+    let (queued, resolved_labels) = match tx_result {
+        Ok(result) => result,
+        Err(error) => {
+            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
+            return Err(error);
+        }
+    };
+    crate::attachment_files::commit_note_attachments(prepared_attachments)?;
     if queued > 0 {
         ctx.wake_embedding_jobs();
     }
@@ -103,6 +121,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
         id,
         title: input.title,
         content: input.content,
+        attachments: input.attachments,
         labels: resolved_labels,
         created_at: now,
         updated_at: now,

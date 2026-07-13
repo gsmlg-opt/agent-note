@@ -1,3 +1,4 @@
+use note_core::NoteAttachment;
 use note_pipelines::{
     delete_note, get_note, list_notes, save_note, search_notes_filtered, update_note, Context,
     ListNotesParams, SaveNoteInput as PipelineSaveNoteInput,
@@ -12,11 +13,46 @@ pub struct LabelData {
     pub value_type: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AttachmentData {
+    pub id: String,
+    pub path: String,
+    pub mime: String,
+    #[serde(default)]
+    pub description: String,
+    pub content: String,
+}
+
+impl From<NoteAttachment> for AttachmentData {
+    fn from(attachment: NoteAttachment) -> Self {
+        Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content: attachment.content,
+        }
+    }
+}
+
+impl From<AttachmentData> for NoteAttachment {
+    fn from(attachment: AttachmentData) -> Self {
+        Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content: attachment.content,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct NoteData {
     pub id: String,
     pub title: String,
     pub content: String,
+    pub attachments: Vec<AttachmentData>,
     pub labels: Vec<LabelData>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -26,6 +62,8 @@ pub struct NoteData {
 pub struct SaveNoteToolInput {
     pub title: String,
     pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentData>,
     #[serde(default)]
     pub labels: Vec<(String, String)>,
 }
@@ -44,6 +82,7 @@ pub async fn save_note_tool(
         PipelineSaveNoteInput {
             title: input.title,
             content: input.content,
+            attachments: input.attachments.into_iter().map(Into::into).collect(),
             labels: input.labels,
         },
     )
@@ -57,6 +96,7 @@ pub async fn get_note_tool(ctx: &Context, id: &str) -> anyhow::Result<Option<Not
         id: note.id,
         title: note.title,
         content: note.content,
+        attachments: note.attachments.into_iter().map(Into::into).collect(),
         labels: note
             .labels
             .into_iter()
@@ -133,6 +173,8 @@ pub struct UpdateNoteToolInput {
     pub title: String,
     pub content: String,
     #[serde(default)]
+    pub attachments: Vec<AttachmentData>,
+    #[serde(default)]
     pub labels: Vec<(String, String)>,
 }
 
@@ -146,6 +188,7 @@ pub async fn update_note_tool(
         PipelineSaveNoteInput {
             title: input.title,
             content: input.content,
+            attachments: input.attachments.into_iter().map(Into::into).collect(),
             labels: input.labels,
         },
     )
@@ -154,6 +197,7 @@ pub async fn update_note_tool(
         id: note.id,
         title: note.title,
         content: note.content,
+        attachments: note.attachments.into_iter().map(Into::into).collect(),
         labels: note
             .labels
             .into_iter()
@@ -194,6 +238,7 @@ pub async fn list_notes_tool(
             id: note.id,
             title: note.title,
             content: note.content,
+            attachments: note.attachments.into_iter().map(Into::into).collect(),
             labels: note
                 .labels
                 .into_iter()

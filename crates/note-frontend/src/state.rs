@@ -1,11 +1,24 @@
 //! Plain view-model types shared across pages. (The app is now multi-page via yew-router, so
 //! state lives locally in each page rather than in one global reducer.)
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteAttachment {
+    pub id: String,
+    pub path: String,
+    pub mime: String,
+    #[serde(default)]
+    pub description: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NoteSummary {
     pub id: String,
     pub title: String,
     pub content: String,
+    pub attachments: Vec<NoteAttachment>,
     /// Attached labels as (key, value) pairs.
     pub labels: Vec<(String, String)>,
     pub created_at: i64,

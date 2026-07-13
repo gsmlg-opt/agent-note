@@ -5,7 +5,7 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::components::NoteEditor;
 use crate::routes::Route;
-use crate::state::LabelKey;
+use crate::state::{LabelKey, NoteAttachment};
 
 /// Dedicated page for composing a note. On save it returns to the note list.
 #[function_component(NewNotePage)]
@@ -33,7 +33,12 @@ pub fn new_note_page() -> Html {
         let error = error.clone();
         let submitting = submitting.clone();
         Callback::from(
-            move |(title, content, labels): (String, String, Vec<(String, String)>)| {
+            move |(
+                title,
+                content,
+                labels,
+                attachments,
+            ): (String, String, Vec<(String, String)>, Vec<NoteAttachment>)| {
                 if *submitting {
                     return;
                 }
@@ -43,7 +48,7 @@ pub fn new_note_page() -> Html {
                 let error = error.clone();
                 let submitting = submitting.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match api::save_note(&title, &content, &labels).await {
+                    match api::save_note(&title, &content, &attachments, &labels).await {
                         Ok(_) => navigator.push(&Route::Notes),
                         Err(e) => {
                             error.set(Some(e));

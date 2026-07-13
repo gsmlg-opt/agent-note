@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 pub type NoteId = String;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -261,11 +263,22 @@ fn compare_ordering(ordering: std::cmp::Ordering, operator: LabelOperator) -> bo
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteAttachment {
+    pub id: String,
+    pub path: String,
+    pub mime: String,
+    #[serde(default)]
+    pub description: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
     pub id: NoteId,
     pub title: String,
     pub content: String,
+    pub attachments: Vec<NoteAttachment>,
     pub labels: Vec<Label>,
     pub created_at: i64,
     pub updated_at: i64,

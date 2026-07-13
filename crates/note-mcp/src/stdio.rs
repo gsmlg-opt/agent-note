@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::{
     delete_note_tool, edit_note_tool, get_note_tool, list_notes_tool, read_note_lines_tool,
-    save_note_tool, semantic_search_tool, update_note_tool, LabelData, NoteData, NoteLine,
-    NoteLinesData, SaveNoteToolInput, SaveNoteToolOutput, SemanticSearchToolInput,
+    save_note_tool, semantic_search_tool, update_note_tool, AttachmentData, LabelData, NoteData,
+    NoteLine, NoteLinesData, SaveNoteToolInput, SaveNoteToolOutput, SemanticSearchToolInput,
     SemanticSearchToolResult, UpdateNoteToolInput,
 };
 
@@ -36,6 +36,9 @@ pub struct SaveNoteRequest {
     pub title: String,
     /// Note body, formatted as Markdown.
     pub content: String,
+    /// Attachments that belong to this note.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentSchema>,
     /// Existing label keys to attach, as `(key, value)` pairs. Cannot create new
     /// label keys — that is REST/UI-only (docs/design.md §8).
     #[serde(default)]
@@ -58,6 +61,7 @@ impl From<SaveNoteRequest> for SaveNoteToolInput {
         Self {
             title: r.title,
             content: r.content,
+            attachments: r.attachments.into_iter().map(Into::into).collect(),
             labels: r.labels,
         }
     }
@@ -89,6 +93,22 @@ pub struct LabelSchema {
     pub value_type: String,
 }
 
+/// MCP attachment schema embedded in note requests and responses.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct AttachmentSchema {
+    /// Unique attachment id within the note.
+    pub id: String,
+    /// Relative path that note Markdown can reference, for example `./meta.json`.
+    pub path: String,
+    /// MIME type of the attachment content.
+    pub mime: String,
+    /// Human-readable attachment description.
+    #[serde(default)]
+    pub description: String,
+    /// Attachment content.
+    pub content: String,
+}
+
 /// MCP response schema for note-returning tools.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct NoteResponse {
@@ -98,6 +118,8 @@ pub struct NoteResponse {
     pub title: String,
     /// Note body, formatted as Markdown.
     pub content: String,
+    /// Attachments that belong to this note.
+    pub attachments: Vec<AttachmentSchema>,
     /// Labels attached to the note.
     pub labels: Vec<LabelSchema>,
     /// Unix timestamp when the note was created.
@@ -117,12 +139,37 @@ impl From<LabelData> for LabelSchema {
     }
 }
 
+impl From<AttachmentData> for AttachmentSchema {
+    fn from(attachment: AttachmentData) -> Self {
+        Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content: attachment.content,
+        }
+    }
+}
+
+impl From<AttachmentSchema> for AttachmentData {
+    fn from(attachment: AttachmentSchema) -> Self {
+        Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content: attachment.content,
+        }
+    }
+}
+
 impl From<NoteData> for NoteResponse {
     fn from(n: NoteData) -> Self {
         Self {
             id: n.id,
             title: n.title,
             content: n.content,
+            attachments: n.attachments.into_iter().map(Into::into).collect(),
             labels: n.labels.into_iter().map(Into::into).collect(),
             created_at: n.created_at,
             updated_at: n.updated_at,
@@ -255,6 +302,9 @@ pub struct UpdateNoteRequest {
     pub title: String,
     /// New note body, formatted as Markdown.
     pub content: String,
+    /// Attachments that belong to this note.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentSchema>,
     /// Existing label keys to attach, as `(key, value)` pairs. Cannot create new
     /// label keys — that is REST/UI-only (docs/design.md §8).
     #[serde(default)]
@@ -267,6 +317,7 @@ impl From<UpdateNoteRequest> for UpdateNoteToolInput {
             id: r.id,
             title: r.title,
             content: r.content,
+            attachments: r.attachments.into_iter().map(Into::into).collect(),
             labels: r.labels,
         }
     }
@@ -555,7 +606,11 @@ mod tests {
         let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
             .await
             .unwrap();
-        let ctx = Context::new(Arc::new(storage), Arc::new(StubEmbedder));
+        let ctx = Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            dir.path().join("attachments"),
+        );
         (ctx, dir)
     }
 

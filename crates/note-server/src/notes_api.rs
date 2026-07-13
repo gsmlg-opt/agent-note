@@ -1,10 +1,11 @@
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
-    response::Html,
+    response::{Html, Response},
     routing::{get as route_get, post},
     Json, Router,
 };
-use note_core::{Note, NoteListItem};
+use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
     count_notes, delete_note, get_note, label_note_counts, list_label_keys, list_note_summaries,
     save_note, search_notes_filtered, update_note, Context, ListNotesParams, SaveNoteInput,
@@ -26,6 +27,8 @@ pub struct SaveNoteRequest {
     pub title: String,
     pub content: String,
     #[serde(default)]
+    pub attachments: Vec<NoteAttachment>,
+    #[serde(default)]
     pub labels: Vec<(String, String)>,
 }
 
@@ -37,6 +40,8 @@ pub struct SaveNoteResponse {
 #[derive(Deserialize)]
 pub struct RenderRequest {
     pub content: String,
+    #[serde(default)]
+    pub attachment_base: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -44,6 +49,7 @@ pub struct NoteDto {
     pub id: String,
     pub title: String,
     pub content: String,
+    pub attachments: Vec<NoteAttachment>,
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -55,6 +61,7 @@ impl From<Note> for NoteDto {
             id: note.id,
             title: note.title,
             content: note.content,
+            attachments: note.attachments,
             labels: note
                 .labels
                 .iter()
@@ -211,6 +218,7 @@ async fn save_note_handler(
         SaveNoteInput {
             title: req.title,
             content: req.content,
+            attachments: req.attachments,
             labels: req.labels,
         },
     )
@@ -293,6 +301,43 @@ async fn get_note_handler(
     }
 }
 
+async fn get_attachment_handler(
+    State(ctx): State<Arc<Context>>,
+    Path((id, path)): Path<(String, String)>,
+) -> Result<Response, (axum::http::StatusCode, String)> {
+    let note = get_note(&ctx, &id)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                "note not found".to_string(),
+            )
+        })?;
+    let requested_path = normalize_attachment_path(&path);
+    let attachment = note
+        .attachments
+        .into_iter()
+        .find(|attachment| normalize_attachment_path(&attachment.path) == requested_path)
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                "attachment not found".to_string(),
+            )
+        })?;
+
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, attachment.mime)
+        .body(Body::from(attachment.content))
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn normalize_attachment_path(path: &str) -> String {
+    path.trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
 async fn update_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -304,6 +349,7 @@ async fn update_note_handler(
         SaveNoteInput {
             title: req.title,
             content: req.content,
+            attachments: req.attachments,
             labels: req.labels,
         },
     )
@@ -377,7 +423,17 @@ async fn search_handler(
 }
 
 async fn render_handler(Json(req): Json<RenderRequest>) -> Html<String> {
-    Html(crate::render::render_markdown_html(&req.content))
+    let mut html = crate::render::render_markdown_html(&req.content);
+    if let Some(base) = req.attachment_base {
+        html = rewrite_relative_attachment_urls(&html, &base);
+    }
+    Html(html)
+}
+
+fn rewrite_relative_attachment_urls(html: &str, base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    html.replace("href=\"./", &format!("href=\"{base}/"))
+        .replace("src=\"./", &format!("src=\"{base}/"))
 }
 
 pub fn notes_router() -> Router<Arc<Context>> {
@@ -393,6 +449,10 @@ pub fn notes_router() -> Router<Arc<Context>> {
             route_get(get_note_handler)
                 .put(update_note_handler)
                 .delete(delete_note_handler),
+        )
+        .route(
+            "/api/notes/{id}/attachments/{*path}",
+            route_get(get_attachment_handler),
         )
         // POST (not GET) because search takes a JSON body: browsers' Fetch API forbids a body on
         // GET, so the Wasm frontend (gloo-net) can't call a GET-with-body search. POST-with-body is
@@ -418,7 +478,11 @@ mod tests {
         let storage = Storage::open_local(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        let ctx = Arc::new(Context::new(Arc::new(storage), Arc::new(StubEmbedder)));
+        let ctx = Arc::new(Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            dir.path().join("attachments"),
+        ));
         (notes_router().with_state(ctx.clone()), ctx, dir)
     }
 
@@ -736,6 +800,66 @@ mod tests {
 
         let resp = app.oneshot(get("/api/notes/does-not-exist")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn note_attachments_roundtrip_and_render_as_relative_files() {
+        let (app, _ctx, dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"With attachment","content":"See [meta](./meta.json)","attachments":[{"id":"meta","path":"./meta.json","mime":"application/json","description":"metadata","content":"{\"ok\":true}"}],"labels":[]}"#,
+        )
+        .await;
+
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let attachments = json
+            .get("attachments")
+            .and_then(|v| v.as_array())
+            .expect("attachments array");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0].get("description").and_then(|v| v.as_str()),
+            Some("metadata")
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/api/notes/{id}/attachments/meta.json")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], br#"{"ok":true}"#);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("attachments").join(&id).join("meta.json"))
+                .unwrap(),
+            r#"{"ok":true}"#
+        );
+
+        let render_body = format!(
+            r#"{{"content":"See [meta](./meta.json)","attachment_base":"/api/notes/{id}/attachments"}}"#
+        );
+        let resp = app
+            .oneshot(post("/api/render", &render_body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let html = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&html).unwrap();
+        assert!(html.contains(&format!(r#"href="/api/notes/{id}/attachments/meta.json""#)));
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow = "1.0.103"
 axum = "0.8"
+note-core = { version = "0.1.0", path = "../note-core" }
 note-pipelines = { version = "0.1.0", path = "../note-pipelines" }
 rmcp = { version = "2.0.0", features = [
     "server",

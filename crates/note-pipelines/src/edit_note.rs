@@ -35,6 +35,7 @@ pub async fn edit_note(
         SaveNoteInput {
             title: note.title.clone(),
             content: new_content,
+            attachments: note.attachments.clone(),
             labels,
         },
     )

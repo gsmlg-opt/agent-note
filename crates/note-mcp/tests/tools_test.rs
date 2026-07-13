@@ -10,7 +10,14 @@ async fn test_context() -> (Context, TempDir) {
     let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
         .await
         .unwrap();
-    (Context::new(Arc::new(storage), Arc::new(StubEmbedder)), dir)
+    (
+        Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            dir.path().join("attachments"),
+        ),
+        dir,
+    )
 }
 
 #[tokio::test]
@@ -21,6 +28,7 @@ async fn save_note_tool_returns_an_id() {
         SaveNoteToolInput {
             title: "Title".into(),
             content: "Content".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -37,6 +45,7 @@ async fn semantic_search_tool_finds_saved_note() {
         SaveNoteToolInput {
             title: "Findable".into(),
             content: "unique searchable content".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -66,6 +75,7 @@ async fn semantic_search_tool_filters_by_label() {
         SaveNoteToolInput {
             title: "Rust".into(),
             content: "shared searchable content".into(),
+            attachments: vec![],
             labels: vec![("topic".into(), "rust".into())],
         },
     )
@@ -76,6 +86,7 @@ async fn semantic_search_tool_filters_by_label() {
         SaveNoteToolInput {
             title: "Ops".into(),
             content: "shared searchable content".into(),
+            attachments: vec![],
             labels: vec![("topic".into(), "ops".into())],
         },
     )

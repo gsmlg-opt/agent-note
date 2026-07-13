@@ -304,12 +304,18 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let write_ctx = Context::new(storage.clone(), Arc::new(StubEmbedder));
+        let attachments_dir = dir.path().join("attachments");
+        let write_ctx = Context::with_attachment_dir(
+            storage.clone(),
+            Arc::new(StubEmbedder),
+            attachments_dir.clone(),
+        );
         let note = save_note(
             &write_ctx,
             SaveNoteInput {
                 title: "original".into(),
                 content: "old content".into(),
+                attachments: vec![],
                 labels: vec![],
             },
         )
@@ -318,12 +324,13 @@ mod tests {
 
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let process_ctx = Arc::new(Context::new(
+        let process_ctx = Arc::new(Context::with_attachment_dir(
             storage.clone(),
             Arc::new(PausingEmbedder {
                 started: started.clone(),
                 release: release.clone(),
             }),
+            attachments_dir,
         ));
         let process_task = {
             let process_ctx = process_ctx.clone();
@@ -342,6 +349,7 @@ mod tests {
             SaveNoteInput {
                 title: "updated".into(),
                 content: "new content".into(),
+                attachments: vec![],
                 labels: vec![],
             },
         )

@@ -5,7 +5,7 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::components::NoteEditor;
 use crate::routes::Route;
-use crate::state::{LabelKey, NoteSummary};
+use crate::state::{LabelKey, NoteAttachment, NoteSummary};
 
 #[derive(Properties, PartialEq)]
 pub struct NoteEditProps {
@@ -51,7 +51,12 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
         let id = props.id.clone();
         let submitting = submitting.clone();
         Callback::from(
-            move |(title, content, labels): (String, String, Vec<(String, String)>)| {
+            move |(
+                title,
+                content,
+                labels,
+                attachments,
+            ): (String, String, Vec<(String, String)>, Vec<NoteAttachment>)| {
                 if *submitting {
                     return;
                 }
@@ -62,7 +67,7 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
                 let id = id.clone();
                 let submitting = submitting.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match api::update_note(&id, &title, &content, &labels).await {
+                    match api::update_note(&id, &title, &content, &attachments, &labels).await {
                         Ok(()) => navigator.push(&Route::NoteShow { id }),
                         Err(e) => {
                             error.set(Some(e));
@@ -87,6 +92,7 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
                     initial_title={n.title.clone()}
                     initial_content={n.content.clone()}
                     initial_labels={n.labels.clone()}
+                    initial_attachments={n.attachments.clone()}
                     card_title="Edit note"
                     submit_label="Save changes"
                     submitting={*submitting}

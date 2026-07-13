@@ -32,7 +32,12 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::get_note(&id).await {
-                    Ok(n) => match api::render_markdown(&n.content).await {
+                    Ok(n) => match api::render_markdown(
+                        &n.content,
+                        Some(&format!("/api/notes/{}/attachments", n.id)),
+                    )
+                    .await
+                    {
                         Ok(html) => {
                             rendered_content.set(Some(html));
                             note.set(Some(n));
@@ -77,6 +82,25 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                     <div class="markdown-body">
                         { Html::from_html_unchecked(AttrValue::from(rendered.clone())) }
                     </div>
+                    if !n.attachments.is_empty() {
+                        <section class="attachment-view-section">
+                            <h3>{ "Attachments" }</h3>
+                            <div class="attachment-view-list">
+                                { for n.attachments.iter().map(|attachment| html! {
+                                    <section class="attachment-view-item" key={attachment.id.clone()}>
+                                        <div class="attachment-view-header">
+                                            <strong>{ attachment.path.clone() }</strong>
+                                            <span>{ attachment.mime.clone() }</span>
+                                        </div>
+                                        if !attachment.description.is_empty() {
+                                            <p class="attachment-description">{ attachment.description.clone() }</p>
+                                        }
+                                        <pre>{ attachment.content.clone() }</pre>
+                                    </section>
+                                }) }
+                            </div>
+                        </section>
+                    }
                 </Card>
             } else {
                 <p class="empty">{ "Note not found." }</p>

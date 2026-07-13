@@ -1,8 +1,8 @@
-use note_core::LabelValueType;
+use note_core::{LabelValueType, NoteAttachment};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    define_label_key, define_label_key_with_type, drain_embedding_jobs, list_label_keys, save_note,
-    update_note, Context, SaveNoteInput,
+    define_label_key, define_label_key_with_type, drain_embedding_jobs, get_note, list_label_keys,
+    save_note, update_note, Context, SaveNoteInput,
 };
 use note_storage::Storage;
 use std::sync::Arc;
@@ -15,7 +15,11 @@ async fn test_context() -> (Context, TempDir) {
     let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
         .await
         .unwrap();
-    let ctx = Context::new(Arc::new(storage), Arc::new(StubEmbedder));
+    let ctx = Context::with_attachment_dir(
+        Arc::new(storage),
+        Arc::new(StubEmbedder),
+        dir.path().join("attachments"),
+    );
     (ctx, dir)
 }
 
@@ -31,6 +35,7 @@ async fn saves_and_returns_a_persisted_note() {
         SaveNoteInput {
             title: "My note".into(),
             content: "Some content".into(),
+            attachments: vec![],
             labels: vec![("status".into(), "done".into())],
         },
     )
@@ -53,6 +58,7 @@ async fn unknown_label_key_is_auto_created() {
         SaveNoteInput {
             title: "My note".into(),
             content: "Some content".into(),
+            attachments: vec![],
             labels: vec![("project".into(), "alpha".into())],
         },
     )
@@ -80,7 +86,83 @@ async fn typed_label_value_is_validated_on_save() {
         SaveNoteInput {
             title: "My note".into(),
             content: "Some content".into(),
+            attachments: vec![],
             labels: vec![("priority".into(), "high".into())],
+        },
+    )
+    .await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn save_persists_attachments() {
+    let (ctx, _dir) = test_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "My note".into(),
+            content: "Some content".into(),
+            attachments: vec![NoteAttachment {
+                id: "meta".into(),
+                path: "./meta.json".into(),
+                mime: "application/json".into(),
+                description: "metadata".into(),
+                content: "{}".into(),
+            }],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(note.attachments.len(), 1);
+    assert_eq!(note.attachments[0].path, "./meta.json");
+
+    let conn = ctx.storage.connect().unwrap();
+    let stored = note_storage::get_note(&conn, &note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.attachments[0].description, "metadata");
+    assert_eq!(stored.attachments[0].content, "");
+
+    let attachment_path = _dir
+        .path()
+        .join("attachments")
+        .join(&note.id)
+        .join("meta.json");
+    assert_eq!(std::fs::read_to_string(attachment_path).unwrap(), "{}");
+
+    let hydrated = get_note(&ctx, &note.id).await.unwrap().unwrap();
+    assert_eq!(hydrated.attachments[0].content, "{}");
+}
+
+#[tokio::test]
+async fn duplicate_attachment_id_is_rejected() {
+    let (ctx, _dir) = test_context().await;
+    let result = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "My note".into(),
+            content: "Some content".into(),
+            attachments: vec![
+                NoteAttachment {
+                    id: "meta".into(),
+                    path: "./meta.json".into(),
+                    mime: "application/json".into(),
+                    description: String::new(),
+                    content: "{}".into(),
+                },
+                NoteAttachment {
+                    id: "meta".into(),
+                    path: "./other.json".into(),
+                    mime: "application/json".into(),
+                    description: String::new(),
+                    content: "{}".into(),
+                },
+            ],
+            labels: vec![],
         },
     )
     .await;
@@ -96,6 +178,7 @@ async fn empty_title_is_rejected() {
         SaveNoteInput {
             title: "".into(),
             content: "Some content".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -115,6 +198,7 @@ async fn successful_save_persists_note_chunks_and_embedding_jobs() {
         SaveNoteInput {
             title: "My note".into(),
             content: "Some content".into(),
+            attachments: vec![],
             labels: vec![("status".into(), "done".into())],
         },
     )
@@ -149,6 +233,7 @@ async fn embedding_worker_populates_recall_tables_from_queue() {
         SaveNoteInput {
             title: "My note".into(),
             content: "Some content".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -171,6 +256,7 @@ async fn update_only_queues_embedding_when_content_hash_changes() {
         SaveNoteInput {
             title: "My note".into(),
             content: "Stable content".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -184,6 +270,7 @@ async fn update_only_queues_embedding_when_content_hash_changes() {
         SaveNoteInput {
             title: "Renamed".into(),
             content: "Stable content".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -201,6 +288,7 @@ async fn update_only_queues_embedding_when_content_hash_changes() {
         SaveNoteInput {
             title: "Renamed".into(),
             content: "Changed content".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -233,6 +321,7 @@ async fn failed_write_rolls_back_all_tables() {
         SaveNoteInput {
             title: "My note".into(),
             content: "Some content".into(),
+            attachments: vec![],
             labels: vec![
                 ("status".into(), "done".into()),
                 ("status".into(), "wip".into()), // duplicate key -> PK violation mid-transaction

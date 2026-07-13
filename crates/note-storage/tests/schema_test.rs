@@ -47,6 +47,7 @@ async fn schema_applies_cleanly_to_a_fresh_db() {
         note_columns.push(row.get::<String>(1).unwrap());
     }
     assert!(note_columns.contains(&"note_revision".to_string()));
+    assert!(note_columns.contains(&"attachments".to_string()));
 
     let mut rows = conn
         .query("PRAGMA table_info(embedding_jobs)", ())

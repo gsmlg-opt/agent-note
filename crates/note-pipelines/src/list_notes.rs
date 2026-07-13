@@ -15,7 +15,12 @@ pub async fn list_notes(ctx: &Context, params: ListNotesParams) -> anyhow::Resul
         .as_deref()
         .map(parse_label_selectors)
         .unwrap_or_default();
-    note_storage::list_notes(&conn, &selectors, params.limit, params.offset).await
+    let mut notes =
+        note_storage::list_notes(&conn, &selectors, params.limit, params.offset).await?;
+    for note in &mut notes {
+        crate::attachment_files::hydrate_note_attachments(ctx, note)?;
+    }
+    Ok(notes)
 }
 
 pub async fn list_note_summaries(

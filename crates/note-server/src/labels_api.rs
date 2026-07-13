@@ -156,7 +156,11 @@ mod tests {
         let storage = Storage::open_local(dir.path().join("t.db").to_str().unwrap())
             .await
             .unwrap();
-        let ctx = Arc::new(Context::new(Arc::new(storage), Arc::new(StubEmbedder)));
+        let ctx = Arc::new(Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            dir.path().join("attachments"),
+        ));
         (labels_router().with_state(ctx), dir)
     }
 

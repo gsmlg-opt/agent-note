@@ -1,6 +1,8 @@
 pub mod context;
 pub use context::*;
 
+mod attachment_files;
+
 pub mod chunk;
 pub use chunk::*;
 

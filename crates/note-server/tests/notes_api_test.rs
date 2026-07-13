@@ -9,7 +9,14 @@ async fn test_context() -> (Context, TempDir) {
     let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
         .await
         .unwrap();
-    (Context::new(Arc::new(storage), Arc::new(StubEmbedder)), dir)
+    (
+        Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            dir.path().join("attachments"),
+        ),
+        dir,
+    )
 }
 
 #[tokio::test]
@@ -20,6 +27,7 @@ async fn saved_note_is_findable_via_pipelines_directly() {
         SaveNoteInput {
             title: "T".into(),
             content: "C unique".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )

@@ -1,5 +1,5 @@
 use libsql::Connection;
-use note_core::{label_matches_selector, LabelSelector, Note, NoteListItem};
+use note_core::{label_matches_selector, LabelSelector, Note, NoteAttachment, NoteListItem};
 
 pub async fn insert_note(
     conn: &Connection,
@@ -10,10 +10,42 @@ pub async fn insert_note(
     updated_at: i64,
     note_revision: i64,
 ) -> anyhow::Result<()> {
+    insert_note_with_attachments(
+        conn,
+        id,
+        title,
+        content,
+        &[],
+        created_at,
+        updated_at,
+        note_revision,
+    )
+    .await
+}
+
+pub async fn insert_note_with_attachments(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    content: &str,
+    attachments: &[NoteAttachment],
+    created_at: i64,
+    updated_at: i64,
+    note_revision: i64,
+) -> anyhow::Result<()> {
+    let attachments = serialize_attachments(attachments)?;
     conn.execute(
-        "INSERT INTO notes (id, title, content, created_at, updated_at, note_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        libsql::params![id, title, content, created_at, updated_at, note_revision],
+        "INSERT INTO notes (id, title, content, attachments, created_at, updated_at, note_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        libsql::params![
+            id,
+            title,
+            content,
+            attachments,
+            created_at,
+            updated_at,
+            note_revision
+        ],
     )
     .await?;
     Ok(())
@@ -35,7 +67,7 @@ pub async fn get_note_revision(conn: &Connection, id: &str) -> anyhow::Result<Op
 pub async fn get_note(conn: &Connection, id: &str) -> anyhow::Result<Option<Note>> {
     let mut rows = conn
         .query(
-            "SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ?1",
+            "SELECT id, title, content, attachments, created_at, updated_at FROM notes WHERE id = ?1",
             libsql::params![id],
         )
         .await?;
@@ -46,8 +78,9 @@ pub async fn get_note(conn: &Connection, id: &str) -> anyhow::Result<Option<Note
     let id = row.get::<String>(0)?;
     let title = row.get::<String>(1)?;
     let content = row.get::<String>(2)?;
-    let created_at = row.get::<i64>(3)?;
-    let updated_at = row.get::<i64>(4)?;
+    let attachments = deserialize_attachments(&row.get::<String>(3)?)?;
+    let created_at = row.get::<i64>(4)?;
+    let updated_at = row.get::<i64>(5)?;
     drop(rows);
 
     let labels = crate::note_labels::labels_for_note(conn, &id).await?;
@@ -56,6 +89,7 @@ pub async fn get_note(conn: &Connection, id: &str) -> anyhow::Result<Option<Note
         id,
         title,
         content,
+        attachments,
         labels,
         created_at,
         updated_at,
@@ -70,12 +104,38 @@ pub async fn update_note(
     updated_at: i64,
     note_revision: i64,
 ) -> anyhow::Result<u64> {
+    let attachments = get_note(conn, id)
+        .await?
+        .map(|note| note.attachments)
+        .unwrap_or_default();
+    update_note_with_attachments(
+        conn,
+        id,
+        title,
+        content,
+        &attachments,
+        updated_at,
+        note_revision,
+    )
+    .await
+}
+
+pub async fn update_note_with_attachments(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    content: &str,
+    attachments: &[NoteAttachment],
+    updated_at: i64,
+    note_revision: i64,
+) -> anyhow::Result<u64> {
+    let attachments = serialize_attachments(attachments)?;
     let affected = conn
         .execute(
             "UPDATE notes
-             SET title = ?2, content = ?3, updated_at = ?4, note_revision = ?5
+             SET title = ?2, content = ?3, attachments = ?4, updated_at = ?5, note_revision = ?6
              WHERE id = ?1",
-            libsql::params![id, title, content, updated_at, note_revision],
+            libsql::params![id, title, content, attachments, updated_at, note_revision],
         )
         .await?;
     Ok(affected)
@@ -158,7 +218,8 @@ pub async fn list_notes(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> anyhow::Result<Vec<Note>> {
-    let mut sql = "SELECT id, title, content, created_at, updated_at FROM notes".to_string();
+    let mut sql =
+        "SELECT id, title, content, attachments, created_at, updated_at FROM notes".to_string();
     let mut params = Vec::<libsql::Value>::new();
 
     sql.push_str(" ORDER BY created_at DESC");
@@ -175,14 +236,16 @@ pub async fn list_notes(
         let id = row.get::<String>(0)?;
         let title = row.get::<String>(1)?;
         let content = row.get::<String>(2)?;
-        let created_at = row.get::<i64>(3)?;
-        let updated_at = row.get::<i64>(4)?;
+        let attachments = deserialize_attachments(&row.get::<String>(3)?)?;
+        let created_at = row.get::<i64>(4)?;
+        let updated_at = row.get::<i64>(5)?;
         let labels = crate::note_labels::labels_for_note(conn, &id).await?;
 
         notes.push(Note {
             id,
             title,
             content,
+            attachments,
             labels,
             created_at,
             updated_at,
@@ -214,6 +277,24 @@ pub async fn list_notes(
         };
     }
     Ok(notes)
+}
+
+fn serialize_attachments(attachments: &[NoteAttachment]) -> anyhow::Result<String> {
+    let metadata = attachments
+        .iter()
+        .map(|attachment| NoteAttachment {
+            id: attachment.id.clone(),
+            path: attachment.path.clone(),
+            mime: attachment.mime.clone(),
+            description: attachment.description.clone(),
+            content: String::new(),
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&metadata).map_err(anyhow::Error::new)
+}
+
+fn deserialize_attachments(value: &str) -> anyhow::Result<Vec<NoteAttachment>> {
+    serde_json::from_str(value).map_err(anyhow::Error::new)
 }
 
 pub async fn list_note_summaries(

@@ -13,7 +13,14 @@ async fn test_context() -> (Context, TempDir) {
     let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
         .await
         .unwrap();
-    (Context::new(Arc::new(storage), Arc::new(StubEmbedder)), dir)
+    (
+        Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            dir.path().join("attachments"),
+        ),
+        dir,
+    )
 }
 
 #[tokio::test]
@@ -24,6 +31,7 @@ async fn search_returns_saved_notes_with_fused_scores() {
         SaveNoteInput {
             title: "Rust ownership".into(),
             content: "Ownership and borrowing in Rust".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -34,6 +42,7 @@ async fn search_returns_saved_notes_with_fused_scores() {
         SaveNoteInput {
             title: "Grocery list".into(),
             content: "Milk eggs bread".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -60,6 +69,7 @@ async fn search_filters_results_by_label() {
         SaveNoteInput {
             title: "Rust ownership".into(),
             content: "Shared searchable content".into(),
+            attachments: vec![],
             labels: vec![("topic".into(), "rust".into())],
         },
     )
@@ -70,6 +80,7 @@ async fn search_filters_results_by_label() {
         SaveNoteInput {
             title: "Ops checklist".into(),
             content: "Shared searchable content".into(),
+            attachments: vec![],
             labels: vec![("topic".into(), "ops".into())],
         },
     )

@@ -1,6 +1,8 @@
+use note_core::NoteAttachment;
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    define_label_key, export_data, import_data, list_label_keys, save_note, Context, SaveNoteInput,
+    define_label_key, export_data, get_note, import_data, list_label_keys, save_note, Context,
+    SaveNoteInput,
 };
 use note_storage::Storage;
 use std::sync::Arc;
@@ -13,7 +15,14 @@ async fn test_context() -> (Context, TempDir) {
     let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
         .await
         .unwrap();
-    (Context::new(Arc::new(storage), Arc::new(StubEmbedder)), dir)
+    (
+        Context::with_attachment_dir(
+            Arc::new(storage),
+            Arc::new(StubEmbedder),
+            dir.path().join("attachments"),
+        ),
+        dir,
+    )
 }
 
 #[tokio::test]
@@ -27,6 +36,13 @@ async fn export_import_roundtrips_notes_and_label_keys() {
         SaveNoteInput {
             title: "Plan".into(),
             content: "Draft the release plan".into(),
+            attachments: vec![NoteAttachment {
+                id: "meta".into(),
+                path: "./meta.json".into(),
+                mime: "application/json".into(),
+                description: "metadata".into(),
+                content: "{}".into(),
+            }],
             labels: vec![("status".into(), "done".into())],
         },
     )
@@ -37,6 +53,7 @@ async fn export_import_roundtrips_notes_and_label_keys() {
         SaveNoteInput {
             title: "Scratch".into(),
             content: "Unlabeled thought".into(),
+            attachments: vec![],
             labels: vec![],
         },
     )
@@ -60,25 +77,19 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     assert_eq!(keys[0].description, "Workflow status");
     assert_eq!(keys[0].value_type.as_str(), "text");
 
-    let conn = target.storage.connect().unwrap();
-    let restored_labeled = note_storage::get_note(&conn, &labeled.id)
-        .await
-        .unwrap()
-        .unwrap();
+    let restored_labeled = get_note(&target, &labeled.id).await.unwrap().unwrap();
     assert_eq!(restored_labeled.title, labeled.title);
     assert_eq!(restored_labeled.content, labeled.content);
     assert_eq!(restored_labeled.created_at, labeled.created_at);
     assert_eq!(restored_labeled.updated_at, labeled.updated_at);
+    assert_eq!(restored_labeled.attachments, labeled.attachments);
     assert_eq!(restored_labeled.labels.len(), 1);
     assert_eq!(restored_labeled.labels[0].key, "status");
     assert_eq!(restored_labeled.labels[0].value, "done");
     assert_eq!(restored_labeled.labels[0].description, "Workflow status");
     assert_eq!(restored_labeled.labels[0].value_type.as_str(), "text");
 
-    let restored_plain = note_storage::get_note(&conn, &plain.id)
-        .await
-        .unwrap()
-        .unwrap();
+    let restored_plain = get_note(&target, &plain.id).await.unwrap().unwrap();
     assert_eq!(restored_plain.title, plain.title);
     assert_eq!(restored_plain.content, plain.content);
     assert_eq!(restored_plain.created_at, plain.created_at);

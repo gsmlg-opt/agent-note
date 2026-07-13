@@ -1,6 +1,7 @@
 use crate::{
     enqueue_missing_chunk_embeddings, list_notes, parse_label_value_type, Context, ListNotesParams,
 };
+use note_core::NoteAttachment;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -24,6 +25,8 @@ pub struct ExportNote {
     pub id: String,
     pub title: String,
     pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<NoteAttachment>,
     pub created_at: i64,
     pub updated_at: i64,
     pub labels: Vec<(String, String)>,
@@ -55,6 +58,7 @@ pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
             id: note.id,
             title: note.title,
             content: note.content,
+            attachments: note.attachments,
             created_at: note.created_at,
             updated_at: note.updated_at,
             labels: note
@@ -80,51 +84,74 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
         .map(|label_key| label_key.key)
         .collect();
     let mut stats = ImportStats::default();
+    let mut prepared_attachments = Vec::new();
 
-    let tx = conn.transaction().await?;
-    for label_key in data.label_keys {
-        if known_keys.insert(label_key.key.clone()) {
-            let value_type = parse_label_value_type(&label_key.value_type)?;
-            note_storage::insert_label_key_with_type(
-                &tx,
-                &label_key.key,
-                &label_key.description,
-                value_type,
-            )
-            .await?;
-            stats.label_keys_added += 1;
-        }
-    }
-
-    for note in data.notes {
-        if note_storage::get_note(&tx, &note.id).await?.is_some() {
-            stats.notes_skipped += 1;
-            continue;
-        }
-
-        for (key, _) in &note.labels {
-            if !key.is_empty() && known_keys.insert(key.clone()) {
-                note_storage::insert_label_key(&tx, key, "").await?;
+    let tx_result = async {
+        let tx = conn.transaction().await?;
+        for label_key in data.label_keys {
+            if known_keys.insert(label_key.key.clone()) {
+                let value_type = parse_label_value_type(&label_key.value_type)?;
+                note_storage::insert_label_key_with_type(
+                    &tx,
+                    &label_key.key,
+                    &label_key.description,
+                    value_type,
+                )
+                .await?;
                 stats.label_keys_added += 1;
             }
         }
 
-        note_storage::insert_note(
-            &tx,
-            &note.id,
-            &note.title,
-            &note.content,
-            note.created_at,
-            note.updated_at,
-            1,
-        )
-        .await?;
-        for (key, value) in &note.labels {
-            note_storage::attach_label(&tx, &note.id, key, value).await?;
+        for note in data.notes {
+            if note_storage::get_note(&tx, &note.id).await?.is_some() {
+                stats.notes_skipped += 1;
+                continue;
+            }
+
+            for (key, _) in &note.labels {
+                if !key.is_empty() && known_keys.insert(key.clone()) {
+                    note_storage::insert_label_key(&tx, key, "").await?;
+                    stats.label_keys_added += 1;
+                }
+            }
+
+            let prepared = crate::attachment_files::prepare_note_attachments(
+                ctx,
+                &note.id,
+                &note.attachments,
+            )?;
+            note_storage::insert_note_with_attachments(
+                &tx,
+                &note.id,
+                &note.title,
+                &note.content,
+                prepared.metadata(),
+                note.created_at,
+                note.updated_at,
+                1,
+            )
+            .await?;
+            for (key, value) in &note.labels {
+                note_storage::attach_label(&tx, &note.id, key, value).await?;
+            }
+            prepared_attachments.push(prepared);
+            stats.notes_added += 1;
         }
-        stats.notes_added += 1;
+        tx.commit().await?;
+        anyhow::Ok(())
     }
-    tx.commit().await?;
+    .await;
+
+    if let Err(error) = tx_result {
+        for prepared in &prepared_attachments {
+            crate::attachment_files::cleanup_prepared_note_attachments(prepared);
+        }
+        return Err(error);
+    }
+
+    for prepared in prepared_attachments {
+        crate::attachment_files::commit_note_attachments(prepared)?;
+    }
 
     stats.embedding_jobs_queued = enqueue_missing_chunk_embeddings(ctx).await?;
     Ok(stats)
