@@ -51,6 +51,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "code-engine"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dff6f217bc53aa278586de142e5da550652db9f53042c6c3588815dbff08532"
+dependencies = [
+ "web-sys",
+ "yew",
+]
+
+[[package]]
 name = "console_error_panic_hook"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -507,6 +517,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "gloo-net 0.7.0",
+ "pulldown-cmark",
+ "pulldown-cmark-to-cmark",
  "serde",
  "serde_json",
  "urlencoding",
@@ -656,6 +668,15 @@ name = "pulldown-cmark-escape"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
+
+[[package]]
+name = "pulldown-cmark-to-cmark"
+version = "22.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50793def1b900256624a709439404384204a5dc3a6ec580281bfaac35e882e90"
+dependencies = [
+ "pulldown-cmark",
+]
 
 [[package]]
 name = "quote"
@@ -1080,10 +1101,11 @@ dependencies = [
 
 [[package]]
 name = "yew-duskmoon"
-version = "0.6.1"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a49a5b2102d38e2a99ed84e8d5accc7daa41a9af816613c824ad9f29f5a2499f"
+checksum = "e18ee000da1cf6037f27e6b1465fd10d8885493def2e178df483e6271d556357"
 dependencies = [
+ "code-engine",
  "log",
  "pulldown-cmark",
  "serde",

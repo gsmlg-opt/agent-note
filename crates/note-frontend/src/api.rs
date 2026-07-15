@@ -313,27 +313,6 @@ pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
     })
 }
 
-pub async fn render_markdown(
-    content: &str,
-    attachment_base: Option<&str>,
-) -> Result<String, String> {
-    let mut body = serde_json::json!({ "content": content });
-    if let Some(attachment_base) = attachment_base {
-        body["attachment_base"] = serde_json::Value::String(attachment_base.to_string());
-    }
-    let resp = Request::post("/api/render")
-        .json(&body)
-        .map_err(|e| e.to_string())?
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    ok_or_body_error(resp)
-        .await?
-        .text()
-        .await
-        .map_err(|e| e.to_string())
-}
-
 pub async fn update_note(
     id: &str,
     title: &str,
