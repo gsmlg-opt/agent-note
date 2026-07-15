@@ -14,6 +14,18 @@ pub struct ModalProps {
 /// the panel's controls. Render it conditionally (mount when open).
 #[function_component(Modal)]
 pub fn modal(props: &ModalProps) -> Html {
+    let panel_ref = use_node_ref();
+
+    {
+        let panel_ref = panel_ref.clone();
+        use_effect_with((), move |_| {
+            if let Some(panel) = panel_ref.cast::<web_sys::HtmlElement>() {
+                let _ = panel.focus();
+            }
+            || ()
+        });
+    }
+
     let on_backdrop = {
         let on_close = props.on_close.clone();
         Callback::from(move |e: MouseEvent| {
@@ -24,11 +36,28 @@ pub fn modal(props: &ModalProps) -> Html {
             }
         })
     };
+    let on_keydown = {
+        let on_close = props.on_close.clone();
+        Callback::from(move |event: KeyboardEvent| {
+            if event.key() == "Escape" {
+                event.prevent_default();
+                on_close.emit(());
+            }
+        })
+    };
 
     html! {
         <div class="app-modal-backdrop" onclick={on_backdrop}>
-            <div class="app-modal-panel">
-                <h2 class="app-modal-title">{ props.title.clone() }</h2>
+            <div
+                ref={panel_ref}
+                class="app-modal-panel"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="app-modal-title"
+                tabindex="-1"
+                onkeydown={on_keydown}
+            >
+                <h2 id="app-modal-title" class="app-modal-title">{ props.title.clone() }</h2>
                 <div class="app-modal-body">
                     { for props.children.iter() }
                 </div>

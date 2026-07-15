@@ -704,65 +704,67 @@ fn note_table(
         };
     }
     html! {
-        <table class="table note-table">
-            <thead>
-                <tr>
-                    <th class="col-title">{ "Title" }</th>
-                    <th>{ "Labels" }</th>
-                    <th class="col-time">{ "Created" }</th>
-                    <th class="col-time">{ "Updated" }</th>
-                    <th class="col-actions">{ "Actions" }</th>
-                </tr>
-            </thead>
-            <tbody>
-                { for notes.iter().map(|note| {
-                    let id = note.id.clone();
-                    let on_remove = {
-                        let delete_target = delete_target.clone();
+        <div class="table-scroll">
+            <table class="table note-table">
+                <thead>
+                    <tr>
+                        <th class="col-title">{ "Title" }</th>
+                        <th>{ "Labels" }</th>
+                        <th class="col-time">{ "Created" }</th>
+                        <th class="col-time">{ "Updated" }</th>
+                        <th class="col-actions">{ "Actions" }</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    { for notes.iter().map(|note| {
                         let id = note.id.clone();
-                        let title = note.title.clone();
-                        Callback::from(move |_| delete_target.set(Some((id.clone(), title.clone()))))
-                    };
-                    html! {
-                        <tr key={note.id.clone()}>
-                            <td class="col-title">
-                                <Link<Route>
-                                    to={Route::NoteShow { id: id.clone() }}
-                                    classes={classes!("note-title-link")}
-                                >
-                                    { note.title.clone() }
-                                </Link<Route>>
-                            </td>
-                            <td>
-                                <div class="applied-labels">
-                                    { for note.labels.iter().map(|(k, v)| html! {
-                                        { label_chip(k, v) }
-                                    }) }
-                                </div>
-                            </td>
-                            <td class="col-time">{ format_timestamp(note.created_at) }</td>
-                            <td class="col-time">{ format_timestamp(note.updated_at) }</td>
-                            <td class="col-actions">
-                                <div class="row-actions">
-                                    <Link<Route> to={Route::NoteShow { id: id.clone() }}
-                                        classes={classes!("btn","btn-ghost","btn-icon")}>
-                                        { icons::eye() }<span class="sr-only">{ "View" }</span>
+                        let on_remove = {
+                            let delete_target = delete_target.clone();
+                            let id = note.id.clone();
+                            let title = note.title.clone();
+                            Callback::from(move |_| delete_target.set(Some((id.clone(), title.clone()))))
+                        };
+                        html! {
+                            <tr key={note.id.clone()}>
+                                <td class="col-title">
+                                    <Link<Route>
+                                        to={Route::NoteShow { id: id.clone() }}
+                                        classes={classes!("note-title-link")}
+                                    >
+                                        { note.title.clone() }
                                     </Link<Route>>
-                                    <Link<Route> to={Route::NoteEdit { id: id.clone() }}
-                                        classes={classes!("btn","btn-ghost","btn-icon")}>
-                                        { icons::pencil() }<span class="sr-only">{ "Edit" }</span>
-                                    </Link<Route>>
-                                    <button type="button" class="btn btn-ghost btn-icon icon-danger"
-                                        onclick={on_remove}>
-                                        { icons::trash() }<span class="sr-only">{ "Remove" }</span>
-                                    </button>
-                                </div>
-                            </td>
-                        </tr>
-                    }
-                }) }
-            </tbody>
-        </table>
+                                </td>
+                                <td>
+                                    <div class="applied-labels">
+                                        { for note.labels.iter().map(|(k, v)| html! {
+                                            { label_chip(k, v) }
+                                        }) }
+                                    </div>
+                                </td>
+                                <td class="col-time">{ format_timestamp(note.created_at) }</td>
+                                <td class="col-time">{ format_timestamp(note.updated_at) }</td>
+                                <td class="col-actions">
+                                    <div class="row-actions">
+                                        <Link<Route> to={Route::NoteShow { id: id.clone() }}
+                                            classes={classes!("btn","btn-ghost","btn-icon")}>
+                                            { icons::eye() }<span class="sr-only">{ "View" }</span>
+                                        </Link<Route>>
+                                        <Link<Route> to={Route::NoteEdit { id: id.clone() }}
+                                            classes={classes!("btn","btn-ghost","btn-icon")}>
+                                            { icons::pencil() }<span class="sr-only">{ "Edit" }</span>
+                                        </Link<Route>>
+                                        <button type="button" class="btn btn-ghost btn-icon icon-danger"
+                                            onclick={on_remove}>
+                                            { icons::trash() }<span class="sr-only">{ "Remove" }</span>
+                                        </button>
+                                    </div>
+                                </td>
+                            </tr>
+                        }
+                    }) }
+                </tbody>
+            </table>
+        </div>
     }
 }
 
