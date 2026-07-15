@@ -1,7 +1,7 @@
 use crate::context::Context;
 use note_core::{
-    validate_label_value, validate_note_input, Label, LabelValueType, Note, NoteAttachment,
-    NoteInput, ValidationError,
+    resolve_duplicate_rule, validate_label_value, validate_note_input, DuplicateNoteError, Label,
+    LabelValueType, Note, NoteAttachment, NoteInput, ValidationError,
 };
 use std::collections::HashMap;
 
@@ -80,9 +80,49 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     // The note row, labels, chunk hashes, and embedding jobs are committed atomically. Actual
     // embedding is deliberately out-of-process: save returns once the durable queue request exists.
     let tx_result = async {
-        let tx = conn.transaction().await?;
+        let tx = conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        let config = note_storage::get_system_config(&tx).await?;
+        if config.duplicate_check.enabled {
+            for rule in &config.duplicate_check.rules {
+                let Some(labels) = resolve_duplicate_rule(rule, &input.labels) else {
+                    continue;
+                };
+                if let Some(existing_note_id) =
+                    note_storage::find_note_with_labels(&tx, &labels).await?
+                {
+                    return Err(anyhow::Error::new(DuplicateNoteError {
+                        existing_note_id,
+                        labels,
+                    }));
+                }
+            }
+        }
         for key in &missing_keys {
-            note_storage::insert_label_key(&tx, key, "").await?;
+            note_storage::insert_label_key_if_missing(&tx, key, "").await?;
+        }
+        // A missing key may have been created with a non-text type before this immediate
+        // transaction acquired the write lock. Validate against the catalog state protected by
+        // this transaction before persisting any label values.
+        let current_label_types: HashMap<String, LabelValueType> =
+            note_storage::list_label_keys(&tx)
+                .await?
+                .into_iter()
+                .map(|label_key| (label_key.key, label_key.value_type))
+                .collect();
+        for (key, value) in &input.labels {
+            let value_type = current_label_types
+                .get(key)
+                .copied()
+                .unwrap_or(LabelValueType::Text);
+            if !validate_label_value(value_type, value) {
+                return Err(anyhow::Error::new(ValidationError::InvalidLabelValue {
+                    key: key.clone(),
+                    value: value.clone(),
+                    value_type,
+                }));
+            }
         }
         note_storage::insert_note_with_attachments(
             &tx,

@@ -1,4 +1,5 @@
 use libsql::{Builder, Connection, Database};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("../schema.sql");
@@ -6,6 +7,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Storage {
     db: Database,
+    path: PathBuf,
 }
 
 impl Storage {
@@ -14,7 +16,10 @@ impl Storage {
         let conn = db.connect()?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         Self::apply_schema(&conn).await?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            path: absolute_path(path),
+        })
     }
 
     // schema.sql must stay free of embedded semicolons (no comments, no string/default literals
@@ -85,5 +90,36 @@ impl Storage {
         let conn = self.db.connect()?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         Ok(conn)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub async fn size_bytes(&self) -> anyhow::Result<u64> {
+        let conn = self.connect()?;
+        let page_count = pragma_i64(&conn, "PRAGMA page_count").await?;
+        let page_size = pragma_i64(&conn, "PRAGMA page_size").await?;
+        Ok(page_count.max(0) as u64 * page_size.max(0) as u64)
+    }
+}
+
+async fn pragma_i64(conn: &Connection, pragma: &str) -> anyhow::Result<i64> {
+    let mut rows = conn.query(pragma, ()).await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("{pragma} returned no value"))?;
+    Ok(row.get::<i64>(0)?)
+}
+
+fn absolute_path(path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     }
 }

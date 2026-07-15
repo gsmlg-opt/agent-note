@@ -227,7 +227,9 @@ async fn save_note_handler(
         // Validation failures are the caller's fault (400); anything else (DB txn, insert,
         // enqueue) is an infra failure (500). save_note preserves the typed ValidationError
         // in the anyhow chain, so we downcast to tell them apart.
-        let status = if e.downcast_ref::<note_core::ValidationError>().is_some() {
+        let status = if e.downcast_ref::<note_core::DuplicateNoteError>().is_some() {
+            axum::http::StatusCode::CONFLICT
+        } else if e.downcast_ref::<note_core::ValidationError>().is_some() {
             axum::http::StatusCode::BAD_REQUEST
         } else {
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -562,6 +564,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn duplicate_labels_return_conflict() {
+        let (app, ctx, _dir) = test_app().await;
+        note_pipelines::update_system_config(
+            &ctx,
+            &note_core::SystemConfig {
+                duplicate_check: note_core::DuplicateCheckConfig {
+                    enabled: true,
+                    rules: vec![note_core::DuplicateCheckRule {
+                        terms: vec![
+                            note_core::DuplicateCheckTerm {
+                                key: "skill-name".to_string(),
+                                value: None,
+                            },
+                            note_core::DuplicateCheckTerm {
+                                key: "version".to_string(),
+                                value: None,
+                            },
+                        ],
+                    }],
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let body = r#"{"title":"T","content":"C","labels":[["skill-name","zddi-hooks"],["version","1.0.0"]]}"#;
+        let first = app.clone().oneshot(post("/api/notes", body)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let duplicate = app.oneshot(post("/api/notes", body)).await.unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+        let bytes = duplicate.into_body().collect().await.unwrap().to_bytes();
+        let message = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(message.contains("skill-name=zddi-hooks + version=1.0.0"));
     }
 
     // An unknown label key is auto-created on save (docs/design.md §6), so this succeeds (200)

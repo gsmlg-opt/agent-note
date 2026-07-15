@@ -68,3 +68,8 @@ CREATE TABLE IF NOT EXISTS note_chunk_sparse (
     PRIMARY KEY (note_id, chunk_idx, token_id)
 );
 CREATE INDEX IF NOT EXISTS idx_note_chunk_sparse_token ON note_chunk_sparse(token_id);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);

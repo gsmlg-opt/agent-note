@@ -1,4 +1,6 @@
-use note_storage::{attach_label, insert_label_key, insert_note, labels_for_note, Storage};
+use note_storage::{
+    attach_label, find_note_with_labels, insert_label_key, insert_note, labels_for_note, Storage,
+};
 
 #[tokio::test]
 async fn attach_and_fetch_labels_for_a_note() {
@@ -39,4 +41,44 @@ async fn attaching_unknown_key_fails() {
         .unwrap();
     let result = attach_label(&conn, "note-1", "does-not-exist", "value").await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn finds_a_note_matching_all_requested_labels_in_any_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let conn = storage.connect().unwrap();
+    insert_note(&conn, "note-1", "Title", "Content", 1000, 1000, 1)
+        .await
+        .unwrap();
+    for key in ["skill-name", "version", "channel"] {
+        insert_label_key(&conn, key, "").await.unwrap();
+    }
+    attach_label(&conn, "note-1", "skill-name", "zddi-hooks")
+        .await
+        .unwrap();
+    attach_label(&conn, "note-1", "version", "1.0.0")
+        .await
+        .unwrap();
+    attach_label(&conn, "note-1", "channel", "stable")
+        .await
+        .unwrap();
+
+    let matched = find_note_with_labels(
+        &conn,
+        &[
+            ("version".to_string(), "1.0.0".to_string()),
+            ("skill-name".to_string(), "zddi-hooks".to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(matched.as_deref(), Some("note-1"));
+
+    let different = find_note_with_labels(&conn, &[("version".to_string(), "2.0.0".to_string())])
+        .await
+        .unwrap();
+    assert_eq!(different, None);
 }

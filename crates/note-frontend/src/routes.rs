@@ -1,7 +1,9 @@
 use yew::prelude::*;
 use yew_router::prelude::*;
 
-use crate::pages::{DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage};
+use crate::pages::{
+    DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage, SystemPage,
+};
 
 #[derive(Clone, Routable, PartialEq)]
 pub enum Route {
@@ -17,6 +19,8 @@ pub enum Route {
     NoteEdit { id: String },
     #[at("/labels")]
     Labels,
+    #[at("/system")]
+    System,
     #[not_found]
     #[at("/404")]
     NotFound,
@@ -30,6 +34,7 @@ pub fn switch(route: Route) -> Html {
         Route::NoteShow { id } => html! { <NoteShowPage {id} /> },
         Route::NoteEdit { id } => html! { <NoteEditPage {id} /> },
         Route::Labels => html! { <LabelsPage /> },
+        Route::System => html! { <SystemPage /> },
         Route::NotFound => html! { <p class="empty">{ "Page not found." }</p> },
     }
 }

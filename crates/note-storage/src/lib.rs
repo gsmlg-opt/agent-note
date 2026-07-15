@@ -15,3 +15,6 @@ pub use embedding_jobs::*;
 
 pub mod retrieval;
 pub use retrieval::*;
+
+pub mod settings;
+pub use settings::*;

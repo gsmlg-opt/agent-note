@@ -1,6 +1,9 @@
+use note_core::{
+    DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SystemConfig,
+};
 use note_embedding::StubEmbedder;
 use note_mcp::{save_note_tool, semantic_search_tool, SaveNoteToolInput, SemanticSearchToolInput};
-use note_pipelines::{drain_embedding_jobs, Context};
+use note_pipelines::{drain_embedding_jobs, update_system_config, Context};
 use note_storage::Storage;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -35,6 +38,46 @@ async fn save_note_tool_returns_an_id() {
     .await
     .unwrap();
     assert!(!result.id.is_empty());
+}
+
+#[tokio::test]
+async fn save_note_tool_honors_duplicate_check_config() {
+    let (ctx, _dir) = test_context().await;
+    update_system_config(
+        &ctx,
+        &SystemConfig {
+            duplicate_check: DuplicateCheckConfig {
+                enabled: true,
+                rules: vec![DuplicateCheckRule {
+                    terms: vec![
+                        DuplicateCheckTerm {
+                            key: "skill-name".into(),
+                            value: None,
+                        },
+                        DuplicateCheckTerm {
+                            key: "version".into(),
+                            value: None,
+                        },
+                    ],
+                }],
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let input = || SaveNoteToolInput {
+        title: "Skill".into(),
+        content: "Content".into(),
+        attachments: vec![],
+        labels: vec![
+            ("skill-name".into(), "zddi-hooks".into()),
+            ("version".into(), "1.0.0".into()),
+        ],
+    };
+
+    save_note_tool(&ctx, input()).await.unwrap();
+    let error = save_note_tool(&ctx, input()).await.unwrap_err();
+    assert!(error.downcast_ref::<DuplicateNoteError>().is_some());
 }
 
 #[tokio::test]

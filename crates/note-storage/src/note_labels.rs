@@ -69,3 +69,44 @@ pub async fn label_note_counts(conn: &Connection) -> anyhow::Result<Vec<(String,
     }
     Ok(counts)
 }
+
+pub async fn find_note_with_labels(
+    conn: &Connection,
+    labels: &[(String, String)],
+) -> anyhow::Result<Option<String>> {
+    if labels.is_empty() {
+        return Ok(None);
+    }
+
+    let predicates = (0..labels.len())
+        .map(|index| {
+            let key_param = index * 2 + 1;
+            let value_param = key_param + 1;
+            format!("(lk.key = ?{key_param} AND nl.value = ?{value_param})")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let count_param = labels.len() * 2 + 1;
+    let sql = format!(
+        "SELECT nl.note_id
+         FROM note_labels nl
+         JOIN label_keys lk ON lk.id = nl.label_key_id
+         WHERE {predicates}
+         GROUP BY nl.note_id
+         HAVING COUNT(*) = ?{count_param}
+         LIMIT 1"
+    );
+    let mut params = Vec::<libsql::Value>::with_capacity(labels.len() * 2 + 1);
+    for (key, value) in labels {
+        params.push(key.clone().into());
+        params.push(value.clone().into());
+    }
+    params.push((labels.len() as i64).into());
+
+    let mut rows = conn.query(&sql, libsql::params_from_iter(params)).await?;
+    Ok(rows
+        .next()
+        .await?
+        .map(|row| row.get::<String>(0))
+        .transpose()?)
+}

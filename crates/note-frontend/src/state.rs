@@ -46,3 +46,36 @@ pub struct LabelFilter {
     pub operator: String,
     pub value: String,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemConfig {
+    #[serde(default)]
+    pub duplicate_check: DuplicateCheckConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateCheckConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub rules: Vec<DuplicateCheckRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateCheckRule {
+    pub terms: Vec<DuplicateCheckTerm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateCheckTerm {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SystemInfo {
+    pub database_path: String,
+    pub database_size_bytes: u64,
+    pub attachments_path: String,
+}

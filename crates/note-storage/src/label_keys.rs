@@ -10,6 +10,20 @@ pub async fn insert_label_key(
     insert_label_key_with_type(conn, key, description, LabelValueType::Text).await
 }
 
+pub async fn insert_label_key_if_missing(
+    conn: &Connection,
+    key: &str,
+    description: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO label_keys (key, description, value_type) VALUES (?1, ?2, 'text')
+         ON CONFLICT(key) DO NOTHING",
+        libsql::params![key, description],
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn insert_label_key_with_type(
     conn: &Connection,
     key: &str,

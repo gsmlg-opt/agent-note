@@ -2,11 +2,15 @@ use note_core::{LabelValueType, NoteAttachment};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
     define_label_key, define_label_key_with_type, drain_embedding_jobs, get_note, list_label_keys,
-    save_note, update_note, Context, SaveNoteInput,
+    save_note, update_note, update_system_config, Context, SaveNoteInput,
 };
 use note_storage::Storage;
 use std::sync::Arc;
 use tempfile::TempDir;
+
+use note_core::{
+    DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SystemConfig,
+};
 
 // Returns the TempDir guard alongside the Context so the caller keeps it alive:
 // dropping it deletes the DB directory and later connect() calls fail with SQLITE_CANTOPEN.
@@ -184,6 +188,279 @@ async fn empty_title_is_rejected() {
     )
     .await;
     assert!(result.is_err());
+}
+
+fn duplicate_config(terms: &[(&str, Option<&str>)]) -> SystemConfig {
+    SystemConfig {
+        duplicate_check: DuplicateCheckConfig {
+            enabled: true,
+            rules: vec![DuplicateCheckRule {
+                terms: terms
+                    .iter()
+                    .map(|(key, value)| DuplicateCheckTerm {
+                        key: (*key).to_string(),
+                        value: value.map(str::to_string),
+                    })
+                    .collect(),
+            }],
+        },
+    }
+}
+
+#[tokio::test]
+async fn duplicate_check_is_disabled_by_default() {
+    let (ctx, _dir) = test_context().await;
+    for title in ["First", "Second"] {
+        save_note(
+            &ctx,
+            SaveNoteInput {
+                title: title.into(),
+                content: "Content".into(),
+                attachments: vec![],
+                labels: vec![
+                    ("skill-name".into(), "zddi-hooks".into()),
+                    ("version".into(), "1.0.0".into()),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn duplicate_rule_rejects_create_with_the_same_composite_labels() {
+    let (ctx, dir) = test_context().await;
+    update_system_config(
+        &ctx,
+        &duplicate_config(&[("skill-name", None), ("version", None)]),
+    )
+    .await
+    .unwrap();
+    save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Existing".into(),
+            content: "Existing content".into(),
+            attachments: vec![],
+            labels: vec![
+                ("skill-name".into(), "zddi-hooks".into()),
+                ("version".into(), "1.0.0".into()),
+                ("channel".into(), "stable".into()),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Duplicate".into(),
+            content: "Duplicate content".into(),
+            attachments: vec![NoteAttachment {
+                id: "metadata".into(),
+                path: "./metadata.json".into(),
+                mime: "application/json".into(),
+                description: String::new(),
+                content: "{}".into(),
+            }],
+            labels: vec![
+                ("version".into(), "1.0.0".into()),
+                ("skill-name".into(), "zddi-hooks".into()),
+            ],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let duplicate = error.downcast_ref::<DuplicateNoteError>().unwrap();
+    assert_eq!(
+        duplicate.labels,
+        vec![
+            ("skill-name".to_string(), "zddi-hooks".to_string()),
+            ("version".to_string(), "1.0.0".to_string()),
+        ]
+    );
+    let conn = ctx.storage.connect().unwrap();
+    assert_eq!(total_rows(&conn, "notes").await, 1);
+    assert_eq!(total_rows(&conn, "embedding_jobs").await, 1);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("attachments"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn duplicate_rule_allows_missing_or_different_terms_and_scopes_fixed_values() {
+    let (ctx, _dir) = test_context().await;
+    update_system_config(
+        &ctx,
+        &duplicate_config(&[
+            ("kind", Some("skill")),
+            ("skill-name", None),
+            ("version", None),
+        ]),
+    )
+    .await
+    .unwrap();
+
+    for (title, labels) in [
+        (
+            "Existing",
+            vec![
+                ("kind".into(), "skill".into()),
+                ("skill-name".into(), "zddi-hooks".into()),
+                ("version".into(), "1.0.0".into()),
+            ],
+        ),
+        (
+            "Different version",
+            vec![
+                ("kind".into(), "skill".into()),
+                ("skill-name".into(), "zddi-hooks".into()),
+                ("version".into(), "2.0.0".into()),
+            ],
+        ),
+        (
+            "Different scope",
+            vec![
+                ("kind".into(), "note".into()),
+                ("skill-name".into(), "zddi-hooks".into()),
+                ("version".into(), "1.0.0".into()),
+            ],
+        ),
+        (
+            "Missing version",
+            vec![
+                ("kind".into(), "skill".into()),
+                ("skill-name".into(), "zddi-hooks".into()),
+            ],
+        ),
+    ] {
+        save_note(
+            &ctx,
+            SaveNoteInput {
+                title: title.into(),
+                content: "Content".into(),
+                attachments: vec![],
+                labels,
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_duplicate_creates_allow_only_one_note() {
+    let (ctx, _dir) = test_context().await;
+    update_system_config(
+        &ctx,
+        &duplicate_config(&[("skill-name", None), ("version", None)]),
+    )
+    .await
+    .unwrap();
+    let input = || SaveNoteInput {
+        title: "Concurrent".into(),
+        content: "Content".into(),
+        attachments: vec![],
+        labels: vec![
+            ("skill-name".into(), "zddi-hooks".into()),
+            ("version".into(), "1.0.0".into()),
+        ],
+    };
+
+    let (first, second) = tokio::join!(save_note(&ctx, input()), save_note(&ctx, input()));
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    let error = first.err().or_else(|| second.err()).unwrap();
+    assert!(error.downcast_ref::<DuplicateNoteError>().is_some());
+    assert_eq!(
+        total_rows(&ctx.storage.connect().unwrap(), "notes").await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_different_values_can_share_a_new_label_key() {
+    let (ctx, _dir) = test_context().await;
+    update_system_config(&ctx, &duplicate_config(&[("race-key", None)]))
+        .await
+        .unwrap();
+    let input = |value: &str| SaveNoteInput {
+        title: format!("Value {value}"),
+        content: "Content".into(),
+        attachments: vec![],
+        labels: vec![("race-key".into(), value.into())],
+    };
+
+    let (first, second) = tokio::join!(save_note(&ctx, input("a")), save_note(&ctx, input("b")));
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(
+        total_rows(&ctx.storage.connect().unwrap(), "notes").await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn duplicate_check_does_not_apply_to_updates() {
+    let (ctx, _dir) = test_context().await;
+    update_system_config(
+        &ctx,
+        &duplicate_config(&[("skill-name", None), ("version", None)]),
+    )
+    .await
+    .unwrap();
+    let first = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "First".into(),
+            content: "Content".into(),
+            attachments: vec![],
+            labels: vec![
+                ("skill-name".into(), "zddi-hooks".into()),
+                ("version".into(), "1.0.0".into()),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+    let second = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Second".into(),
+            content: "Content".into(),
+            attachments: vec![],
+            labels: vec![
+                ("skill-name".into(), "other".into()),
+                ("version".into(), "2.0.0".into()),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+
+    let updated = update_note(
+        &ctx,
+        &second.id,
+        SaveNoteInput {
+            title: "Second".into(),
+            content: "Content".into(),
+            attachments: vec![],
+            labels: vec![
+                ("skill-name".into(), "zddi-hooks".into()),
+                ("version".into(), "1.0.0".into()),
+            ],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(updated.id, second.id);
+    assert_ne!(first.id, second.id);
 }
 
 #[tokio::test]

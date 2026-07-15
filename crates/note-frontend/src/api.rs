@@ -1,4 +1,7 @@
-use crate::state::{LabelFilter, LabelKey, NoteAttachment, NoteSummary, SearchResultSummary};
+use crate::state::{
+    LabelFilter, LabelKey, NoteAttachment, NoteSummary, SearchResultSummary, SystemConfig,
+    SystemInfo,
+};
 use gloo_net::http::{Request, Response};
 use serde::Deserialize;
 
@@ -15,6 +18,42 @@ async fn ok_or_body_error(resp: Response) -> Result<Response, String> {
         let body = resp.text().await.unwrap_or_default();
         Err(format!("server error {status}: {body}"))
     }
+}
+
+// ---- System ----
+
+pub async fn get_system_config() -> Result<SystemConfig, String> {
+    let resp = Request::get("/api/system/config")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    ok_or_body_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+pub async fn update_system_config(config: &SystemConfig) -> Result<(), String> {
+    let resp = Request::put("/api/system/config")
+        .json(config)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    ok_or_body_error(resp).await.map(|_| ())
+}
+
+pub async fn get_system_info() -> Result<SystemInfo, String> {
+    let resp = Request::get("/api/system/info")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    ok_or_body_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---- Notes ----
@@ -274,7 +313,10 @@ pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
     })
 }
 
-pub async fn render_markdown(content: &str, attachment_base: Option<&str>) -> Result<String, String> {
+pub async fn render_markdown(
+    content: &str,
+    attachment_base: Option<&str>,
+) -> Result<String, String> {
     let mut body = serde_json::json!({ "content": content });
     if let Some(attachment_base) = attachment_base {
         body["attachment_base"] = serde_json::Value::String(attachment_base.to_string());
@@ -285,7 +327,11 @@ pub async fn render_markdown(content: &str, attachment_base: Option<&str>) -> Re
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    ok_or_body_error(resp).await?.text().await.map_err(|e| e.to_string())
+    ok_or_body_error(resp)
+        .await?
+        .text()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 pub async fn update_note(

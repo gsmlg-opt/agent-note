@@ -1,6 +1,7 @@
 mod labels_api;
 mod notes_api;
 mod render;
+mod system_api;
 
 use axum::response::IntoResponse;
 use axum::Router;
@@ -246,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
         let rest = Router::new()
             .merge(notes_api::notes_router())
             .merge(labels_api::labels_router())
+            .merge(system_api::system_router())
             .with_state(ctx.clone());
         let mut app: Router = rest.merge(note_mcp::mcp_router(ctx));
 
