@@ -1,3 +1,5 @@
+use gloo_file::futures::read_as_text;
+use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 use yew::virtual_dom::AttrValue;
@@ -43,11 +45,12 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
     // The currently-selected label key and value being staged in the picker.
     let picker_key = use_state(String::new);
     let picker_value = use_state(String::new);
-    let attachment_id = use_state(String::new);
-    let attachment_path = use_state(|| "./".to_string());
+    let attachment_path = use_state(String::new);
     let attachment_mime = use_state(|| "text/plain".to_string());
     let attachment_description = use_state(String::new);
     let attachment_content = use_state(String::new);
+    let attachment_file_reading = use_state(|| false);
+    let attachment_file_error = use_state(|| None::<String>);
 
     let on_title_input = {
         let title = title.clone();
@@ -80,14 +83,6 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         })
     };
 
-    let on_attachment_id_input = {
-        let attachment_id = attachment_id.clone();
-        Callback::from(move |e: InputEvent| {
-            let input: HtmlInputElement = e.target_unchecked_into();
-            attachment_id.set(input.value());
-        })
-    };
-
     let on_attachment_path_input = {
         let attachment_path = attachment_path.clone();
         Callback::from(move |e: InputEvent| {
@@ -107,7 +102,7 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
     let on_attachment_description_input = {
         let attachment_description = attachment_description.clone();
         Callback::from(move |e: InputEvent| {
-            let input: HtmlInputElement = e.target_unchecked_into();
+            let input: HtmlTextAreaElement = e.target_unchecked_into();
             attachment_description.set(input.value());
         })
     };
@@ -117,6 +112,40 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         Callback::from(move |e: InputEvent| {
             let input: HtmlTextAreaElement = e.target_unchecked_into();
             attachment_content.set(input.value());
+        })
+    };
+
+    let on_attachment_file_change = {
+        let attachment_path = attachment_path.clone();
+        let attachment_mime = attachment_mime.clone();
+        let attachment_content = attachment_content.clone();
+        let attachment_file_reading = attachment_file_reading.clone();
+        let attachment_file_error = attachment_file_error.clone();
+        Callback::from(move |e: Event| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            let Some(file) = input.files().and_then(|files| files.get(0)) else {
+                return;
+            };
+            input.set_value("");
+
+            attachment_path.set(attachment_path_for_file(&file.name()));
+            attachment_mime.set(attachment_mime_for_file(&file.type_()));
+            attachment_file_error.set(None);
+            attachment_file_reading.set(true);
+
+            let file = gloo_file::Blob::from(file);
+            let attachment_content = attachment_content.clone();
+            let attachment_file_reading = attachment_file_reading.clone();
+            let attachment_file_error = attachment_file_error.clone();
+            spawn_local(async move {
+                match read_as_text(&file).await {
+                    Ok(file_content) => attachment_content.set(file_content),
+                    Err(error) => {
+                        attachment_file_error.set(Some(format!("Unable to read file: {error}")))
+                    }
+                }
+                attachment_file_reading.set(false);
+            });
         })
     };
 
@@ -139,19 +168,19 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
 
     let on_add_attachment = {
         let attachments = attachments.clone();
-        let attachment_id = attachment_id.clone();
         let attachment_path = attachment_path.clone();
         let attachment_mime = attachment_mime.clone();
         let attachment_description = attachment_description.clone();
         let attachment_content = attachment_content.clone();
+        let attachment_file_error = attachment_file_error.clone();
         Callback::from(move |_| {
-            let id = attachment_id.trim().to_string();
             let path = attachment_path.trim().to_string();
             let mime = attachment_mime.trim().to_string();
-            if id.is_empty() || path.is_empty() || mime.is_empty() {
+            if path.is_empty() || path == "." || path == "./" || mime.is_empty() {
                 return;
             }
             let mut next = (*attachments).clone();
+            let id = next_attachment_id(&next);
             next.push(NoteAttachment {
                 id,
                 path,
@@ -160,11 +189,11 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                 content: attachment_content.to_string(),
             });
             attachments.set(next);
-            attachment_id.set(String::new());
-            attachment_path.set("./".to_string());
+            attachment_path.set(String::new());
             attachment_mime.set("text/plain".to_string());
             attachment_description.set(String::new());
             attachment_content.set(String::new());
+            attachment_file_error.set(None);
         })
     };
 
@@ -174,12 +203,13 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         let content = content.clone();
         let labels = labels.clone();
         let attachments = attachments.clone();
+        let attachment_file_reading = attachment_file_reading.clone();
         let submit_debounce = submit_debounce.clone();
         let submit_locked = submit_locked.clone();
         let submitting = props.submitting;
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
-            if submitting || *submit_locked.borrow() {
+            if submitting || *attachment_file_reading || *submit_locked.borrow() {
                 return;
             }
             *submit_locked.borrow_mut() = true;
@@ -206,7 +236,12 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         });
     }
 
-    let submit_disabled = props.submitting || *submit_debounce;
+    let submit_disabled = props.submitting || *submit_debounce || *attachment_file_reading;
+    let attachment_add_disabled = *attachment_file_reading
+        || attachment_path.trim().is_empty()
+        || attachment_path.trim() == "."
+        || attachment_path.trim() == "./"
+        || attachment_mime.trim().is_empty();
 
     // Description for the currently-selected key, shown as hint text.
     let selected_hint = props
@@ -237,8 +272,10 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                         loading={submit_disabled}
                     >
                         <span>{
-                            if submit_disabled {
+                            if props.submitting || *submit_debounce {
                                 "Saving...".to_string()
+                            } else if *attachment_file_reading {
+                                "Reading file...".to_string()
                             } else {
                                 props.submit_label.clone()
                             }
@@ -300,53 +337,99 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                     </div>
                 </fieldset>
 
+                <div class="field">
+                    <span>{ "Content" }</span>
+                    <MarkdownInput
+                        class="note-content-input"
+                        variant={Some("primary".to_string())}
+                        value={Some(AttrValue::from((*content).clone()))}
+                        placeholder="Write markdown..."
+                        on_change={on_content_change}
+                    />
+                </div>
+
                 <fieldset class="attachment-picker">
                     <legend>{ "Attachments" }</legend>
                     <div class="attachment-picker-grid">
-                        <input
-                            class="input"
-                            type="text"
-                            placeholder="id"
-                            value={(*attachment_id).clone()}
-                            oninput={on_attachment_id_input}
-                        />
-                        <input
-                            class="input"
-                            type="text"
-                            placeholder="./meta.json"
-                            value={(*attachment_path).clone()}
-                            oninput={on_attachment_path_input}
-                        />
-                        <input
-                            class="input"
-                            type="text"
-                            placeholder="application/json"
-                            value={(*attachment_mime).clone()}
-                            oninput={on_attachment_mime_input}
-                        />
-                        <input
-                            class="input attachment-description-input"
-                            type="text"
-                            placeholder="description"
-                            value={(*attachment_description).clone()}
-                            oninput={on_attachment_description_input}
-                        />
-                        <textarea
-                            class="input attachment-content-input"
-                            placeholder="attachment content"
-                            value={(*attachment_content).clone()}
-                            oninput={on_attachment_content_input}
-                        />
-                        <button type="button" class="btn btn-outline" onclick={on_add_attachment}>
-                            { "Add attachment" }
+                        <label class="field attachment-path-field">
+                            <span>{ "Path" }</span>
+                            <input
+                                class="input"
+                                type="text"
+                                placeholder="./meta.json"
+                                value={(*attachment_path).clone()}
+                                disabled={*attachment_file_reading}
+                                oninput={on_attachment_path_input}
+                            />
+                        </label>
+                        <label class="field attachment-mime-field">
+                            <span>{ "MIME type" }</span>
+                            <input
+                                class="input"
+                                type="text"
+                                placeholder="application/json"
+                                value={(*attachment_mime).clone()}
+                                disabled={*attachment_file_reading}
+                                oninput={on_attachment_mime_input}
+                            />
+                        </label>
+                        <label class="field attachment-description-field">
+                            <span>{ "Description" }</span>
+                            <textarea
+                                class="input attachment-description-input"
+                                placeholder="Description"
+                                value={(*attachment_description).clone()}
+                                disabled={*attachment_file_reading}
+                                oninput={on_attachment_description_input}
+                            />
+                        </label>
+                        <label class="field attachment-file-field">
+                            <span>{ "File" }</span>
+                            <input
+                                class="input attachment-file-input"
+                                type="file"
+                                accept="text/*,.json,.md,.csv,.xml,.yaml,.yml,.svg"
+                                disabled={*attachment_file_reading}
+                                onchange={on_attachment_file_change}
+                            />
+                        </label>
+                        <label class="field attachment-content-field">
+                            <span>{ "Content" }</span>
+                            <textarea
+                                class="input attachment-content-input"
+                                placeholder="Attachment content"
+                                value={(*attachment_content).clone()}
+                                disabled={*attachment_file_reading}
+                                oninput={on_attachment_content_input}
+                            />
+                        </label>
+                        <button
+                            type="button"
+                            class="btn btn-outline attachment-add-button"
+                            disabled={attachment_add_disabled}
+                            onclick={on_add_attachment}
+                        >
+                            { if *attachment_file_reading { "Reading..." } else { "Add attachment" } }
                         </button>
                     </div>
+                    if let Some(error) = (*attachment_file_error).as_ref() {
+                        <p class="attachment-file-error" role="alert">{ error.clone() }</p>
+                    }
                     <div class="attachment-list">
                         { for attachments.iter().enumerate().map(|(idx, attachment)| {
-                            let on_id_input = attachment_input_callback(&attachments, idx, AttachmentField::Id);
                             let on_path_input = attachment_input_callback(&attachments, idx, AttachmentField::Path);
                             let on_mime_input = attachment_input_callback(&attachments, idx, AttachmentField::Mime);
-                            let on_description_input = attachment_input_callback(&attachments, idx, AttachmentField::Description);
+                            let on_description_input = {
+                                let attachments = attachments.clone();
+                                Callback::from(move |e: InputEvent| {
+                                    let input: HtmlTextAreaElement = e.target_unchecked_into();
+                                    let mut next = (*attachments).clone();
+                                    if let Some(attachment) = next.get_mut(idx) {
+                                        attachment.description = input.value();
+                                    }
+                                    attachments.set(next);
+                                })
+                            };
                             let on_content_input = {
                                 let attachments = attachments.clone();
                                 Callback::from(move |e: InputEvent| {
@@ -358,6 +441,12 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                                     attachments.set(next);
                                 })
                             };
+                            let on_file_change = attachment_file_callback(
+                                &attachments,
+                                attachment.id.clone(),
+                                &attachment_file_reading,
+                                &attachment_file_error,
+                            );
                             let on_remove = {
                                 let attachments = attachments.clone();
                                 Callback::from(move |_| {
@@ -371,33 +460,46 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                             html! {
                                 <div class="attachment-item" key={attachment.id.clone()}>
                                     <div class="attachment-item-grid">
-                                        <input class="input" type="text" value={attachment.id.clone()} oninput={on_id_input} />
-                                        <input class="input" type="text" value={attachment.path.clone()} oninput={on_path_input} />
-                                        <input class="input" type="text" value={attachment.mime.clone()} oninput={on_mime_input} />
-                                        <input class="input" type="text" value={attachment.description.clone()} oninput={on_description_input} />
-                                        <button type="button" class="btn btn-outline" onclick={on_remove}>{ "Remove" }</button>
+                                        <label class="field attachment-path-field">
+                                            <span>{ "Path" }</span>
+                                            <input class="input" type="text" value={attachment.path.clone()} disabled={*attachment_file_reading} oninput={on_path_input} />
+                                        </label>
+                                        <label class="field attachment-mime-field">
+                                            <span>{ "MIME type" }</span>
+                                            <input class="input" type="text" value={attachment.mime.clone()} disabled={*attachment_file_reading} oninput={on_mime_input} />
+                                        </label>
+                                        <label class="field attachment-description-field">
+                                            <span>{ "Description" }</span>
+                                            <textarea class="input attachment-description-input" value={attachment.description.clone()} disabled={*attachment_file_reading} oninput={on_description_input} />
+                                        </label>
+                                        <label class="field attachment-file-field">
+                                            <span>{ "File" }</span>
+                                            <input
+                                                class="input attachment-file-input"
+                                                type="file"
+                                                accept="text/*,.json,.md,.csv,.xml,.yaml,.yml,.svg"
+                                                disabled={*attachment_file_reading}
+                                                onchange={on_file_change}
+                                            />
+                                        </label>
+                                        <label class="field attachment-content-field">
+                                            <span>{ "Content" }</span>
+                                            <textarea
+                                                class="input attachment-content-input"
+                                                value={attachment.content.clone()}
+                                                disabled={*attachment_file_reading}
+                                                oninput={on_content_input}
+                                            />
+                                        </label>
+                                        <button type="button" class="btn btn-outline attachment-remove-button" disabled={*attachment_file_reading} onclick={on_remove}>
+                                            { "Remove" }
+                                        </button>
                                     </div>
-                                    <textarea
-                                        class="input attachment-content-input"
-                                        value={attachment.content.clone()}
-                                        oninput={on_content_input}
-                                    />
                                 </div>
                             }
                         }) }
                     </div>
                 </fieldset>
-
-                <div class="field">
-                    <span>{ "Content" }</span>
-                    <MarkdownInput
-                        class="note-content-input"
-                        variant={Some("primary".to_string())}
-                        value={Some(AttrValue::from((*content).clone()))}
-                        placeholder="Write markdown..."
-                        on_change={on_content_change}
-                    />
-                </div>
             </form>
         </Card>
     }
@@ -405,10 +507,8 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
 
 #[derive(Clone, Copy)]
 enum AttachmentField {
-    Id,
     Path,
     Mime,
-    Description,
 }
 
 fn attachment_input_callback(
@@ -422,14 +522,87 @@ fn attachment_input_callback(
         let mut next = (*attachments).clone();
         if let Some(attachment) = next.get_mut(idx) {
             match field {
-                AttachmentField::Id => attachment.id = input.value(),
                 AttachmentField::Path => attachment.path = input.value(),
                 AttachmentField::Mime => attachment.mime = input.value(),
-                AttachmentField::Description => attachment.description = input.value(),
             }
         }
         attachments.set(next);
     })
+}
+
+fn attachment_file_callback(
+    attachments: &UseStateHandle<Vec<NoteAttachment>>,
+    attachment_id: String,
+    attachment_file_reading: &UseStateHandle<bool>,
+    attachment_file_error: &UseStateHandle<Option<String>>,
+) -> Callback<Event> {
+    let attachments = attachments.clone();
+    let attachment_file_reading = attachment_file_reading.clone();
+    let attachment_file_error = attachment_file_error.clone();
+    Callback::from(move |e: Event| {
+        let input: HtmlInputElement = e.target_unchecked_into();
+        let Some(file) = input.files().and_then(|files| files.get(0)) else {
+            return;
+        };
+        input.set_value("");
+
+        attachment_file_error.set(None);
+        attachment_file_reading.set(true);
+        let path = attachment_path_for_file(&file.name());
+        let mime = attachment_mime_for_file(&file.type_());
+        let file = gloo_file::Blob::from(file);
+        let attachments = attachments.clone();
+        let attachment_id = attachment_id.clone();
+        let attachment_file_reading = attachment_file_reading.clone();
+        let attachment_file_error = attachment_file_error.clone();
+        spawn_local(async move {
+            match read_as_text(&file).await {
+                Ok(file_content) => {
+                    let mut next = (*attachments).clone();
+                    if let Some(attachment) = next
+                        .iter_mut()
+                        .find(|attachment| attachment.id == attachment_id)
+                    {
+                        attachment.path = path;
+                        attachment.mime = mime;
+                        attachment.content = file_content;
+                    }
+                    attachments.set(next);
+                }
+                Err(error) => {
+                    attachment_file_error.set(Some(format!("Unable to read file: {error}")))
+                }
+            }
+            attachment_file_reading.set(false);
+        });
+    })
+}
+
+fn next_attachment_id(attachments: &[NoteAttachment]) -> String {
+    let mut sequence = 1;
+    loop {
+        let candidate = format!("attachment-{sequence}");
+        if attachments
+            .iter()
+            .all(|attachment| attachment.id != candidate)
+        {
+            return candidate;
+        }
+        sequence += 1;
+    }
+}
+
+fn attachment_path_for_file(file_name: &str) -> String {
+    let file_name = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
+    format!("./{file_name}")
+}
+
+fn attachment_mime_for_file(mime: &str) -> String {
+    if mime.trim().is_empty() {
+        "text/plain".to_string()
+    } else {
+        mime.to_string()
+    }
 }
 
 fn label_value_input_type(value_type: &str) -> &'static str {
@@ -439,5 +612,34 @@ fn label_value_input_type(value_type: &str) -> &'static str {
         "datetime" => "datetime-local",
         "time" => "time",
         _ => "text",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attachment(id: &str) -> NoteAttachment {
+        NoteAttachment {
+            id: id.to_string(),
+            path: "./file.txt".to_string(),
+            mime: "text/plain".to_string(),
+            description: String::new(),
+            content: String::new(),
+        }
+    }
+
+    #[test]
+    fn generates_the_next_available_attachment_id() {
+        let attachments = vec![attachment("attachment-1"), attachment("custom-id")];
+
+        assert_eq!(next_attachment_id(&attachments), "attachment-2");
+    }
+
+    #[test]
+    fn derives_safe_file_defaults() {
+        assert_eq!(attachment_path_for_file("folder\\notes.md"), "./notes.md");
+        assert_eq!(attachment_mime_for_file(""), "text/plain");
+        assert_eq!(attachment_mime_for_file("text/markdown"), "text/markdown");
     }
 }

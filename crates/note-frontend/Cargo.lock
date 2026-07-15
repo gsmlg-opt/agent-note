@@ -516,6 +516,7 @@ name = "note-frontend"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "gloo-file",
  "gloo-net 0.7.0",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",

@@ -1262,13 +1262,54 @@ body {
 .attachment-picker-grid,
 .attachment-item-grid {
     display: grid;
-    grid-template-columns: minmax(7rem, 0.8fr) minmax(10rem, 1.2fr) minmax(8rem, 1fr) minmax(10rem, 1.2fr) auto;
+    grid-template-columns: minmax(0, 1.4fr) minmax(12rem, 0.8fr) auto;
     gap: 0.5rem;
     align-items: start;
 }
 
-.attachment-picker-grid .attachment-content-input {
-    grid-column: 1 / -2;
+.attachment-picker-grid .field,
+.attachment-item-grid .field {
+    margin: 0;
+}
+
+.attachment-description-field,
+.attachment-file-field,
+.attachment-content-field {
+    grid-column: 1 / -1;
+}
+
+.attachment-description-input {
+    min-height: 4rem;
+    resize: vertical;
+}
+
+.attachment-file-input {
+    padding: 0.35rem 0.5rem;
+}
+
+.attachment-file-input::file-selector-button {
+    margin-right: 0.5rem;
+    padding: 0.35rem 0.65rem;
+    border: var(--border, 0.5px) solid var(--color-outline, #d7dbec);
+    border-radius: var(--radius-md, 6px);
+    color: var(--color-on-surface, #2f2e3f);
+    background: var(--color-surface, #ffffff);
+    font: inherit;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.attachment-file-input::file-selector-button:hover {
+    border-color: var(--color-primary, #0065ff);
+    color: var(--color-primary, #0065ff);
+    background: var(--color-surface-hover, #eef2f5);
+}
+
+.attachment-add-button,
+.attachment-remove-button {
+    grid-column: 3;
+    grid-row: 1;
+    align-self: end;
 }
 
 .attachment-list,
@@ -1297,8 +1338,14 @@ body {
 }
 
 .attachment-content-input {
-    min-height: 5rem;
+    min-height: 7rem;
     resize: vertical;
+}
+
+.attachment-file-error {
+    margin: 0.5rem 0 0;
+    color: var(--color-error, #ff4444);
+    font-size: 0.85rem;
 }
 
 .attachment-view-header {
@@ -1333,8 +1380,17 @@ body {
         grid-template-columns: 1fr;
     }
 
-    .attachment-picker-grid .attachment-content-input {
+    .attachment-description-field,
+    .attachment-file-field,
+    .attachment-content-field {
         grid-column: auto;
+    }
+
+    .attachment-add-button,
+    .attachment-remove-button {
+        grid-column: auto;
+        grid-row: auto;
+        justify-self: start;
     }
 }
 
