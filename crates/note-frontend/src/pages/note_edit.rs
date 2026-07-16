@@ -93,6 +93,7 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
                     initial_content={n.content.clone()}
                     initial_labels={n.labels.clone()}
                     initial_attachments={n.attachments.clone()}
+                    attachment_base={Some(format!("/api/notes/{}/attachments", n.id))}
                     card_title="Edit note"
                     submit_label="Save changes"
                     submitting={*submitting}

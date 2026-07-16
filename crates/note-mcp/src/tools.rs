@@ -13,14 +13,14 @@ pub struct LabelData {
     pub value_type: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AttachmentData {
     pub id: String,
     pub path: String,
     pub mime: String,
     #[serde(default)]
     pub description: String,
-    pub content: String,
+    pub content: Vec<u8>,
 }
 
 impl From<NoteAttachment> for AttachmentData {

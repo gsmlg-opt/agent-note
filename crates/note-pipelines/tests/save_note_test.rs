@@ -113,7 +113,7 @@ async fn save_persists_attachments() {
                 path: "./meta.json".into(),
                 mime: "application/json".into(),
                 description: "metadata".into(),
-                content: "{}".into(),
+                content: b"{}".to_vec(),
             }],
             labels: vec![],
         },
@@ -130,7 +130,7 @@ async fn save_persists_attachments() {
         .unwrap()
         .unwrap();
     assert_eq!(stored.attachments[0].description, "metadata");
-    assert_eq!(stored.attachments[0].content, "");
+    assert!(stored.attachments[0].content.is_empty());
 
     let attachment_path = _dir
         .path()
@@ -140,7 +140,43 @@ async fn save_persists_attachments() {
     assert_eq!(std::fs::read_to_string(attachment_path).unwrap(), "{}");
 
     let hydrated = get_note(&ctx, &note.id).await.unwrap().unwrap();
-    assert_eq!(hydrated.attachments[0].content, "{}");
+    assert_eq!(hydrated.attachments[0].content, b"{}");
+}
+
+#[tokio::test]
+async fn save_and_get_preserve_binary_attachment_bytes() {
+    let (ctx, dir) = test_context().await;
+    let bytes = vec![0, 159, 146, 150, 255];
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Binary attachment".into(),
+            content: "Contains arbitrary bytes".into(),
+            attachments: vec![NoteAttachment {
+                id: "blob".into(),
+                path: "blob.bin".into(),
+                mime: "application/octet-stream".into(),
+                description: String::new(),
+                content: bytes.clone(),
+            }],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(
+            dir.path()
+                .join("attachments")
+                .join(&note.id)
+                .join("blob.bin")
+        )
+        .unwrap(),
+        bytes
+    );
+    let hydrated = get_note(&ctx, &note.id).await.unwrap().unwrap();
+    assert_eq!(hydrated.attachments[0].content, bytes);
 }
 
 #[tokio::test]
@@ -156,7 +192,7 @@ async fn delete_and_restore_preserve_note_data_and_requeue_embeddings() {
                 path: "./meta.json".into(),
                 mime: "application/json".into(),
                 description: "metadata".into(),
-                content: "{}".into(),
+                content: b"{}".to_vec(),
             }],
             labels: vec![("status".into(), "done".into())],
         },
@@ -199,7 +235,7 @@ async fn delete_and_restore_preserve_note_data_and_requeue_embeddings() {
         .unwrap());
     let restored = get_note(&ctx, &note.id).await.unwrap().unwrap();
     assert_eq!(restored.labels.len(), 1);
-    assert_eq!(restored.attachments[0].content, "{}");
+    assert_eq!(restored.attachments[0].content, b"{}");
     assert_eq!(
         note_storage::get_note_revision(&conn, &note.id)
             .await
@@ -260,7 +296,7 @@ async fn purge_removes_notes_at_the_ninety_day_boundary_and_their_attachments() 
                 path: "./proof.txt".into(),
                 mime: "text/plain".into(),
                 description: String::new(),
-                content: "expired".into(),
+                content: b"expired".to_vec(),
             }],
             labels: vec![],
         },
@@ -277,7 +313,7 @@ async fn purge_removes_notes_at_the_ninety_day_boundary_and_their_attachments() 
                 path: "./proof.txt".into(),
                 mime: "text/plain".into(),
                 description: String::new(),
-                content: "retained".into(),
+                content: b"retained".to_vec(),
             }],
             labels: vec![],
         },
@@ -331,14 +367,14 @@ async fn duplicate_attachment_id_is_rejected() {
                     path: "./meta.json".into(),
                     mime: "application/json".into(),
                     description: String::new(),
-                    content: "{}".into(),
+                    content: b"{}".to_vec(),
                 },
                 NoteAttachment {
                     id: "meta".into(),
                     path: "./other.json".into(),
                     mime: "application/json".into(),
                     description: String::new(),
-                    content: "{}".into(),
+                    content: b"{}".to_vec(),
                 },
             ],
             labels: vec![],
@@ -438,7 +474,7 @@ async fn duplicate_rule_rejects_create_with_the_same_composite_labels() {
                 path: "./metadata.json".into(),
                 mime: "application/json".into(),
                 description: String::new(),
-                content: "{}".into(),
+                content: b"{}".to_vec(),
             }],
             labels: vec![
                 ("version".into(), "1.0.0".into()),

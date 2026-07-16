@@ -17,6 +17,7 @@ pub enum ValidationError {
     DuplicateAttachmentId(String),
     EmptyAttachmentPath,
     InvalidAttachmentPath(String),
+    DuplicateAttachmentPath(String),
     EmptyAttachmentMime,
 }
 
@@ -43,6 +44,9 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::InvalidAttachmentPath(path) => {
                 write!(f, "attachment path must be relative: {path}")
+            }
+            ValidationError::DuplicateAttachmentPath(path) => {
+                write!(f, "duplicate attachment path: {path}")
             }
             ValidationError::EmptyAttachmentMime => write!(f, "attachment mime must not be empty"),
         }
@@ -102,6 +106,7 @@ pub fn validate_note_input(
 
 fn validate_attachments(attachments: &[NoteAttachment]) -> Result<(), ValidationError> {
     let mut ids = HashSet::new();
+    let mut paths = HashSet::new();
     for attachment in attachments {
         let id = attachment.id.trim();
         if id.is_empty() {
@@ -117,11 +122,22 @@ fn validate_attachments(attachments: &[NoteAttachment]) -> Result<(), Validation
         if !is_relative_attachment_path(path) {
             return Err(ValidationError::InvalidAttachmentPath(path.to_string()));
         }
+        let normalized_path = normalize_attachment_path(path);
+        if !paths.insert(normalized_path.clone()) {
+            return Err(ValidationError::DuplicateAttachmentPath(normalized_path));
+        }
         if attachment.mime.trim().is_empty() {
             return Err(ValidationError::EmptyAttachmentMime);
         }
     }
     Ok(())
+}
+
+fn normalize_attachment_path(path: &str) -> String {
+    path.split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn is_relative_attachment_path(path: &str) -> bool {
@@ -199,7 +215,7 @@ mod tests {
             path: "./meta.json".to_string(),
             mime: "application/json".to_string(),
             description: "metadata".to_string(),
-            content: "{}".to_string(),
+            content: b"{}".to_vec(),
         }];
         assert_eq!(validate_note_input(&input, &[]), Ok(()));
 
@@ -208,7 +224,7 @@ mod tests {
             path: "other.json".to_string(),
             mime: "application/json".to_string(),
             description: String::new(),
-            content: "{}".to_string(),
+            content: b"{}".to_vec(),
         });
         assert_eq!(
             validate_note_input(&input, &[]),
@@ -221,6 +237,34 @@ mod tests {
             validate_note_input(&input, &[]),
             Err(ValidationError::InvalidAttachmentPath(
                 "../secret.json".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_normalized_attachment_paths() {
+        let mut input = input("title", "content", &[]);
+        input.attachments = vec![
+            NoteAttachment {
+                id: "first".to_string(),
+                path: "./assets//meta.json".to_string(),
+                mime: "application/json".to_string(),
+                description: String::new(),
+                content: b"first".to_vec(),
+            },
+            NoteAttachment {
+                id: "second".to_string(),
+                path: "assets/./meta.json".to_string(),
+                mime: "application/json".to_string(),
+                description: String::new(),
+                content: b"second".to_vec(),
+            },
+        ];
+
+        assert_eq!(
+            validate_note_input(&input, &[]),
+            Err(ValidationError::DuplicateAttachmentPath(
+                "assets/meta.json".to_string()
             ))
         );
     }

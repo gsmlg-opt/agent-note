@@ -578,40 +578,6 @@ a.dashboard-metric-detail:hover {
 }
 
 /* --- Markdown code + diagrams --- */
-/* WORKAROUND(upstream): duskmoon-dev/yew-duskmoon-ui#5 */
-.markdown-body .dm-color-code {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35em;
-    white-space: nowrap;
-    vertical-align: middle;
-}
-
-.markdown-body .dm-color-chip {
-    position: relative;
-    display: inline-block;
-    flex: 0 0 auto;
-    width: 1em;
-    height: 1em;
-    overflow: hidden;
-    border: 1px solid color-mix(in oklch, var(--color-base-content, #111827) 56%, var(--color-surface, #ffffff));
-    border-radius: 3px;
-    background-color: var(--color-surface, #ffffff);
-    background-image: conic-gradient(
-        color-mix(in oklch, var(--color-base-content, #111827) 22%, transparent) 25%,
-        transparent 0 50%,
-        color-mix(in oklch, var(--color-base-content, #111827) 22%, transparent) 0 75%,
-        transparent 0
-    );
-    background-size: 6px 6px;
-    box-shadow: 0 0 0 1px color-mix(in oklch, var(--color-surface, #ffffff) 68%, transparent);
-}
-
-.markdown-body .dm-color-chip-swatch {
-    position: absolute;
-    inset: 0;
-}
-
 .markdown-body pre {
     padding: 0.85rem 1rem;
     border-radius: var(--radius-field, 8px);
@@ -1400,6 +1366,30 @@ a.dashboard-metric-detail:hover {
     margin: 0.5rem 0 0;
     color: var(--color-error, #ff4444);
     font-size: 0.85rem;
+}
+
+.attachment-binary-status {
+    margin: 0.4rem 0 0;
+    color: var(--color-on-surface-variant, #5a607f);
+    font-size: 0.85rem;
+}
+
+.attachment-binary-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-top: 0.6rem;
+}
+
+.attachment-binary-actions > span {
+    color: var(--color-on-surface-variant, #5a607f);
+    font-size: 0.85rem;
+}
+
+.attachment-content-field > .btn {
+    align-self: flex-start;
+    margin-top: 0.4rem;
 }
 
 .attachment-view-header {

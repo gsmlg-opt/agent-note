@@ -206,7 +206,7 @@ mod tests {
                     path: "./details.txt".into(),
                     mime: "text/plain".into(),
                     description: "Backup details".into(),
-                    content: "attachment content".into(),
+                    content: b"attachment content".to_vec(),
                 }],
                 labels: vec![("status".into(), "ready".into())],
             },
@@ -236,13 +236,17 @@ mod tests {
         assert!(entries.next().is_none());
 
         let export: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(export["version"], 1);
+        assert_eq!(export["version"], 2);
         assert_eq!(export["notes"].as_array().unwrap().len(), 1);
         assert_eq!(export["notes"][0]["title"], "Backup me");
         assert_eq!(export["notes"][0]["content"], "Complete note content");
         assert_eq!(
             export["notes"][0]["attachments"][0]["content"],
             "attachment content"
+        );
+        assert_eq!(
+            export["notes"][0]["attachments"][0]["content_base64"],
+            "YXR0YWNobWVudCBjb250ZW50"
         );
         assert_eq!(export["notes"][0]["labels"][0][0], "status");
         assert_eq!(export["notes"][0]["labels"][0][1], "ready");

@@ -3,14 +3,19 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachmentContent {
+    Text(String),
+    Base64(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteAttachment {
     pub id: String,
     pub path: String,
     pub mime: String,
-    #[serde(default)]
     pub description: String,
-    pub content: String,
+    pub content: AttachmentContent,
 }
 
 #[derive(Debug, Clone, PartialEq)]

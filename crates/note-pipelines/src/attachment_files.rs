@@ -30,7 +30,7 @@ pub fn prepare_note_attachments(
             path: attachment.path.clone(),
             mime: attachment.mime.clone(),
             description: attachment.description.clone(),
-            content: String::new(),
+            content: Vec::new(),
         })
         .collect::<Vec<_>>();
 
@@ -57,7 +57,7 @@ pub fn prepare_note_attachments(
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(path, attachment.content.as_bytes())?;
+            fs::write(path, &attachment.content)?;
         }
         Ok(())
     })();
@@ -101,7 +101,7 @@ pub fn remove_note_attachments(ctx: &Context, note_id: &str) -> anyhow::Result<(
 pub fn hydrate_note_attachments(ctx: &Context, note: &mut Note) -> anyhow::Result<()> {
     for attachment in &mut note.attachments {
         let path = attachment_path(&ctx.attachments_dir().join(&note.id), &attachment.path)?;
-        attachment.content = fs::read_to_string(path)?;
+        attachment.content = fs::read(path)?;
     }
     Ok(())
 }

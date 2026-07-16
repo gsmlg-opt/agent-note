@@ -1,5 +1,5 @@
 use crate::{enqueue_missing_chunk_embeddings, list_all_notes, parse_label_value_type, Context};
-use note_core::NoteAttachment;
+use note_core::{decode_attachment_content, encode_attachment_content, NoteAttachment};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -28,12 +28,57 @@ pub struct ExportNote {
     pub title: String,
     pub content: String,
     #[serde(default)]
-    pub attachments: Vec<NoteAttachment>,
+    pub attachments: Vec<ExportAttachment>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default)]
     pub deleted_at: Option<i64>,
     pub labels: Vec<(String, String)>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ExportAttachment {
+    pub id: String,
+    pub path: String,
+    pub mime: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_base64: Option<String>,
+}
+
+impl From<NoteAttachment> for ExportAttachment {
+    fn from(attachment: NoteAttachment) -> Self {
+        Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content: std::str::from_utf8(&attachment.content)
+                .ok()
+                .map(str::to_owned),
+            content_base64: Some(encode_attachment_content(&attachment.content)),
+        }
+    }
+}
+
+impl ExportAttachment {
+    fn into_note_attachment(self) -> anyhow::Result<NoteAttachment> {
+        let content =
+            decode_attachment_content(self.content.as_deref(), self.content_base64.as_deref())
+                .map_err(|error| {
+                    anyhow::anyhow!("invalid content for attachment {}: {error}", self.id)
+                })?;
+        Ok(NoteAttachment {
+            id: self.id,
+            path: self.path,
+            mime: self.mime,
+            description: self.description,
+            content,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -62,7 +107,11 @@ pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
             id: note.id,
             title: note.title,
             content: note.content,
-            attachments: note.attachments,
+            attachments: note
+                .attachments
+                .into_iter()
+                .map(ExportAttachment::from)
+                .collect(),
             created_at: note.created_at,
             updated_at: note.updated_at,
             deleted_at: note.deleted_at,
@@ -75,13 +124,16 @@ pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
         .collect();
 
     Ok(ExportData {
-        version: 1,
+        version: 2,
         label_keys,
         notes,
     })
 }
 
 pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<ImportStats> {
+    if !matches!(data.version, 1 | 2) {
+        anyhow::bail!("unsupported export version: {}", data.version);
+    }
     let conn = ctx.storage.connect()?;
     let mut known_keys: HashSet<String> = note_storage::list_label_keys(&conn)
         .await?
@@ -120,11 +172,13 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
                 }
             }
 
-            let prepared = crate::attachment_files::prepare_note_attachments(
-                ctx,
-                &note.id,
-                &note.attachments,
-            )?;
+            let attachments = note
+                .attachments
+                .into_iter()
+                .map(ExportAttachment::into_note_attachment)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let prepared =
+                crate::attachment_files::prepare_note_attachments(ctx, &note.id, &attachments)?;
             note_storage::insert_note_with_attachments_and_deleted_at(
                 &tx,
                 &note.id,

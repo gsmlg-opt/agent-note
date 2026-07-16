@@ -1795,6 +1795,7 @@ dependencies = [
 name = "note-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "serde",
 ]
@@ -1829,6 +1830,7 @@ dependencies = [
  "rmcp",
  "schemars",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -1889,6 +1891,7 @@ dependencies = [
  "anyhow",
  "libsql",
  "note-core",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

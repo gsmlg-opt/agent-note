@@ -1,7 +1,7 @@
 use note_core::NoteAttachment;
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    define_label_key, delete_note, export_data, get_note, import_data, list_all_notes,
+    define_label_key, delete_note, export_data, get_note, import_data, import_json, list_all_notes,
     list_deleted_note_summaries, list_label_keys, save_note, Context, SaveNoteInput,
 };
 use note_storage::Storage;
@@ -36,13 +36,22 @@ async fn export_import_roundtrips_notes_and_label_keys() {
         SaveNoteInput {
             title: "Plan".into(),
             content: "Draft the release plan".into(),
-            attachments: vec![NoteAttachment {
-                id: "meta".into(),
-                path: "./meta.json".into(),
-                mime: "application/json".into(),
-                description: "metadata".into(),
-                content: "{}".into(),
-            }],
+            attachments: vec![
+                NoteAttachment {
+                    id: "meta".into(),
+                    path: "./meta.json".into(),
+                    mime: "application/json".into(),
+                    description: "metadata".into(),
+                    content: b"{}".to_vec(),
+                },
+                NoteAttachment {
+                    id: "binary".into(),
+                    path: "./blob.bin".into(),
+                    mime: "application/octet-stream".into(),
+                    description: "binary data".into(),
+                    content: vec![0, 159, 146, 150],
+                },
+            ],
             labels: vec![("status".into(), "done".into())],
         },
     )
@@ -62,7 +71,7 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     delete_note(&source, &labeled.id).await.unwrap();
 
     let data = export_data(&source).await.unwrap();
-    assert_eq!(data.version, 1);
+    assert_eq!(data.version, 2);
     assert_eq!(data.notes.len(), 2);
     let deleted_export = data
         .notes
@@ -70,7 +79,16 @@ async fn export_import_roundtrips_notes_and_label_keys() {
         .find(|note| note.id == labeled.id)
         .unwrap();
     assert!(deleted_export.deleted_at.is_some());
-    assert_eq!(deleted_export.attachments[0].content, "{}");
+    assert_eq!(deleted_export.attachments[0].content.as_deref(), Some("{}"));
+    assert_eq!(
+        deleted_export.attachments[0].content_base64.as_deref(),
+        Some("e30=")
+    );
+    assert!(deleted_export.attachments[1].content.is_none());
+    assert_eq!(
+        deleted_export.attachments[1].content_base64.as_deref(),
+        Some("AJ+Slg==")
+    );
 
     let (target, target_dir) = test_context().await;
     let stats = import_data(&target, data).await.unwrap();
@@ -123,4 +141,95 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     assert_eq!(restored_plain.created_at, plain.created_at);
     assert_eq!(restored_plain.updated_at, plain.updated_at);
     assert!(restored_plain.labels.is_empty());
+}
+
+#[tokio::test]
+async fn imports_version_one_text_attachments() {
+    let (ctx, _dir) = test_context().await;
+    let input = r#"{
+        "version": 1,
+        "label_keys": [],
+        "notes": [{
+            "id": "legacy-note",
+            "title": "Legacy",
+            "content": "Imported note",
+            "attachments": [{
+                "id": "text",
+                "path": "legacy.txt",
+                "mime": "text/plain",
+                "description": "legacy attachment",
+                "content": "legacy text"
+            }],
+            "created_at": 1000,
+            "updated_at": 1000,
+            "labels": []
+        }]
+    }"#;
+
+    let stats = import_json(&ctx, input).await.unwrap();
+    assert_eq!(stats.notes_added, 1);
+    let note = get_note(&ctx, "legacy-note").await.unwrap().unwrap();
+    assert_eq!(note.attachments[0].content, b"legacy text");
+}
+
+#[tokio::test]
+async fn rejects_unsupported_export_versions() {
+    let (ctx, _dir) = test_context().await;
+    let error = import_json(&ctx, r#"{"version":3,"label_keys":[],"notes":[]}"#)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "unsupported export version: 3");
+}
+
+#[tokio::test]
+async fn invalid_version_two_attachment_rolls_back_the_import() {
+    let (ctx, dir) = test_context().await;
+    let input = r#"{
+        "version": 2,
+        "label_keys": [{"key":"status","description":"Workflow status","value_type":"text"}],
+        "notes": [
+            {
+                "id": "valid-note",
+                "title": "Valid",
+                "content": "Would otherwise import",
+                "attachments": [{
+                    "id": "blob",
+                    "path": "blob.bin",
+                    "mime": "application/octet-stream",
+                    "content_base64": "AP8="
+                }],
+                "created_at": 1000,
+                "updated_at": 1000,
+                "labels": [["status", "done"]]
+            },
+            {
+                "id": "invalid-note",
+                "title": "Invalid",
+                "content": "Reject the whole import",
+                "attachments": [{
+                    "id": "text",
+                    "path": "text.txt",
+                    "mime": "text/plain",
+                    "content": "text",
+                    "content_base64": "b3RoZXI="
+                }],
+                "created_at": 1000,
+                "updated_at": 1000,
+                "labels": []
+            }
+        ]
+    }"#;
+
+    let error = import_json(&ctx, input).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("attachment content and content_base64 do not match"));
+    assert!(list_all_notes(&ctx).await.unwrap().is_empty());
+    assert!(list_label_keys(&ctx).await.unwrap().is_empty());
+
+    let attachments_dir = dir.path().join("attachments");
+    assert!(
+        !attachments_dir.exists() || std::fs::read_dir(attachments_dir).unwrap().next().is_none()
+    );
 }

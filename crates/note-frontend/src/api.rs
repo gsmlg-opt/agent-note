@@ -1,9 +1,9 @@
 use crate::state::{
-    DeletedNoteSummary, LabelFilter, LabelKey, NoteAttachment, NoteSummary, SearchResultSummary,
-    SystemConfig, SystemInfo,
+    AttachmentContent, DeletedNoteSummary, LabelFilter, LabelKey, NoteAttachment, NoteSummary,
+    SearchResultSummary, SystemConfig, SystemInfo,
 };
 use gloo_net::http::{Request, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // gloo-net (like the Fetch API) does NOT return Err on a 4xx/5xx status — .send() resolves fine and
 // only the body read would fail. So without this check, a server error (e.g. "empty title") gets
@@ -57,6 +57,17 @@ pub async fn get_system_info() -> Result<SystemInfo, String> {
 }
 
 // ---- Notes ----
+
+pub fn attachment_url(base: &str, path: &str) -> String {
+    let encoded_path = path
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .split('/')
+        .map(urlencoding::encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{}/{encoded_path}", base.trim_end_matches('/'))
+}
 
 #[derive(Deserialize)]
 struct SearchResultDto {
@@ -122,6 +133,10 @@ pub async fn save_note(
     attachments: &[NoteAttachment],
     labels: &[(String, String)],
 ) -> Result<String, String> {
+    let attachments = attachments
+        .iter()
+        .map(NoteAttachmentRequestDto::from)
+        .collect::<Vec<_>>();
     let body = serde_json::json!({
         "title": title,
         "content": content,
@@ -146,13 +161,79 @@ pub async fn save_note(
     Ok(resp.id)
 }
 
+#[derive(Serialize)]
+struct NoteAttachmentRequestDto<'a> {
+    id: &'a str,
+    path: &'a str,
+    mime: &'a str,
+    description: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_base64: Option<&'a str>,
+}
+
+impl<'a> From<&'a NoteAttachment> for NoteAttachmentRequestDto<'a> {
+    fn from(attachment: &'a NoteAttachment) -> Self {
+        let (content, content_base64) = match &attachment.content {
+            AttachmentContent::Text(content) => (Some(content.as_str()), None),
+            AttachmentContent::Base64(content) => (None, Some(content.as_str())),
+        };
+        Self {
+            id: &attachment.id,
+            path: &attachment.path,
+            mime: &attachment.mime,
+            description: &attachment.description,
+            content,
+            content_base64,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NoteAttachmentResponseDto {
+    id: String,
+    path: String,
+    mime: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    content_base64: Option<String>,
+}
+
+impl TryFrom<NoteAttachmentResponseDto> for NoteAttachment {
+    type Error = String;
+
+    fn try_from(attachment: NoteAttachmentResponseDto) -> Result<Self, Self::Error> {
+        let content = match (attachment.content, attachment.content_base64) {
+            (Some(content), _) => AttachmentContent::Text(content),
+            (None, Some(content)) => AttachmentContent::Base64(content),
+            (None, None) => {
+                return Err(format!(
+                    "attachment {} has no content representation",
+                    attachment.id
+                ));
+            }
+        };
+        Ok(Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content,
+        })
+    }
+}
+
 #[derive(Deserialize)]
 struct NoteDto {
     id: String,
     title: String,
     content: String,
     #[serde(default)]
-    attachments: Vec<NoteAttachment>,
+    attachments: Vec<NoteAttachmentResponseDto>,
     labels: Vec<(String, String)>,
     #[serde(default)]
     created_at: i64,
@@ -310,11 +391,16 @@ pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
         .json()
         .await
         .map_err(|e| e.to_string())?;
+    let attachments = d
+        .attachments
+        .into_iter()
+        .map(NoteAttachment::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(NoteSummary {
         id: d.id,
         title: d.title,
         content: d.content,
-        attachments: d.attachments,
+        attachments,
         labels: d.labels,
         created_at: d.created_at,
         updated_at: d.updated_at,
@@ -328,6 +414,10 @@ pub async fn update_note(
     attachments: &[NoteAttachment],
     labels: &[(String, String)],
 ) -> Result<(), String> {
+    let attachments = attachments
+        .iter()
+        .map(NoteAttachmentRequestDto::from)
+        .collect::<Vec<_>>();
     let body = serde_json::json!({
         "title": title,
         "content": content,
@@ -463,4 +553,87 @@ pub async fn delete_label(key: &str) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     ok_or_body_error(resp).await.map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attachment(content: AttachmentContent) -> NoteAttachment {
+        NoteAttachment {
+            id: "file-1".to_string(),
+            path: "./file.dat".to_string(),
+            mime: "application/octet-stream".to_string(),
+            description: String::new(),
+            content,
+        }
+    }
+
+    #[test]
+    fn attachment_requests_send_exactly_one_content_representation() {
+        let text = attachment(AttachmentContent::Text("hello".to_string()));
+        let text = serde_json::to_value(NoteAttachmentRequestDto::from(&text)).unwrap();
+        assert_eq!(text["content"], "hello");
+        assert!(text.get("content_base64").is_none());
+
+        let binary = attachment(AttachmentContent::Base64("/wA=".to_string()));
+        let binary = serde_json::to_value(NoteAttachmentRequestDto::from(&binary)).unwrap();
+        assert_eq!(binary["content_base64"], "/wA=");
+        assert!(binary.get("content").is_none());
+    }
+
+    #[test]
+    fn attachment_responses_accept_legacy_text_and_canonical_base64() {
+        let legacy: NoteAttachmentResponseDto = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "path": "./legacy.txt",
+            "mime": "text/plain",
+            "content": "hello"
+        }))
+        .unwrap();
+        assert_eq!(
+            NoteAttachment::try_from(legacy).unwrap().content,
+            AttachmentContent::Text("hello".to_string())
+        );
+
+        let binary: NoteAttachmentResponseDto = serde_json::from_value(serde_json::json!({
+            "id": "binary",
+            "path": "./binary.dat",
+            "mime": "application/octet-stream",
+            "content_base64": "/wA="
+        }))
+        .unwrap();
+        assert_eq!(
+            NoteAttachment::try_from(binary).unwrap().content,
+            AttachmentContent::Base64("/wA=".to_string())
+        );
+    }
+
+    #[test]
+    fn attachment_responses_prefer_utf8_text_when_both_are_present() {
+        let response: NoteAttachmentResponseDto = serde_json::from_value(serde_json::json!({
+            "id": "text",
+            "path": "./text.txt",
+            "mime": "text/plain",
+            "content": "hello",
+            "content_base64": "aGVsbG8="
+        }))
+        .unwrap();
+
+        assert_eq!(
+            NoteAttachment::try_from(response).unwrap().content,
+            AttachmentContent::Text("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn attachment_urls_encode_each_path_segment() {
+        assert_eq!(
+            attachment_url(
+                "/api/notes/note-1/attachments/",
+                "./images/report #1?progress=50%.png"
+            ),
+            "/api/notes/note-1/attachments/images/report%20%231%3Fprogress%3D50%25.png"
+        );
+    }
 }

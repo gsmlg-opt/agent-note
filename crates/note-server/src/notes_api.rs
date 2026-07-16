@@ -29,9 +29,40 @@ pub struct SaveNoteRequest {
     pub title: String,
     pub content: String,
     #[serde(default)]
-    pub attachments: Vec<NoteAttachment>,
+    pub attachments: Vec<AttachmentRequest>,
     #[serde(default)]
     pub labels: Vec<(String, String)>,
+}
+
+#[derive(Deserialize)]
+pub struct AttachmentRequest {
+    pub id: String,
+    pub path: String,
+    pub mime: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub content_base64: Option<String>,
+}
+
+impl TryFrom<AttachmentRequest> for NoteAttachment {
+    type Error = note_core::AttachmentContentError;
+
+    fn try_from(attachment: AttachmentRequest) -> Result<Self, Self::Error> {
+        let content = note_core::decode_attachment_content(
+            attachment.content.as_deref(),
+            attachment.content_base64.as_deref(),
+        )?;
+        Ok(Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -51,10 +82,35 @@ pub struct NoteDto {
     pub id: String,
     pub title: String,
     pub content: String,
-    pub attachments: Vec<NoteAttachment>,
+    pub attachments: Vec<AttachmentResponse>,
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Serialize)]
+pub struct AttachmentResponse {
+    pub id: String,
+    pub path: String,
+    pub mime: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    pub content_base64: String,
+}
+
+impl From<NoteAttachment> for AttachmentResponse {
+    fn from(attachment: NoteAttachment) -> Self {
+        let content = String::from_utf8(attachment.content.clone()).ok();
+        Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content,
+            content_base64: note_core::encode_attachment_content(&attachment.content),
+        }
+    }
 }
 
 impl From<Note> for NoteDto {
@@ -63,7 +119,7 @@ impl From<Note> for NoteDto {
             id: note.id,
             title: note.title,
             content: note.content,
-            attachments: note.attachments,
+            attachments: note.attachments.into_iter().map(Into::into).collect(),
             labels: note
                 .labels
                 .iter()
@@ -275,12 +331,13 @@ async fn save_note_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<SaveNoteRequest>,
 ) -> Result<Json<SaveNoteResponse>, (axum::http::StatusCode, String)> {
+    let attachments = decode_attachment_requests(req.attachments)?;
     let note = save_note(
         &ctx,
         SaveNoteInput {
             title: req.title,
             content: req.content,
-            attachments: req.attachments,
+            attachments,
             labels: req.labels,
         },
     )
@@ -300,6 +357,23 @@ async fn save_note_handler(
     })?;
     invalidate_dashboard_cache();
     Ok(Json(SaveNoteResponse { id: note.id }))
+}
+
+fn decode_attachment_requests(
+    attachments: Vec<AttachmentRequest>,
+) -> Result<Vec<NoteAttachment>, (axum::http::StatusCode, String)> {
+    attachments
+        .into_iter()
+        .map(|attachment| {
+            let id = attachment.id.clone();
+            attachment.try_into().map_err(|error| {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("invalid attachment {id}: {error}"),
+                )
+            })
+        })
+        .collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -392,6 +466,7 @@ async fn get_attachment_handler(
 
     Response::builder()
         .header(axum::http::header::CONTENT_TYPE, attachment.mime)
+        .header("x-content-type-options", "nosniff")
         .body(Body::from(attachment.content))
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
@@ -407,13 +482,14 @@ async fn update_note_handler(
     Path(id): Path<String>,
     Json(req): Json<SaveNoteRequest>,
 ) -> Result<Json<NoteDto>, (axum::http::StatusCode, String)> {
+    let attachments = decode_attachment_requests(req.attachments)?;
     let note = update_note(
         &ctx,
         &id,
         SaveNoteInput {
             title: req.title,
             content: req.content,
-            attachments: req.attachments,
+            attachments,
             labels: req.labels,
         },
     )
@@ -1020,6 +1096,16 @@ mod tests {
             attachments[0].get("description").and_then(|v| v.as_str()),
             Some("metadata")
         );
+        assert_eq!(
+            attachments[0]
+                .get("content_base64")
+                .and_then(|v| v.as_str()),
+            Some("eyJvayI6dHJ1ZX0=")
+        );
+        assert_eq!(
+            attachments[0].get("content").and_then(|v| v.as_str()),
+            Some(r#"{"ok":true}"#)
+        );
 
         let resp = app
             .clone()
@@ -1032,6 +1118,12 @@ mod tests {
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok()),
             Some("application/json")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-content-type-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], br#"{"ok":true}"#);
@@ -1052,6 +1144,94 @@ mod tests {
         let html = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&html).unwrap();
         assert!(html.contains(&format!(r#"href="/api/notes/{id}/attachments/meta.json""#)));
+    }
+
+    #[tokio::test]
+    async fn binary_attachments_roundtrip_as_base64_and_download_as_raw_bytes() {
+        let (app, _ctx, dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Binary","content":"![blob](./blob.bin)","attachments":[{"id":"blob","path":"./blob.bin","mime":"application/octet-stream","description":"raw bytes","content_base64":"AJ+Slv8="}],"labels":[]}"#,
+        )
+        .await;
+
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let attachment = &json["attachments"][0];
+        assert_eq!(attachment["content_base64"], "AJ+Slv8=");
+        assert!(attachment.get("content").is_none());
+
+        json["title"] = serde_json::Value::String("Binary updated".into());
+        let resp = app
+            .clone()
+            .oneshot(put(
+                &format!("/api/notes/{id}"),
+                &serde_json::to_string(&json).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/api/notes/{id}/attachments/blob.bin")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-content-type-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], &[0, 0x9f, 0x92, 0x96, 0xff]);
+        assert_eq!(
+            std::fs::read(dir.path().join("attachments").join(&id).join("blob.bin")).unwrap(),
+            [0, 0x9f, 0x92, 0x96, 0xff]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_or_ambiguous_attachment_content_is_rejected() {
+        let (app, _ctx, dir) = test_app().await;
+        let invalid = app
+            .clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Invalid","content":"C","attachments":[{"id":"blob","path":"./blob.bin","mime":"application/octet-stream","content_base64":"not base64 !!"}],"labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let mismatched = app
+            .clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Mismatch","content":"C","attachments":[{"id":"blob","path":"./blob.bin","mime":"application/octet-stream","content":"abc","content_base64":"eHl6"}],"labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+
+        let resp = app.oneshot(get("/api/notes/count")).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let count: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(count["total"], 0);
+        assert!(!dir.path().join("attachments").exists());
     }
 
     #[tokio::test]

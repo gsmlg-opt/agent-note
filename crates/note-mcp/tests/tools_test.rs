@@ -3,10 +3,11 @@ use note_core::{
 };
 use note_embedding::StubEmbedder;
 use note_mcp::{
-    delete_note_tool, list_notes_tool, save_note_tool, semantic_search_tool, SaveNoteToolInput,
-    SemanticSearchToolInput,
+    delete_note_tool, edit_note_tool, get_note_tool, list_notes_tool, read_note_lines_tool,
+    save_note_tool, semantic_search_tool, update_note_tool, AttachmentData, SaveNoteToolInput,
+    SemanticSearchToolInput, UpdateNoteToolInput,
 };
-use note_pipelines::{drain_embedding_jobs, update_system_config, Context};
+use note_pipelines::{drain_embedding_jobs, update_system_config, Context, EditOp};
 use note_storage::Storage;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -41,6 +42,117 @@ async fn save_note_tool_returns_an_id() {
     .await
     .unwrap();
     assert!(!result.id.is_empty());
+}
+
+#[tokio::test]
+async fn binary_attachment_roundtrips_through_save_get_update_and_list() {
+    let (ctx, dir) = test_context().await;
+    let bytes = vec![0x00, 0x9f, 0x92, 0x96, 0xff];
+    let attachment = AttachmentData {
+        id: "blob".into(),
+        path: "./blob.bin".into(),
+        mime: "application/octet-stream".into(),
+        description: "raw bytes".into(),
+        content: bytes.clone(),
+    };
+    let saved = save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Binary".into(),
+            content: "First line".into(),
+            attachments: vec![attachment.clone()],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read(
+            dir.path()
+                .join("attachments")
+                .join(&saved.id)
+                .join("blob.bin")
+        )
+        .unwrap(),
+        bytes
+    );
+    let fetched = get_note_tool(&ctx, &saved.id).await.unwrap().unwrap();
+    assert_eq!(fetched.attachments, vec![attachment.clone()]);
+
+    let updated = update_note_tool(
+        &ctx,
+        UpdateNoteToolInput {
+            id: saved.id.clone(),
+            title: "Binary updated".into(),
+            content: "Updated body".into(),
+            attachments: vec![attachment.clone()],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(updated.attachments, vec![attachment.clone()]);
+
+    let listed = list_notes_tool(&ctx, None, None, None).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].attachments, vec![attachment]);
+}
+
+#[tokio::test]
+async fn line_edit_preserves_binary_attachment_bytes() {
+    let (ctx, dir) = test_context().await;
+    let bytes = vec![0x00, 0x9f, 0x92, 0x96, 0xff];
+    let saved = save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Binary edit".into(),
+            content: "First line".into(),
+            attachments: vec![AttachmentData {
+                id: "blob".into(),
+                path: "./blob.bin".into(),
+                mime: "application/octet-stream".into(),
+                description: String::new(),
+                content: bytes.clone(),
+            }],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let read = read_note_lines_tool(&ctx, &saved.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let edited = edit_note_tool(
+        &ctx,
+        &saved.id,
+        &read.tag,
+        vec![EditOp::InsertTail {
+            lines: vec!["Second line".into()],
+        }],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(edited.lines.len(), 2);
+    assert_eq!(edited.lines[1].text, "Second line");
+    let fetched = get_note_tool(&ctx, &saved.id).await.unwrap().unwrap();
+    assert_eq!(fetched.content, "First line\nSecond line");
+    assert_eq!(fetched.attachments[0].content, bytes);
+    assert_eq!(
+        std::fs::read(
+            dir.path()
+                .join("attachments")
+                .join(&saved.id)
+                .join("blob.bin")
+        )
+        .unwrap(),
+        fetched.attachments[0].content
+    );
 }
 
 #[tokio::test]

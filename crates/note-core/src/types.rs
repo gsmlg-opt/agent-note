@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 pub type NoteId = String;
@@ -270,7 +271,64 @@ pub struct NoteAttachment {
     pub mime: String,
     #[serde(default)]
     pub description: String,
-    pub content: String,
+    pub content: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum AttachmentContentError {
+    MissingContent,
+    InvalidBase64(base64::DecodeError),
+    ContentMismatch,
+}
+
+impl std::fmt::Display for AttachmentContentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingContent => {
+                write!(f, "attachment content or content_base64 is required")
+            }
+            Self::InvalidBase64(error) => write!(f, "invalid attachment content_base64: {error}"),
+            Self::ContentMismatch => {
+                write!(f, "attachment content and content_base64 do not match")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AttachmentContentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidBase64(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+pub fn decode_attachment_content(
+    content: Option<&str>,
+    content_base64: Option<&str>,
+) -> Result<Vec<u8>, AttachmentContentError> {
+    match (content, content_base64) {
+        (None, None) => Err(AttachmentContentError::MissingContent),
+        (Some(content), None) => Ok(content.as_bytes().to_vec()),
+        (None, Some(content_base64)) => STANDARD
+            .decode(content_base64)
+            .map_err(AttachmentContentError::InvalidBase64),
+        (Some(content), Some(content_base64)) => {
+            let decoded = STANDARD
+                .decode(content_base64)
+                .map_err(AttachmentContentError::InvalidBase64)?;
+            if decoded == content.as_bytes() {
+                Ok(decoded)
+            } else {
+                Err(AttachmentContentError::ContentMismatch)
+            }
+        }
+    }
+}
+
+pub fn encode_attachment_content(content: &[u8]) -> String {
+    STANDARD.encode(content)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -457,5 +515,42 @@ mod tests {
         ));
         assert!(!validate_label_value(LabelValueType::Date, "07/09/2026"));
         assert!(!validate_label_value(LabelValueType::Version, "1.2.beta"));
+    }
+
+    #[test]
+    fn attachment_content_accepts_legacy_text_and_strict_base64() {
+        assert_eq!(
+            decode_attachment_content(Some("metadata"), None).unwrap(),
+            b"metadata"
+        );
+        assert_eq!(
+            decode_attachment_content(None, Some("AP8=")).unwrap(),
+            vec![0, 255]
+        );
+        assert!(matches!(
+            decode_attachment_content(None, Some("AP8")),
+            Err(AttachmentContentError::InvalidBase64(_))
+        ));
+    }
+
+    #[test]
+    fn attachment_content_requires_matching_dual_inputs() {
+        assert_eq!(
+            decode_attachment_content(Some("metadata"), Some("bWV0YWRhdGE=")).unwrap(),
+            b"metadata"
+        );
+        assert!(matches!(
+            decode_attachment_content(Some("metadata"), Some("b3RoZXI=")),
+            Err(AttachmentContentError::ContentMismatch)
+        ));
+        assert!(matches!(
+            decode_attachment_content(None, None),
+            Err(AttachmentContentError::MissingContent)
+        ));
+    }
+
+    #[test]
+    fn attachment_content_encoding_is_canonical_base64() {
+        assert_eq!(encode_attachment_content(&[0, 255]), "AP8=");
     }
 }

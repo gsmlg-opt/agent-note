@@ -95,8 +95,12 @@ The same binary also speaks MCP over stdio (for MCP clients that spawn a subproc
 cargo run -p note-server -- --stdio
 ```
 
-It exposes two tools — `save_note` and `semantic_search`. Label-key management is REST/UI-only.
-The HTTP server additionally exposes the MCP Streamable HTTP transport at `/mcp`.
+It exposes `save_note`, `get_note`, `read_note_lines`, `edit_note`, `update_note`, `delete_note`,
+`list_notes`, and `semantic_search`. Label-key management is REST/UI-only. Attachments in
+`save_note` and `update_note` accept either UTF-8 `content` or padded Base64 `content_base64`;
+attachment responses always include `content_base64` and additionally include `content` when the
+bytes are valid UTF-8. The HTTP server additionally exposes the MCP Streamable HTTP transport at
+`/mcp`.
 
 `note-server` still binds its backend to loopback by default. The Debug Trunk server deliberately
 binds `0.0.0.0:6221`, so the development UI and its proxied endpoints are reachable from the local

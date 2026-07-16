@@ -44,7 +44,7 @@ async fn insert_with_attachments_roundtrips() {
             path: "./meta.json".into(),
             mime: "application/json".into(),
             description: "metadata".into(),
-            content: "{}".into(),
+            content: b"{}".to_vec(),
         }],
         1000,
         1000,
@@ -52,6 +52,18 @@ async fn insert_with_attachments_roundtrips() {
     )
     .await
     .unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT attachments FROM notes WHERE id = ?1",
+            libsql::params!["note-1"],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let raw = row.get::<String>(0).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(metadata[0].get("content").is_none());
+
     let fetched = get_note(&conn, "note-1")
         .await
         .unwrap()
@@ -61,7 +73,38 @@ async fn insert_with_attachments_roundtrips() {
     assert_eq!(fetched.attachments[0].id, "meta");
     assert_eq!(fetched.attachments[0].path, "./meta.json");
     assert_eq!(fetched.attachments[0].description, "metadata");
-    assert_eq!(fetched.attachments[0].content, "");
+    assert!(fetched.attachments[0].content.is_empty());
+}
+
+#[tokio::test]
+async fn reads_legacy_attachment_metadata_with_empty_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let conn = storage.connect().unwrap();
+
+    insert_note(&conn, "note-1", "Title", "Content", 1000, 1000, 1)
+        .await
+        .unwrap();
+    conn.execute(
+        "UPDATE notes SET attachments = ?2 WHERE id = ?1",
+        libsql::params![
+            "note-1",
+            r#"[{"id":"meta","path":"./meta.json","mime":"application/json","description":"metadata","content":""}]"#
+        ],
+    )
+    .await
+    .unwrap();
+
+    let fetched = get_note(&conn, "note-1")
+        .await
+        .unwrap()
+        .expect("note should exist");
+    assert_eq!(fetched.attachments.len(), 1);
+    assert_eq!(fetched.attachments[0].id, "meta");
+    assert_eq!(fetched.attachments[0].description, "metadata");
+    assert!(fetched.attachments[0].content.is_empty());
 }
 
 #[tokio::test]

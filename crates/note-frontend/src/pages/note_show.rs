@@ -6,7 +6,7 @@ use yew_router::prelude::*;
 
 use crate::api;
 use crate::routes::Route;
-use crate::state::NoteSummary;
+use crate::state::{AttachmentContent, NoteSummary};
 
 #[derive(Properties, PartialEq)]
 pub struct NoteShowProps {
@@ -67,22 +67,39 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                             }) }
                         </div>
                     }
-                    <DmMarkdown markdown={AttrValue::from(note_markdown(n))} />
+                    <DmMarkdown
+                        markdown={AttrValue::from(note_markdown(n))}
+                        base_url={Some(format!("/api/notes/{}/attachments", n.id))}
+                    />
                     if !n.attachments.is_empty() {
                         <section class="attachment-view-section">
                             <h3>{ "Attachments" }</h3>
                             <div class="attachment-view-list">
-                                { for n.attachments.iter().map(|attachment| html! {
-                                    <section class="attachment-view-item" key={attachment.id.clone()}>
-                                        <div class="attachment-view-header">
-                                            <strong>{ attachment.path.clone() }</strong>
-                                            <span>{ attachment.mime.clone() }</span>
-                                        </div>
-                                        if !attachment.description.is_empty() {
-                                            <p class="attachment-description">{ attachment.description.clone() }</p>
-                                        }
-                                        <pre>{ attachment.content.clone() }</pre>
-                                    </section>
+                                { for n.attachments.iter().map(|attachment| {
+                                    let attachment_base = format!("/api/notes/{}/attachments", n.id);
+                                    let download_url = api::attachment_url(&attachment_base, &attachment.path);
+                                    html! {
+                                        <section class="attachment-view-item" key={attachment.id.clone()}>
+                                            <div class="attachment-view-header">
+                                                <strong>{ attachment.path.clone() }</strong>
+                                                <span>{ attachment.mime.clone() }</span>
+                                            </div>
+                                            if !attachment.description.is_empty() {
+                                                <p class="attachment-description">{ attachment.description.clone() }</p>
+                                            }
+                                            { match &attachment.content {
+                                                AttachmentContent::Text(content) => html! {
+                                                    <pre>{ content.clone() }</pre>
+                                                },
+                                                AttachmentContent::Base64(_) => html! {
+                                                    <div class="attachment-binary-actions">
+                                                        <span>{ "Binary attachment" }</span>
+                                                        <a class="btn btn-outline" href={download_url} download="">{ "Download" }</a>
+                                                    </div>
+                                                },
+                                            } }
+                                        </section>
+                                    }
                                 }) }
                             </div>
                         </section>
@@ -100,7 +117,7 @@ fn note_markdown(note: &NoteSummary) -> String {
     rewrite_attachment_urls(&note.content, &attachment_base)
 }
 
-// WORKAROUND(upstream): duskmoon-dev/yew-duskmoon-ui#4
+// WORKAROUND(upstream): duskmoon-dev/yew-duskmoon-ui#8
 fn rewrite_attachment_urls(markdown: &str, attachment_base: &str) -> String {
     let (front_matter, body) = split_front_matter(markdown);
     let events = Parser::new_ext(body, markdown_options()).map(|event| match event {
@@ -111,7 +128,7 @@ fn rewrite_attachment_urls(markdown: &str, attachment_base: &str) -> String {
             id,
         }) => Event::Start(Tag::Link {
             link_type,
-            dest_url: rewrite_relative_url(dest_url, attachment_base),
+            dest_url: rewrite_url_needing_encoding(dest_url, attachment_base),
             title,
             id,
         }),
@@ -122,7 +139,7 @@ fn rewrite_attachment_urls(markdown: &str, attachment_base: &str) -> String {
             id,
         }) => Event::Start(Tag::Image {
             link_type,
-            dest_url: rewrite_relative_url(dest_url, attachment_base),
+            dest_url: rewrite_url_needing_encoding(dest_url, attachment_base),
             title,
             id,
         }),
@@ -168,12 +185,18 @@ fn split_front_matter(markdown: &str) -> (&str, &str) {
     ("", markdown)
 }
 
-fn rewrite_relative_url<'a>(url: CowStr<'a>, attachment_base: &str) -> CowStr<'a> {
+fn rewrite_url_needing_encoding<'a>(url: CowStr<'a>, attachment_base: &str) -> CowStr<'a> {
     let Some(path) = url.strip_prefix("./") else {
         return url;
     };
 
-    CowStr::Boxed(format!("{}/{path}", attachment_base.trim_end_matches('/')).into_boxed_str())
+    let encoded = api::attachment_url(attachment_base, path);
+    let unencoded = format!("{}/{path}", attachment_base.trim_end_matches('/'));
+    if encoded == unencoded {
+        url
+    } else {
+        CowStr::Boxed(encoded.into_boxed_str())
+    }
 }
 
 fn rewrite_relative_html_urls<'a>(html: CowStr<'a>, attachment_base: &str) -> CowStr<'a> {
@@ -181,12 +204,35 @@ fn rewrite_relative_html_urls<'a>(html: CowStr<'a>, attachment_base: &str) -> Co
         return html;
     }
 
-    let base = attachment_base.trim_end_matches('/');
+    let rewritten = rewrite_relative_html_attribute(&html, "href", attachment_base);
     CowStr::Boxed(
-        html.replace("href=\"./", &format!("href=\"{base}/"))
-            .replace("src=\"./", &format!("src=\"{base}/"))
-            .into_boxed_str(),
+        rewrite_relative_html_attribute(&rewritten, "src", attachment_base).into_boxed_str(),
     )
+}
+
+fn rewrite_relative_html_attribute(html: &str, attribute: &str, attachment_base: &str) -> String {
+    let marker = format!(r#"{attribute}="./"#);
+    let mut remaining = html;
+    let mut rewritten = String::with_capacity(html.len());
+
+    while let Some(marker_start) = remaining.find(&marker) {
+        let path_start = marker_start + marker.len();
+        let Some(path_end) = remaining[path_start..].find('"') else {
+            break;
+        };
+        let path_end = path_start + path_end;
+        rewritten.push_str(&remaining[..marker_start]);
+        rewritten.push_str(attribute);
+        rewritten.push_str("=\"");
+        rewritten.push_str(&api::attachment_url(
+            attachment_base,
+            &remaining[path_start..path_end],
+        ));
+        remaining = &remaining[path_end..];
+    }
+
+    rewritten.push_str(remaining);
+    rewritten
 }
 
 fn markdown_options() -> Options {
@@ -200,7 +246,7 @@ fn markdown_options() -> Options {
 #[cfg(test)]
 mod tests {
     use super::rewrite_attachment_urls;
-    use yew_duskmoon::render_markdown_to_html;
+    use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
     const BASE: &str = "/api/notes/note-1/attachments";
 
@@ -216,15 +262,35 @@ mod tests {
 <img src="./raw.svg">"#;
 
         let rewritten = rewrite_attachment_urls(markdown, BASE);
+        let html = render_markdown_to_html_with_options(
+            &rewritten,
+            DmMarkdownOptions {
+                base_url: Some(BASE.to_string()),
+                ..DmMarkdownOptions::default()
+            },
+        );
 
-        assert!(rewritten.contains("/api/notes/note-1/attachments/meta.json"));
-        assert!(rewritten.contains("/api/notes/note-1/attachments/images/diagram.svg"));
+        assert!(rewritten.contains("[meta](./meta.json \"metadata\")"));
+        assert!(rewritten.contains("[diagram]: ./images/diagram.svg"));
         assert!(rewritten.contains("href=\"/api/notes/note-1/attachments/raw.txt\""));
         assert!(rewritten.contains("src=\"/api/notes/note-1/attachments/raw.svg\""));
-
-        let html = render_markdown_to_html(&rewritten);
         assert!(html.contains("href=\"/api/notes/note-1/attachments/meta.json\""));
         assert!(html.contains("src=\"/api/notes/note-1/attachments/images/diagram.svg\""));
+    }
+
+    #[test]
+    fn percent_encodes_reserved_characters_in_attachment_paths() {
+        let markdown = r#"[report](./reports/progress#1?value=50%.txt)
+
+<img src="./images/status #1?value=50%.png">"#;
+
+        let rewritten = rewrite_attachment_urls(markdown, BASE);
+
+        assert!(rewritten
+            .contains("/api/notes/note-1/attachments/reports/progress%231%3Fvalue%3D50%25.txt"));
+        assert!(rewritten.contains(
+            "src=\"/api/notes/note-1/attachments/images/status%20%231%3Fvalue%3D50%25.png\""
+        ));
     }
 
     #[test]
@@ -261,10 +327,17 @@ title: Example
             "| Token | Value |\n| --- | --- |\n| `primary` | `#0065FF` |",
             BASE,
         );
-        let html = render_markdown_to_html(&rewritten);
+        let html = render_markdown_to_html_with_options(
+            &rewritten,
+            DmMarkdownOptions {
+                base_url: Some(BASE.to_string()),
+                ..DmMarkdownOptions::default()
+            },
+        );
 
         assert!(html.contains(r#"class="dm-color-code""#));
         assert!(html.contains(r#"class="dm-color-chip""#));
-        assert!(html.contains(r#"style="background-color:#0065FF""#));
+        assert!(html.contains("background-color:#0065FF;"));
+        assert!(html.contains("display:inline-flex"));
     }
 }

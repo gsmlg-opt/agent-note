@@ -438,19 +438,37 @@ pub async fn list_all_notes(conn: &Connection) -> anyhow::Result<Vec<Note>> {
 fn serialize_attachments(attachments: &[NoteAttachment]) -> anyhow::Result<String> {
     let metadata = attachments
         .iter()
-        .map(|attachment| NoteAttachment {
+        .map(|attachment| StoredAttachment {
             id: attachment.id.clone(),
             path: attachment.path.clone(),
             mime: attachment.mime.clone(),
             description: attachment.description.clone(),
-            content: String::new(),
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&metadata).map_err(anyhow::Error::new)
 }
 
 fn deserialize_attachments(value: &str) -> anyhow::Result<Vec<NoteAttachment>> {
-    serde_json::from_str(value).map_err(anyhow::Error::new)
+    let metadata: Vec<StoredAttachment> = serde_json::from_str(value)?;
+    Ok(metadata
+        .into_iter()
+        .map(|attachment| NoteAttachment {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content: Vec::new(),
+        })
+        .collect())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredAttachment {
+    id: String,
+    path: String,
+    mime: String,
+    #[serde(default)]
+    description: String,
 }
 
 pub async fn list_note_summaries(

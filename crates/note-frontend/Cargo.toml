@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+base64 = "0.22.1"
 yew = { version = "0.23.0", features = ["csr"] }
 web-sys = { version = "0.3", features = ["HtmlElement", "HtmlInputElement", "HtmlTextAreaElement", "HtmlSelectElement"] }
 gloo-net = "0.7.0"
@@ -16,5 +17,5 @@ serde_json = "1.0.150"
 urlencoding = "2.1.3"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 wasm-bindgen-futures = "0.4.76"
-yew-duskmoon = "0.8.0"
+yew-duskmoon = "0.8.1"
 yew-router = "0.20.0"

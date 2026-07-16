@@ -1,11 +1,15 @@
-use gloo_file::futures::read_as_text;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use gloo_file::futures::read_as_bytes;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 use yew::virtual_dom::AttrValue;
 use yew_duskmoon::{Button, Card, Chip, MarkdownInput};
 
-use crate::state::{LabelKey, NoteAttachment};
+use crate::{
+    api::attachment_url,
+    state::{AttachmentContent, LabelKey, NoteAttachment},
+};
 
 type NoteEditorSubmit = (String, String, Vec<(String, String)>, Vec<NoteAttachment>);
 
@@ -25,6 +29,8 @@ pub struct NoteEditorProps {
     pub initial_labels: Vec<(String, String)>,
     #[prop_or_default]
     pub initial_attachments: Vec<NoteAttachment>,
+    #[prop_or_default]
+    pub attachment_base: Option<String>,
     #[prop_or_else(|| "New note".to_string())]
     pub card_title: String,
     #[prop_or_else(|| "Save note".to_string())]
@@ -48,7 +54,7 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
     let attachment_path = use_state(String::new);
     let attachment_mime = use_state(|| "text/plain".to_string());
     let attachment_description = use_state(String::new);
-    let attachment_content = use_state(String::new);
+    let attachment_content = use_state(|| AttachmentContent::Text(String::new()));
     let attachment_file_reading = use_state(|| false);
     let attachment_file_error = use_state(|| None::<String>);
 
@@ -111,7 +117,7 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         let attachment_content = attachment_content.clone();
         Callback::from(move |e: InputEvent| {
             let input: HtmlTextAreaElement = e.target_unchecked_into();
-            attachment_content.set(input.value());
+            attachment_content.set(AttachmentContent::Text(input.value()));
         })
     };
 
@@ -138,8 +144,8 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
             let attachment_file_reading = attachment_file_reading.clone();
             let attachment_file_error = attachment_file_error.clone();
             spawn_local(async move {
-                match read_as_text(&file).await {
-                    Ok(file_content) => attachment_content.set(file_content),
+                match read_as_bytes(&file).await {
+                    Ok(bytes) => attachment_content.set(attachment_content_for_bytes(bytes)),
                     Err(error) => {
                         attachment_file_error.set(Some(format!("Unable to read file: {error}")))
                     }
@@ -186,13 +192,13 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                 path,
                 mime,
                 description: (*attachment_description).clone(),
-                content: attachment_content.to_string(),
+                content: (*attachment_content).clone(),
             });
             attachments.set(next);
             attachment_path.set(String::new());
             attachment_mime.set("text/plain".to_string());
             attachment_description.set(String::new());
-            attachment_content.set(String::new());
+            attachment_content.set(AttachmentContent::Text(String::new()));
             attachment_file_error.set(None);
         })
     };
@@ -388,21 +394,30 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                             <input
                                 class="input attachment-file-input"
                                 type="file"
-                                accept="text/*,.json,.md,.csv,.xml,.yaml,.yml,.svg"
                                 disabled={*attachment_file_reading}
                                 onchange={on_attachment_file_change}
                             />
                         </label>
-                        <label class="field attachment-content-field">
-                            <span>{ "Content" }</span>
-                            <textarea
-                                class="input attachment-content-input"
-                                placeholder="Attachment content"
-                                value={(*attachment_content).clone()}
-                                disabled={*attachment_file_reading}
-                                oninput={on_attachment_content_input}
-                            />
-                        </label>
+                        { match &*attachment_content {
+                            AttachmentContent::Text(content) => html! {
+                                <label class="field attachment-content-field">
+                                    <span>{ "Content" }</span>
+                                    <textarea
+                                        class="input attachment-content-input"
+                                        placeholder="Attachment content"
+                                        value={content.clone()}
+                                        disabled={*attachment_file_reading}
+                                        oninput={on_attachment_content_input.clone()}
+                                    />
+                                </label>
+                            },
+                            AttachmentContent::Base64(_) => html! {
+                                <div class="field attachment-content-field">
+                                    <span>{ "Content" }</span>
+                                    <p class="attachment-binary-status">{ "Binary attachment" }</p>
+                                </div>
+                            },
+                        } }
                         <button
                             type="button"
                             class="btn btn-outline attachment-add-button"
@@ -436,11 +451,20 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                                     let input: HtmlTextAreaElement = e.target_unchecked_into();
                                     let mut next = (*attachments).clone();
                                     if let Some(attachment) = next.get_mut(idx) {
-                                        attachment.content = input.value();
+                                        if let AttachmentContent::Text(content) = &mut attachment.content {
+                                            *content = input.value();
+                                        }
                                     }
                                     attachments.set(next);
                                 })
                             };
+                            let download_url = props.attachment_base.as_ref().and_then(|base| {
+                                props.initial_attachments.iter().find(|initial| {
+                                    initial.id == attachment.id
+                                        && initial.path == attachment.path
+                                        && initial.content == attachment.content
+                                }).map(|_| attachment_url(base, &attachment.path))
+                            });
                             let on_file_change = attachment_file_callback(
                                 &attachments,
                                 attachment.id.clone(),
@@ -477,20 +501,32 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                                             <input
                                                 class="input attachment-file-input"
                                                 type="file"
-                                                accept="text/*,.json,.md,.csv,.xml,.yaml,.yml,.svg"
                                                 disabled={*attachment_file_reading}
                                                 onchange={on_file_change}
                                             />
                                         </label>
-                                        <label class="field attachment-content-field">
-                                            <span>{ "Content" }</span>
-                                            <textarea
-                                                class="input attachment-content-input"
-                                                value={attachment.content.clone()}
-                                                disabled={*attachment_file_reading}
-                                                oninput={on_content_input}
-                                            />
-                                        </label>
+                                        { match &attachment.content {
+                                            AttachmentContent::Text(content) => html! {
+                                                <label class="field attachment-content-field">
+                                                    <span>{ "Content" }</span>
+                                                    <textarea
+                                                        class="input attachment-content-input"
+                                                        value={content.clone()}
+                                                        disabled={*attachment_file_reading}
+                                                        oninput={on_content_input}
+                                                    />
+                                                </label>
+                                            },
+                                            AttachmentContent::Base64(_) => html! {
+                                                <div class="field attachment-content-field">
+                                                    <span>{ "Content" }</span>
+                                                    <p class="attachment-binary-status">{ "Binary attachment" }</p>
+                                                    if let Some(url) = download_url {
+                                                        <a class="btn btn-ghost" href={url} download="">{ "Download" }</a>
+                                                    }
+                                                </div>
+                                            },
+                                        } }
                                         <button type="button" class="btn btn-outline attachment-remove-button" disabled={*attachment_file_reading} onclick={on_remove}>
                                             { "Remove" }
                                         </button>
@@ -556,8 +592,8 @@ fn attachment_file_callback(
         let attachment_file_reading = attachment_file_reading.clone();
         let attachment_file_error = attachment_file_error.clone();
         spawn_local(async move {
-            match read_as_text(&file).await {
-                Ok(file_content) => {
+            match read_as_bytes(&file).await {
+                Ok(bytes) => {
                     let mut next = (*attachments).clone();
                     if let Some(attachment) = next
                         .iter_mut()
@@ -565,7 +601,7 @@ fn attachment_file_callback(
                     {
                         attachment.path = path;
                         attachment.mime = mime;
-                        attachment.content = file_content;
+                        attachment.content = attachment_content_for_bytes(bytes);
                     }
                     attachments.set(next);
                 }
@@ -605,6 +641,13 @@ fn attachment_mime_for_file(mime: &str) -> String {
     }
 }
 
+fn attachment_content_for_bytes(bytes: Vec<u8>) -> AttachmentContent {
+    match String::from_utf8(bytes) {
+        Ok(content) => AttachmentContent::Text(content),
+        Err(error) => AttachmentContent::Base64(STANDARD.encode(error.into_bytes())),
+    }
+}
+
 fn label_value_input_type(value_type: &str) -> &'static str {
     match value_type {
         "number" => "number",
@@ -625,7 +668,7 @@ mod tests {
             path: "./file.txt".to_string(),
             mime: "text/plain".to_string(),
             description: String::new(),
-            content: String::new(),
+            content: AttachmentContent::Text(String::new()),
         }
     }
 
@@ -641,5 +684,17 @@ mod tests {
         assert_eq!(attachment_path_for_file("folder\\notes.md"), "./notes.md");
         assert_eq!(attachment_mime_for_file(""), "text/plain");
         assert_eq!(attachment_mime_for_file("text/markdown"), "text/markdown");
+    }
+
+    #[test]
+    fn keeps_utf8_files_as_text_and_encodes_binary_files() {
+        assert_eq!(
+            attachment_content_for_bytes(b"hello".to_vec()),
+            AttachmentContent::Text("hello".to_string())
+        );
+        assert_eq!(
+            attachment_content_for_bytes(vec![0xff, 0x00]),
+            AttachmentContent::Base64("/wA=".to_string())
+        );
     }
 }
