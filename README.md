@@ -74,26 +74,18 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
 
 ## Run (end to end, dev)
 
-1. Build the frontend bundle once:
+1. Install Trunk once:
    ```
-   cd crates/note-frontend && trunk build
+   cargo install --locked trunk
    ```
-2. From the repo root, start the app (UI + REST + `/mcp` on `127.0.0.1:6222`):
+2. From the repo root, start the backend and hot-reloading frontend together:
    ```
    cargo run
    ```
-   Then open http://127.0.0.1:6222. (`cargo run` resolves to `note-server` — the workspace's only
-   binary — and a debug build auto-serves the `dist/` bundle from step 1. By default, `cargo run`
-   stores the SQLite database at `./dev-data/notes.db` and attachments under
-   `./dev-data/attachments`. Set `NOTE_DB_PATH` or `NOTE_ATTACHMENTS_DIR` to override either path.)
-
-For frontend hot reload, keep the backend running and serve the frontend separately (on
-`127.0.0.1:8081`, proxying `/api` + `/mcp` to the backend — see
-`crates/note-frontend/Trunk.toml`):
-   ```
-   cd crates/note-frontend && trunk serve
-   ```
-Then open http://127.0.0.1:8081.
+   Then open http://0.0.0.0:6221. Trunk proxies `/api` and `/mcp` to `note-server` on
+   `127.0.0.1:6222`. By default, the SQLite database is stored at `./dev-data/notes.db` and
+   attachments under `./dev-data/attachments`. Set `NOTE_DB_PATH` or `NOTE_ATTACHMENTS_DIR` to
+   override either path.
 
 ## MCP
 
@@ -106,6 +98,7 @@ cargo run -p note-server -- --stdio
 It exposes two tools — `save_note` and `semantic_search`. Label-key management is REST/UI-only.
 The HTTP server additionally exposes the MCP Streamable HTTP transport at `/mcp`.
 
-Both `note-server` (HTTP) and the `/mcp` transport bind to loopback only — this is a fully-offline,
-single-user, unauthenticated personal app. Exposing it beyond localhost is a deliberate opt-in that
-also requires widening the MCP `Host` allowlist (see `crates/note-mcp/src/http.rs`).
+`note-server` still binds its backend to loopback by default. The Debug Trunk server deliberately
+binds `0.0.0.0:6221`, so the development UI and its proxied endpoints are reachable from the local
+network; run it only on a trusted network. Packaged builds do not start Trunk and retain their
+explicit bind/static-directory configuration.

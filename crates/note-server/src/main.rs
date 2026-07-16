@@ -10,14 +10,21 @@ use note_pipelines::{Context, EmbeddingJobNotifier, ProcessEmbeddingJobStatus};
 use note_storage::Storage;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+#[cfg(debug_assertions)]
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::process::Child;
+#[cfg(debug_assertions)]
+use tokio::process::Command;
 use tokio::sync::{watch, Notify};
 
 const DEFAULT_EMBEDDING_POLL_MS: u64 = 1000;
 const TRASH_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_DB_PATH: &str = "./dev-data/notes.db";
 const DEFAULT_ATTACHMENTS_DIR: &str = "./dev-data/attachments";
+const DEV_FRONTEND_URL: &str = "http://0.0.0.0:6221";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddingExecutionMode {
@@ -108,6 +115,76 @@ fn ensure_data_directories(db_path: &str, attachments_dir: &Path) -> anyhow::Res
     }
     std::fs::create_dir_all(attachments_dir)?;
     Ok(())
+}
+
+fn should_start_dev_frontend(
+    debug_build: bool,
+    http_mode: bool,
+    explicit_static_dir: bool,
+) -> bool {
+    debug_build && http_mode && !explicit_static_dir
+}
+
+#[cfg(debug_assertions)]
+fn frontend_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../note-frontend")
+}
+
+fn start_dev_frontend(enabled: bool) -> anyhow::Result<Option<Child>> {
+    if !enabled {
+        return Ok(None);
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let frontend_dir = frontend_dir().canonicalize().map_err(|error| {
+            anyhow::anyhow!(
+                "resolve frontend directory {}: {error}",
+                frontend_dir().display()
+            )
+        })?;
+        let mut command = Command::new("trunk");
+        command
+            .arg("serve")
+            .current_dir(&frontend_dir)
+            .stdin(Stdio::null())
+            .env_remove("NO_COLOR")
+            .kill_on_drop(true);
+        command.spawn().map(Some).map_err(|error| {
+            anyhow::anyhow!(
+                "start `trunk serve` from {}: {error}. Install it with `cargo install --locked trunk`",
+                frontend_dir.display()
+            )
+        })
+    }
+
+    #[cfg(not(debug_assertions))]
+    Ok(None)
+}
+
+async fn wait_for_dev_frontend(child: &mut Option<Child>) -> std::io::Result<ExitStatus> {
+    match child {
+        Some(child) => child.wait().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn stop_dev_frontend(child: &mut Option<Child>) {
+    let Some(child) = child else {
+        return;
+    };
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) => {
+            if let Err(error) = child.start_kill() {
+                eprintln!("failed to stop trunk serve: {error}");
+            }
+        }
+        Err(error) => eprintln!("failed to inspect trunk serve: {error}"),
+    }
+    if let Err(error) = child.wait().await {
+        eprintln!("failed to reap trunk serve: {error}");
+    }
 }
 
 async fn run_embedding_scheduler(
@@ -290,18 +367,11 @@ async fn main() -> anyhow::Result<()> {
             .with_state(ctx.clone());
         let mut app: Router = rest.merge(note_mcp::mcp_router(ctx));
 
-        // If NOTE_STATIC_DIR is set (e.g. the Docker image points it at the built wasm bundle),
-        // serve those static files for any path the API/MCP routes don't claim, falling back to
-        // index.html. In debug builds, `cargo run` also serves a previously built Trunk bundle.
-        let static_dir = match std::env::var("NOTE_STATIC_DIR") {
-            Ok(static_dir) if !static_dir.is_empty() => Some(static_dir),
-            _ if cfg!(debug_assertions)
-                && std::path::Path::new("crates/note-frontend/dist").is_dir() =>
-            {
-                Some("crates/note-frontend/dist".to_string())
-            }
-            _ => None,
-        };
+        // NOTE_STATIC_DIR is for packaged builds such as Docker. Local debug HTTP runs use the
+        // Trunk development server instead, unless an explicit static directory is configured.
+        let static_dir = std::env::var("NOTE_STATIC_DIR")
+            .ok()
+            .filter(|static_dir| !static_dir.is_empty());
         if let Some(static_dir) = &static_dir {
             // SPA fallback for any path the API/MCP routes don't claim: serve a real static asset
             // when one exists at that path, otherwise return index.html (200) so client-side routes
@@ -342,31 +412,59 @@ async fn main() -> anyhow::Result<()> {
         // (container-network isolation makes that safe; exposing it to your LAN is your `-p` choice).
         let bind_addr =
             std::env::var("NOTE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:6222".to_string());
-        eprintln!("note-server listening on http://{bind_addr}");
-        if let Some(static_dir) = &static_dir {
-            eprintln!("serving frontend from {static_dir}");
-        } else {
-            eprintln!(
-                "API only — run `trunk build` then re-run for the UI, or `trunk serve` for hot reload"
-            );
-        }
-        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-        let server = axum::serve(listener, app);
-        tokio::select! {
-            result = server => result?,
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(error) = signal {
-                    eprintln!("failed to listen for shutdown signal: {error}");
+        let mut dev_frontend = None;
+        let run_result = match tokio::net::TcpListener::bind(&bind_addr).await {
+            Err(error) => Err(anyhow::Error::new(error)),
+            Ok(listener) => match start_dev_frontend(should_start_dev_frontend(
+                cfg!(debug_assertions),
+                true,
+                static_dir.is_some(),
+            )) {
+                Err(error) => Err(error),
+                Ok(child) => {
+                    dev_frontend = child;
+                    eprintln!("note-server listening on http://{bind_addr}");
+                    if dev_frontend.is_some() {
+                        eprintln!("frontend dev server listening on {DEV_FRONTEND_URL}");
+                    } else if let Some(static_dir) = &static_dir {
+                        eprintln!("serving frontend from {static_dir}");
+                    } else {
+                        eprintln!("API only — set NOTE_STATIC_DIR to serve a frontend bundle");
+                    }
+
+                    let server = axum::serve(listener, app);
+                    tokio::select! {
+                        biased;
+                        signal = tokio::signal::ctrl_c() => {
+                            if let Err(error) = signal {
+                                eprintln!("failed to listen for shutdown signal: {error}");
+                            }
+                            eprintln!("shutting down note-server");
+                            Ok(())
+                        }
+                        status = wait_for_dev_frontend(&mut dev_frontend) => {
+                            match status {
+                                Ok(status) => Err(anyhow::anyhow!(
+                                    "trunk serve exited unexpectedly: {status}"
+                                )),
+                                Err(error) => Err(anyhow::anyhow!(
+                                    "wait for trunk serve: {error}"
+                                )),
+                            }
+                        }
+                        result = server => result.map_err(anyhow::Error::new),
+                    }
                 }
-                eprintln!("shutting down note-server");
-            }
-        }
+            },
+        };
+        stop_dev_frontend(&mut dev_frontend).await;
         let _ = scheduler_shutdown_tx.send(true);
         let _ = scheduler.await;
         let _ = trash_retention.await;
         if let Some(process_runtime) = embedding.process_runtime {
             process_runtime.shutdown().await;
         }
+        run_result?;
     }
     Ok(())
 }
@@ -392,5 +490,21 @@ mod tests {
         assert!(db_path.parent().unwrap().is_dir());
         assert!(attachments_dir.is_dir());
         assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn dev_frontend_only_starts_for_debug_http_without_static_dir() {
+        assert!(should_start_dev_frontend(true, true, false));
+        assert!(!should_start_dev_frontend(false, true, false));
+        assert!(!should_start_dev_frontend(true, false, false));
+        assert!(!should_start_dev_frontend(true, true, true));
+    }
+
+    #[test]
+    fn frontend_config_uses_the_expected_dev_address() {
+        let config = std::fs::read_to_string(frontend_dir().join("Trunk.toml")).unwrap();
+        assert!(config.contains("addresses = [\"0.0.0.0\"]"));
+        assert!(config.contains("port = 6221"));
+        assert_eq!(DEV_FRONTEND_URL, "http://0.0.0.0:6221");
     }
 }
