@@ -518,6 +518,7 @@ dependencies = [
  "chrono",
  "gloo-file",
  "gloo-net 0.7.0",
+ "gloo-timers",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "serde",

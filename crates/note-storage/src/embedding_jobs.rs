@@ -22,6 +22,18 @@ pub struct EmbeddingJob {
     pub attempts: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessingEmbeddingNote {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingDashboardStatus {
+    pub embedded_note_count: usize,
+    pub processing_note: Option<ProcessingEmbeddingNote>,
+}
+
 pub struct UpsertNoteChunk<'a> {
     pub note_id: &'a str,
     pub chunk_idx: i64,
@@ -30,6 +42,59 @@ pub struct UpsertNoteChunk<'a> {
     pub note_revision: i64,
     pub status: &'a str,
     pub updated_at: i64,
+}
+
+pub async fn embedding_dashboard_status(
+    conn: &Connection,
+) -> anyhow::Result<EmbeddingDashboardStatus> {
+    let mut count_rows = conn
+        .query(
+            "SELECT COUNT(*)
+             FROM notes n
+             WHERE n.deleted_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM note_chunks c
+                   WHERE c.note_id = n.id AND c.note_revision = n.note_revision
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM note_chunks c
+                   WHERE c.note_id = n.id
+                     AND (c.note_revision != n.note_revision OR c.status != 'embedded')
+               )",
+            (),
+        )
+        .await?;
+    let embedded_note_count = count_rows
+        .next()
+        .await?
+        .map(|row| row.get::<i64>(0))
+        .transpose()?
+        .unwrap_or(0)
+        .max(0) as usize;
+
+    let mut processing_rows = conn
+        .query(
+            "SELECT n.id, n.title
+             FROM embedding_jobs j
+             JOIN notes n ON n.id = j.note_id
+             WHERE j.status = 'processing' AND n.deleted_at IS NULL
+             ORDER BY j.updated_at, j.id
+             LIMIT 1",
+            (),
+        )
+        .await?;
+    let processing_note = match processing_rows.next().await? {
+        Some(row) => Some(ProcessingEmbeddingNote {
+            id: row.get::<String>(0)?,
+            title: row.get::<String>(1)?,
+        }),
+        None => None,
+    };
+
+    Ok(EmbeddingDashboardStatus {
+        embedded_note_count,
+        processing_note,
+    })
 }
 
 pub async fn list_note_chunks(conn: &Connection, note_id: &str) -> anyhow::Result<Vec<NoteChunk>> {

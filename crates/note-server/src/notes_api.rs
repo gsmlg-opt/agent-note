@@ -7,9 +7,10 @@ use axum::{
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
-    count_notes, delete_note, get_note, label_note_counts, list_deleted_note_summaries,
-    list_label_keys, list_note_summaries, permanently_delete_note, restore_notes, save_note,
-    search_notes_filtered, update_note, Context, ListNotesParams, SaveNoteInput,
+    count_notes, delete_note, embedding_dashboard_status, get_note, label_note_counts,
+    list_deleted_note_summaries, list_label_keys, list_note_summaries, permanently_delete_note,
+    restore_notes, save_note, search_notes_filtered, update_note, Context, ListNotesParams,
+    SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -144,8 +145,16 @@ pub struct DashboardNoteDto {
 }
 
 #[derive(Clone, Serialize)]
+pub struct DashboardEmbeddingNoteDto {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Serialize)]
 pub struct DashboardDto {
     pub note_count: usize,
+    pub embedded_note_count: usize,
+    pub embedding_note: Option<DashboardEmbeddingNoteDto>,
     pub label_count: usize,
     pub last_updated_at: Option<i64>,
     pub labels: Vec<DashboardLabelDto>,
@@ -210,13 +219,32 @@ async fn load_dashboard(ctx: &Context) -> anyhow::Result<DashboardDto> {
         .collect::<Vec<_>>();
     let last_updated_at = recent_updates.first().map(|note| note.updated_at);
 
-    Ok(DashboardDto {
+    let mut dashboard = DashboardDto {
         note_count,
+        embedded_note_count: 0,
+        embedding_note: None,
         label_count,
         last_updated_at,
         labels,
         recent_updates,
-    })
+    };
+    refresh_dashboard_embedding_status(ctx, &mut dashboard).await?;
+    Ok(dashboard)
+}
+
+async fn refresh_dashboard_embedding_status(
+    ctx: &Context,
+    dashboard: &mut DashboardDto,
+) -> anyhow::Result<()> {
+    let status = embedding_dashboard_status(ctx).await?;
+    dashboard.embedded_note_count = status.embedded_note_count;
+    dashboard.embedding_note = status
+        .processing_note
+        .map(|note| DashboardEmbeddingNoteDto {
+            id: note.id,
+            title: note.title,
+        });
+    Ok(())
 }
 
 async fn dashboard_handler(
@@ -225,7 +253,11 @@ async fn dashboard_handler(
     let now = Instant::now();
     if let Some(cached) = dashboard_cache().read().await.clone() {
         if cached.expires_at > now {
-            return Ok(Json(cached.value));
+            let mut value = cached.value;
+            refresh_dashboard_embedding_status(&ctx, &mut value)
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            return Ok(Json(value));
         }
     }
 
@@ -792,13 +824,18 @@ mod tests {
     #[tokio::test]
     async fn dashboard_uses_summary_data_and_invalidates_after_note_write() {
         invalidate_dashboard_cache();
-        let (app, _ctx, _dir) = test_app().await;
+        let (app, ctx, _dir) = test_app().await;
 
         let resp = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json.get("note_count").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            json.get("embedded_note_count").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert!(json.get("embedding_note").unwrap().is_null());
 
         app.clone()
             .oneshot(post(
@@ -808,7 +845,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = app.oneshot(get("/api/dashboard")).await.unwrap();
+        let resp = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -831,6 +868,35 @@ mod tests {
             recent[0].get("title").and_then(|v| v.as_str()),
             Some("Dashboard")
         );
+
+        let conn = ctx.storage.connect().unwrap();
+        assert_eq!(
+            note_storage::claim_pending_embedding_jobs(&conn, 1, 2000)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let resp = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["embedding_note"]["title"].as_str(), Some("Dashboard"));
+        assert_eq!(json["embedded_note_count"].as_u64(), Some(0));
+
+        note_pipelines::requeue_processing_embedding_jobs(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            note_pipelines::drain_embedding_jobs(&ctx, 10)
+                .await
+                .unwrap(),
+            1
+        );
+        let resp = app.oneshot(get("/api/dashboard")).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["embedding_note"].is_null());
+        assert_eq!(json["embedded_note_count"].as_u64(), Some(1));
         invalidate_dashboard_cache();
     }
 

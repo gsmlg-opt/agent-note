@@ -8,6 +8,7 @@ yew = { version = "0.23.0", features = ["csr"] }
 web-sys = { version = "0.3", features = ["HtmlElement", "HtmlInputElement", "HtmlTextAreaElement", "HtmlSelectElement"] }
 gloo-net = "0.7.0"
 gloo-file = { version = "0.3.0", features = ["futures"] }
+gloo-timers = { version = "0.3.0", features = ["futures"] }
 pulldown-cmark = "0.13.4"
 pulldown-cmark-to-cmark = "22.0.0"
 serde = { version = "1.0.228", features = ["derive"] }

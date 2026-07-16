@@ -197,8 +197,16 @@ pub struct DashboardNote {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DashboardEmbeddingNote {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct DashboardSummary {
     pub note_count: usize,
+    pub embedded_note_count: usize,
+    pub embedding_note: Option<DashboardEmbeddingNote>,
     pub label_count: usize,
     pub last_updated_at: Option<i64>,
     pub labels: Vec<DashboardLabel>,

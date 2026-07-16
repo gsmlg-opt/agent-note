@@ -1,3 +1,5 @@
+use std::{cell::Cell, rc::Rc};
+
 use yew::prelude::*;
 use yew_duskmoon::Alert;
 use yew_router::prelude::*;
@@ -16,16 +18,23 @@ pub fn dashboard_page() -> Html {
         let loading = loading.clone();
         let error = error.clone();
         use_effect_with((), move |_| {
+            let active = Rc::new(Cell::new(true));
+            let task_active = active.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 loading.set(true);
-                error.set(None);
-                match api::dashboard().await {
-                    Ok(next) => summary.set(Some(next)),
-                    Err(e) => error.set(Some(e)),
+                while task_active.get() {
+                    match api::dashboard().await {
+                        Ok(next) => {
+                            summary.set(Some(next));
+                            error.set(None);
+                        }
+                        Err(e) => error.set(Some(e)),
+                    }
+                    loading.set(false);
+                    gloo_timers::future::TimeoutFuture::new(1_000).await;
                 }
-                loading.set(false);
             });
-            || ()
+            move || active.set(false)
         });
     }
 
@@ -34,7 +43,7 @@ pub fn dashboard_page() -> Html {
             <div class="page-head">
                 <div>
                     <h2 class="page-title">{ "Dashboard" }</h2>
-                    <p class="page-hint">{ "Current note inventory, label usage, and recent updates." }</p>
+                    <p class="page-hint">{ "Current note inventory, embedding status, label usage, and recent updates." }</p>
                 </div>
                 <Link<Route> to={Route::Notes} classes={classes!("btn", "btn-primary")}>{ "Open notes" }</Link<Route>>
             </div>
@@ -50,6 +59,22 @@ pub fn dashboard_page() -> Html {
                     <div class="dashboard-metric">
                         <span class="dashboard-metric-label">{ "Notes" }</span>
                         <strong>{ summary.note_count }</strong>
+                    </div>
+                    <div class="dashboard-metric">
+                        <span class="dashboard-metric-label">{ "Embedded notes" }</span>
+                        <strong>{ summary.embedded_note_count }</strong>
+                        if let Some(note) = &summary.embedding_note {
+                            <Link<Route>
+                                to={Route::NoteShow { id: note.id.clone() }}
+                                classes={classes!("dashboard-metric-detail")}
+                            >
+                                <span title={format!("Embedding: {} ({})", note.title, note.id)}>
+                                    { format!("Embedding: {} ({})", note.title, note.id) }
+                                </span>
+                            </Link<Route>>
+                        } else {
+                            <span class="dashboard-metric-detail">{ "No active embedding" }</span>
+                        }
                     </div>
                     <div class="dashboard-metric">
                         <span class="dashboard-metric-label">{ "Labels" }</span>

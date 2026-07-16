@@ -143,6 +143,13 @@ pub async fn requeue_processing_embedding_jobs(ctx: &Context) -> anyhow::Result<
     Ok(note_storage::requeue_processing_embedding_jobs(&conn, now).await? as usize)
 }
 
+pub async fn embedding_dashboard_status(
+    ctx: &Context,
+) -> anyhow::Result<note_storage::EmbeddingDashboardStatus> {
+    let conn = ctx.storage.connect()?;
+    note_storage::embedding_dashboard_status(&conn).await
+}
+
 pub async fn process_next_embedding_job(
     ctx: &Context,
 ) -> anyhow::Result<Option<ProcessedEmbeddingJob>> {
