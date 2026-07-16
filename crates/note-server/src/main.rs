@@ -16,6 +16,8 @@ use tokio::sync::{watch, Notify};
 
 const DEFAULT_EMBEDDING_POLL_MS: u64 = 1000;
 const TRASH_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_DB_PATH: &str = "./dev-data/notes.db";
+const DEFAULT_ATTACHMENTS_DIR: &str = "./dev-data/attachments";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddingExecutionMode {
@@ -87,16 +89,25 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn attachments_dir_from_env(db_path: &str) -> PathBuf {
+fn db_path_from_env() -> String {
+    std::env::var("NOTE_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string())
+}
+
+fn attachments_dir_from_env() -> PathBuf {
     std::env::var("NOTE_ATTACHMENTS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            Path::new(db_path)
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-                .join("attachments")
-        })
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ATTACHMENTS_DIR))
+}
+
+fn ensure_data_directories(db_path: &str, attachments_dir: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = Path::new(db_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir_all(attachments_dir)?;
+    Ok(())
 }
 
 async fn run_embedding_scheduler(
@@ -177,8 +188,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let stdio_mode = args.iter().any(|a| a == "--stdio");
-    let db_path = std::env::var("NOTE_DB_PATH").unwrap_or_else(|_| "notes.db".to_string());
-    let attachments_dir = attachments_dir_from_env(&db_path);
+    let db_path = db_path_from_env();
+    let attachments_dir = attachments_dir_from_env();
+    ensure_data_directories(&db_path, &attachments_dir)?;
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
 
@@ -357,4 +369,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_data_paths_use_dev_data() {
+        assert_eq!(DEFAULT_DB_PATH, "./dev-data/notes.db");
+        assert_eq!(DEFAULT_ATTACHMENTS_DIR, "./dev-data/attachments");
+    }
+
+    #[test]
+    fn data_directories_are_created_before_storage_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("dev-data/notes.db");
+        let attachments_dir = temp.path().join("dev-data/attachments");
+
+        ensure_data_directories(db_path.to_str().unwrap(), &attachments_dir).unwrap();
+
+        assert!(db_path.parent().unwrap().is_dir());
+        assert!(attachments_dir.is_dir());
+        assert!(!db_path.exists());
+    }
 }

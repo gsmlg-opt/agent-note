@@ -83,8 +83,9 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
    cargo run
    ```
    Then open http://127.0.0.1:6222. (`cargo run` resolves to `note-server` — the workspace's only
-   binary — and a debug build auto-serves the `dist/` bundle from step 1. Set `NOTE_DB_PATH` to
-   change the SQLite file; it defaults to `notes.db` in the working directory.)
+   binary — and a debug build auto-serves the `dist/` bundle from step 1. By default, `cargo run`
+   stores the SQLite database at `./dev-data/notes.db` and attachments under
+   `./dev-data/attachments`. Set `NOTE_DB_PATH` or `NOTE_ATTACHMENTS_DIR` to override either path.)
 
 For frontend hot reload, keep the backend running and serve the frontend separately (on
 `127.0.0.1:8081`, proxying `/api` + `/mcp` to the backend — see

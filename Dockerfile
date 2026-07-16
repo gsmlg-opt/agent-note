@@ -68,6 +68,7 @@ COPY --from=onnxruntime /opt/ort/lib/libonnxruntime.so.1.24.2 /usr/local/lib/lib
 ENV NOTE_BIND_ADDR=0.0.0.0:6222 \
     NOTE_STATIC_DIR=/app/static \
     NOTE_DB_PATH=/app/data/notes.db \
+    NOTE_ATTACHMENTS_DIR=/app/data/attachments \
     ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
 RUN mkdir -p /app/data
 EXPOSE 6222

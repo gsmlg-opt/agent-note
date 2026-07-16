@@ -6,3 +6,4 @@
 !/models/.gitkeep
 *.db
 *.db-journal
+/dev-data
