@@ -137,6 +137,19 @@ pub async fn get_note(conn: &Connection, id: &str) -> anyhow::Result<Option<Note
     }))
 }
 
+pub async fn get_note_content(conn: &Connection, id: &str) -> anyhow::Result<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT content FROM notes WHERE id = ?1 AND deleted_at IS NULL",
+            libsql::params![id],
+        )
+        .await?;
+    Ok(match rows.next().await? {
+        Some(row) => Some(row.get::<String>(0)?),
+        None => None,
+    })
+}
+
 pub async fn update_note(
     conn: &Connection,
     id: &str,

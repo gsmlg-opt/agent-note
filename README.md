@@ -85,7 +85,11 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
    Then open http://0.0.0.0:6221. Trunk proxies `/api` and `/mcp` to `note-server` on
    `127.0.0.1:6222`. By default, the SQLite database is stored at `./dev-data/notes.db` and
    attachments under `./dev-data/attachments`. Set `NOTE_DB_PATH` or `NOTE_ATTACHMENTS_DIR` to
-   override either path.
+   override either path. A note's unrendered Markdown is available at
+   `GET /api/notes/{id}/raw` and `GET /notes/{id}/content`. During local development, use the
+   backend URL `http://127.0.0.1:6222/notes/{id}/content` for the latter because Trunk owns the
+   frontend `/notes/*` routes on port 6221. Add `?type=html` to the latter URL for a standalone,
+   styled HTML document suitable for iframe embedding.
 
 ## MCP
 

@@ -7,10 +7,10 @@ use axum::{
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
-    count_notes, delete_note, embedding_dashboard_status, get_note, label_note_counts,
-    list_deleted_note_summaries, list_label_keys, list_note_summaries, permanently_delete_note,
-    restore_notes, save_note, search_notes_filtered, update_note, Context, ListNotesParams,
-    SaveNoteInput,
+    count_notes, delete_note, embedding_dashboard_status, get_note, get_note_markdown,
+    label_note_counts, list_deleted_note_summaries, list_label_keys, list_note_summaries,
+    permanently_delete_note, restore_notes, save_note, search_notes_filtered, update_note, Context,
+    ListNotesParams, SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -439,6 +439,71 @@ async fn get_note_handler(
     }
 }
 
+async fn get_note_raw_handler(
+    State(ctx): State<Arc<Context>>,
+    Path(id): Path<String>,
+    Query(query): Query<NoteContentQuery>,
+) -> Result<Response, (axum::http::StatusCode, String)> {
+    let content = get_note_markdown(&ctx, &id)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                "note not found".to_string(),
+            )
+        })?;
+
+    match query.output_type.as_deref() {
+        None => markdown_response(content),
+        Some("html") => {
+            let attachment_base = format!("/api/notes/{id}/attachments");
+            let mut content_html = yew_duskmoon::render_markdown_to_html_with_options(
+                &content,
+                yew_duskmoon::DmMarkdownOptions {
+                    base_url: Some(attachment_base.clone()),
+                    ..yew_duskmoon::DmMarkdownOptions::default()
+                },
+            );
+            content_html = rewrite_relative_attachment_urls(&content_html, &attachment_base);
+            let document = crate::render::render_embedded_markdown_document(&content_html);
+            Response::builder()
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/html; charset=utf-8",
+                )
+                .header("x-content-type-options", "nosniff")
+                .header(
+                    "content-security-policy",
+                    "default-src 'none'; img-src 'self' data: https:; style-src 'unsafe-inline'; frame-ancestors *; base-uri 'none'; form-action 'none'",
+                )
+                .body(Body::from(document))
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+        Some(output_type) => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("unsupported content type: {output_type}"),
+        )),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct NoteContentQuery {
+    #[serde(rename = "type")]
+    output_type: Option<String>,
+}
+
+fn markdown_response(content: String) -> Result<Response, (axum::http::StatusCode, String)> {
+    Response::builder()
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(content))
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 async fn get_attachment_handler(
     State(ctx): State<Arc<Context>>,
     Path((id, path)): Path<(String, String)>,
@@ -648,6 +713,8 @@ pub fn notes_router() -> Router<Arc<Context>> {
                 .put(update_note_handler)
                 .delete(delete_note_handler),
         )
+        .route("/api/notes/{id}/raw", route_get(get_note_raw_handler))
+        .route("/notes/{id}/content", route_get(get_note_raw_handler))
         .route(
             "/api/notes/{id}/attachments/{*path}",
             route_get(get_attachment_handler),
@@ -1068,6 +1135,108 @@ mod tests {
 
         let resp = app.oneshot(get("/api/notes/does-not-exist")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_note_raw_returns_exact_markdown_or_404() {
+        let (app, _ctx, _dir) = test_app().await;
+        let markdown = "# Raw Markdown\n\n<span style=\"color: #0065ff\">HTML</span>\n";
+        let id = save_note_id(
+            app.clone(),
+            &serde_json::json!({
+                "title": "Raw",
+                "content": markdown,
+                "labels": []
+            })
+            .to_string(),
+        )
+        .await;
+
+        for uri in [
+            format!("/api/notes/{id}/raw"),
+            format!("/notes/{id}/content"),
+        ] {
+            let resp = app.clone().oneshot(get(&uri)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/markdown; charset=utf-8")
+            );
+            assert_eq!(
+                resp.headers()
+                    .get("x-content-type-options")
+                    .and_then(|value| value.to_str().ok()),
+                Some("nosniff")
+            );
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&bytes[..], markdown.as_bytes());
+        }
+
+        let resp = app
+            .oneshot(get("/notes/does-not-exist/content"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_note_content_html_returns_styled_embeddable_document() {
+        let (app, _ctx, _dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            &serde_json::json!({
+                "title": "Embedded",
+                "content": "---\ntheme: zdns\n---\n\n# Embedded\n\n| Key | Value |\n| --- | --- |\n| color | `#0065ff` |\n\n![image](./image.png)\n\n<a id=\"raw\"></a>",
+                "attachments": [{
+                    "id": "image",
+                    "path": "./image.png",
+                    "mime": "image/png",
+                    "content_base64": "iVBORw0KGgo="
+                }],
+                "labels": []
+            })
+            .to_string(),
+        )
+        .await;
+
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/notes/{id}/content?type=html")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert!(resp
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("frame-ancestors *")));
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("<style>"));
+        assert!(html.contains(".markdown-body table"));
+        assert!(html.contains("<h1>Embedded</h1>"));
+        assert!(html.contains("<table>"));
+        assert!(html.contains(r#"class="dm-code-block""#));
+        assert!(html.contains("theme: zdns"));
+        assert!(html.contains(r#"class="dm-color-chip""#));
+        assert!(html.contains("background-color:#0065ff;"));
+        assert!(html.contains(&format!("src=\"/api/notes/{id}/attachments/image.png\"")));
+        assert!(html.contains("<a id=\"raw\"></a>"));
+
+        let resp = app
+            .oneshot(get(&format!("/notes/{id}/content?type=pdf")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

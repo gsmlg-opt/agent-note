@@ -48,6 +48,166 @@ pub fn render_markdown_html(md: &str) -> String {
     out
 }
 
+pub fn render_embedded_markdown_document(content_html: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Note content</title>
+<style>
+:root {{
+  --color-primary: #0065ff;
+  --color-surface: #ffffff;
+  --color-surface-container: #f5f6fa;
+  --color-on-surface: #2f2e3f;
+  --color-on-surface-variant: #5a607f;
+  --color-outline: #d7dbec;
+}}
+* {{ box-sizing: border-box; }}
+html {{ background: var(--color-surface); }}
+body {{
+  margin: 0;
+  background: var(--color-surface);
+  color: var(--color-on-surface);
+  font-family: "PingFang SC", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+}}
+.markdown-body {{
+  width: min(100%, 960px);
+  margin: 0 auto;
+  padding: 24px;
+  overflow-wrap: anywhere;
+}}
+.markdown-body > :first-child {{ margin-top: 0; }}
+.markdown-body > :last-child {{ margin-bottom: 0; }}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {{
+  margin: 1.5rem 0 1rem;
+  color: #191919;
+  font-weight: 600;
+  line-height: 1.25;
+}}
+.markdown-body h1 {{ font-size: 2rem; }}
+.markdown-body h2 {{ font-size: 1.5rem; }}
+.markdown-body h3 {{ font-size: 1.25rem; }}
+.markdown-body h1,
+.markdown-body h2 {{ padding-bottom: 0.3em; border-bottom: 1px solid var(--color-outline); }}
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body pre,
+.markdown-body table,
+.markdown-body blockquote {{ margin: 0 0 1rem; }}
+.markdown-body ul,
+.markdown-body ol {{ padding-left: 2rem; }}
+.markdown-body li + li {{ margin-top: 0.25rem; }}
+.markdown-body a {{ color: var(--color-primary); text-decoration: none; }}
+.markdown-body a:hover {{ text-decoration: underline; }}
+.markdown-body a:focus-visible {{ outline: 2px solid var(--color-primary); outline-offset: 2px; }}
+.markdown-body code,
+.markdown-body pre {{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875rem;
+}}
+.markdown-body :not(pre) > code {{
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+  background: var(--color-surface-container);
+}}
+.markdown-body pre {{
+  max-width: 100%;
+  padding: 1rem;
+  overflow-x: auto;
+  border: 1px solid var(--color-outline);
+  border-radius: 6px;
+  background: var(--color-surface-container);
+  line-height: 1.45;
+}}
+.markdown-body pre code {{ padding: 0; background: transparent; }}
+.markdown-body .dm-code-block {{
+  margin: 0 0 1rem;
+  overflow: hidden;
+  border: 1px solid var(--color-outline);
+  border-radius: 6px;
+  background: #101720;
+}}
+.markdown-body .dm-code-block-header {{
+  min-height: 2rem;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid #2d3748;
+  background: #17202c;
+  color: #d7dee9;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+}}
+.markdown-body .dm-code-block pre {{
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #d7dee9;
+}}
+.markdown-body .dm-token-keyword {{ color: #ffb454; font-weight: 600; }}
+.markdown-body .dm-token-function {{ color: #82aaff; }}
+.markdown-body .dm-token-type {{ color: #c792ea; }}
+.markdown-body .dm-token-builtin {{ color: #7dd3fc; }}
+.markdown-body .dm-token-string {{ color: #a5d977; }}
+.markdown-body .dm-token-number {{ color: #f78c6c; }}
+.markdown-body .dm-token-literal {{ color: #ff8fa3; }}
+.markdown-body .dm-token-comment {{ color: #7a869a; font-style: italic; }}
+.markdown-body blockquote {{
+  margin-left: 0;
+  padding-left: 1rem;
+  border-left: 4px solid var(--color-outline);
+  color: var(--color-on-surface-variant);
+}}
+.markdown-body table {{
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}}
+.markdown-body th,
+.markdown-body td {{
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--color-outline);
+  text-align: left;
+  vertical-align: top;
+}}
+.markdown-body th,
+.markdown-body tr:nth-child(even) {{ background: var(--color-surface-container); }}
+.markdown-body img,
+.markdown-body svg {{ max-width: 100%; height: auto; }}
+.markdown-body hr {{
+  height: 1px;
+  margin: 1.5rem 0;
+  border: 0;
+  background: var(--color-outline);
+}}
+.markdown-body .mermaid-diagram {{ max-width: 100%; overflow-x: auto; }}
+.markdown-body .mermaid-error {{ color: #b42318; }}
+@media (max-width: 640px) {{
+  .markdown-body {{ padding: 16px; }}
+}}
+</style>
+</head>
+<body>
+<main class="markdown-body">{content_html}</main>
+</body>
+</html>
+"#
+    )
+}
+
 fn highlight_code(code: &str, lang: &str) -> String {
     static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
     static THEMES: OnceLock<ThemeSet> = OnceLock::new();
@@ -83,7 +243,7 @@ fn escape_html(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_markdown_html;
+    use super::{render_embedded_markdown_document, render_markdown_html};
 
     #[test]
     fn preserves_raw_html_anchors() {
@@ -91,5 +251,15 @@ mod tests {
 
         assert!(html.contains("<a id=\"abstract\"></a>"));
         assert!(!html.contains("&lt;a id=&quot;abstract&quot;&gt;"));
+    }
+
+    #[test]
+    fn embedded_document_contains_inline_markdown_styles() {
+        let document = render_embedded_markdown_document("<h1>Embedded</h1>");
+
+        assert!(document.starts_with("<!doctype html>"));
+        assert!(document.contains("<style>"));
+        assert!(document.contains(".markdown-body table"));
+        assert!(document.contains("<main class=\"markdown-body\"><h1>Embedded</h1></main>"));
     }
 }

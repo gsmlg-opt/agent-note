@@ -9,3 +9,8 @@ pub async fn get_note(ctx: &Context, id: &str) -> anyhow::Result<Option<Note>> {
     crate::attachment_files::hydrate_note_attachments(ctx, &mut note)?;
     Ok(Some(note))
 }
+
+pub async fn get_note_markdown(ctx: &Context, id: &str) -> anyhow::Result<Option<String>> {
+    let conn = ctx.storage.connect()?;
+    note_storage::get_note_content(&conn, id).await
+}
