@@ -12,8 +12,8 @@ The frontend styling comes from the `@duskmoon-dev/core` design system, vendored
 stylesheet at `crates/note-frontend/duskmoon-core.css` (Trunk links it; no JS build step needed).
 To refresh it: `bun add @duskmoon-dev/core` in `crates/note-frontend`, copy
 `node_modules/@duskmoon-dev/core/dist/index.css` over `duskmoon-core.css`, then remove
-`node_modules`/`package.json`. The theme is selected via `data-theme` on `<html>` in `index.html`
-(`sunshine` = light, `moonlight` = dark).
+`node_modules`/`package.json`. With no `data-theme` on `<html>`, DuskMoon automatically uses
+`sunshine` in light mode and `moonlight` when the operating system prefers dark mode.
 
 ## Architecture
 
