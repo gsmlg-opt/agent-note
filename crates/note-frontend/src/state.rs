@@ -26,6 +26,16 @@ pub struct NoteSummary {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DeletedNoteSummary {
+    pub id: String,
+    pub title: String,
+    pub labels: Vec<(String, String)>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub deleted_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchResultSummary {
     pub id: String,
     pub title: String,

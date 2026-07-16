@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
 const DEFAULT_EMBEDDING_POLL_MS: u64 = 1000;
+const TRASH_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddingExecutionMode {
@@ -149,6 +150,23 @@ async fn run_embedding_scheduler(
     }
 }
 
+async fn run_trash_retention(ctx: Arc<Context>, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        match note_pipelines::purge_expired_deleted_notes(&ctx, chrono::Utc::now().timestamp())
+            .await
+        {
+            Ok(count) if count > 0 => eprintln!("permanently deleted {count} expired trash notes"),
+            Ok(_) => {}
+            Err(error) => eprintln!("trash retention cleanup failed: {error:#}"),
+        }
+
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = tokio::time::sleep(TRASH_RETENTION_CHECK_INTERVAL) => {}
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -209,6 +227,10 @@ async fn main() -> anyhow::Result<()> {
             attachments_dir.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
+        let trash_retention = tokio::spawn(run_trash_retention(
+            ctx.clone(),
+            scheduler_shutdown_rx.clone(),
+        ));
         let scheduler = tokio::spawn(run_embedding_scheduler(
             ctx.clone(),
             embedding.wake.clone(),
@@ -217,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
         note_mcp::run_stdio(ctx).await?;
         let _ = scheduler_shutdown_tx.send(true);
         let _ = scheduler.await;
+        let _ = trash_retention.await;
         if let Some(process_runtime) = embedding.process_runtime {
             process_runtime.shutdown().await;
         }
@@ -236,6 +259,10 @@ async fn main() -> anyhow::Result<()> {
             attachments_dir.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
+        let trash_retention = tokio::spawn(run_trash_retention(
+            ctx.clone(),
+            scheduler_shutdown_rx.clone(),
+        ));
         let scheduler = tokio::spawn(run_embedding_scheduler(
             ctx.clone(),
             embedding.wake.clone(),
@@ -324,6 +351,7 @@ async fn main() -> anyhow::Result<()> {
         }
         let _ = scheduler_shutdown_tx.send(true);
         let _ = scheduler.await;
+        let _ = trash_retention.await;
         if let Some(process_runtime) = embedding.process_runtime {
             process_runtime.shutdown().await;
         }

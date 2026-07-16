@@ -1,5 +1,6 @@
 use note_storage::{
-    attach_label, find_note_with_labels, insert_label_key, insert_note, labels_for_note, Storage,
+    attach_label, delete_note, find_note_with_labels, insert_label_key, insert_note,
+    label_note_counts, labels_for_note, Storage,
 };
 
 #[tokio::test]
@@ -81,4 +82,16 @@ async fn finds_a_note_matching_all_requested_labels_in_any_order() {
         .await
         .unwrap();
     assert_eq!(different, None);
+
+    delete_note(&conn, "note-1", 2000).await.unwrap();
+    let matched = find_note_with_labels(
+        &conn,
+        &[("skill-name".to_string(), "zddi-hooks".to_string())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(matched, None);
+    assert_eq!(labels_for_note(&conn, "note-1").await.unwrap().len(), 3);
+    let counts = label_note_counts(&conn).await.unwrap();
+    assert!(counts.iter().all(|(_, count)| *count == 0));
 }

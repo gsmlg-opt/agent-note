@@ -282,6 +282,7 @@ pub struct Note {
     pub labels: Vec<Label>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub deleted_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -291,6 +292,7 @@ pub struct NoteListItem {
     pub labels: Vec<Label>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub deleted_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

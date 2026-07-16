@@ -15,6 +15,7 @@ pub fn app_bar() -> Html {
     );
     let new_note_active = route == Route::NewNote;
     let labels_active = route == Route::Labels;
+    let trash_active = route == Route::Trash;
     let system_active = route == Route::System;
 
     html! {
@@ -29,6 +30,7 @@ pub fn app_bar() -> Html {
                         <Link<Route> to={Route::Notes} classes={nav_classes(notes_active)}>{ "Notes" }</Link<Route>>
                         <Link<Route> to={Route::NewNote} classes={nav_classes(new_note_active)}>{ "New note" }</Link<Route>>
                         <Link<Route> to={Route::Labels} classes={nav_classes(labels_active)}>{ "Labels" }</Link<Route>>
+                        <Link<Route> to={Route::Trash} classes={nav_classes(trash_active)}>{ "Trash" }</Link<Route>>
                     </nav>
                     <Link<Route> to={Route::System} classes={nav_classes_with(system_active, "nav-link-system")}>
                         { icons::settings() }

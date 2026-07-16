@@ -1,6 +1,6 @@
 use crate::state::{
-    LabelFilter, LabelKey, NoteAttachment, NoteSummary, SearchResultSummary, SystemConfig,
-    SystemInfo,
+    DeletedNoteSummary, LabelFilter, LabelKey, NoteAttachment, NoteSummary, SearchResultSummary,
+    SystemConfig, SystemInfo,
 };
 use gloo_net::http::{Request, Response};
 use serde::Deserialize;
@@ -337,6 +337,57 @@ pub async fn update_note(
 
 pub async fn delete_note(id: &str) -> Result<(), String> {
     let resp = Request::delete(&format!("/api/notes/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    ok_or_body_error(resp).await.map(|_| ())
+}
+
+#[derive(Deserialize)]
+struct TrashNoteDto {
+    id: String,
+    title: String,
+    labels: Vec<(String, String)>,
+    created_at: i64,
+    updated_at: i64,
+    deleted_at: i64,
+}
+
+pub async fn list_deleted_notes() -> Result<Vec<DeletedNoteSummary>, String> {
+    let resp = Request::get("/api/trash")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let notes: Vec<TrashNoteDto> = ok_or_body_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(notes
+        .into_iter()
+        .map(|note| DeletedNoteSummary {
+            id: note.id,
+            title: note.title,
+            labels: note.labels,
+            created_at: note.created_at,
+            updated_at: note.updated_at,
+            deleted_at: note.deleted_at,
+        })
+        .collect())
+}
+
+pub async fn permanently_delete_note(id: &str) -> Result<(), String> {
+    let resp = Request::delete(&format!("/api/trash/{id}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    ok_or_body_error(resp).await.map(|_| ())
+}
+
+pub async fn restore_deleted_notes(ids: &[String]) -> Result<(), String> {
+    let resp = Request::post("/api/trash/restore")
+        .json(&serde_json::json!({ "ids": ids }))
+        .map_err(|e| e.to_string())?
         .send()
         .await
         .map_err(|e| e.to_string())?;

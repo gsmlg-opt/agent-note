@@ -3,7 +3,10 @@ use note_core::{
     validate_label_value, validate_note_input, Label, LabelValueType, Note, NoteInput,
     ValidationError,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+pub const TRASH_RETENTION_DAYS: i64 = 90;
+pub const TRASH_RETENTION_SECONDS: i64 = TRASH_RETENTION_DAYS * 24 * 60 * 60;
 
 pub async fn update_note(
     ctx: &Context,
@@ -127,14 +130,84 @@ pub async fn update_note(
         labels: resolved_labels,
         created_at: existing.created_at,
         updated_at: now,
+        deleted_at: None,
     }))
 }
 
 pub async fn delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
     let conn = ctx.storage.connect()?;
-    let deleted = note_storage::delete_note(&conn, id).await? > 0;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    let deleted = note_storage::delete_note(&tx, id, chrono::Utc::now().timestamp()).await? > 0;
+    if deleted {
+        note_storage::clear_note_search_data(&tx, id).await?;
+    }
+    tx.commit().await?;
+    Ok(deleted)
+}
+
+pub async fn permanently_delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
+    let conn = ctx.storage.connect()?;
+    let deleted = note_storage::permanently_delete_note(&conn, id).await? > 0;
     if deleted {
         crate::attachment_files::remove_note_attachments(ctx, id)?;
     }
     Ok(deleted)
+}
+
+pub async fn restore_notes(ctx: &Context, ids: &[String]) -> anyhow::Result<bool> {
+    let mut seen = HashSet::new();
+    let ids = ids
+        .iter()
+        .filter(|id| seen.insert((*id).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(false);
+    }
+
+    let conn = ctx.storage.connect()?;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    let mut notes = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let Some((content, note_revision)) =
+            note_storage::get_deleted_note_content_and_revision(&tx, id).await?
+        else {
+            return Ok(false);
+        };
+        notes.push((id, content, note_revision.saturating_add(1)));
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let mut queued = 0;
+    for (id, content, note_revision) in notes {
+        note_storage::restore_note(&tx, id, note_revision).await?;
+        let chunks = crate::chunk::chunk_content(&content);
+        queued += crate::sync_note_embedding_jobs(&tx, id, &chunks, note_revision, now).await?;
+    }
+    tx.commit().await?;
+    if queued > 0 {
+        ctx.wake_embedding_jobs();
+    }
+    Ok(true)
+}
+
+pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Result<usize> {
+    let conn = ctx.storage.connect()?;
+    let tx = conn
+        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+        .await?;
+    let cutoff = now.saturating_sub(TRASH_RETENTION_SECONDS);
+    let ids = note_storage::list_expired_deleted_note_ids(&tx, cutoff).await?;
+    for id in &ids {
+        note_storage::permanently_delete_note(&tx, id).await?;
+    }
+    tx.commit().await?;
+    for id in &ids {
+        crate::attachment_files::remove_note_attachments(ctx, id)?;
+    }
+    Ok(ids.len())
 }

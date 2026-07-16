@@ -1,8 +1,9 @@
 use note_core::{LabelValueType, NoteAttachment};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    define_label_key, define_label_key_with_type, drain_embedding_jobs, get_note, list_label_keys,
-    save_note, update_note, update_system_config, Context, SaveNoteInput,
+    define_label_key, define_label_key_with_type, delete_note, drain_embedding_jobs, get_note,
+    list_deleted_note_summaries, list_label_keys, purge_expired_deleted_notes, restore_notes,
+    save_note, update_note, update_system_config, Context, SaveNoteInput, TRASH_RETENTION_SECONDS,
 };
 use note_storage::Storage;
 use std::sync::Arc;
@@ -140,6 +141,180 @@ async fn save_persists_attachments() {
 
     let hydrated = get_note(&ctx, &note.id).await.unwrap().unwrap();
     assert_eq!(hydrated.attachments[0].content, "{}");
+}
+
+#[tokio::test]
+async fn delete_and_restore_preserve_note_data_and_requeue_embeddings() {
+    let (ctx, dir) = test_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete me".into(),
+            content: "Searchable content".into(),
+            attachments: vec![NoteAttachment {
+                id: "meta".into(),
+                path: "./meta.json".into(),
+                mime: "application/json".into(),
+                description: "metadata".into(),
+                content: "{}".into(),
+            }],
+            labels: vec![("status".into(), "done".into())],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
+
+    assert!(delete_note(&ctx, &note.id).await.unwrap());
+    assert!(!delete_note(&ctx, &note.id).await.unwrap());
+    assert!(get_note(&ctx, &note.id).await.unwrap().is_none());
+    assert_eq!(
+        std::fs::read_to_string(
+            dir.path()
+                .join("attachments")
+                .join(&note.id)
+                .join("meta.json")
+        )
+        .unwrap(),
+        "{}"
+    );
+
+    let deleted = list_deleted_note_summaries(&ctx).await.unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].id, note.id);
+    assert_eq!(deleted[0].labels.len(), 1);
+
+    let conn = ctx.storage.connect().unwrap();
+    assert_eq!(count_rows(&conn, "note_labels", &note.id).await, 1);
+    assert_eq!(count_rows(&conn, "note_chunks", &note.id).await, 0);
+    assert_eq!(count_rows(&conn, "embedding_jobs", &note.id).await, 0);
+    assert_eq!(
+        count_rows(&conn, "note_chunk_embeddings", &note.id).await,
+        0
+    );
+    assert_eq!(count_rows(&conn, "note_chunk_sparse", &note.id).await, 0);
+
+    assert!(restore_notes(&ctx, &[note.id.clone(), note.id.clone()])
+        .await
+        .unwrap());
+    let restored = get_note(&ctx, &note.id).await.unwrap().unwrap();
+    assert_eq!(restored.labels.len(), 1);
+    assert_eq!(restored.attachments[0].content, "{}");
+    assert_eq!(
+        note_storage::get_note_revision(&conn, &note.id)
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert!(list_deleted_note_summaries(&ctx).await.unwrap().is_empty());
+    assert!(count_rows(&conn, "note_chunks", &note.id).await > 0);
+    assert!(count_rows(&conn, "embedding_jobs", &note.id).await > 0);
+}
+
+#[tokio::test]
+async fn restore_batch_rolls_back_when_any_note_is_not_in_trash() {
+    let (ctx, _dir) = test_context().await;
+    let deleted = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Deleted".into(),
+            content: "Deleted content".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let active = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Active".into(),
+            content: "Active content".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    delete_note(&ctx, &deleted.id).await.unwrap();
+
+    assert!(!restore_notes(&ctx, &[deleted.id.clone(), active.id])
+        .await
+        .unwrap());
+    assert!(get_note(&ctx, &deleted.id).await.unwrap().is_none());
+    let conn = ctx.storage.connect().unwrap();
+    assert_eq!(count_rows(&conn, "note_chunks", &deleted.id).await, 0);
+    assert_eq!(count_rows(&conn, "embedding_jobs", &deleted.id).await, 0);
+}
+
+#[tokio::test]
+async fn purge_removes_notes_at_the_ninety_day_boundary_and_their_attachments() {
+    let (ctx, dir) = test_context().await;
+    let expired = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Expired".into(),
+            content: "Content".into(),
+            attachments: vec![NoteAttachment {
+                id: "proof".into(),
+                path: "./proof.txt".into(),
+                mime: "text/plain".into(),
+                description: String::new(),
+                content: "expired".into(),
+            }],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let retained = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Retained".into(),
+            content: "Content".into(),
+            attachments: vec![NoteAttachment {
+                id: "proof".into(),
+                path: "./proof.txt".into(),
+                mime: "text/plain".into(),
+                description: String::new(),
+                content: "retained".into(),
+            }],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    delete_note(&ctx, &expired.id).await.unwrap();
+    delete_note(&ctx, &retained.id).await.unwrap();
+
+    let now = 1_800_000_000;
+    let cutoff = now - TRASH_RETENTION_SECONDS;
+    let conn = ctx.storage.connect().unwrap();
+    conn.execute(
+        "UPDATE notes SET deleted_at = ?2 WHERE id = ?1",
+        libsql::params![expired.id.as_str(), cutoff],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "UPDATE notes SET deleted_at = ?2 WHERE id = ?1",
+        libsql::params![retained.id.as_str(), cutoff + 1],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(purge_expired_deleted_notes(&ctx, now).await.unwrap(), 1);
+    assert!(!note_storage::note_exists(&conn, &expired.id).await.unwrap());
+    assert!(note_storage::note_exists(&conn, &retained.id)
+        .await
+        .unwrap());
+    assert!(!dir.path().join("attachments").join(&expired.id).exists());
+    assert!(dir.path().join("attachments").join(&retained.id).exists());
+
+    let deleted = list_deleted_note_summaries(&ctx).await.unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].id, retained.id);
+    assert_eq!(purge_expired_deleted_notes(&ctx, now).await.unwrap(), 0);
 }
 
 #[tokio::test]

@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS notes (
     attachments TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    note_revision INTEGER NOT NULL DEFAULT 1
+    note_revision INTEGER NOT NULL DEFAULT 1,
+    deleted_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS label_keys (

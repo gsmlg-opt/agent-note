@@ -33,10 +33,36 @@ pub async fn insert_note_with_attachments(
     updated_at: i64,
     note_revision: i64,
 ) -> anyhow::Result<()> {
+    insert_note_with_attachments_and_deleted_at(
+        conn,
+        id,
+        title,
+        content,
+        attachments,
+        created_at,
+        updated_at,
+        note_revision,
+        None,
+    )
+    .await
+}
+
+pub async fn insert_note_with_attachments_and_deleted_at(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    content: &str,
+    attachments: &[NoteAttachment],
+    created_at: i64,
+    updated_at: i64,
+    note_revision: i64,
+    deleted_at: Option<i64>,
+) -> anyhow::Result<()> {
     let attachments = serialize_attachments(attachments)?;
     conn.execute(
-        "INSERT INTO notes (id, title, content, attachments, created_at, updated_at, note_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO notes (
+             id, title, content, attachments, created_at, updated_at, note_revision, deleted_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         libsql::params![
             id,
             title,
@@ -44,7 +70,8 @@ pub async fn insert_note_with_attachments(
             attachments,
             created_at,
             updated_at,
-            note_revision
+            note_revision,
+            deleted_at
         ],
     )
     .await?;
@@ -54,7 +81,7 @@ pub async fn insert_note_with_attachments(
 pub async fn get_note_revision(conn: &Connection, id: &str) -> anyhow::Result<Option<i64>> {
     let mut rows = conn
         .query(
-            "SELECT note_revision FROM notes WHERE id = ?1",
+            "SELECT note_revision FROM notes WHERE id = ?1 AND deleted_at IS NULL",
             libsql::params![id],
         )
         .await?;
@@ -64,10 +91,22 @@ pub async fn get_note_revision(conn: &Connection, id: &str) -> anyhow::Result<Op
     })
 }
 
+pub async fn note_exists(conn: &Connection, id: &str) -> anyhow::Result<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM notes WHERE id = ?1 LIMIT 1",
+            libsql::params![id],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
 pub async fn get_note(conn: &Connection, id: &str) -> anyhow::Result<Option<Note>> {
     let mut rows = conn
         .query(
-            "SELECT id, title, content, attachments, created_at, updated_at FROM notes WHERE id = ?1",
+            "SELECT id, title, content, attachments, created_at, updated_at, deleted_at
+             FROM notes
+             WHERE id = ?1 AND deleted_at IS NULL",
             libsql::params![id],
         )
         .await?;
@@ -81,6 +120,7 @@ pub async fn get_note(conn: &Connection, id: &str) -> anyhow::Result<Option<Note
     let attachments = deserialize_attachments(&row.get::<String>(3)?)?;
     let created_at = row.get::<i64>(4)?;
     let updated_at = row.get::<i64>(5)?;
+    let deleted_at = row.get::<Option<i64>>(6)?;
     drop(rows);
 
     let labels = crate::note_labels::labels_for_note(conn, &id).await?;
@@ -93,6 +133,7 @@ pub async fn get_note(conn: &Connection, id: &str) -> anyhow::Result<Option<Note
         labels,
         created_at,
         updated_at,
+        deleted_at,
     }))
 }
 
@@ -134,18 +175,104 @@ pub async fn update_note_with_attachments(
         .execute(
             "UPDATE notes
              SET title = ?2, content = ?3, attachments = ?4, updated_at = ?5, note_revision = ?6
-             WHERE id = ?1",
+             WHERE id = ?1 AND deleted_at IS NULL",
             libsql::params![id, title, content, attachments, updated_at, note_revision],
         )
         .await?;
     Ok(affected)
 }
 
-pub async fn delete_note(conn: &Connection, id: &str) -> anyhow::Result<u64> {
+pub async fn delete_note(conn: &Connection, id: &str, deleted_at: i64) -> anyhow::Result<u64> {
     let affected = conn
-        .execute("DELETE FROM notes WHERE id = ?1", libsql::params![id])
+        .execute(
+            "UPDATE notes SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            libsql::params![id, deleted_at],
+        )
         .await?;
     Ok(affected)
+}
+
+pub async fn get_deleted_note_content_and_revision(
+    conn: &Connection,
+    id: &str,
+) -> anyhow::Result<Option<(String, i64)>> {
+    let mut rows = conn
+        .query(
+            "SELECT content, note_revision
+             FROM notes
+             WHERE id = ?1 AND deleted_at IS NOT NULL",
+            libsql::params![id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some((row.get::<String>(0)?, row.get::<i64>(1)?)))
+}
+
+pub async fn restore_note(conn: &Connection, id: &str, note_revision: i64) -> anyhow::Result<u64> {
+    let affected = conn
+        .execute(
+            "UPDATE notes
+             SET deleted_at = NULL, note_revision = ?2
+             WHERE id = ?1 AND deleted_at IS NOT NULL",
+            libsql::params![id, note_revision],
+        )
+        .await?;
+    Ok(affected)
+}
+
+pub async fn permanently_delete_note(conn: &Connection, id: &str) -> anyhow::Result<u64> {
+    let affected = conn
+        .execute(
+            "DELETE FROM notes WHERE id = ?1 AND deleted_at IS NOT NULL",
+            libsql::params![id],
+        )
+        .await?;
+    Ok(affected)
+}
+
+pub async fn list_expired_deleted_note_ids(
+    conn: &Connection,
+    deleted_at_cutoff: i64,
+) -> anyhow::Result<Vec<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT id FROM notes
+             WHERE deleted_at IS NOT NULL AND deleted_at <= ?1
+             ORDER BY deleted_at, id",
+            libsql::params![deleted_at_cutoff],
+        )
+        .await?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await? {
+        ids.push(row.get::<String>(0)?);
+    }
+    Ok(ids)
+}
+
+pub async fn clear_note_search_data(conn: &Connection, id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM note_chunk_embeddings WHERE note_id = ?1",
+        libsql::params![id],
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM note_chunk_sparse WHERE note_id = ?1",
+        libsql::params![id],
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM embedding_jobs WHERE note_id = ?1",
+        libsql::params![id],
+    )
+    .await?;
+    conn.execute(
+        "DELETE FROM note_chunks WHERE note_id = ?1",
+        libsql::params![id],
+    )
+    .await?;
+    Ok(())
 }
 
 pub async fn clear_note_derived(conn: &Connection, id: &str) -> anyhow::Result<()> {
@@ -218,8 +345,9 @@ pub async fn list_notes(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> anyhow::Result<Vec<Note>> {
-    let mut sql =
-        "SELECT id, title, content, attachments, created_at, updated_at FROM notes".to_string();
+    let mut sql = "SELECT id, title, content, attachments, created_at, updated_at, deleted_at
+                   FROM notes WHERE deleted_at IS NULL"
+        .to_string();
     let mut params = Vec::<libsql::Value>::new();
 
     sql.push_str(" ORDER BY created_at DESC");
@@ -239,6 +367,7 @@ pub async fn list_notes(
         let attachments = deserialize_attachments(&row.get::<String>(3)?)?;
         let created_at = row.get::<i64>(4)?;
         let updated_at = row.get::<i64>(5)?;
+        let deleted_at = row.get::<Option<i64>>(6)?;
         let labels = crate::note_labels::labels_for_note(conn, &id).await?;
 
         notes.push(Note {
@@ -249,6 +378,7 @@ pub async fn list_notes(
             labels,
             created_at,
             updated_at,
+            deleted_at,
         });
     }
     if !selectors.is_empty() {
@@ -275,6 +405,32 @@ pub async fn list_notes(
         } else {
             notes[start..end].to_vec()
         };
+    }
+    Ok(notes)
+}
+
+pub async fn list_all_notes(conn: &Connection) -> anyhow::Result<Vec<Note>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, title, content, attachments, created_at, updated_at, deleted_at
+             FROM notes
+             ORDER BY created_at DESC",
+            (),
+        )
+        .await?;
+    let mut notes = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let id = row.get::<String>(0)?;
+        notes.push(Note {
+            title: row.get::<String>(1)?,
+            content: row.get::<String>(2)?,
+            attachments: deserialize_attachments(&row.get::<String>(3)?)?,
+            created_at: row.get::<i64>(4)?,
+            updated_at: row.get::<i64>(5)?,
+            deleted_at: row.get::<Option<i64>>(6)?,
+            labels: crate::note_labels::labels_for_note(conn, &id).await?,
+            id,
+        });
     }
     Ok(notes)
 }
@@ -303,7 +459,9 @@ pub async fn list_note_summaries(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> anyhow::Result<Vec<NoteListItem>> {
-    let mut sql = "SELECT id, title, created_at, updated_at FROM notes".to_string();
+    let mut sql = "SELECT id, title, created_at, updated_at, deleted_at
+                   FROM notes WHERE deleted_at IS NULL"
+        .to_string();
     let mut params = Vec::<libsql::Value>::new();
 
     sql.push_str(" ORDER BY created_at DESC");
@@ -321,6 +479,7 @@ pub async fn list_note_summaries(
         let title = row.get::<String>(1)?;
         let created_at = row.get::<i64>(2)?;
         let updated_at = row.get::<i64>(3)?;
+        let deleted_at = row.get::<Option<i64>>(4)?;
         let labels = crate::note_labels::labels_for_note(conn, &id).await?;
 
         notes.push(NoteListItem {
@@ -329,6 +488,7 @@ pub async fn list_note_summaries(
             labels,
             created_at,
             updated_at,
+            deleted_at,
         });
     }
     if !selectors.is_empty() {
@@ -359,9 +519,36 @@ pub async fn list_note_summaries(
     Ok(notes)
 }
 
+pub async fn list_deleted_note_summaries(conn: &Connection) -> anyhow::Result<Vec<NoteListItem>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, title, created_at, updated_at, deleted_at
+             FROM notes
+             WHERE deleted_at IS NOT NULL
+             ORDER BY deleted_at DESC, id",
+            (),
+        )
+        .await?;
+    let mut notes = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let id = row.get::<String>(0)?;
+        notes.push(NoteListItem {
+            title: row.get::<String>(1)?,
+            created_at: row.get::<i64>(2)?,
+            updated_at: row.get::<i64>(3)?,
+            deleted_at: row.get::<Option<i64>>(4)?,
+            labels: crate::note_labels::labels_for_note(conn, &id).await?,
+            id,
+        });
+    }
+    Ok(notes)
+}
+
 pub async fn count_notes(conn: &Connection, selectors: &[LabelSelector]) -> anyhow::Result<usize> {
     if selectors.is_empty() {
-        let mut rows = conn.query("SELECT COUNT(*) FROM notes", ()).await?;
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL", ())
+            .await?;
         let Some(row) = rows.next().await? else {
             return Ok(0);
         };

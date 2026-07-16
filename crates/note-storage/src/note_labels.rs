@@ -55,9 +55,10 @@ pub async fn labels_for_note(conn: &Connection, note_id: &str) -> anyhow::Result
 pub async fn label_note_counts(conn: &Connection) -> anyhow::Result<Vec<(String, usize)>> {
     let mut rows = conn
         .query(
-            "SELECT lk.key, COUNT(nl.note_id)
+            "SELECT lk.key, COUNT(n.id)
              FROM label_keys lk
              LEFT JOIN note_labels nl ON nl.label_key_id = lk.id
+             LEFT JOIN notes n ON n.id = nl.note_id AND n.deleted_at IS NULL
              GROUP BY lk.id, lk.key
              ORDER BY lk.key",
             (),
@@ -91,6 +92,7 @@ pub async fn find_note_with_labels(
         "SELECT nl.note_id
          FROM note_labels nl
          JOIN label_keys lk ON lk.id = nl.label_key_id
+         JOIN notes n ON n.id = nl.note_id AND n.deleted_at IS NULL
          WHERE {predicates}
          GROUP BY nl.note_id
          HAVING COUNT(*) = ?{count_param}

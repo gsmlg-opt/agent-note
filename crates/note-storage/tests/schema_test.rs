@@ -48,6 +48,7 @@ async fn schema_applies_cleanly_to_a_fresh_db() {
     }
     assert!(note_columns.contains(&"note_revision".to_string()));
     assert!(note_columns.contains(&"attachments".to_string()));
+    assert!(note_columns.contains(&"deleted_at".to_string()));
 
     let mut rows = conn
         .query("PRAGMA table_info(embedding_jobs)", ())
@@ -68,4 +69,44 @@ async fn schema_reapplies_to_an_existing_db() {
 
     Storage::open_local(path).await.unwrap();
     Storage::open_local(path).await.unwrap();
+}
+
+#[tokio::test]
+async fn existing_notes_table_is_migrated_with_deleted_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let db = libsql::Builder::new_local(&path).build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE notes (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            attachments TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            note_revision INTEGER NOT NULL DEFAULT 1
+        )",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO notes (id, title, content, created_at, updated_at)
+         VALUES ('legacy', 'Legacy', 'Content', 1, 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(db);
+
+    let storage = Storage::open_local(path.to_str().unwrap()).await.unwrap();
+    let conn = storage.connect().unwrap();
+    let mut rows = conn
+        .query("SELECT deleted_at FROM notes WHERE id = 'legacy'", ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<Option<i64>>(0).unwrap(), None);
 }

@@ -106,7 +106,10 @@ pub async fn sync_note_embedding_jobs(
 pub async fn enqueue_missing_chunk_embeddings(ctx: &Context) -> anyhow::Result<usize> {
     let conn = ctx.storage.connect()?;
     let mut rows = conn
-        .query("SELECT id, content, note_revision FROM notes", ())
+        .query(
+            "SELECT id, content, note_revision FROM notes WHERE deleted_at IS NULL",
+            (),
+        )
         .await?;
     let mut notes = Vec::new();
     while let Some(row) = rows.next().await? {

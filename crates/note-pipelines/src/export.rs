@@ -1,6 +1,4 @@
-use crate::{
-    enqueue_missing_chunk_embeddings, list_notes, parse_label_value_type, Context, ListNotesParams,
-};
+use crate::{enqueue_missing_chunk_embeddings, list_all_notes, parse_label_value_type, Context};
 use note_core::NoteAttachment;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -29,6 +27,8 @@ pub struct ExportNote {
     pub attachments: Vec<NoteAttachment>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
     pub labels: Vec<(String, String)>,
 }
 
@@ -51,7 +51,7 @@ pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
             value_type: label_key.value_type.as_str().to_string(),
         })
         .collect();
-    let notes = list_notes(ctx, ListNotesParams::default())
+    let notes = list_all_notes(ctx)
         .await?
         .into_iter()
         .map(|note| ExportNote {
@@ -61,6 +61,7 @@ pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
             attachments: note.attachments,
             created_at: note.created_at,
             updated_at: note.updated_at,
+            deleted_at: note.deleted_at,
             labels: note
                 .labels
                 .into_iter()
@@ -103,7 +104,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
         }
 
         for note in data.notes {
-            if note_storage::get_note(&tx, &note.id).await?.is_some() {
+            if note_storage::note_exists(&tx, &note.id).await? {
                 stats.notes_skipped += 1;
                 continue;
             }
@@ -120,7 +121,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
                 &note.id,
                 &note.attachments,
             )?;
-            note_storage::insert_note_with_attachments(
+            note_storage::insert_note_with_attachments_and_deleted_at(
                 &tx,
                 &note.id,
                 &note.title,
@@ -129,6 +130,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
                 note.created_at,
                 note.updated_at,
                 1,
+                note.deleted_at,
             )
             .await?;
             for (key, value) in &note.labels {

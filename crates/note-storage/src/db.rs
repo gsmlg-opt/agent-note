@@ -56,6 +56,10 @@ impl Storage {
             )
             .await?;
         }
+        if !Self::column_exists(conn, "notes", "deleted_at").await? {
+            conn.execute("ALTER TABLE notes ADD COLUMN deleted_at INTEGER", ())
+                .await?;
+        }
         if !Self::column_exists(conn, "note_chunks", "note_revision").await? {
             conn.execute(
                 "ALTER TABLE note_chunks ADD COLUMN note_revision INTEGER NOT NULL DEFAULT 1",

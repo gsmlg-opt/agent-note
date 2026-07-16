@@ -5,6 +5,7 @@ pub mod note_edit;
 pub mod note_show;
 pub mod notes;
 pub mod system;
+pub mod trash;
 
 pub use dashboard::DashboardPage;
 pub use labels::LabelsPage;
@@ -13,3 +14,4 @@ pub use note_edit::NoteEditPage;
 pub use note_show::NoteShowPage;
 pub use notes::NotesPage;
 pub use system::SystemPage;
+pub use trash::TrashPage;

@@ -23,6 +23,15 @@ pub async fn list_notes(ctx: &Context, params: ListNotesParams) -> anyhow::Resul
     Ok(notes)
 }
 
+pub async fn list_all_notes(ctx: &Context) -> anyhow::Result<Vec<Note>> {
+    let conn = ctx.storage.connect()?;
+    let mut notes = note_storage::list_all_notes(&conn).await?;
+    for note in &mut notes {
+        crate::attachment_files::hydrate_note_attachments(ctx, note)?;
+    }
+    Ok(notes)
+}
+
 pub async fn list_note_summaries(
     ctx: &Context,
     params: ListNotesParams,
@@ -43,4 +52,9 @@ pub async fn count_notes(ctx: &Context, label: Option<String>) -> anyhow::Result
         .map(parse_label_selectors)
         .unwrap_or_default();
     note_storage::count_notes(&conn, &selectors).await
+}
+
+pub async fn list_deleted_note_summaries(ctx: &Context) -> anyhow::Result<Vec<NoteListItem>> {
+    let conn = ctx.storage.connect()?;
+    note_storage::list_deleted_note_summaries(&conn).await
 }

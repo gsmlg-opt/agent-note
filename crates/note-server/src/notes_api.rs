@@ -7,8 +7,9 @@ use axum::{
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
-    count_notes, delete_note, get_note, label_note_counts, list_label_keys, list_note_summaries,
-    save_note, search_notes_filtered, update_note, Context, ListNotesParams, SaveNoteInput,
+    count_notes, delete_note, get_note, label_note_counts, list_deleted_note_summaries,
+    list_label_keys, list_note_summaries, permanently_delete_note, restore_notes, save_note,
+    search_notes_filtered, update_note, Context, ListNotesParams, SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -94,6 +95,35 @@ impl From<NoteListItem> for NoteListDto {
                 .collect(),
             created_at: note.created_at,
             updated_at: note.updated_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct TrashNoteDto {
+    pub id: String,
+    pub title: String,
+    pub labels: Vec<(String, String)>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub deleted_at: i64,
+}
+
+impl From<NoteListItem> for TrashNoteDto {
+    fn from(note: NoteListItem) -> Self {
+        Self {
+            id: note.id,
+            title: note.title,
+            labels: note
+                .labels
+                .iter()
+                .map(|label| (label.key.clone(), label.value.clone()))
+                .collect(),
+            created_at: note.created_at,
+            updated_at: note.updated_at,
+            deleted_at: note
+                .deleted_at
+                .expect("trash queries only return deleted notes"),
         }
     }
 }
@@ -390,6 +420,58 @@ async fn delete_note_handler(
     }
 }
 
+async fn list_deleted_notes_handler(
+    State(ctx): State<Arc<Context>>,
+) -> Result<Json<Vec<TrashNoteDto>>, (axum::http::StatusCode, String)> {
+    let notes = list_deleted_note_summaries(&ctx)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(notes.into_iter().map(TrashNoteDto::from).collect()))
+}
+
+#[derive(Deserialize)]
+struct RestoreNotesRequest {
+    ids: Vec<String>,
+}
+
+async fn restore_notes_handler(
+    State(ctx): State<Arc<Context>>,
+    Json(req): Json<RestoreNotesRequest>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    if req.ids.is_empty() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "at least one note id is required".into(),
+        ));
+    }
+    match restore_notes(&ctx, &req.ids)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        true => {
+            invalidate_dashboard_cache();
+            Ok(axum::http::StatusCode::NO_CONTENT)
+        }
+        false => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "one or more notes were not found in Trash".into(),
+        )),
+    }
+}
+
+async fn permanently_delete_note_handler(
+    State(ctx): State<Arc<Context>>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    match permanently_delete_note(&ctx, &id)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        true => Ok(axum::http::StatusCode::NO_CONTENT),
+        false => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SearchQuery {
     pub query: String,
@@ -445,6 +527,12 @@ pub fn notes_router() -> Router<Arc<Context>> {
             post(save_note_handler).get(list_notes_handler),
         )
         .route("/api/notes/count", route_get(count_notes_handler))
+        .route("/api/trash", route_get(list_deleted_notes_handler))
+        .route("/api/trash/restore", post(restore_notes_handler))
+        .route(
+            "/api/trash/{id}",
+            axum::routing::delete(permanently_delete_note_handler),
+        )
         .route("/api/dashboard", route_get(dashboard_handler))
         .route(
             "/api/notes/{id}",
@@ -943,11 +1031,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_note_by_id_removes_note_or_404() {
-        let (app, _ctx, _dir) = test_app().await;
+    async fn delete_note_by_id_lists_deleted_note_in_trash_or_404() {
+        let (app, _ctx, dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
-            r#"{"title":"Delete Me","content":"C","labels":[]}"#,
+            r#"{"title":"Delete Me","content":"C","attachments":[{"id":"proof","path":"./proof.txt","mime":"text/plain","description":"proof","content":"keep me"}],"labels":[["status","deleted"]]}"#,
         )
         .await;
 
@@ -965,8 +1053,166 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
+        let resp = app.clone().oneshot(get("/api/notes")).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let notes: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(notes.as_array().unwrap().len(), 0);
+
+        let resp = app.clone().oneshot(get("/api/notes/count")).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let count: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(count["total"], 0);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("attachments").join(&id).join("proof.txt"))
+                .unwrap(),
+            "keep me"
+        );
+
+        let resp = app.clone().oneshot(get("/api/trash")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let deleted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let deleted = deleted.as_array().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0]["id"], id);
+        assert_eq!(deleted[0]["title"], "Delete Me");
+        assert_eq!(deleted[0]["labels"][0][0], "status");
+        assert!(deleted[0]["deleted_at"].as_i64().is_some());
+
+        let resp = app
+            .clone()
+            .oneshot(delete(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/api/trash/restore",
+                &format!(r#"{{"ids":["{id}"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app
+            .clone()
+            .oneshot(get(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app.clone().oneshot(get("/api/trash")).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let deleted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(deleted.as_array().unwrap().is_empty());
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/api/trash/restore",
+                &format!(r#"{{"ids":["{id}"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = app
+            .clone()
+            .oneshot(delete(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let resp = app
+            .clone()
+            .oneshot(delete(&format!("/api/trash/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(!dir.path().join("attachments").join(&id).exists());
+
+        let resp = app.clone().oneshot(get("/api/trash")).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let deleted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(deleted.as_array().unwrap().is_empty());
+
+        let resp = app
+            .clone()
+            .oneshot(delete(&format!("/api/trash/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
         let resp = app.oneshot(delete("/api/notes/nope")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn batch_restore_is_atomic_and_requeues_embeddings() {
+        let (app, ctx, _dir) = test_app().await;
+        let first = save_note_id(
+            app.clone(),
+            r#"{"title":"First","content":"First content","labels":[]}"#,
+        )
+        .await;
+        let second = save_note_id(
+            app.clone(),
+            r#"{"title":"Second","content":"Second content","labels":[]}"#,
+        )
+        .await;
+        for id in [&first, &second] {
+            let resp = app
+                .clone()
+                .oneshot(delete(&format!("/api/notes/{id}")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        }
+
+        let resp = app
+            .clone()
+            .oneshot(post("/api/trash/restore", r#"{"ids":[]}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/api/trash/restore",
+                &format!(r#"{{"ids":["{first}","missing"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(note_pipelines::get_note(&ctx, &first)
+            .await
+            .unwrap()
+            .is_none());
+
+        let resp = app
+            .clone()
+            .oneshot(post(
+                "/api/trash/restore",
+                &format!(r#"{{"ids":["{first}","{second}","{first}"]}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app.clone().oneshot(get("/api/notes/count")).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let count: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(count["total"], 2);
+        let resp = app.oneshot(get("/api/trash")).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let deleted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(deleted.as_array().unwrap().is_empty());
+
+        let conn = ctx.storage.connect().unwrap();
+        let jobs = note_storage::claim_pending_embedding_jobs(&conn, 10, 3000)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().any(|job| job.note_id == first));
+        assert!(jobs.iter().any(|job| job.note_id == second));
     }
 
     #[tokio::test]

@@ -30,6 +30,7 @@ fn app_shell() -> Html {
         Route::NoteShow { .. } => "Note",
         Route::NoteEdit { .. } => "Edit note",
         Route::Labels => "Labels",
+        Route::Trash => "Trash",
         Route::System => "System",
         Route::NotFound => "Not found",
     };

@@ -1,8 +1,8 @@
 use note_core::NoteAttachment;
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    define_label_key, export_data, get_note, import_data, list_label_keys, save_note, Context,
-    SaveNoteInput,
+    define_label_key, delete_note, export_data, get_note, import_data, list_all_notes,
+    list_deleted_note_summaries, list_label_keys, save_note, Context, SaveNoteInput,
 };
 use note_storage::Storage;
 use std::sync::Arc;
@@ -59,12 +59,20 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     )
     .await
     .unwrap();
+    delete_note(&source, &labeled.id).await.unwrap();
 
     let data = export_data(&source).await.unwrap();
     assert_eq!(data.version, 1);
     assert_eq!(data.notes.len(), 2);
+    let deleted_export = data
+        .notes
+        .iter()
+        .find(|note| note.id == labeled.id)
+        .unwrap();
+    assert!(deleted_export.deleted_at.is_some());
+    assert_eq!(deleted_export.attachments[0].content, "{}");
 
-    let (target, _target_dir) = test_context().await;
+    let (target, target_dir) = test_context().await;
     let stats = import_data(&target, data).await.unwrap();
     assert_eq!(stats.notes_added, 2);
     assert_eq!(stats.notes_skipped, 0);
@@ -77,7 +85,15 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     assert_eq!(keys[0].description, "Workflow status");
     assert_eq!(keys[0].value_type.as_str(), "text");
 
-    let restored_labeled = get_note(&target, &labeled.id).await.unwrap().unwrap();
+    assert!(get_note(&target, &labeled.id).await.unwrap().is_none());
+    let deleted = list_deleted_note_summaries(&target).await.unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0].id, labeled.id);
+    let restored_notes = list_all_notes(&target).await.unwrap();
+    let restored_labeled = restored_notes
+        .iter()
+        .find(|note| note.id == labeled.id)
+        .unwrap();
     assert_eq!(restored_labeled.title, labeled.title);
     assert_eq!(restored_labeled.content, labeled.content);
     assert_eq!(restored_labeled.created_at, labeled.created_at);
@@ -88,6 +104,18 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     assert_eq!(restored_labeled.labels[0].value, "done");
     assert_eq!(restored_labeled.labels[0].description, "Workflow status");
     assert_eq!(restored_labeled.labels[0].value_type.as_str(), "text");
+    assert!(restored_labeled.deleted_at.is_some());
+    assert_eq!(
+        std::fs::read_to_string(
+            target_dir
+                .path()
+                .join("attachments")
+                .join(&labeled.id)
+                .join("meta.json")
+        )
+        .unwrap(),
+        "{}"
+    );
 
     let restored_plain = get_note(&target, &plain.id).await.unwrap().unwrap();
     assert_eq!(restored_plain.title, plain.title);

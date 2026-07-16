@@ -2,7 +2,10 @@ use note_core::{
     DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SystemConfig,
 };
 use note_embedding::StubEmbedder;
-use note_mcp::{save_note_tool, semantic_search_tool, SaveNoteToolInput, SemanticSearchToolInput};
+use note_mcp::{
+    delete_note_tool, list_notes_tool, save_note_tool, semantic_search_tool, SaveNoteToolInput,
+    SemanticSearchToolInput,
+};
 use note_pipelines::{drain_embedding_jobs, update_system_config, Context};
 use note_storage::Storage;
 use std::sync::Arc;
@@ -38,6 +41,34 @@ async fn save_note_tool_returns_an_id() {
     .await
     .unwrap();
     assert!(!result.id.is_empty());
+}
+
+#[tokio::test]
+async fn delete_note_tool_soft_deletes_once_and_hides_the_note() {
+    let (ctx, _dir) = test_context().await;
+    let note = save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Delete through MCP".into(),
+            content: "Content".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(delete_note_tool(&ctx, &note.id).await.unwrap());
+    assert!(!delete_note_tool(&ctx, &note.id).await.unwrap());
+    assert!(list_notes_tool(&ctx, None, None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        note_storage::note_exists(&ctx.storage.connect().unwrap(), &note.id)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
