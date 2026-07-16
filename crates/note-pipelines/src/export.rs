@@ -1,7 +1,11 @@
 use crate::{enqueue_missing_chunk_embeddings, list_all_notes, parse_label_value_type, Context};
 use note_core::NoteAttachment;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    io,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Serialize, Deserialize)]
 pub struct ExportData {
@@ -162,6 +166,27 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
 pub async fn export_json(ctx: &Context) -> anyhow::Result<String> {
     let data = export_data(ctx).await?;
     serde_json::to_string_pretty(&data).map_err(anyhow::Error::new)
+}
+
+pub fn create_backup_archive(data: &ExportData) -> anyhow::Result<Vec<u8>> {
+    let json = serde_json::to_vec_pretty(data)?;
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(json.len() as u64);
+    header.set_mode(0o644);
+    header.set_mtime(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
+    header.set_cksum();
+    archive.append_data(&mut header, "notes.json", io::Cursor::new(json))?;
+    archive.finish()?;
+    let encoder = archive.into_inner()?;
+    encoder.finish().map_err(anyhow::Error::new)
 }
 
 pub async fn import_json(ctx: &Context, input: &str) -> anyhow::Result<ImportStats> {

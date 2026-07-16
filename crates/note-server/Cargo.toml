@@ -21,7 +21,9 @@ syntect = { version = "5.3.0", default-features = false, features = ["default-fa
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 
 [dev-dependencies]
+flate2 = "1.1.5"
 http-body-util = "0.1.3"
+tar = "0.4.44"
 tempfile = "3.27.0"
 tarpc = { version = "0.37.0", features = ["serde1", "tokio1", "serde-transport", "serde-transport-bincode"] }
 tower = "0.5.3"

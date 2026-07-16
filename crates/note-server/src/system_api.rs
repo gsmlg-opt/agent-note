@@ -1,7 +1,15 @@
-use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{header, StatusCode},
+    response::Response,
+    routing::get,
+    Json, Router,
+};
 use note_core::SystemConfig;
 use note_pipelines::{
-    get_system_config, get_system_info, update_system_config, Context, SystemInfo,
+    create_backup_archive, export_data, get_system_config, get_system_info, update_system_config,
+    Context, SystemInfo,
 };
 use std::sync::Arc;
 
@@ -43,6 +51,31 @@ async fn get_info_handler(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
+async fn get_backup_handler(
+    State(ctx): State<Arc<Context>>,
+) -> Result<Response, (StatusCode, String)> {
+    let data = export_data(&ctx)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let archive = tokio::task::spawn_blocking(move || create_backup_archive(&data))
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"agent-note-backup-{timestamp}.tar.gz\""),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(Body::from(archive))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
 pub fn system_router() -> Router<Arc<Context>> {
     Router::new()
         .route(
@@ -50,18 +83,23 @@ pub fn system_router() -> Router<Arc<Context>> {
             get(get_config_handler).put(update_config_handler),
         )
         .route("/api/system/info", get(get_info_handler))
+        .route("/api/system/backup", get(get_backup_handler))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use flate2::read::GzDecoder;
     use http_body_util::BodyExt;
+    use note_core::NoteAttachment;
     use note_embedding::StubEmbedder;
+    use note_pipelines::{save_note, SaveNoteInput};
     use note_storage::Storage;
+    use std::io::Read;
     use tower::ServiceExt;
 
-    async fn test_app() -> (Router, tempfile::TempDir) {
+    async fn test_app() -> (Router, Arc<Context>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
             .await
@@ -71,7 +109,7 @@ mod tests {
             Arc::new(StubEmbedder),
             dir.path().join("attachments"),
         ));
-        (system_router().with_state(ctx), dir)
+        (system_router().with_state(ctx.clone()), ctx, dir)
     }
 
     fn request(method: &str, uri: &str, body: &str) -> Request<Body> {
@@ -85,7 +123,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_defaults_and_roundtrips() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let response = app
             .clone()
             .oneshot(request("GET", "/api/system/config", ""))
@@ -125,7 +163,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_config_returns_bad_request() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let response = app
             .oneshot(request(
                 "PUT",
@@ -139,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn info_reports_read_only_storage_fields() {
-        let (app, _dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let response = app
             .oneshot(request("GET", "/api/system/info", ""))
             .await
@@ -153,5 +191,60 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("attachments"));
+    }
+
+    #[tokio::test]
+    async fn backup_download_contains_all_note_data() {
+        let (app, ctx, _dir) = test_app().await;
+        save_note(
+            &ctx,
+            SaveNoteInput {
+                title: "Backup me".into(),
+                content: "Complete note content".into(),
+                attachments: vec![NoteAttachment {
+                    id: "details".into(),
+                    path: "./details.txt".into(),
+                    mime: "text/plain".into(),
+                    description: "Backup details".into(),
+                    content: "attachment content".into(),
+                }],
+                labels: vec![("status".into(), "ready".into())],
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(request("GET", "/api/system/backup", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/gzip");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let disposition = response.headers()["content-disposition"].to_str().unwrap();
+        assert!(disposition.starts_with("attachment; filename=\"agent-note-backup-"));
+        assert!(disposition.ends_with(".tar.gz\""));
+
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let mut archive = tar::Archive::new(GzDecoder::new(bytes.as_ref()));
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap().to_str(), Some("notes.json"));
+        let mut json = String::new();
+        entry.read_to_string(&mut json).unwrap();
+        assert!(entries.next().is_none());
+
+        let export: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(export["version"], 1);
+        assert_eq!(export["notes"].as_array().unwrap().len(), 1);
+        assert_eq!(export["notes"][0]["title"], "Backup me");
+        assert_eq!(export["notes"][0]["content"], "Complete note content");
+        assert_eq!(
+            export["notes"][0]["attachments"][0]["content"],
+            "attachment content"
+        );
+        assert_eq!(export["notes"][0]["labels"][0][0], "status");
+        assert_eq!(export["notes"][0]["labels"][0][1], "ready");
     }
 }

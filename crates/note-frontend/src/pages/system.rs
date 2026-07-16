@@ -185,6 +185,19 @@ pub fn system_page() -> Html {
                     </dl>
                 </section>
             }
+
+            <section class="system-section" aria-labelledby="backup-title">
+                <div class="system-section-head">
+                    <div>
+                        <h3 id="backup-title">{ "Backup" }</h3>
+                        <p>{ "Download all notes, labels, and attachments as a compressed archive." }</p>
+                    </div>
+                    <a class="btn btn-outline" href="/api/system/backup" download="">
+                        { icons::download() }
+                        <span>{ "Download backup" }</span>
+                    </a>
+                </div>
+            </section>
         </section>
     }
 }
