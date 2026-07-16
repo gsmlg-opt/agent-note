@@ -3,6 +3,7 @@ mod notes_api;
 mod render;
 mod system_api;
 
+use axum::extract::DefaultBodyLimit;
 use axum::response::IntoResponse;
 use axum::Router;
 use note_embedding::{ProcessWorkerConfig, ProcessWorkerRuntime, StubEmbedder, WorkerConfig};
@@ -365,7 +366,10 @@ async fn main() -> anyhow::Result<()> {
             .merge(labels_api::labels_router())
             .merge(system_api::system_router())
             .with_state(ctx.clone());
-        let mut app: Router = rest.merge(note_mcp::mcp_router(ctx));
+        let max_request_bytes = env_u64("NOTE_MAX_REQUEST_BYTES", 512 * 1024 * 1024);
+        let mut app: Router = rest
+            .merge(note_mcp::mcp_router(ctx))
+            .layer(DefaultBodyLimit::max(max_request_bytes as usize));
 
         // NOTE_STATIC_DIR is for packaged builds such as Docker. Local debug HTTP runs use the
         // Trunk development server instead, unless an explicit static directory is configured.
