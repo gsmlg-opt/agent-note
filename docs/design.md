@@ -5,7 +5,10 @@ Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, Turso Data
 ## 1. Design Philosophy
 
 - **Pure core, effectful shell.** Validation, fusion scoring, and DTO assembly are pure transforms. All I/O (DB, inference) is pushed to explicit boundaries and threaded through one immutable context. Do not scatter DB calls or inference calls inside business logic — pipelines take pure data in, effects happen only at named boundary steps.
-- **Fully offline.** No external embedding APIs. BGE-M3 runs in-process via ONNX Runtime.
+- **Fully offline.** No external embedding APIs. The default `NOTE_EMBEDDING_MODE=process` starts
+  a supervised local worker subprocess and sends embedding requests over local IPC; that worker
+  runs BGE-M3 via ONNX Runtime when `NOTE_MODEL_PATH` is configured, or the deterministic stub
+  otherwise. The reserved `thread` and `remote` modes are not implemented.
 - **One core, two front doors.** REST/MCP-over-HTTP and MCP-over-stdio both call the same pipeline functions. No duplicated business logic per transport.
 
 ## 2. System Topology
@@ -41,7 +44,8 @@ entry and each *note* attaches its own value. Keys may be registered explicitly 
 description or auto-created with an empty description on first save. A note can have at most one
 value per key (same semantics as k8s labels) — this is not a free-form tagging system.
 
-The embedded adapter's current schema is v2:
+The following is a retrieval-relevant excerpt of the embedded adapter's schema v2. Idempotency
+clauses, unrelated operational indexes, and non-retrieval tables such as `app_settings` are omitted:
 
 ```sql
 CREATE TABLE notes (
@@ -76,7 +80,7 @@ CREATE TABLE note_chunks (
     chunk_idx INTEGER NOT NULL,
     chunk_hash TEXT NOT NULL,
     content TEXT NOT NULL,
-    note_revision INTEGER NOT NULL,
+    note_revision INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (note_id, chunk_idx)
@@ -88,7 +92,7 @@ CREATE TABLE embedding_jobs (
     chunk_idx INTEGER NOT NULL,
     chunk_hash TEXT NOT NULL,
     content TEXT NOT NULL,
-    note_revision INTEGER NOT NULL,
+    note_revision INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL,
     error TEXT,
@@ -131,7 +135,10 @@ default values are based on the process working directory.
 - **Quantization**: int8. Do not drop to 4-bit — CPU ONNX Runtime kernels for INT4 are not reliably faster than int8 on CPU EP, and quantization noise directly perturbs retrieval ordering (unlike LLM generation, where it's more forgiving). If corpus size later justifies revisiting this, it requires re-embedding the full corpus — quantization levels are not mixable in the same vector space.
 - **Output used**: the 1024-dimensional dense head. The worker persists one dense vector for each body chunk; no lexical or multi-vector embedding output is stored.
 - **Threading**: inference runs via `spawn_blocking`, never inline on the async reactor.
-- **Backpressure**: bound concurrent inference calls with a semaphore sized to the ONNX session's thread count. Do not rely on `spawn_blocking`'s default pool to absorb load silently — queuing should be visible at the app layer, not hidden as creeping tail latency.
+- **Backpressure**: the worker wraps its embedder in `BoundedEmbedder` with concurrency `1`, so
+  inference calls are serialized behind a semaphore. The local IPC worker queue is also bounded
+  (default capacity `8`). `NOTE_EMBEDDING_THREADS` controls ONNX intra-op CPU threads separately;
+  it does not change request concurrency.
 
 ## 5. Retrieval Design
 
@@ -208,7 +215,7 @@ REST/UI-only.
 - Whether label filtering should move deeper into backend retrieval at larger corpus sizes.
 - Storage-session concurrency sizing for Axum's concurrent path.
 
-## 10. Future Extensions (v2, not built now)
+## 10. Future Extensions
 
-- **Resources**: file attachments (image, PDF, etc.) attached to a note. Naturally keyed by `note_id`, so no schema changes are needed now to accommodate this later.
-- **References**: links/URIs pointing to outside resources, attached to a note. Same as above — additive, `note_id`-keyed, deferred rather than designed now.
+- **Structured references**: external links currently live in Markdown content. A dedicated
+  reference model with its own metadata remains deferred until a concrete use case requires it.
