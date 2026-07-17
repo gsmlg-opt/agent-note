@@ -49,6 +49,20 @@ mod tests {
     }
 
     #[test]
+    fn weighted_fusion_accumulates_scores_across_rankings() {
+        let title = vec!["shared".to_string()];
+        let content = vec!["content-only".to_string(), "shared".to_string()];
+        let result = weighted_rrf_fuse(&[(3.0, title.as_slice()), (1.0, content.as_slice())], 60.0);
+        let shared_score = result
+            .iter()
+            .find(|(note_id, _)| note_id == "shared")
+            .unwrap()
+            .1;
+
+        assert!((shared_score - (3.0 / 61.0 + 1.0 / 62.0)).abs() < 1e-6);
+    }
+
+    #[test]
     fn weighted_fusion_breaks_equal_scores_by_note_id() {
         let title = vec!["b".to_string()];
         let content = vec!["a".to_string()];
