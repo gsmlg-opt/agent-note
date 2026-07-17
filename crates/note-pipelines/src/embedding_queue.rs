@@ -197,6 +197,7 @@ async fn complete_embedding_job(
         let current = transaction
             .get_note_chunk(&job.note_id, job.chunk_idx)
             .await?;
+        transaction.delete_embedding_job(job.id).await?;
         let status = if current.as_ref().is_some_and(|chunk| {
             chunk.content_hash == job.content_hash && chunk.note_revision == job.note_revision
         }) {
@@ -238,7 +239,6 @@ async fn complete_embedding_job(
             ProcessEmbeddingJobStatus::Stale
         };
 
-        transaction.delete_embedding_job(job.id).await?;
         anyhow::Ok(ProcessedEmbeddingJob {
             job_id: job.id,
             note_id: job.note_id.clone(),
@@ -395,5 +395,87 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].note_id, note.id);
         assert_eq!(pending[0].content, "new content");
+    }
+
+    #[tokio::test]
+    async fn same_content_new_revision_requeues_after_stale_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            TursoStorage::open(dir.path().join("test.db"))
+                .await
+                .unwrap(),
+        );
+        let attachments_dir = dir.path().join("attachments");
+        let write_ctx = Context::new(
+            storage.clone(),
+            Arc::new(StubEmbedder),
+            attachments_dir.clone(),
+        );
+        let note = save_note(
+            &write_ctx,
+            SaveNoteInput {
+                title: "original".into(),
+                content: "stable content".into(),
+                attachments: vec![],
+                labels: vec![("phase".into(), "draft".into())],
+            },
+        )
+        .await
+        .unwrap();
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let process_ctx = Arc::new(Context::new(
+            storage.clone(),
+            Arc::new(PausingEmbedder {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+            attachments_dir,
+        ));
+        let process_task = {
+            let process_ctx = process_ctx.clone();
+            tokio::spawn(async move {
+                process_next_embedding_job(&process_ctx)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        started.notified().await;
+
+        update_note(
+            &write_ctx,
+            &note.id,
+            SaveNoteInput {
+                title: "renamed".into(),
+                content: "stable content".into(),
+                attachments: vec![],
+                labels: vec![("phase".into(), "published".into())],
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let session = storage.session().await.unwrap();
+        assert_eq!(session.get_note_revision(&note.id).await.unwrap(), Some(2));
+        let current_chunk = session.get_note_chunk(&note.id, 0).await.unwrap().unwrap();
+        assert_eq!(current_chunk.note_revision, 2);
+        assert_eq!(current_chunk.content_hash, chunk_hash("stable content"));
+        drop(session);
+
+        release.notify_one();
+        let processed = process_task.await.unwrap();
+        assert_eq!(processed.status, ProcessEmbeddingJobStatus::Stale);
+
+        let replacement = process_next_embedding_job(&write_ctx)
+            .await
+            .unwrap()
+            .expect("stale completion must leave a replacement job");
+        assert_eq!(replacement.status, ProcessEmbeddingJobStatus::Completed);
+
+        let session = storage.session().await.unwrap();
+        assert!(session.chunk_embedding_exists(&note.id, 0).await.unwrap());
     }
 }
