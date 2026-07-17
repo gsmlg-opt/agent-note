@@ -1,9 +1,16 @@
+use anyhow::Context as _;
 use libsql::{Builder, Connection, Database};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const CHUNK_VECTOR_INDEX_NAME: &str = "idx_note_chunk_embedding";
+const DROP_CHUNK_VECTOR_INDEX_SQL: &str = "DROP INDEX IF EXISTS idx_note_chunk_embedding";
+const CHUNK_VECTOR_INDEX_SQL: &str = "CREATE INDEX idx_note_chunk_embedding
+    ON note_chunk_embeddings(
+        libsql_vector_idx(embedding, 'compress_neighbors=float8', 'max_neighbors=20')
+    )";
 
 pub struct Storage {
     db: Database,
@@ -106,6 +113,55 @@ impl Storage {
         let page_size = pragma_i64(&conn, "PRAGMA page_size").await?;
         Ok(page_count.max(0) as u64 * page_size.max(0) as u64)
     }
+
+    /// Explicit maintenance operation; normal schema application must not rebuild a large index.
+    pub async fn optimize_chunk_vector_index(&self) -> anyhow::Result<bool> {
+        let conn = self.connect()?;
+        let Some(sql) = index_definition(&conn, CHUNK_VECTOR_INDEX_NAME).await? else {
+            conn.execute(CHUNK_VECTOR_INDEX_SQL, ())
+                .await
+                .context("create optimized chunk vector index")?;
+            return Ok(true);
+        };
+        if is_optimized_chunk_vector_index(&sql) {
+            return Ok(false);
+        }
+
+        conn.execute(DROP_CHUNK_VECTOR_INDEX_SQL, ())
+            .await
+            .context("drop existing chunk vector index")?;
+        conn.execute(CHUNK_VECTOR_INDEX_SQL, ())
+            .await
+            .context(
+                "create optimized chunk vector index; rerun the maintenance command before starting the server",
+            )?;
+        Ok(true)
+    }
+
+    pub async fn vacuum(&self) -> anyhow::Result<()> {
+        let conn = self.connect()?;
+        conn.execute("VACUUM", ())
+            .await
+            .context("vacuum database")?;
+        Ok(())
+    }
+}
+
+async fn index_definition(conn: &Connection, name: &str) -> anyhow::Result<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            libsql::params![name],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(row.get::<String>(0)?))
+}
+
+fn is_optimized_chunk_vector_index(sql: &str) -> bool {
+    sql.contains("'compress_neighbors=float8'") && sql.contains("'max_neighbors=20'")
 }
 
 async fn pragma_i64(conn: &Connection, pragma: &str) -> anyhow::Result<i64> {

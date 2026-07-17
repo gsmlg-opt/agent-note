@@ -92,6 +92,30 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
    frontend `/notes/*` routes on port 6221. Add `?type=html` to the latter URL for a standalone,
    styled HTML document suitable for iframe embedding.
 
+## Vector index maintenance
+
+New databases store DiskANN neighbor vectors as `float8` with `max_neighbors=20`. Existing databases
+keep their current index until the explicit maintenance command is run. Stop every process using the
+database and make a backup before rebuilding the index:
+
+```
+NOTE_DB_PATH=/path/to/notes.db cargo run -p note-server --release -- \
+  --optimize-vector-index --vacuum
+```
+
+`--optimize-vector-index` preserves the base embeddings and rebuilds only the derived vector index.
+`--vacuum` then rewrites the database so the filesystem releases pages from the old index. Both
+operations can take a long time on a large database, must not run concurrently with note-server,
+and require enough free disk for SQLite to rewrite the database.
+
+For a Docker Compose deployment, run the same maintenance mode through the service image:
+
+```
+docker compose stop agent-note
+docker compose run --rm agent-note note-server --optimize-vector-index --vacuum
+docker compose up -d agent-note
+```
+
 ## MCP
 
 The same binary also speaks MCP over stdio (for MCP clients that spawn a subprocess):

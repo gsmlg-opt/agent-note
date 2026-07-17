@@ -271,6 +271,31 @@ async fn main() -> anyhow::Result<()> {
     ensure_data_directories(&db_path, &attachments_dir)?;
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
+    let optimize_vector_index_mode = args.iter().any(|a| a == "--optimize-vector-index");
+    let vacuum_mode = args.iter().any(|a| a == "--vacuum");
+
+    if vacuum_mode && !optimize_vector_index_mode {
+        anyhow::bail!("--vacuum requires --optimize-vector-index");
+    }
+
+    if optimize_vector_index_mode {
+        eprintln!("opening database for vector index maintenance");
+        let storage = Storage::open_local(&db_path).await?;
+        eprintln!(
+            "optimizing chunk vector index with compress_neighbors=float8 and max_neighbors=20"
+        );
+        if storage.optimize_chunk_vector_index().await? {
+            eprintln!("chunk vector index rebuilt");
+        } else {
+            eprintln!("chunk vector index already uses the optimized configuration");
+        }
+        if vacuum_mode {
+            eprintln!("vacuuming database to release unused pages");
+            storage.vacuum().await?;
+            eprintln!("database vacuum complete");
+        }
+        return Ok(());
+    }
 
     if export_mode {
         let storage = Storage::open_local(&db_path).await?;

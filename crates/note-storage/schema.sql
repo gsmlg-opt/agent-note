@@ -59,7 +59,9 @@ CREATE TABLE IF NOT EXISTS note_chunk_embeddings (
     embedding F32_BLOB(1024) NOT NULL,
     PRIMARY KEY (note_id, chunk_idx)
 );
-CREATE INDEX IF NOT EXISTS idx_note_chunk_embedding ON note_chunk_embeddings(libsql_vector_idx(embedding));
+CREATE INDEX IF NOT EXISTS idx_note_chunk_embedding ON note_chunk_embeddings(
+    libsql_vector_idx(embedding, 'compress_neighbors=float8', 'max_neighbors=20')
+);
 
 CREATE TABLE IF NOT EXISTS note_chunk_sparse (
     note_id  TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
