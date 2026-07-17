@@ -132,11 +132,17 @@ matches with BM25, while dense retrieval uses an exact linear cosine-distance sc
 ranking has weight `3.0` and the dense body ranking has weight `1.0`; deterministic weighted RRF
 combines them using `weight / (60 + rank)` and breaks equal fused scores by note ID.
 
-Both channels retrieve a bounded candidate set before fusion, label filtering, hydration, and the
-requested top-k limit are applied. Exact dense scanning avoids an approximate-index lifecycle and
-gives deterministic results; the accepted trade-off is linear dense-search cost, which is
-appropriate for the current personal-notes corpus. A future `pg` backend can introduce a different
-physical retrieval strategy without changing pipeline or transport code.
+The pipeline requests `clamp(requested_limit × 32, 128, 4096)` ranked IDs from each channel before
+fusion, label filtering, hydration, and the requested top-k limit are applied. Dense retrieval uses
+that overfetch length directly. Title FTS physically materializes a fixed pool of up to 4,096 hits,
+batch-filters deleted notes, orders equal BM25 scores by note ID, and returns only the requested
+overfetch length. Fusion therefore receives the same requested ranking length from both channels;
+the larger fixed title pool bounds physical FTS work and makes ties deterministic within that pool.
+
+Exact dense scanning avoids an approximate-index lifecycle and gives deterministic results; the
+accepted trade-off is linear dense-search cost, which is appropriate for the current personal-notes
+corpus. A future `pg` backend can introduce a different physical retrieval strategy without
+changing pipeline or transport code.
 
 The adapter intentionally makes a clean break from databases created by the retired storage
 implementation. Delete and recreate disposable test/development databases. For non-disposable

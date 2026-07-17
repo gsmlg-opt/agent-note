@@ -87,12 +87,20 @@ async fn title_search_tracks_updates_deletion_and_restoration() {
 
 #[tokio::test]
 async fn equal_title_scores_use_note_id_order() {
-    let fixture = fixture().await;
-    insert_named_note(&fixture.session, "b", "Shared heading", "body").await;
-    insert_named_note(&fixture.session, "a", "Shared heading", "body").await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tie-boundary.db");
+    {
+        let storage = note_storage_turso::TursoStorage::open(&path).await.unwrap();
+        let session = storage.connect().await.unwrap();
+        for id in ["b", "c", "a"] {
+            insert_named_note(&session, id, "Shared heading", "body").await;
+        }
+    }
+    let storage = note_storage_turso::TursoStorage::open(&path).await.unwrap();
+    let observer = storage.connect().await.unwrap();
 
     assert_eq!(
-        fixture.session.title_search("Shared", 2).await.unwrap(),
+        observer.title_search("Shared", 2).await.unwrap(),
         vec!["a", "b"]
     );
 }

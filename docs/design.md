@@ -154,10 +154,14 @@ title FTS weight = 3.0
 dense content weight = 1.0
 ```
 
-Fusion ordering is deterministic: equal fused scores are broken by note ID. Each channel receives
-a bounded overfetch limit of `clamp(requested_limit × 32, 128, 4096)` so fusion can consider notes
-beyond the requested top-k. Label filtering and hydration happen after fusion, and iteration stops
-at the requested result limit.
+Fusion ordering is deterministic: equal fused scores are broken by note ID. The pipeline requests
+`clamp(requested_limit × 32, 128, 4096)` ranked IDs from each channel so fusion can consider notes
+beyond the requested top-k. Dense retrieval uses that overfetch length directly. Title FTS first
+materializes a fixed bounded pool of up to 4,096 BM25 hits, batch-filters deleted notes, and orders
+score ties by note ID before returning only the requested overfetch length. Fusion therefore still
+receives the requested ranking length from both channels; the fixed title pool is the physical FTS
+work bound needed for deterministic ties within the accepted pool. Label filtering and hydration
+happen after fusion, and iteration stops at the requested result limit.
 
 Exact scanning avoids approximate-index build and maintenance, produces deterministic results, and
 fits the expected personal-notes corpus. Its accepted trade-off is linear dense-search cost. If

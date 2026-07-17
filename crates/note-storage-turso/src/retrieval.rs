@@ -68,8 +68,8 @@ impl RetrievalRepository for TursoSession {
         let Some(query) = normalize_title_query(query) else {
             return Ok(Vec::new());
         };
-        let requested_limit = title_candidate_limit(limit);
-        let candidate_limit = checked_limit(requested_limit, "title search")?;
+        let (requested_limit, physical_candidate_limit) = title_search_limits(limit);
+        let candidate_limit = checked_limit(physical_candidate_limit, "title search")?;
         let mut rows = self
             .connection
             .query(
@@ -149,8 +149,11 @@ fn normalize_title_query(query: &str) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(" OR "))
 }
 
-fn title_candidate_limit(limit: usize) -> usize {
-    limit.min(MAX_TITLE_FTS_CANDIDATES)
+fn title_search_limits(limit: usize) -> (usize, usize) {
+    (
+        limit.min(MAX_TITLE_FTS_CANDIDATES),
+        MAX_TITLE_FTS_CANDIDATES,
+    )
 }
 
 fn vector_to_json(vector: &[f32]) -> StorageResult<String> {
@@ -193,9 +196,9 @@ mod tests {
     use crate::TursoStorage;
 
     #[test]
-    fn title_candidate_limit_is_capped_at_storage_boundary() {
-        assert_eq!(title_candidate_limit(17), 17);
-        assert_eq!(title_candidate_limit(usize::MAX), 4_096);
+    fn title_search_uses_fixed_physical_pool_and_capped_return_limit() {
+        assert_eq!(title_search_limits(2), (2, 4_096));
+        assert_eq!(title_search_limits(usize::MAX), (4_096, 4_096));
     }
 
     #[tokio::test]
@@ -209,7 +212,7 @@ mod tests {
             .connection
             .query(
                 format!("EXPLAIN {TITLE_FTS_CANDIDATE_SQL}"),
-                turso::params![r#""rust""#, 10_i64],
+                turso::params![r#""rust""#, MAX_TITLE_FTS_CANDIDATES as i64],
             )
             .await
             .unwrap();
