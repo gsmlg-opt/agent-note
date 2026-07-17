@@ -73,15 +73,19 @@ async fn dropping_unfinished_transaction_discards_repository_writes() {
 
     drop(transaction);
 
-    let second_session = storage.session().await.unwrap();
-    let exists = tokio::time::timeout(
+    let second = tokio::time::timeout(
         Duration::from_secs(2),
-        second_session.note_exists("dropped"),
+        storage.begin(TransactionMode::Immediate),
     )
     .await
-    .expect("observer session remained blocked after the transaction was dropped")
+    .expect("writer lock remained held after the transaction was dropped")
     .unwrap();
-    assert!(!exists);
+    insert_note(second.as_ref(), "after-drop").await;
+    second.commit().await.unwrap();
+
+    let observer = storage.session().await.unwrap();
+    assert!(!observer.note_exists("dropped").await.unwrap());
+    assert!(observer.note_exists("after-drop").await.unwrap());
 }
 
 #[tokio::test]

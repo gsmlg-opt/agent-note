@@ -99,26 +99,31 @@ fn database_path(path: &Path) -> StorageResult<&str> {
 }
 
 fn absolute_database_path(path: &Path) -> StorageResult<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    std::env::current_dir()
-        .map(|current_dir| current_dir.join(path))
-        .map_err(|error| {
-            StorageError::with_source(
-                StorageErrorKind::Operation,
-                format!(
-                    "resolve absolute database path for reporting: {}",
-                    path.display()
-                ),
-                error,
-            )
-        })
+    std::path::absolute(path).map_err(|error| {
+        StorageError::with_source(
+            StorageErrorKind::Operation,
+            format!(
+                "resolve absolute database path for reporting: {}",
+                path.display()
+            ),
+            error,
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_database_path_resolves_to_an_absolute_path() {
+        let path = Path::new(r"C:backend.db");
+
+        let absolute = absolute_database_path(path).unwrap();
+
+        assert!(absolute.is_absolute());
+    }
 
     async fn create_unmarked_database(path: &Path) {
         let database = turso::Builder::new_local(path.to_str().unwrap())
