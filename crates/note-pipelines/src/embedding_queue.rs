@@ -1,5 +1,5 @@
 use crate::{chunk_content, Context};
-use note_embedding::{DenseVector, SparseVector};
+use note_embedding::DenseVector;
 use note_storage::{EmbeddingJob, TransactionMode};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -164,9 +164,7 @@ pub async fn process_next_embedding_job(
     };
 
     match ctx.embedder.embed(&job.content).await {
-        Ok((dense, sparse)) => complete_embedding_job(ctx, job, dense, sparse)
-            .await
-            .map(Some),
+        Ok(dense) => complete_embedding_job(ctx, job, dense).await.map(Some),
         Err(error) => fail_embedding_job(ctx, job, &error.to_string())
             .await
             .map(Some),
@@ -188,9 +186,7 @@ async fn complete_embedding_job(
     ctx: &Context,
     job: EmbeddingJob,
     dense: DenseVector,
-    sparse: SparseVector,
 ) -> anyhow::Result<ProcessedEmbeddingJob> {
-    let weights: Vec<(i64, f64)> = sparse.into_iter().map(|(k, v)| (k, v as f64)).collect();
     let now = chrono::Utc::now().timestamp();
     let transaction = ctx.storage().begin(TransactionMode::Deferred).await?;
     let transaction_result = async {
@@ -206,9 +202,6 @@ async fn complete_embedding_job(
                 .await?;
             transaction
                 .insert_chunk_embedding(&job.note_id, job.chunk_idx, &dense)
-                .await?;
-            transaction
-                .insert_chunk_sparse_weights(&job.note_id, job.chunk_idx, &weights)
                 .await?;
             transaction
                 .mark_note_chunk_status(
@@ -289,7 +282,7 @@ async fn fail_embedding_job(
 mod tests {
     use super::*;
     use crate::{save_note, update_note, SaveNoteInput};
-    use note_embedding::{DenseVector, Embedder, SparseVector, StubEmbedder};
+    use note_embedding::{DenseVector, Embedder, StubEmbedder};
     use note_storage::StorageBackend;
     use note_storage_turso::TursoStorage;
     use std::sync::Arc;
@@ -302,12 +295,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Embedder for PausingEmbedder {
-        async fn embed(&self, _text: &str) -> anyhow::Result<(DenseVector, SparseVector)> {
+        async fn embed(&self, _text: &str) -> anyhow::Result<DenseVector> {
             self.started.notify_one();
             self.release.notified().await;
-            let mut sparse = SparseVector::new();
-            sparse.insert(42, 1.0);
-            Ok((vec![0.1; 1024], sparse))
+            Ok(vec![0.1; 1024])
         }
     }
 
@@ -380,11 +371,6 @@ mod tests {
         assert!(!session.chunk_embedding_exists(&note.id, 0).await.unwrap());
         assert!(session
             .dense_search(&vec![0.1; 1024], 10)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(session
-            .sparse_postings_query(&[42], 10)
             .await
             .unwrap()
             .is_empty());

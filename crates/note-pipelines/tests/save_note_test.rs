@@ -695,7 +695,7 @@ async fn successful_save_persists_note_chunks_and_embedding_jobs() {
 }
 
 #[tokio::test]
-async fn embedding_worker_populates_recall_tables_from_queue() {
+async fn embedding_worker_populates_dense_recall_table_from_queue() {
     let (ctx, backend, _dir) = test_context().await;
     let note = save_note(
         &ctx,
@@ -711,17 +711,11 @@ async fn embedding_worker_populates_recall_tables_from_queue() {
 
     assert_eq!(drain_embedding_jobs(&ctx, 10).await.unwrap(), 1);
 
-    let (dense, sparse) = ctx.embedder.embed("Some content").await.unwrap();
-    let token_ids = sparse.keys().copied().collect::<Vec<_>>();
+    let dense = ctx.embedder.embed("Some content").await.unwrap();
     let session = backend.session().await.unwrap();
     assert!(session.chunk_embedding_exists(&note.id, 0).await.unwrap());
     assert!(session
         .dense_search(&dense, 10)
-        .await
-        .unwrap()
-        .contains(&note.id));
-    assert!(session
-        .sparse_postings_query(&token_ids, 10)
         .await
         .unwrap()
         .contains(&note.id));

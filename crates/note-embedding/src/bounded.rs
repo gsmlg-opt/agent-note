@@ -1,4 +1,4 @@
-use crate::embedder::{DenseVector, Embedder, SparseVector};
+use crate::embedder::{DenseVector, Embedder};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -20,7 +20,7 @@ impl<E: Embedder + 'static> BoundedEmbedder<E> {
 
 #[async_trait::async_trait]
 impl<E: Embedder + 'static> Embedder for BoundedEmbedder<E> {
-    async fn embed(&self, text: &str) -> anyhow::Result<(DenseVector, SparseVector)> {
+    async fn embed(&self, text: &str) -> anyhow::Result<DenseVector> {
         let _permit = self.semaphore.acquire().await?;
         self.inner.embed(text).await
     }
@@ -39,12 +39,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Embedder for CountingEmbedder {
-        async fn embed(&self, _text: &str) -> anyhow::Result<(DenseVector, SparseVector)> {
+        async fn embed(&self, _text: &str) -> anyhow::Result<DenseVector> {
             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_observed.fetch_max(current, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(20)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            Ok((vec![0.0; 1024], Default::default()))
+            Ok(vec![0.0; 1024])
         }
     }
 

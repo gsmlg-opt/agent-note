@@ -22,12 +22,10 @@ pub async fn search_notes_filtered(
         return Ok(Vec::new());
     }
 
-    let (dense, sparse) = ctx.embedder.embed(query).await?;
-    let token_ids: Vec<i64> = sparse.keys().copied().collect();
+    let dense = ctx.embedder.embed(query).await?;
 
-    // Exact dense and sparse postings are independent read-only queries. Keep one session for
-    // filtering, retrieval, and hydration so the whole search observes one configured backend
-    // handle. Correctness (RRF-fused ranking) is unaffected by the sequential ordering.
+    // Keep one session for filtering, retrieval, and hydration so the whole search observes one
+    // configured backend handle.
     let session = ctx.storage().session().await?;
     let selectors = label
         .as_deref()
@@ -54,18 +52,7 @@ pub async fn search_notes_filtered(
     };
 
     let dense_ranking = session.dense_search(&dense, retrieval_limit).await?;
-    // Guard the empty case: sparse_postings_query builds `WHERE token_id IN (...)`, which is invalid
-    // SQL when there are no tokens. The current StubEmbedder never yields an empty sparse map, but the
-    // Embedder contract doesn't guarantee it, so fall back to a dense-only ranking rather than error.
-    let sparse_ranking = if token_ids.is_empty() {
-        Vec::new()
-    } else {
-        session
-            .sparse_postings_query(&token_ids, retrieval_limit)
-            .await?
-    };
-
-    let fused = rrf_fuse(&[dense_ranking, sparse_ranking], RRF_K);
+    let fused = rrf_fuse(&[dense_ranking], RRF_K);
 
     let mut results = vec![];
     for (note_id, score) in fused {
@@ -75,9 +62,8 @@ pub async fn search_notes_filtered(
         {
             continue;
         }
-        // A None here means an index row (dense/sparse) outlived its note row. save_note writes all
-        // three tables in one atomic transaction (see save_note.rs), so this is unreachable today;
-        // it would only occur under index/note divergence (e.g. a future delete path with a bug).
+        // A None here means an index row outlived its note row; it would only occur under index/note
+        // divergence (e.g. a future delete path with a bug).
         if let Some(mut note) = session.get_note(&note_id).await? {
             crate::attachment_files::hydrate_note_attachments(ctx, &mut note)?;
             results.push(SearchResult { note, score });

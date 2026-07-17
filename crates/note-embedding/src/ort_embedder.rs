@@ -1,7 +1,6 @@
-use crate::embedder::{DenseVector, Embedder, SparseVector};
+use crate::embedder::{DenseVector, Embedder};
 use ort::session::Session;
 use ort::value::Tensor;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
@@ -44,14 +43,13 @@ impl OrtEmbedder {
 
 #[async_trait::async_trait]
 impl Embedder for OrtEmbedder {
-    async fn embed(&self, text: &str) -> anyhow::Result<(DenseVector, SparseVector)> {
+    async fn embed(&self, text: &str) -> anyhow::Result<DenseVector> {
         // Inference must run via spawn_blocking, never inline on the async reactor (docs/design.md §4).
-        // A single forward pass must produce both dense and sparse output (see Embedder trait doc comment).
         let session = Arc::clone(&self.session);
         let tokenizer = Arc::clone(&self.tokenizer);
         let text = text.to_string();
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<(DenseVector, SparseVector)> {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<DenseVector> {
             let enc = tokenizer
                 .encode(text, true)
                 .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
@@ -66,7 +64,7 @@ impl Embedder for OrtEmbedder {
                 anyhow::bail!("empty tokenization");
             }
 
-            let input_ids = Tensor::from_array((vec![1_i64, seq as i64], ids.clone()))?;
+            let input_ids = Tensor::from_array((vec![1_i64, seq as i64], ids))?;
             let attn = Tensor::from_array((vec![1_i64, seq as i64], mask))?;
             let mut session = session.lock().unwrap();
             let outputs = session.run(ort::inputs![
@@ -81,28 +79,7 @@ impl Embedder for OrtEmbedder {
                 .ok_or_else(|| anyhow::anyhow!("dense_vecs output too short: {}", dense.len()))?
                 .to_vec();
 
-            let (_sparse_shape, weights): (&_, &[f32]) =
-                outputs["sparse_vecs"].try_extract_tensor::<f32>()?;
-            if weights.len() < seq {
-                anyhow::bail!("sparse_vecs output too short: {} < {seq}", weights.len());
-            }
-
-            let mut sparse = HashMap::new();
-            for i in 0..seq {
-                let id = ids[i];
-                if matches!(id, 0..=3) {
-                    continue;
-                }
-                let w = weights[i];
-                if w > 0.0 {
-                    let e = sparse.entry(id).or_insert(0.0);
-                    if w > *e {
-                        *e = w;
-                    }
-                }
-            }
-
-            Ok((dense_vec, sparse))
+            Ok(dense_vec)
         })
         .await?
     }

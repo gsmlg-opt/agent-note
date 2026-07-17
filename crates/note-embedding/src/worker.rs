@@ -1,7 +1,7 @@
 use crate::rpc::{
     unix_time_ms, validate_handshake, EmbedRequest, EmbedResponse, EmbeddingRpc,
-    EmbeddingRpcClient, EmbeddingVectors, HandshakeRequest, HandshakeResponse, HealthResponse,
-    ModelInfo, RpcError, RpcErrorKind, WorkerLimits,
+    EmbeddingRpcClient, HandshakeRequest, HandshakeResponse, HealthResponse, ModelInfo, RpcError,
+    RpcErrorKind, WorkerLimits,
 };
 use crate::{BoundedEmbedder, Embedder, OrtEmbedder, StubEmbedder};
 use futures::StreamExt;
@@ -265,9 +265,9 @@ async fn process_embed_request(
         .inputs
         .into_iter()
         .zip(embedded)
-        .map(|(input, (dense, sparse))| crate::rpc::EmbedOutput {
+        .map(|(input, dense)| crate::rpc::EmbedOutput {
             job_id: input.job_id,
-            result: Ok(EmbeddingVectors::new(dense, sparse)),
+            result: Ok(dense),
         })
         .collect::<Vec<_>>();
     let response = EmbedResponse {
@@ -330,12 +330,7 @@ fn estimate_response_bytes(response: &EmbedResponse) -> usize {
         .outputs
         .iter()
         .map(|output| match &output.result {
-            Ok(vectors) => {
-                vectors.dense.len() * std::mem::size_of::<f32>()
-                    + vectors.sparse.len()
-                        * (std::mem::size_of::<i64>() + std::mem::size_of::<f32>())
-                    + 32
-            }
+            Ok(dense) => dense.len() * std::mem::size_of::<f32>() + 32,
             Err(error) => error.message.len() + 32,
         })
         .sum::<usize>()
@@ -424,6 +419,21 @@ mod tests {
         };
         let error = validate_embed_request(&request, &limits).unwrap_err();
         assert_eq!(error.kind, RpcErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn response_size_counts_dense_payload_only() {
+        let response = EmbedResponse {
+            request_id: "req".to_string(),
+            outputs: vec![crate::rpc::EmbedOutput {
+                job_id: 1,
+                result: Ok(vec![0.0; 4]),
+            }],
+        };
+        assert_eq!(
+            estimate_response_bytes(&response),
+            "req".len() + 4 * std::mem::size_of::<f32>() + 32
+        );
     }
 
     #[test]

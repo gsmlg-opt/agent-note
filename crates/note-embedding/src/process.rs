@@ -3,7 +3,7 @@ use crate::rpc::{
     DEFAULT_EMBEDDING_DIMENSION, DEFAULT_MAX_RESPONSE_BYTES,
 };
 use crate::worker::{connect_client, embedding_threads_from_env};
-use crate::{DenseVector, Embedder, EmbeddingRpcClient, SparseVector};
+use crate::{DenseVector, Embedder, EmbeddingRpcClient};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -157,7 +157,7 @@ impl ProcessEmbedder {
 
 #[async_trait::async_trait]
 impl Embedder for ProcessEmbedder {
-    async fn embed(&self, text: &str) -> anyhow::Result<(DenseVector, SparseVector)> {
+    async fn embed(&self, text: &str) -> anyhow::Result<DenseVector> {
         let client = self.wait_client().await?;
         let request_id = format!("embed-{}-{}", std::process::id(), unix_time_ms());
         let deadline_unix_ms =
@@ -184,7 +184,7 @@ impl Embedder for ProcessEmbedder {
             .next()
             .ok_or_else(|| anyhow::anyhow!("embedding worker returned no output"))?;
         match output.result {
-            Ok(vectors) => Ok(vectors.into_parts()),
+            Ok(dense) => Ok(dense),
             Err(error) => Err(anyhow::anyhow!("embedding worker item error: {error}")),
         }
     }

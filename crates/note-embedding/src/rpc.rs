@@ -1,14 +1,13 @@
-use crate::{DenseVector, SparseVector};
+use crate::DenseVector;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const IPC_PROTOCOL_VERSION: u16 = 1;
+pub const IPC_PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_EMBEDDING_DIMENSION: usize = 1024;
 pub const DEFAULT_MAX_BATCH_INPUTS: usize = 16;
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 pub const CAPABILITY_DENSE: &str = "dense";
-pub const CAPABILITY_SPARSE: &str = "sparse";
 pub const CAPABILITY_BATCH: &str = "batch";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,7 +39,7 @@ impl ModelInfo {
 }
 
 pub fn default_capabilities() -> Vec<String> {
-    [CAPABILITY_DENSE, CAPABILITY_SPARSE, CAPABILITY_BATCH]
+    [CAPABILITY_DENSE, CAPABILITY_BATCH]
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -119,25 +118,7 @@ pub struct EmbedResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EmbedOutput {
     pub job_id: i64,
-    pub result: Result<EmbeddingVectors, RpcError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct EmbeddingVectors {
-    pub dense: DenseVector,
-    pub sparse: Vec<(i64, f32)>,
-}
-
-impl EmbeddingVectors {
-    pub fn new(dense: DenseVector, sparse: SparseVector) -> Self {
-        let mut sparse = sparse.into_iter().collect::<Vec<_>>();
-        sparse.sort_by_key(|(token_id, _)| *token_id);
-        Self { dense, sparse }
-    }
-
-    pub fn into_parts(self) -> (DenseVector, SparseVector) {
-        (self.dense, self.sparse.into_iter().collect())
-    }
+    pub result: Result<DenseVector, RpcError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -235,6 +216,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_capabilities_are_dense_and_batch_only() {
+        assert_eq!(
+            default_capabilities(),
+            vec![CAPABILITY_DENSE.to_string(), CAPABILITY_BATCH.to_string()]
+        );
+    }
+
+    #[test]
     fn rpc_messages_round_trip_through_bincode() {
         let request = EmbedRequest {
             request_id: "req-1".to_string(),
@@ -250,6 +239,20 @@ mod tests {
         assert!(bytes.len() < 256);
         let decoded: EmbedRequest = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn dense_response_round_trips_through_bincode() {
+        let response = EmbedResponse {
+            request_id: "req-1".to_string(),
+            outputs: vec![EmbedOutput {
+                job_id: 7,
+                result: Ok(vec![0.25; DEFAULT_EMBEDDING_DIMENSION]),
+            }],
+        };
+        let bytes = bincode::serialize(&response).unwrap();
+        let decoded: EmbedResponse = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]

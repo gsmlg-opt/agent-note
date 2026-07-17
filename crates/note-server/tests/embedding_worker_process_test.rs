@@ -21,6 +21,10 @@ async fn embedding_worker_child_process_embeds_text() {
         .unwrap()
         .unwrap();
     assert_eq!(handshake.model.embedding_dimension, 1024);
+    assert_eq!(
+        handshake.model.capabilities,
+        vec!["dense".to_string(), "batch".to_string()]
+    );
 
     let response = client
         .embed(
@@ -39,9 +43,8 @@ async fn embedding_worker_child_process_embeds_text() {
         .unwrap()
         .unwrap();
 
-    let vectors = response.outputs[0].result.as_ref().unwrap();
-    assert_eq!(vectors.dense.len(), 1024);
-    assert!(!vectors.sparse.is_empty());
+    let dense = response.outputs[0].result.as_ref().unwrap();
+    assert_eq!(dense.len(), 1024);
 
     let _ = client.shutdown(context::current()).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
@@ -70,13 +73,12 @@ async fn process_supervisor_restarts_after_worker_crash() {
 
     let _ = embedder.embed("first request may trigger crash").await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let (dense, sparse) = embedder
+    let dense = embedder
         .embed("second request after restart")
         .await
         .unwrap();
 
     assert_eq!(dense.len(), 1024);
-    assert!(!sparse.is_empty());
     assert!(crash_file.exists());
 
     runtime.shutdown().await;
