@@ -27,6 +27,14 @@ async fn title_search_matches_titles_but_not_body_text() {
         fixture.session.title_search("Rust", 10).await.unwrap(),
         vec!["title-hit"]
     );
+    assert_eq!(
+        fixture
+            .session
+            .title_search("Rust ownership", 10)
+            .await
+            .unwrap(),
+        vec!["title-hit"]
+    );
     assert!(fixture
         .session
         .title_search("unrelated", 10)
@@ -86,6 +94,65 @@ async fn equal_title_scores_use_note_id_order() {
     assert_eq!(
         fixture.session.title_search("Shared", 2).await.unwrap(),
         vec!["a", "b"]
+    );
+}
+
+#[tokio::test]
+async fn title_search_treats_query_syntax_as_literal_term_separators() {
+    let fixture = fixture().await;
+    insert_named_note(
+        &fixture.session,
+        "unterminated",
+        "Unterminated field guide",
+        "body",
+    )
+    .await;
+    insert_named_note(&fixture.session, "foo", "Foo reference", "body").await;
+    insert_named_note(&fixture.session, "letters", "A B primer", "body").await;
+    insert_named_note(
+        &fixture.session,
+        "operators",
+        "AND OR NOT reference",
+        "body",
+    )
+    .await;
+    insert_named_note(&fixture.session, "unicode", "Café résumé", "body").await;
+
+    for (query, expected_id) in [
+        (r#""unterminated"#, "unterminated"),
+        ("foo:", "foo"),
+        ("a - b", "letters"),
+        ("(foo", "foo"),
+        ("AND OR NOT", "operators"),
+        ("café / résumé", "unicode"),
+    ] {
+        let results = fixture.session.title_search(query, 10).await.unwrap();
+        assert!(
+            results.iter().any(|id| id == expected_id),
+            "expected {query:?} to retrieve {expected_id:?}, got {results:?}"
+        );
+    }
+
+    assert!(fixture
+        .session
+        .title_search(r#""():-"#, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn title_search_caps_direct_callers_before_limit_conversion() {
+    let fixture = fixture().await;
+    insert_named_note(&fixture.session, "rust", "Rust guide", "body").await;
+
+    assert_eq!(
+        fixture
+            .session
+            .title_search("Rust", usize::MAX)
+            .await
+            .unwrap(),
+        vec!["rust"]
     );
 }
 

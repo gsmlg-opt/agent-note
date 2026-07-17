@@ -1690,6 +1690,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_treats_malformed_fts_syntax_as_literal_title_text() {
+        let (app, _ctx, _dir) = test_app().await;
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Foo reference","content":"unrelated body","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(post("/api/notes/search", r#"{"query":"foo:","limit":5}"#))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let results: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            results
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|result| result["title"] == "Foo reference"),
+            "expected literal title hit, got {results}"
+        );
+    }
+
+    #[tokio::test]
     async fn search_filters_by_label() {
         let (app, ctx, _dir) = test_app().await;
         app.clone()
