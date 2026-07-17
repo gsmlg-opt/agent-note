@@ -12,7 +12,7 @@ pub struct OrtEmbedder {
 }
 
 impl OrtEmbedder {
-    pub fn load(model_path: &Path) -> anyhow::Result<Self> {
+    pub fn load(model_path: &Path, intra_threads: usize) -> anyhow::Result<Self> {
         // int8 quantization per docs/design.md §4 — do not attempt int4, see design.md rationale.
         let model_dir = model_path.parent().ok_or_else(|| {
             anyhow::anyhow!(
@@ -29,7 +29,7 @@ impl OrtEmbedder {
         // `Send` error.
         let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("create ort session builder: {e}"))?
-            .with_intra_threads(1)
+            .with_intra_threads(intra_threads)
             .map_err(|e| anyhow::anyhow!("configure ort session: {e}"))?;
         let session = builder
             .commit_from_file(model_path)

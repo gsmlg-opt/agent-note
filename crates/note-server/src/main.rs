@@ -262,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
     if arg_value(&args, "--internal-role").as_deref() == Some("embedding-worker") {
         let ipc_name = arg_value(&args, "--ipc-name")
             .ok_or_else(|| anyhow::anyhow!("missing --ipc-name for embedding worker"))?;
-        return note_embedding::run_embedding_worker(WorkerConfig::new(ipc_name)).await;
+        return note_embedding::run_embedding_worker(WorkerConfig::new(ipc_name)?).await;
     }
 
     let stdio_mode = args.iter().any(|a| a == "--stdio");

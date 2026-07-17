@@ -2050,6 +2050,7 @@ dependencies = [
  "bincode",
  "futures",
  "interprocess",
+ "num_cpus",
  "ort",
  "serde",
  "tarpc",

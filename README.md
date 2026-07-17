@@ -61,9 +61,10 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
    ```
    hf download gpahal/bge-m3-onnx-int8 --local-dir ./models/bge-m3-int8.onnx
    ```
-   The whole app runs without it using a deterministic stub embedder — only the real
-   `OrtEmbedder` needs it (and wiring it into `note-server` is a one-line swap in
-   `crates/note-server/src/main.rs`, marked with a comment).
+   The whole app runs without it using a deterministic stub embedder. Set `NOTE_MODEL_PATH` to
+   `./models/bge-m3-int8.onnx/model_quantized.onnx` to use the real model. Embedding inference uses
+   all detected physical CPU cores by default; set `NOTE_EMBEDDING_THREADS` to a positive integer
+   to override it, or explicitly set it to `auto` to retain the default.
 
 ## Build & test
 

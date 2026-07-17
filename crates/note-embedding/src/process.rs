@@ -2,7 +2,7 @@ use crate::rpc::{
     default_capabilities, unix_time_ms, EmbedInput, EmbedRequest, HandshakeRequest, RpcErrorKind,
     DEFAULT_EMBEDDING_DIMENSION, DEFAULT_MAX_RESPONSE_BYTES,
 };
-use crate::worker::connect_client;
+use crate::worker::{connect_client, embedding_threads_from_env};
 use crate::{DenseVector, Embedder, EmbeddingRpcClient, SparseVector};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ pub struct ProcessWorkerConfig {
     pub ipc_name: String,
     pub model_path: Option<PathBuf>,
     pub queue_capacity: usize,
+    pub embedding_threads: usize,
     pub max_restarts: usize,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
@@ -35,6 +36,7 @@ impl ProcessWorkerConfig {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
             queue_capacity: env_usize("NOTE_EMBEDDING_WORKER_QUEUE", 8),
+            embedding_threads: embedding_threads_from_env()?,
             max_restarts: env_usize("NOTE_EMBEDDING_WORKER_MAX_RESTARTS", 5),
             connect_timeout: Duration::from_secs(env_u64(
                 "NOTE_EMBEDDING_WORKER_CONNECT_TIMEOUT_SECS",
@@ -271,6 +273,10 @@ fn spawn_worker(config: &ProcessWorkerConfig) -> anyhow::Result<Child> {
         .env(
             "NOTE_EMBEDDING_WORKER_QUEUE",
             config.queue_capacity.to_string(),
+        )
+        .env(
+            "NOTE_EMBEDDING_THREADS",
+            config.embedding_threads.to_string(),
         );
     if let Some(model_path) = &config.model_path {
         command.env("NOTE_MODEL_PATH", model_path);

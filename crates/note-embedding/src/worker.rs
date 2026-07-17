@@ -27,20 +27,22 @@ pub struct WorkerConfig {
     pub ipc_name: String,
     pub model_path: Option<PathBuf>,
     pub queue_capacity: usize,
+    pub embedding_threads: usize,
     pub limits: WorkerLimits,
 }
 
 impl WorkerConfig {
-    pub fn new(ipc_name: String) -> Self {
-        Self {
+    pub fn new(ipc_name: String) -> anyhow::Result<Self> {
+        Ok(Self {
             ipc_name,
             model_path: std::env::var("NOTE_MODEL_PATH")
                 .ok()
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
             queue_capacity: env_usize("NOTE_EMBEDDING_WORKER_QUEUE", 8),
+            embedding_threads: embedding_threads_from_env()?,
             limits: WorkerLimits::default(),
-        }
+        })
     }
 }
 
@@ -136,7 +138,8 @@ impl EmbeddingRpc for WorkerService {
 
 pub async fn run_embedding_worker(config: WorkerConfig) -> anyhow::Result<()> {
     let socket_name = local_socket_name(&config.ipc_name)?;
-    let (embedder, model) = build_local_embedder(config.model_path.as_deref(), 1)?;
+    let (embedder, model) =
+        build_local_embedder(config.model_path.as_deref(), 1, config.embedding_threads)?;
     let (tx, rx) = mpsc::channel(config.queue_capacity.max(1));
     let in_flight = Arc::new(AtomicUsize::new(0));
     tokio::spawn(embed_actor(
@@ -202,11 +205,16 @@ pub fn local_socket_name(raw: &str) -> std::io::Result<Name<'static>> {
 pub fn build_local_embedder(
     model_path: Option<&Path>,
     concurrency: usize,
+    embedding_threads: usize,
 ) -> anyhow::Result<(Arc<dyn Embedder>, ModelInfo)> {
     match model_path {
         Some(path) => {
-            eprintln!("embedder: ONNX ({})", path.display());
-            let ort = OrtEmbedder::load(path)?;
+            eprintln!(
+                "embedder: ONNX ({}) with {} CPU threads",
+                path.display(),
+                embedding_threads
+            );
+            let ort = OrtEmbedder::load(path, embedding_threads)?;
             Ok((
                 Arc::new(BoundedEmbedder::new(ort, concurrency.max(1))),
                 ModelInfo::onnx(&path.display().to_string()),
@@ -346,6 +354,37 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+pub(crate) fn embedding_threads_from_env() -> anyhow::Result<usize> {
+    let available_cores = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    resolve_embedding_threads(
+        std::env::var("NOTE_EMBEDDING_THREADS").ok().as_deref(),
+        num_cpus::get_physical(),
+        available_cores,
+    )
+}
+
+fn resolve_embedding_threads(
+    value: Option<&str>,
+    physical_cores: usize,
+    available_cores: usize,
+) -> anyhow::Result<usize> {
+    let auto = physical_cores.min(available_cores).max(1);
+    match value.map(str::trim) {
+        None | Some("") | Some("auto") => Ok(auto),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "NOTE_EMBEDDING_THREADS must be 'auto' or a positive integer, got {value:?}"
+                )
+            }),
+    }
+}
+
 fn maybe_crash_once_after_response() {
     let Some(path) = std::env::var_os("NOTE_EMBEDDING_WORKER_CRASH_ONCE_FILE") else {
         return;
@@ -385,5 +424,37 @@ mod tests {
         };
         let error = validate_embed_request(&request, &limits).unwrap_err();
         assert_eq!(error.kind, RpcErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn embedding_threads_default_and_auto_use_physical_cores() {
+        assert_eq!(resolve_embedding_threads(None, 16, 32).unwrap(), 16);
+        assert_eq!(resolve_embedding_threads(Some("auto"), 16, 32).unwrap(), 16);
+        assert_eq!(resolve_embedding_threads(Some(""), 16, 32).unwrap(), 16);
+        assert_eq!(
+            resolve_embedding_threads(Some(" auto "), 16, 32).unwrap(),
+            16
+        );
+        assert_eq!(resolve_embedding_threads(None, 0, 32).unwrap(), 1);
+    }
+
+    #[test]
+    fn embedding_threads_auto_respects_available_cpus() {
+        assert_eq!(resolve_embedding_threads(None, 16, 4).unwrap(), 4);
+        assert_eq!(resolve_embedding_threads(Some("auto"), 16, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn embedding_threads_accept_positive_override() {
+        assert_eq!(resolve_embedding_threads(Some("1"), 16, 32).unwrap(), 1);
+        assert_eq!(resolve_embedding_threads(Some(" 6 "), 16, 32).unwrap(), 6);
+    }
+
+    #[test]
+    fn embedding_threads_reject_invalid_override() {
+        for value in ["0", "-1", "many"] {
+            let error = resolve_embedding_threads(Some(value), 16, 32).unwrap_err();
+            assert!(error.to_string().contains("NOTE_EMBEDDING_THREADS"));
+        }
     }
 }

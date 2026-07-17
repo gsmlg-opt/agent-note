@@ -8,6 +8,7 @@ anyhow = "1.0.103"
 async-trait = "0.1.89"
 futures = "0.3"
 interprocess = { version = "2.4.2", features = ["tokio"] }
+num_cpus = "1.17"
 # Not yet referenced in code (OrtEmbedder is a deferred skeleton, Task 12 of the implementation
 # plan) — kept as a pre-staged dependency for the real wiring task, do not prune as unused.
 # default-features disabled + load-dynamic: this ort version has no prebuilt ONNX Runtime binary
