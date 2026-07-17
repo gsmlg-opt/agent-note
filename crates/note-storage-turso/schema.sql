@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS notes (
     deleted_at INTEGER
 );
 
+CREATE INDEX IF NOT EXISTS idx_notes_title_fts
+ON notes USING fts (title);
+
 CREATE TABLE IF NOT EXISTS label_keys (
     id INTEGER PRIMARY KEY,
     key TEXT NOT NULL UNIQUE,
@@ -59,15 +62,6 @@ CREATE TABLE IF NOT EXISTS note_chunk_embeddings (
     embedding F32_BLOB(1024) NOT NULL,
     PRIMARY KEY (note_id, chunk_idx)
 );
-
-CREATE TABLE IF NOT EXISTS note_chunk_sparse (
-    note_id  TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-    chunk_idx INTEGER NOT NULL,
-    token_id INTEGER NOT NULL,
-    weight   REAL NOT NULL,
-    PRIMARY KEY (note_id, chunk_idx, token_id)
-);
-CREATE INDEX IF NOT EXISTS idx_note_chunk_sparse_token ON note_chunk_sparse(token_id);
 
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,

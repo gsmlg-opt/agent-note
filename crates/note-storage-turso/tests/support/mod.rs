@@ -38,6 +38,28 @@ pub async fn insert_test_note(session: &note_storage_turso::TursoSession, id: &s
 }
 
 #[allow(dead_code)]
+pub async fn insert_named_note(
+    session: &note_storage_turso::TursoSession,
+    id: &str,
+    title: &str,
+    content: &str,
+) {
+    session
+        .insert_note(NewNote {
+            id,
+            title,
+            content,
+            attachments: &[],
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[allow(dead_code)]
 pub fn unit(axis: usize) -> Vec<f32> {
     let mut vector = vec![0.0; note_storage::EMBEDDING_DIMENSION];
     vector[axis] = 1.0;

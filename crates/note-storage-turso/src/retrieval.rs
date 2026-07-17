@@ -53,71 +53,32 @@ impl RetrievalRepository for TursoSession {
         Ok(ids)
     }
 
-    async fn insert_chunk_sparse_weights(
-        &self,
-        note_id: &str,
-        chunk_idx: i64,
-        weights: &[(i64, f64)],
-    ) -> StorageResult<()> {
-        for (token_id, weight) in weights {
-            self.connection
-                .execute(
-                    "INSERT INTO note_chunk_sparse (note_id, chunk_idx, token_id, weight)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    turso::params![note_id, chunk_idx, *token_id, *weight],
-                )
-                .await
-                .map_err(|error| map_turso_error("insert chunk sparse weight", error))?;
-        }
-        Ok(())
-    }
-
-    async fn sparse_postings_query(
-        &self,
-        token_ids: &[i64],
-        limit: usize,
-    ) -> StorageResult<Vec<String>> {
-        if token_ids.is_empty() {
+    async fn title_search(&self, query: &str, limit: usize) -> StorageResult<Vec<String>> {
+        if query.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let limit = checked_limit(limit, "sparse postings query")?;
-        let placeholders = (1..=token_ids.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>();
-        let limit_param = token_ids.len() + 1;
-        let sql = format!(
-            "SELECT note_id, MAX(chunk_total) AS total FROM (
-                 SELECT note_id, chunk_idx, SUM(weight) AS chunk_total
-                 FROM note_chunk_sparse
-                 WHERE token_id IN ({})
-                 GROUP BY note_id, chunk_idx
-             )
-             GROUP BY note_id
-             ORDER BY total DESC, note_id ASC
-             LIMIT ?{limit_param}",
-            placeholders.join(",")
-        );
-        let mut params = token_ids
-            .iter()
-            .copied()
-            .map(turso::Value::from)
-            .collect::<Vec<_>>();
-        params.push(limit.into());
-
+        let limit = checked_limit(limit, "title search")?;
         let mut rows = self
             .connection
-            .query(&sql, turso::params_from_iter(params))
+            .query(
+                "SELECT id, fts_score(title, ?1) AS score
+                 FROM notes
+                 WHERE fts_match(title, ?1) AND deleted_at IS NULL
+                 ORDER BY score DESC, id ASC
+                 LIMIT ?2",
+                turso::params![query, limit],
+            )
             .await
-            .map_err(|error| map_turso_error("query sparse postings", error))?;
+            .map_err(|error| map_turso_error("query title search", error))?;
         let mut ids = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|error| map_turso_error("read sparse postings", error))?
+            .map_err(|error| map_turso_error("read title search", error))?
         {
             ids.push(
                 row.get::<String>(0)
-                    .map_err(|error| map_turso_error("decode sparse posting note id", error))?,
+                    .map_err(|error| map_turso_error("decode title search note id", error))?,
             );
         }
         Ok(ids)

@@ -3,7 +3,7 @@ use note_storage_turso::TursoStorage;
 use std::path::Path;
 
 const APPLICATION_ID: u32 = 0x414E4F54;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 fn database_header(path: &Path) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap();
@@ -93,11 +93,29 @@ async fn unsupported_marked_schema_is_rejected_without_modification() {
     let path = dir.path().join("future.db");
     drop(TursoStorage::open(&path).await.unwrap());
     let mut before = std::fs::read(&path).unwrap();
-    before[60..64].copy_from_slice(&2_u32.to_be_bytes());
+    before[60..64].copy_from_slice(&(SCHEMA_VERSION + 1).to_be_bytes());
     std::fs::write(&path, &before).unwrap();
 
     let error = match TursoStorage::open(&path).await {
         Ok(_) => panic!("unsupported schema was accepted"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind(), StorageErrorKind::UnsupportedSchema);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn schema_v1_is_rejected_without_modification() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1.db");
+    drop(TursoStorage::open(&path).await.unwrap());
+    let mut before = std::fs::read(&path).unwrap();
+    before[60..64].copy_from_slice(&1_u32.to_be_bytes());
+    std::fs::write(&path, &before).unwrap();
+
+    let error = match TursoStorage::open(&path).await {
+        Ok(_) => panic!("schema v1 was accepted"),
         Err(error) => error,
     };
 
@@ -112,6 +130,7 @@ async fn fresh_database_contains_the_logical_schema_for_exact_linear_retrieval()
     drop(TursoStorage::open(&path).await.unwrap());
 
     let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
         .build()
         .await
         .unwrap();
@@ -149,7 +168,6 @@ async fn fresh_database_contains_the_logical_schema_for_exact_linear_retrieval()
         "note_chunks",
         "embedding_jobs",
         "note_chunk_embeddings",
-        "note_chunk_sparse",
         "app_settings",
     ] {
         assert!(
@@ -162,13 +180,17 @@ async fn fresh_database_contains_the_logical_schema_for_exact_linear_retrieval()
         "idx_note_chunks_hash",
         "idx_note_chunks_status",
         "idx_embedding_jobs_status",
-        "idx_note_chunk_sparse_token",
     ] {
         assert!(
             indexes.iter().any(|index| index == expected),
             "missing index {expected}"
         );
     }
+    assert!(indexes.iter().any(|index| index == "idx_notes_title_fts"));
+    assert!(!tables.iter().any(|table| table == "note_chunk_sparse"));
+    assert!(!indexes
+        .iter()
+        .any(|index| index == "idx_note_chunk_sparse_token"));
 
     let schema_sql = schema_sql.join("\n");
     assert!(include_str!("../schema.sql").contains("embedding F32_BLOB(1024) NOT NULL"));
@@ -219,6 +241,7 @@ async fn configured_sessions_and_initialization_survive_reopen() {
 
     database_header(&path);
     let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
         .build()
         .await
         .unwrap();

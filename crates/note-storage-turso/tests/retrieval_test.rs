@@ -3,88 +3,89 @@ mod support;
 use note_storage::{
     EmbeddingRepository, NotesRepository, RetrievalRepository, StorageErrorKind, UpsertNoteChunk,
 };
-use support::{fixture, insert_test_note, unit};
+use support::{fixture, insert_named_note, insert_test_note, unit};
 
 #[tokio::test]
-async fn sparse_query_ranks_by_matching_token_weight() {
+async fn title_search_matches_titles_but_not_body_text() {
     let fixture = fixture().await;
-    insert_test_note(&fixture.session, "note-1").await;
-    insert_test_note(&fixture.session, "note-2").await;
-    fixture
+    insert_named_note(
+        &fixture.session,
+        "title-hit",
+        "Rust ownership guide",
+        "unrelated body",
+    )
+    .await;
+    insert_named_note(
+        &fixture.session,
+        "body-only",
+        "Other guide",
+        "Rust ownership body",
+    )
+    .await;
+
+    assert_eq!(
+        fixture.session.title_search("Rust", 10).await.unwrap(),
+        vec!["title-hit"]
+    );
+    assert!(fixture
         .session
-        .insert_chunk_sparse_weights("note-1", 0, &[(42, 0.9)])
+        .title_search("unrelated", 10)
         .await
-        .unwrap();
+        .unwrap()
+        .is_empty());
+    assert!(fixture
+        .session
+        .title_search("Rust", 0)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn title_search_tracks_updates_deletion_and_restoration() {
+    let fixture = fixture().await;
+    insert_named_note(&fixture.session, "note", "Old heading", "body").await;
     fixture
         .session
-        .insert_chunk_sparse_weights("note-2", 0, &[(42, 0.3)])
+        .update_note(note_storage::NoteUpdate {
+            id: "note",
+            title: "New heading",
+            content: "body",
+            attachments: &[],
+            updated_at: 2,
+            note_revision: 2,
+        })
         .await
         .unwrap();
 
+    let observer = fixture.storage.connect().await.unwrap();
     assert_eq!(
-        fixture
-            .session
-            .sparse_postings_query(&[42], 10)
-            .await
-            .unwrap(),
-        vec!["note-1", "note-2"]
+        observer.title_search("New", 10).await.unwrap(),
+        vec!["note"]
+    );
+    assert!(observer.title_search("Old", 10).await.unwrap().is_empty());
+    observer.soft_delete_note("note", 3).await.unwrap();
+
+    let observer = fixture.storage.connect().await.unwrap();
+    assert!(observer.title_search("New", 10).await.unwrap().is_empty());
+    observer.restore_note("note", 3).await.unwrap();
+
+    let observer = fixture.storage.connect().await.unwrap();
+    assert_eq!(
+        observer.title_search("New", 10).await.unwrap(),
+        vec!["note"]
     );
 }
 
 #[tokio::test]
-async fn sparse_query_ranks_by_best_matching_chunk_per_note() {
+async fn equal_title_scores_use_note_id_order() {
     let fixture = fixture().await;
-    insert_test_note(&fixture.session, "note-1").await;
-    insert_test_note(&fixture.session, "note-2").await;
-    fixture
-        .session
-        .insert_chunk_sparse_weights("note-1", 0, &[(42, 0.2)])
-        .await
-        .unwrap();
-    fixture
-        .session
-        .insert_chunk_sparse_weights("note-1", 1, &[(42, 0.8)])
-        .await
-        .unwrap();
-    fixture
-        .session
-        .insert_chunk_sparse_weights("note-2", 0, &[(42, 0.6), (7, 0.3)])
-        .await
-        .unwrap();
+    insert_named_note(&fixture.session, "b", "Shared heading", "body").await;
+    insert_named_note(&fixture.session, "a", "Shared heading", "body").await;
 
     assert_eq!(
-        fixture
-            .session
-            .sparse_postings_query(&[42, 7], 10)
-            .await
-            .unwrap(),
-        vec!["note-2", "note-1"]
-    );
-}
-
-#[tokio::test]
-async fn sparse_ties_use_note_id_order_and_respect_limits() {
-    let fixture = fixture().await;
-    insert_test_note(&fixture.session, "b").await;
-    insert_test_note(&fixture.session, "a").await;
-    fixture
-        .session
-        .insert_chunk_sparse_weights("b", 0, &[(42, 1.0)])
-        .await
-        .unwrap();
-    fixture
-        .session
-        .insert_chunk_sparse_weights("a", 0, &[(42, 1.0)])
-        .await
-        .unwrap();
-
-    assert_eq!(
-        fixture
-            .session
-            .sparse_postings_query(&[42], 1)
-            .await
-            .unwrap(),
-        vec!["a"]
+        fixture.session.title_search("Shared", 2).await.unwrap(),
+        vec!["a", "b"]
     );
 }
 
@@ -239,32 +240,10 @@ async fn empty_inputs_and_zero_limits_return_no_results() {
         .insert_chunk_embedding("a", 0, &unit(0))
         .await
         .unwrap();
-    fixture
-        .session
-        .insert_chunk_sparse_weights("a", 0, &[])
-        .await
-        .unwrap();
-    fixture
-        .session
-        .insert_chunk_sparse_weights("a", 0, &[(7, 1.0)])
-        .await
-        .unwrap();
 
     assert!(fixture
         .session
         .dense_search(&unit(0), 0)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(fixture
-        .session
-        .sparse_postings_query(&[], 10)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(fixture
-        .session
-        .sparse_postings_query(&[7], 0)
         .await
         .unwrap()
         .is_empty());
@@ -294,11 +273,6 @@ async fn deleting_a_note_cascades_chunks_jobs_and_retrieval() {
         .unwrap();
     fixture
         .session
-        .insert_chunk_sparse_weights("a", 0, &[(7, 1.0)])
-        .await
-        .unwrap();
-    fixture
-        .session
         .enqueue_embedding_job("a", 0, "hash", "content", 1, 1)
         .await
         .unwrap();
@@ -314,12 +288,6 @@ async fn deleting_a_note_cascades_chunks_jobs_and_retrieval() {
     assert!(fixture
         .session
         .dense_search(&unit(0), 10)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(fixture
-        .session
-        .sparse_postings_query(&[7], 10)
         .await
         .unwrap()
         .is_empty());

@@ -173,10 +173,6 @@ async fn failed_multi_repository_write_rolls_back_all_turso_tables() {
         .await
         .unwrap();
     transaction
-        .insert_chunk_sparse_weights("atomic", 0, &[(7, 1.0)])
-        .await
-        .unwrap();
-    transaction
         .attach_label("atomic", "status", "done")
         .await
         .unwrap();
@@ -193,6 +189,7 @@ async fn failed_multi_repository_write_rolls_back_all_turso_tables() {
             .to_str()
             .expect("temporary path is UTF-8"),
     )
+    .experimental_index_method(true)
     .build()
     .await
     .unwrap();
@@ -202,7 +199,6 @@ async fn failed_multi_repository_write_rolls_back_all_turso_tables() {
         "note_chunks",
         "embedding_jobs",
         "note_chunk_embeddings",
-        "note_chunk_sparse",
         "note_labels",
     ] {
         assert_eq!(table_row_count(&connection, table).await, 0, "{table}");

@@ -236,10 +236,6 @@ impl NotesRepository for TursoSession {
                 "clear note embeddings",
             ),
             (
-                "DELETE FROM note_chunk_sparse WHERE note_id = ?1",
-                "clear note sparse weights",
-            ),
-            (
                 "DELETE FROM embedding_jobs WHERE note_id = ?1",
                 "clear note embedding jobs",
             ),
@@ -268,21 +264,13 @@ impl NotesRepository for TursoSession {
     }
 
     async fn clear_note_chunk_derived(&self, id: &str, chunk_idx: i64) -> StorageResult<()> {
-        for (sql, context) in [
-            (
+        self.connection
+            .execute(
                 "DELETE FROM note_chunk_embeddings WHERE note_id = ?1 AND chunk_idx = ?2",
-                "clear note chunk embedding",
-            ),
-            (
-                "DELETE FROM note_chunk_sparse WHERE note_id = ?1 AND chunk_idx = ?2",
-                "clear note chunk sparse weights",
-            ),
-        ] {
-            self.connection
-                .execute(sql, turso::params![id, chunk_idx])
-                .await
-                .map_err(|error| map_turso_error(context, error))?;
-        }
+                turso::params![id, chunk_idx],
+            )
+            .await
+            .map_err(|error| map_turso_error("clear note chunk embedding", error))?;
         Ok(())
     }
 
@@ -291,21 +279,13 @@ impl NotesRepository for TursoSession {
         id: &str,
         min_chunk_idx: i64,
     ) -> StorageResult<()> {
-        for (sql, context) in [
-            (
+        self.connection
+            .execute(
                 "DELETE FROM note_chunk_embeddings WHERE note_id = ?1 AND chunk_idx >= ?2",
-                "clear trailing note chunk embeddings",
-            ),
-            (
-                "DELETE FROM note_chunk_sparse WHERE note_id = ?1 AND chunk_idx >= ?2",
-                "clear trailing note chunk sparse weights",
-            ),
-        ] {
-            self.connection
-                .execute(sql, turso::params![id, min_chunk_idx])
-                .await
-                .map_err(|error| map_turso_error(context, error))?;
-        }
+                turso::params![id, min_chunk_idx],
+            )
+            .await
+            .map_err(|error| map_turso_error("clear trailing note chunk embeddings", error))?;
         Ok(())
     }
 

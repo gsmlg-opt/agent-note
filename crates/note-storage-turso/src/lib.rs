@@ -38,6 +38,7 @@ impl TursoStorage {
         let (io, state) = PinnedIo::prepare(path, path_string, state)?;
         let database = turso::Builder::new_local(path_string)
             .with_io_impl(io.clone())
+            .experimental_index_method(true)
             .build()
             .await
             .map_err(|error| map_turso_error("open local database", error))?;

@@ -11,7 +11,7 @@ use turso::core::{
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_HEADER_LEN: usize = 100;
 pub(crate) const APPLICATION_ID: u32 = 0x414E4F54;
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Preflight {

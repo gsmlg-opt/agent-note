@@ -116,9 +116,8 @@ impl TursoSession {
                     self.connection
                         .execute("PRAGMA application_id = 1095651156", ())
                         .await?;
-                    self.connection
-                        .execute("PRAGMA user_version = 1", ())
-                        .await?;
+                    let user_version_sql = format!("PRAGMA user_version = {SCHEMA_VERSION}");
+                    self.connection.execute(&user_version_sql, ()).await?;
                     self.connection.execute("COMMIT", ()).await?;
                     Ok(())
                 }
