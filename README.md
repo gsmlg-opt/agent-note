@@ -3,10 +3,10 @@
 Local-inference hybrid-search notes app. See `docs/design.md` for the full design.
 
 A Rust workspace: `note-core` (pure types/validation/RRF fusion), `note-storage` (backend-neutral
-repository contracts), `note-storage-turso` (embedded Rust Turso Database adapter with exact dense
-retrieval), `note-embedding` (BGE-M3 via ONNX, with a deterministic stub for offline dev),
-`note-pipelines` (save/search workflows), `note-mcp` (MCP over stdio + Streamable HTTP),
-`note-server` (Axum REST + `/mcp`), and `note-frontend` (Yew/Wasm UI built with the
+repository contracts), `note-storage-turso` (embedded Rust Turso Database adapter with title FTS
+and exact dense retrieval), `note-embedding` (BGE-M3 via ONNX, with a deterministic stub for
+offline dev), `note-pipelines` (save/search workflows), `note-mcp` (MCP over stdio + Streamable
+HTTP), `note-server` (Axum REST + `/mcp`), and `note-frontend` (Yew/Wasm UI built with the
 [`yew-duskmoon`](https://crates.io/crates/yew-duskmoon) component library).
 
 The frontend styling comes from the `@duskmoon-dev/core` design system, vendored as a prebuilt
@@ -27,13 +27,13 @@ note-core        pure: Note/Label/LabelKey types, input validation, RRF rank-fus
    ▲
    ├── note-storage     backend-neutral repository/session/transaction contracts
    ├── note-storage-turso
-   │                    Rust Turso Database: notes + labels, exact dense cosine + sparse postings
+   │                    Rust Turso Database: notes + labels, title FTS/BM25 + exact dense cosine
    ├── note-embedding   Embedder trait → StubEmbedder (offline) | OrtEmbedder (BGE-M3); semaphore backpressure
    ▲
 note-pipelines   Context + workflows that compose core/storage/embedding:
                    • save_note   — validate → atomically persist note/chunks/jobs/labels → return Note
-                   • embedding worker — embed queued chunks → atomically persist dense+sparse data
-                   • search_notes — embed query → exact dense + sparse postings → RRF → hydrate top-k
+                   • embedding worker — embed queued body chunks → atomically persist dense vectors only
+                   • search_notes — title FTS + exact dense content → weighted RRF → hydrate top-k
    ▲
    ├── note-mcp     save_note / semantic_search tools over stdio AND Streamable HTTP (same server type)
    └── note-server  Axum REST (/api/notes, /api/labels) + /mcp; one binary, `--stdio` flag picks the door
@@ -42,12 +42,14 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
 ```
 
 **One core, two front doors.** REST and both MCP transports call the exact same `note-pipelines`
-functions — no business logic is duplicated per transport (design.md §1–2). **Hybrid search** runs
-dense (vector) and sparse (token) retrieval independently, then fuses by *rank* via Reciprocal Rank
-Fusion (scores aren't directly comparable), so a result's `score` is a fused rank score, not a raw
-similarity — the UI labels it accordingly. **Labels** are Kubernetes-style: each key is registered
-once in a catalog with a description, and notes attach known keys with a value (at most one value
-per key); save auto-creates a missing key with an empty description.
+functions — no business logic is duplicated per transport (design.md §1–2). **Hybrid retrieval**
+runs Turso full-text ranking over note titles and exact dense-vector ranking over body chunks, then
+fuses the two ranked lists with deterministic weighted Reciprocal Rank Fusion. Title FTS has weight
+`3.0`; dense body retrieval has weight `1.0`. The resulting `score` is a fused rank score, not raw
+BM25 or cosine similarity, so the UI labels the action as retrieval. **Labels** are
+Kubernetes-style: each key is registered once in a catalog with a description, and notes attach
+known keys with a value (at most one value per key); save auto-creates a missing key with an empty
+description.
 
 See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec and build plan.
 
@@ -124,13 +126,17 @@ default paths are based on the process working directory.
 
 ## Exact hybrid retrieval
 
-Dense retrieval uses an exact linear cosine-distance scan over stored 1024-component chunk
-embeddings. Notes are ranked by their closest matching chunk. Sparse postings are ranked
-independently by the best matching chunk, and the two note rankings are fused with RRF. This avoids
-an approximate-index lifecycle and gives deterministic exact results; the accepted trade-off is
-linear dense-search cost, which is appropriate for the current personal-notes corpus. A future
-`pg` backend can introduce a different physical retrieval strategy without changing pipeline or
-transport code.
+The two retrieval channels cover different note fields. Rust Turso Database FTS ranks title
+matches with BM25, while dense retrieval uses an exact linear cosine-distance scan over stored
+1024-component body-chunk embeddings and ranks each note by its closest matching chunk. The title
+ranking has weight `3.0` and the dense body ranking has weight `1.0`; deterministic weighted RRF
+combines them using `weight / (60 + rank)` and breaks equal fused scores by note ID.
+
+Both channels retrieve a bounded candidate set before fusion, label filtering, hydration, and the
+requested top-k limit are applied. Exact dense scanning avoids an approximate-index lifecycle and
+gives deterministic results; the accepted trade-off is linear dense-search cost, which is
+appropriate for the current personal-notes corpus. A future `pg` backend can introduce a different
+physical retrieval strategy without changing pipeline or transport code.
 
 The adapter intentionally makes a clean break from databases created by the retired storage
 implementation. Delete and recreate disposable test/development databases. For non-disposable

@@ -23,8 +23,8 @@ Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, Turso Data
            ┌──────────────┴──────────────┐
            ▼                             ▼
   BGE-M3 Inference (ORT)          Rust Turso Database Storage
-  dense + sparse heads,          exact dense cosine +
-  int8 quantized                 sparse postings + notes/labels
+  1024-d dense output only,      title FTS/BM25 + exact dense
+  int8 quantized                 cosine + notes/labels
 ```
 
 stdio is the same binary, selected by an entrypoint flag, and calls pipelines directly — never
@@ -41,6 +41,8 @@ entry and each *note* attaches its own value. Keys may be registered explicitly 
 description or auto-created with an empty description on first save. A note can have at most one
 value per key (same semantics as k8s labels) — this is not a free-form tagging system.
 
+The embedded adapter's current schema is v2:
+
 ```sql
 CREATE TABLE notes (
     id TEXT PRIMARY KEY,
@@ -52,6 +54,7 @@ CREATE TABLE notes (
     note_revision INTEGER NOT NULL DEFAULT 1,
     deleted_at INTEGER
 );
+CREATE INDEX idx_notes_title_fts ON notes USING fts (title);
 
 CREATE TABLE label_keys (
     id INTEGER PRIMARY KEY,
@@ -100,21 +103,12 @@ CREATE TABLE note_chunk_embeddings (
     embedding F32_BLOB(1024) NOT NULL,
     PRIMARY KEY (note_id, chunk_idx)
 );
-
-CREATE TABLE note_chunk_sparse (
-    note_id  TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-    chunk_idx INTEGER NOT NULL,
-    token_id INTEGER NOT NULL,
-    weight   REAL NOT NULL,
-    PRIMARY KEY (note_id, chunk_idx, token_id)
-);
-CREATE INDEX idx_note_chunk_sparse_token ON note_chunk_sparse(token_id);
 ```
 
 The note write transaction atomically persists note metadata, labels, chunks, and durable embedding
 jobs. A worker claims a job in a short immediate transaction, performs inference without holding a
-database transaction, then atomically persists dense and sparse chunk data. Partial dense/sparse
-completion is a correctness bug, not a soft failure.
+database transaction, then atomically persists the dense body-chunk vector and marks the current
+chunk revision embedded.
 
 Runtime storage configuration is optional. The default `./config.toml` shape is:
 
@@ -135,29 +129,36 @@ default values are based on the process working directory.
 ## 4. Embedding Pipeline (BGE-M3)
 
 - **Quantization**: int8. Do not drop to 4-bit — CPU ONNX Runtime kernels for INT4 are not reliably faster than int8 on CPU EP, and quantization noise directly perturbs retrieval ordering (unlike LLM generation, where it's more forgiving). If corpus size later justifies revisiting this, it requires re-embedding the full corpus — quantization levels are not mixable in the same vector space.
-- **Outputs used**: dense (1024-d, CLS-pooled, L2-normalized) + sparse (token_id → weight, thresholded to drop near-zero weights before persistence). Multi-vector (ColBERT) output is computed by the model but **not persisted or indexed** initially — cost is disproportionate for a personal notes corpus. Defer unless recall on short/ambiguous queries proves insufficient in practice.
+- **Output used**: the 1024-dimensional dense head. The worker persists one dense vector for each body chunk; no lexical or multi-vector embedding output is stored.
 - **Threading**: inference runs via `spawn_blocking`, never inline on the async reactor.
 - **Backpressure**: bound concurrent inference calls with a semaphore sized to the ONNX session's thread count. Do not rely on `spawn_blocking`'s default pool to absorb load silently — queuing should be visible at the app layer, not hidden as creeping tail latency.
 
 ## 5. Retrieval Design
 
-Dense and sparse retrieval are independent queries, each producing a ranked note list. Dense
-retrieval performs an exact linear cosine-distance scan over chunk embeddings, grouping by note and
-using the closest chunk as that note's rank. Sparse retrieval likewise uses each note's best
-matching chunk. Scores are not directly comparable (cosine vs. sparse weight sum), so fuse by rank,
-not raw score:
+Title FTS and dense content retrieval are independent queries, each producing a ranked note list.
+Rust Turso Database FTS ranks title matches with BM25. Dense retrieval performs an exact linear
+cosine-distance scan over body-chunk embeddings, grouping by note and using the closest chunk as
+that note's rank. The scores are not directly comparable, so fuse by weighted rank rather than raw
+score:
 
 ```
-RRF(note) = Σ over retrievers r: 1 / (k + rank_r(note))     # k ≈ 60, tunable
+weighted_RRF(note) = Σ over retrievers r: weight_r / (60 + rank_r(note))
+title FTS weight = 3.0
+dense content weight = 1.0
 ```
+
+Fusion ordering is deterministic: equal fused scores are broken by note ID. Each channel receives
+a bounded overfetch limit of `clamp(requested_limit × 32, 128, 4096)` so fusion can consider notes
+beyond the requested top-k. Label filtering and hydration happen after fusion, and iteration stops
+at the requested result limit.
 
 Exact scanning avoids approximate-index build and maintenance, produces deterministic results, and
 fits the expected personal-notes corpus. Its accepted trade-off is linear dense-search cost. If
 corpus measurements outgrow that choice, a future backend can change its physical retrieval
 strategy without changing pipeline callers.
 
-If dense results consistently drown out obvious exact-term matches (or vice versa), `k` is the
-first tuning knob — before reaching for a hand-weighted score sum.
+The weights and RRF constant are ranking-policy parameters and should be tuned only against measured
+retrieval quality.
 
 ## 6. Pipeline Contracts
 
@@ -171,12 +172,13 @@ clients and the UI to populate suggestions and explain known keys.
 **save_note**: validate non-empty title/content and typed label values → atomically persist the note,
 auto-created missing label keys, attached labels, chunk records, and durable embedding jobs → commit
 prepared attachment files → return the persisted `Note`. The embedding worker later claims each job,
-performs one dense+sparse inference call outside the database transaction, and atomically persists
-both retrieval representations for the current chunk revision.
+performs one dense inference call outside the database transaction, and atomically persists the
+dense body-chunk vector for the current chunk revision.
 
-**search_notes**: embed query (dense + sparse) → exact dense cosine ranking + sparse postings
-ranking → RRF fusion (pure function, no I/O) → hydrate labels/metadata for top-k → return
-`Vec<(Note, f32)>` where the score is the fused RRF score, not raw cosine.
+**search_notes**: embed the query once for exact dense content retrieval → request the title FTS
+ranking and dense note ranking → combine the two ranked ID lists with weighted RRF (pure function,
+no I/O) → apply label filtering and hydrate labels/metadata for top-k → return
+`Vec<(Note, f32)>` where the score is the fused weighted-RRF score, not raw BM25 or cosine.
 
 Context/environment: one struct holds a shared `StorageBackend` and embedder. The application
 composition root constructs it once and passes it explicitly — no global or implicit storage state.
@@ -185,9 +187,12 @@ composition root constructs it once and passes it explicitly — no global or im
 
 Strict MVU: single `AppState`, all mutations go through a reducer dispatching typed actions (no direct field mutation from components).
 
-State surface: notes list, search results (with fused score attached — label it as such in the UI, not as "similarity," since it's a rank fusion not a raw distance), loading flag, error slot.
+State surface: notes list, retrieval results (with fused score attached — do not label it as
+"similarity," since it is rank fusion rather than raw distance), loading flag, error slot.
 
-Components: `NoteEditor` (form → emits note on submit; label picker lists registered keys with their descriptions, lets the user pick a key and enter a value), `VectorSearch` (query input → renders fused-score results). Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than custom equivalents — `Tag` renders each attached label as `key=value`, with the key's description as a tooltip/hint.
+The Notes page retrieval bar says “Retrieve by title or content” and renders fused-score results.
+Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than custom equivalents
+— `Tag` renders each attached label as `key=value`, with the key's description as a tooltip/hint.
 
 ## 8. MCP Integration
 
@@ -200,7 +205,6 @@ REST/UI-only.
 
 ## 9. Open Decisions (resolve during implementation, not before)
 
-- Sparse weight threshold value — start conservative, tune against measured postings-table size and recall.
 - Whether label filtering should move deeper into backend retrieval at larger corpus sizes.
 - Storage-session concurrency sizing for Axum's concurrent path.
 
