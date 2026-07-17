@@ -63,8 +63,8 @@ async fn define_label_key_handler(
         .map_err(|e| {
             // Empty keys are the caller's fault (400); anything else (storage failure, or a
             // duplicate-key UNIQUE violation) falls through to 500. A duplicate arguably wants 409,
-            // but distinguishing it from a genuine storage error needs libsql-error inspection we
-            // don't do here — noted as a minor known limitation.
+            // but mapping the backend-neutral StorageErrorKind::Constraint category is not currently
+            // part of this handler's error handling.
             let status = if e
                 .downcast_ref::<note_core::LabelKeyValidationError>()
                 .is_some()
@@ -148,16 +148,16 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use note_embedding::StubEmbedder;
-    use note_storage::Storage;
+    use note_storage::StorageBackend;
+    use note_storage_turso::TursoStorage;
     use tower::ServiceExt;
 
     async fn test_app() -> (Router, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open_local(dir.path().join("t.db").to_str().unwrap())
-            .await
-            .unwrap();
-        let ctx = Arc::new(Context::with_attachment_dir(
-            Arc::new(storage),
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
+        let ctx = Arc::new(Context::new(
+            storage,
             Arc::new(StubEmbedder),
             dir.path().join("attachments"),
         ));

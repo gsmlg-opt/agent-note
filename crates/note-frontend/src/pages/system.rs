@@ -166,18 +166,26 @@ pub fn system_page() -> Html {
                     <div class="system-section-head">
                         <div>
                             <h3 id="storage-info-title">{ "Storage" }</h3>
-                            <p>{ "Active local storage locations." }</p>
+                            <p>{ "Active storage backend and local paths." }</p>
                         </div>
                     </div>
                     <dl class="system-info">
                         <div>
-                            <dt>{ "Database path" }</dt>
-                            <dd>{ info.database_path.clone() }</dd>
+                            <dt>{ "Database engine" }</dt>
+                            <dd>{ info.database_engine.clone() }</dd>
                         </div>
-                        <div>
-                            <dt>{ "Database size" }</dt>
-                            <dd>{ format_bytes(info.database_size_bytes) }</dd>
-                        </div>
+                        if let Some(path) = &info.database_path {
+                            <div>
+                                <dt>{ "Database path" }</dt>
+                                <dd>{ path.clone() }</dd>
+                            </div>
+                        }
+                        if let Some(size) = info.database_size_bytes {
+                            <div>
+                                <dt>{ "Database size" }</dt>
+                                <dd>{ format_bytes(size) }</dd>
+                            </div>
+                        }
                         <div>
                             <dt>{ "Attachments path" }</dt>
                             <dd>{ info.attachments_path.clone() }</dd>

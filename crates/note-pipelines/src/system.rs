@@ -5,26 +5,31 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SystemInfo {
-    pub database_path: String,
-    pub database_size_bytes: u64,
+    pub database_engine: String,
+    pub database_path: Option<String>,
+    pub database_size_bytes: Option<u64>,
     pub attachments_path: String,
 }
 
 pub async fn get_system_config(ctx: &Context) -> anyhow::Result<SystemConfig> {
-    let conn = ctx.storage.connect()?;
-    note_storage::get_system_config(&conn).await
+    let session = ctx.storage().session().await?;
+    Ok(session.get_system_config().await?)
 }
 
 pub async fn update_system_config(ctx: &Context, config: &SystemConfig) -> anyhow::Result<()> {
     validate_system_config(config).map_err(anyhow::Error::new)?;
-    let conn = ctx.storage.connect()?;
-    note_storage::set_system_config(&conn, config).await
+    let session = ctx.storage().session().await?;
+    Ok(session.set_system_config(config).await?)
 }
 
 pub async fn get_system_info(ctx: &Context) -> anyhow::Result<SystemInfo> {
+    let info = ctx.storage().info().await?;
     Ok(SystemInfo {
-        database_path: ctx.storage.path().to_string_lossy().into_owned(),
-        database_size_bytes: ctx.storage.size_bytes().await?,
+        database_engine: info.engine,
+        database_path: info
+            .location
+            .map(|path| path.to_string_lossy().into_owned()),
+        database_size_bytes: info.size_bytes,
         attachments_path: absolute_path(ctx.attachments_dir())
             .to_string_lossy()
             .into_owned(),

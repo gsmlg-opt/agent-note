@@ -62,9 +62,10 @@ WORKDIR /app
 COPY --from=backend /build/target/release/note-server /usr/local/bin/note-server
 COPY --from=frontend /build/crates/note-frontend/dist /app/static
 COPY --from=onnxruntime /opt/ort/lib/libonnxruntime.so.1.24.2 /usr/local/lib/libonnxruntime.so
-# 0.0.0.0 so the container is reachable via `docker run -p`; the DB lives on a volume so notes
-# survive container restarts. ORT_DYLIB_PATH points ort at the bundled ONNX Runtime; set
-# NOTE_MODEL_PATH (e.g. a mounted model_quantized.onnx) to switch from the stub to real BGE-M3.
+# 0.0.0.0 makes the container reachable via `docker run -p`; the embedded Rust Turso Database and
+# attachments live on a volume so notes survive restarts. Exact dense retrieval needs no index
+# maintenance. ORT_DYLIB_PATH points ort at the bundled ONNX Runtime; set NOTE_MODEL_PATH (for
+# example, a mounted model_quantized.onnx) to switch from the stub to real BGE-M3.
 ENV NOTE_BIND_ADDR=0.0.0.0:6222 \
     NOTE_STATIC_DIR=/app/static \
     NOTE_DB_PATH=/app/data/notes.db \

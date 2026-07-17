@@ -1,31 +1,13 @@
-use note_embedding::StubEmbedder;
-use note_pipelines::{
-    drain_embedding_jobs, save_note, search_notes, search_notes_filtered, Context, SaveNoteInput,
-};
-use note_storage::Storage;
-use std::sync::Arc;
-use tempfile::TempDir;
+mod support;
 
-// Returns the TempDir guard alongside the Context so the caller keeps it alive:
-// dropping it deletes the DB directory and later connect() calls fail with SQLITE_CANTOPEN.
-async fn test_context() -> (Context, TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
-        .await
-        .unwrap();
-    (
-        Context::with_attachment_dir(
-            Arc::new(storage),
-            Arc::new(StubEmbedder),
-            dir.path().join("attachments"),
-        ),
-        dir,
-    )
-}
+use note_pipelines::{
+    drain_embedding_jobs, save_note, search_notes, search_notes_filtered, SaveNoteInput,
+};
+use support::test_context;
 
 #[tokio::test]
 async fn search_returns_saved_notes_with_fused_scores() {
-    let (ctx, _dir) = test_context().await;
+    let (ctx, _backend, _dir) = test_context().await;
     save_note(
         &ctx,
         SaveNoteInput {
@@ -63,7 +45,7 @@ async fn search_returns_saved_notes_with_fused_scores() {
 
 #[tokio::test]
 async fn search_filters_results_by_label() {
-    let (ctx, _dir) = test_context().await;
+    let (ctx, _backend, _dir) = test_context().await;
     save_note(
         &ctx,
         SaveNoteInput {

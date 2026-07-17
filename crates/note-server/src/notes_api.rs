@@ -733,22 +733,32 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use note_embedding::StubEmbedder;
-    use note_storage::Storage;
+    use note_storage::{NewNote, StorageBackend, TransactionMode};
+    use note_storage_turso::TursoStorage;
     use tower::ServiceExt;
 
     // Builds the real /api/notes router over a fresh temp DB + stub embedder so tests exercise the
     // actual HTTP surface (routing, JSON extractor, status codes, DTO serialization) via oneshot.
-    async fn test_app() -> (Router, Arc<Context>, tempfile::TempDir) {
+    async fn test_app_with_backend() -> (
+        Router,
+        Arc<Context>,
+        Arc<dyn StorageBackend>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open_local(dir.path().join("t.db").to_str().unwrap())
-            .await
-            .unwrap();
-        let ctx = Arc::new(Context::with_attachment_dir(
-            Arc::new(storage),
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
+        let ctx = Arc::new(Context::new(
+            storage.clone(),
             Arc::new(StubEmbedder),
             dir.path().join("attachments"),
         ));
-        (notes_router().with_state(ctx.clone()), ctx, dir)
+        (notes_router().with_state(ctx.clone()), ctx, storage, dir)
+    }
+
+    async fn test_app() -> (Router, Arc<Context>, tempfile::TempDir) {
+        let (app, ctx, _storage, dir) = test_app_with_backend().await;
+        (app, ctx, dir)
     }
 
     fn post(uri: &str, body: &str) -> Request<Body> {
@@ -941,20 +951,25 @@ mod tests {
 
     #[tokio::test]
     async fn list_notes_clamps_limit_to_one_thousand() {
-        let (app, ctx, _dir) = test_app().await;
-        let conn = ctx.storage.connect().unwrap();
+        let (app, _ctx, storage, _dir) = test_app_with_backend().await;
+        let session = storage.session().await.unwrap();
         for idx in 0..1002 {
-            note_storage::insert_note(
-                &conn,
-                &format!("note-{idx}"),
-                &format!("N{idx}"),
-                &format!("C{idx}"),
-                idx,
-                idx,
-                1,
-            )
-            .await
-            .unwrap();
+            let id = format!("note-{idx}");
+            let title = format!("N{idx}");
+            let content = format!("C{idx}");
+            session
+                .insert_note(NewNote {
+                    id: &id,
+                    title: &title,
+                    content: &content,
+                    attachments: &[],
+                    created_at: idx,
+                    updated_at: idx,
+                    note_revision: 1,
+                    deleted_at: None,
+                })
+                .await
+                .unwrap();
         }
 
         let resp = app.oneshot(get("/api/notes?limit=2000")).await.unwrap();
@@ -967,7 +982,7 @@ mod tests {
     #[tokio::test]
     async fn dashboard_uses_summary_data_and_invalidates_after_note_write() {
         invalidate_dashboard_cache();
-        let (app, ctx, _dir) = test_app().await;
+        let (app, ctx, storage, _dir) = test_app_with_backend().await;
 
         let resp = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1012,14 +1027,16 @@ mod tests {
             Some("Dashboard")
         );
 
-        let conn = ctx.storage.connect().unwrap();
+        let transaction = storage.begin(TransactionMode::Immediate).await.unwrap();
         assert_eq!(
-            note_storage::claim_pending_embedding_jobs(&conn, 1, 2000)
+            transaction
+                .claim_pending_embedding_jobs(1, 2000)
                 .await
                 .unwrap()
                 .len(),
             1
         );
+        transaction.commit().await.unwrap();
         let resp = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1563,7 +1580,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_restore_is_atomic_and_requeues_embeddings() {
-        let (app, ctx, _dir) = test_app().await;
+        let (app, ctx, storage, _dir) = test_app_with_backend().await;
         let first = save_note_id(
             app.clone(),
             r#"{"title":"First","content":"First content","labels":[]}"#,
@@ -1621,10 +1638,12 @@ mod tests {
         let deleted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(deleted.as_array().unwrap().is_empty());
 
-        let conn = ctx.storage.connect().unwrap();
-        let jobs = note_storage::claim_pending_embedding_jobs(&conn, 10, 3000)
+        let transaction = storage.begin(TransactionMode::Immediate).await.unwrap();
+        let jobs = transaction
+            .claim_pending_embedding_jobs(10, 3000)
             .await
             .unwrap();
+        transaction.commit().await.unwrap();
         assert_eq!(jobs.len(), 2);
         assert!(jobs.iter().any(|job| job.note_id == first));
         assert!(jobs.iter().any(|job| job.note_id == second));

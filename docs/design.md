@@ -1,6 +1,6 @@
 # Design Doc: Local-Inference Hybrid-Search Notes App
 
-Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, libsql), Yew/Wasm frontend, MCP server. This doc specifies contracts and decisions; implementation details are left to the builder.
+Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, Turso Database), Yew/Wasm frontend, MCP server. This doc specifies contracts and decisions; implementation details are left to the builder.
 
 ## 1. Design Philosophy
 
@@ -22,32 +22,42 @@ Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, libsql), Y
                           │
            ┌──────────────┴──────────────┐
            ▼                             ▼
-  BGE-M3 Inference (ORT)          Turso/libsql Storage
-  dense + sparse heads,          dense ANN index +
+  BGE-M3 Inference (ORT)          Rust Turso Database Storage
+  dense + sparse heads,          exact dense cosine +
   int8 quantized                 sparse postings + notes/labels
 ```
 
-stdio is the same binary, different entrypoint flag. It constructs its own context and calls pipelines directly — never proxies through Axum. Axum is the only process that needs connection pooling.
+stdio is the same binary, selected by an entrypoint flag, and calls pipelines directly — never
+proxies through Axum. The composition root resolves configuration once, constructs one shared
+storage backend, and passes it explicitly to whichever transport is active.
 
 ## 3. Storage Contract
 
-Labels are normalized (join table), not JSON-serialized — filtering must compose with ANN retrieval via real indexes.
+Labels are normalized (join table), not JSON-serialized. Filtering and retrieval are exposed
+through backend-neutral repository contracts rather than physical database details.
 
-Notes are categorized with Kubernetes-style labels: key=value pairs where each *key* is pre-registered once in a catalog with a human-readable description (shown in the UI so users know what the label is for), and each *note* attaches existing keys with its own value. A note can have at most one value per key (same semantics as k8s labels) — this is not a free-form tagging system.
+Notes are categorized with Kubernetes-style labels: key=value pairs where each *key* has one catalog
+entry and each *note* attaches its own value. Keys may be registered explicitly with a human-readable
+description or auto-created with an empty description on first save. A note can have at most one
+value per key (same semantics as k8s labels) — this is not a free-form tagging system.
 
 ```sql
 CREATE TABLE notes (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     content TEXT NOT NULL,
+    attachments TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    note_revision INTEGER NOT NULL DEFAULT 1,
+    deleted_at INTEGER
 );
 
 CREATE TABLE label_keys (
     id INTEGER PRIMARY KEY,
     key TEXT NOT NULL UNIQUE,
-    description TEXT NOT NULL   -- shown to user: what this label is for
+    description TEXT NOT NULL,
+    value_type TEXT NOT NULL DEFAULT 'text'
 );
 
 CREATE TABLE note_labels (
@@ -58,22 +68,69 @@ CREATE TABLE note_labels (
 );
 CREATE INDEX idx_note_labels_key_value ON note_labels(label_key_id, value);
 
-CREATE TABLE notes_embeddings (
-    note_id TEXT PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
-    embedding F32_BLOB(1024) NOT NULL
+CREATE TABLE note_chunks (
+    note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    chunk_idx INTEGER NOT NULL,
+    chunk_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    note_revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (note_id, chunk_idx)
 );
-CREATE INDEX idx_notes_embedding ON notes_embeddings(libsql_vector_idx(embedding));
 
-CREATE TABLE notes_sparse_weights (
+CREATE TABLE embedding_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    chunk_idx INTEGER NOT NULL,
+    chunk_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    note_revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(note_id, chunk_idx, chunk_hash)
+);
+
+CREATE TABLE note_chunk_embeddings (
+    note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    chunk_idx INTEGER NOT NULL,
+    embedding F32_BLOB(1024) NOT NULL,
+    PRIMARY KEY (note_id, chunk_idx)
+);
+
+CREATE TABLE note_chunk_sparse (
     note_id  TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+    chunk_idx INTEGER NOT NULL,
     token_id INTEGER NOT NULL,
     weight   REAL NOT NULL,
-    PRIMARY KEY (note_id, token_id)
+    PRIMARY KEY (note_id, chunk_idx, token_id)
 );
-CREATE INDEX idx_sparse_token ON notes_sparse_weights(token_id);
+CREATE INDEX idx_note_chunk_sparse_token ON note_chunk_sparse(token_id);
 ```
 
-Write path: `notes`, `notes_embeddings`, `notes_sparse_weights` are written in one atomic transaction. A partial write (dense persisted, sparse missing) silently degrades that note to dense-only recall — treat this as a correctness bug, not a soft failure.
+The note write transaction atomically persists note metadata, labels, chunks, and durable embedding
+jobs. A worker claims a job in a short immediate transaction, performs inference without holding a
+database transaction, then atomically persists dense and sparse chunk data. Partial dense/sparse
+completion is a correctness bug, not a soft failure.
+
+Runtime storage configuration is optional. The default `./config.toml` shape is:
+
+```toml
+attachments_dir = "dev-data/attachments"
+
+[database]
+engine = "embed"
+path = "dev-data/notes.db"
+```
+
+Each field resolves independently in file-over-environment-over-default order. `NOTE_CONFIG_PATH`
+selects the file, `NOTE_DB_ENGINE` selects `embed` or the parsed-but-not-yet-supported future `pg`
+adapter, `NOTE_DB_PATH` selects the embedded database, and `NOTE_ATTACHMENTS_DIR` selects attachment
+storage. Relative TOML values are based on the selected file's directory; relative environment and
+default values are based on the process working directory.
 
 ## 4. Embedding Pipeline (BGE-M3)
 
@@ -84,25 +141,45 @@ Write path: `notes`, `notes_embeddings`, `notes_sparse_weights` are written in o
 
 ## 5. Retrieval Design
 
-Dense and sparse retrieval are independent queries against their respective indexes, each producing a ranked candidate list. Scores are not directly comparable (cosine vs. sparse dot product) — fuse by rank, not raw score:
+Dense and sparse retrieval are independent queries, each producing a ranked note list. Dense
+retrieval performs an exact linear cosine-distance scan over chunk embeddings, grouping by note and
+using the closest chunk as that note's rank. Sparse retrieval likewise uses each note's best
+matching chunk. Scores are not directly comparable (cosine vs. sparse weight sum), so fuse by rank,
+not raw score:
 
 ```
 RRF(note) = Σ over retrievers r: 1 / (k + rank_r(note))     # k ≈ 60, tunable
 ```
 
-If dense results consistently drown out obvious exact-term matches (or vice versa), `k` is the first tuning knob — before reaching for a hand-weighted score sum.
+Exact scanning avoids approximate-index build and maintenance, produces deterministic results, and
+fits the expected personal-notes corpus. Its accepted trade-off is linear dense-search cost. If
+corpus measurements outgrow that choice, a future backend can change its physical retrieval
+strategy without changing pipeline callers.
+
+If dense results consistently drown out obvious exact-term matches (or vice versa), `k` is the
+first tuning knob — before reaching for a hand-weighted score sum.
 
 ## 6. Pipeline Contracts
 
-**define_label_key**: validate input (`key` non-empty and unique, `description` non-empty) → insert into `label_keys` → return persisted `LabelKey`. Keys are not auto-created by `save_note` — using an unregistered key is a validation error, not a silent insert.
+**define_label_key**: validate that `key` is non-empty, then insert the key, description, and value
+type into `label_keys`. Descriptions may be empty and filled in later. Missing keys referenced by a
+note are also auto-created by `save_note` with an empty description.
 
-**list_label_keys**: read-only → return the full label-key catalog (`key` + `description`), used by clients/UI to populate label pickers and to validate keys before submission.
+**list_label_keys**: read-only → return the full label-key catalog (`key` + `description`), used by
+clients and the UI to populate suggestions and explain known keys.
 
-**save_note**: validate input (non-empty title/content) → embed content (dense + sparse, one inference call) → atomic write across the three core tables (§3: `notes`, `notes_embeddings`, `notes_sparse_weights`) → attach `note_labels` rows → return persisted `Note` with labels resolved to `{key, value, description}`. Label keys are **auto-created**: any attached label whose key isn't yet in the `label_keys` catalog (§3) is inserted (with an empty description) as part of the same transaction rather than rejected. (This supersedes the earlier "unknown key rejects the request" rule — descriptions for auto-created keys can be filled in later via `define_label_key`/the labels API.)
+**save_note**: validate non-empty title/content and typed label values → atomically persist the note,
+auto-created missing label keys, attached labels, chunk records, and durable embedding jobs → commit
+prepared attachment files → return the persisted `Note`. The embedding worker later claims each job,
+performs one dense+sparse inference call outside the database transaction, and atomically persists
+both retrieval representations for the current chunk revision.
 
-**search_notes**: embed query (dense + sparse) → dense ANN query + sparse postings query (parallel, both against Turso) → RRF fusion (pure function, no I/O) → hydrate labels/metadata for top-k → return `Vec<(Note, f32)>` where the score is the fused RRF score, not raw cosine.
+**search_notes**: embed query (dense + sparse) → exact dense cosine ranking + sparse postings
+ranking → RRF fusion (pure function, no I/O) → hydrate labels/metadata for top-k → return
+`Vec<(Note, f32)>` where the score is the fused RRF score, not raw cosine.
 
-Context/environment: one struct holding a pooled DB handle and the shared embedder instance, constructed once per process (Axum) or per stdio invocation, passed explicitly — no global/implicit state.
+Context/environment: one struct holds a shared `StorageBackend` and embedder. The application
+composition root constructs it once and passes it explicitly — no global or implicit storage state.
 
 ## 7. Frontend (Yew + duskmoon-ui)
 
@@ -114,15 +191,18 @@ Components: `NoteEditor` (form → emits note on submit; label picker lists regi
 
 ## 8. MCP Integration
 
-**Tools**: `save_note_tool { title, content, labels }`, `semantic_search_tool { query, limit }`. Both call the pipeline contracts in §6 directly — no MCP-specific business logic. `save_note_tool` can attach existing label keys but cannot create new ones — label-key catalog management (`define_label_key`, `list_label_keys`) is REST/UI-only, not exposed over MCP.
+**Tools**: `save_note_tool { title, content, labels }`, `semantic_search_tool { query, limit }`.
+Both call the pipeline contracts in §6 directly — no MCP-specific business logic. Saving through
+MCP uses the same missing-label-key auto-creation behavior; explicit catalog management remains
+REST/UI-only.
 
 **Transports**: stdio (subprocess, JSON-RPC over stdin/stdout, stderr for logs) and Streamable HTTP (single `/mcp` endpoint, POST+GET, optional SSE upgrade per-response for long calls). Do not implement legacy two-endpoint HTTP+SSE — it's deprecated protocol-side; add only if a specific client requires it, as a documented exception.
 
 ## 9. Open Decisions (resolve during implementation, not before)
 
 - Sparse weight threshold value — start conservative, tune against measured postings-table size and recall.
-- Whether label filtering happens pre- or post-ANN at current corpus scale (post-filter is fine below ~low thousands of notes; revisit if that changes).
-- DB pool sizing for Axum's concurrent path (stdio is single-client, doesn't need this).
+- Whether label filtering should move deeper into backend retrieval at larger corpus sizes.
+- Storage-session concurrency sizing for Axum's concurrent path.
 
 ## 10. Future Extensions (v2, not built now)
 

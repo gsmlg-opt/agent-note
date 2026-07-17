@@ -3,6 +3,7 @@ use note_core::{
     validate_label_value, validate_note_input, Label, LabelValueType, Note, NoteInput,
     ValidationError,
 };
+use note_storage::{NoteUpdate, TransactionMode};
 use std::collections::{HashMap, HashSet};
 
 pub const TRASH_RETENTION_DAYS: i64 = 90;
@@ -13,14 +14,14 @@ pub async fn update_note(
     id: &str,
     input: SaveNoteInput,
 ) -> anyhow::Result<Option<Note>> {
-    let conn = ctx.storage.connect()?;
+    let session = ctx.storage().session().await?;
 
-    let existing = match note_storage::get_note(&conn, id).await? {
+    let existing = match session.get_note(id).await? {
         Some(note) => note,
         None => return Ok(None),
     };
 
-    let existing_label_keys = note_storage::list_label_keys(&conn).await?;
+    let existing_label_keys = session.list_label_keys().await?;
     let existing_keys: Vec<String> = existing_label_keys.iter().map(|k| k.key.clone()).collect();
     let label_value_types: HashMap<String, LabelValueType> = existing_label_keys
         .into_iter()
@@ -70,52 +71,65 @@ pub async fn update_note(
     }
 
     let now = chrono::Utc::now().timestamp();
-    let note_revision = note_storage::get_note_revision(&conn, id)
-        .await?
-        .unwrap_or(1)
-        + 1;
+    let note_revision = session.get_note_revision(id).await?.unwrap_or(1) + 1;
+    drop(session);
     let chunks = crate::chunk::chunk_content(&input.content);
     let prepared_attachments =
         crate::attachment_files::prepare_note_attachments(ctx, id, &input.attachments)?;
 
-    let tx_result = async {
-        let tx = conn.transaction().await?;
-        let affected = note_storage::update_note_with_attachments(
-            &tx,
-            id,
-            &input.title,
-            &input.content,
-            prepared_attachments.metadata(),
-            now,
-            note_revision,
-        )
-        .await?;
+    let transaction = match ctx.storage().begin(TransactionMode::Deferred).await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
+            return Err(error.into());
+        }
+    };
+    let transaction_result = async {
+        let affected = transaction
+            .update_note(NoteUpdate {
+                id,
+                title: &input.title,
+                content: &input.content,
+                attachments: prepared_attachments.metadata(),
+                updated_at: now,
+                note_revision,
+            })
+            .await?;
         if affected == 0 {
             return anyhow::Ok(None);
         }
         for key in &missing_keys {
-            note_storage::insert_label_key(&tx, key, "").await?;
+            transaction.insert_label_key(key, "").await?;
         }
-        note_storage::clear_note_labels(&tx, id).await?;
-        let queued = crate::sync_note_embedding_jobs(&tx, id, &chunks, note_revision, now).await?;
+        transaction.clear_note_labels(id).await?;
+        let queued =
+            crate::sync_note_embedding_jobs(transaction.as_ref(), id, &chunks, note_revision, now)
+                .await?;
         for (key, value) in &input.labels {
-            note_storage::attach_label(&tx, id, key, value).await?;
+            transaction.attach_label(id, key, value).await?;
         }
-        let resolved_labels: Vec<Label> = note_storage::labels_for_note(&tx, id).await?;
-        tx.commit().await?;
+        let resolved_labels: Vec<Label> = transaction.labels_for_note(id).await?;
         anyhow::Ok(Some((queued, resolved_labels)))
     }
     .await;
 
-    let Some((queued, resolved_labels)) = (match tx_result {
+    let transaction_result = match transaction_result {
+        Ok(Some(result)) => Ok(result),
+        Ok(None) => {
+            let rollback_result = transaction.rollback().await;
+            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
+            rollback_result?;
+            return Ok(None);
+        }
+        Err(error) => Err(error),
+    };
+    let finalized = crate::save_note::finish_transaction(transaction, transaction_result).await;
+    let (queued, resolved_labels) = match finalized {
         Ok(result) => result,
         Err(error) => {
             crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
             return Err(error);
         }
-    }) else {
-        crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
-        return Ok(None);
     };
     crate::attachment_files::commit_note_attachments(prepared_attachments)?;
     if queued > 0 {
@@ -135,21 +149,24 @@ pub async fn update_note(
 }
 
 pub async fn delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
-    let conn = ctx.storage.connect()?;
-    let tx = conn
-        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-        .await?;
-    let deleted = note_storage::delete_note(&tx, id, chrono::Utc::now().timestamp()).await? > 0;
-    if deleted {
-        note_storage::clear_note_search_data(&tx, id).await?;
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let transaction_result = async {
+        let deleted = transaction
+            .soft_delete_note(id, chrono::Utc::now().timestamp())
+            .await?
+            > 0;
+        if deleted {
+            transaction.clear_note_search_data(id).await?;
+        }
+        anyhow::Ok(deleted)
     }
-    tx.commit().await?;
-    Ok(deleted)
+    .await;
+    crate::save_note::finish_transaction(transaction, transaction_result).await
 }
 
 pub async fn permanently_delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
-    let conn = ctx.storage.connect()?;
-    let deleted = note_storage::permanently_delete_note(&conn, id).await? > 0;
+    let session = ctx.storage().session().await?;
+    let deleted = session.permanently_delete_note(id).await? > 0;
     if deleted {
         crate::attachment_files::remove_note_attachments(ctx, id)?;
     }
@@ -167,28 +184,46 @@ pub async fn restore_notes(ctx: &Context, ids: &[String]) -> anyhow::Result<bool
         return Ok(false);
     }
 
-    let conn = ctx.storage.connect()?;
-    let tx = conn
-        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-        .await?;
-    let mut notes = Vec::with_capacity(ids.len());
-    for id in &ids {
-        let Some((content, note_revision)) =
-            note_storage::get_deleted_note_content_and_revision(&tx, id).await?
-        else {
-            return Ok(false);
-        };
-        notes.push((id, content, note_revision.saturating_add(1)));
-    }
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let transaction_result = async {
+        let mut notes = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let Some((content, note_revision)) = transaction
+                .get_deleted_note_content_and_revision(id)
+                .await?
+            else {
+                return anyhow::Ok(None);
+            };
+            notes.push((id, content, note_revision.saturating_add(1)));
+        }
 
-    let now = chrono::Utc::now().timestamp();
-    let mut queued = 0;
-    for (id, content, note_revision) in notes {
-        note_storage::restore_note(&tx, id, note_revision).await?;
-        let chunks = crate::chunk::chunk_content(&content);
-        queued += crate::sync_note_embedding_jobs(&tx, id, &chunks, note_revision, now).await?;
+        let now = chrono::Utc::now().timestamp();
+        let mut queued = 0;
+        for (id, content, note_revision) in notes {
+            transaction.restore_note(id, note_revision).await?;
+            let chunks = crate::chunk::chunk_content(&content);
+            queued += crate::sync_note_embedding_jobs(
+                transaction.as_ref(),
+                id,
+                &chunks,
+                note_revision,
+                now,
+            )
+            .await?;
+        }
+        anyhow::Ok(Some(queued))
     }
-    tx.commit().await?;
+    .await;
+
+    let transaction_result = match transaction_result {
+        Ok(Some(queued)) => Ok(queued),
+        Ok(None) => {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        Err(error) => Err(error),
+    };
+    let queued = crate::save_note::finish_transaction(transaction, transaction_result).await?;
     if queued > 0 {
         ctx.wake_embedding_jobs();
     }
@@ -196,16 +231,17 @@ pub async fn restore_notes(ctx: &Context, ids: &[String]) -> anyhow::Result<bool
 }
 
 pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Result<usize> {
-    let conn = ctx.storage.connect()?;
-    let tx = conn
-        .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-        .await?;
-    let cutoff = now.saturating_sub(TRASH_RETENTION_SECONDS);
-    let ids = note_storage::list_expired_deleted_note_ids(&tx, cutoff).await?;
-    for id in &ids {
-        note_storage::permanently_delete_note(&tx, id).await?;
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let transaction_result = async {
+        let cutoff = now.saturating_sub(TRASH_RETENTION_SECONDS);
+        let ids = transaction.list_expired_deleted_note_ids(cutoff).await?;
+        for id in &ids {
+            transaction.permanently_delete_note(id).await?;
+        }
+        anyhow::Ok(ids)
     }
-    tx.commit().await?;
+    .await;
+    let ids = crate::save_note::finish_transaction(transaction, transaction_result).await?;
     for id in &ids {
         crate::attachment_files::remove_note_attachments(ctx, id)?;
     }

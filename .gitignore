@@ -7,4 +7,5 @@
 *.db
 *.db-journal
 /dev-data
+/config.toml
 /scripts

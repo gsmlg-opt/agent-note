@@ -95,17 +95,20 @@ mod tests {
     use note_core::NoteAttachment;
     use note_embedding::StubEmbedder;
     use note_pipelines::{save_note, SaveNoteInput};
-    use note_storage::Storage;
+    use note_storage::StorageBackend;
+    use note_storage_turso::TursoStorage;
     use std::io::Read;
     use tower::ServiceExt;
 
     async fn test_app() -> (Router, Arc<Context>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
-            .await
-            .unwrap();
-        let ctx = Arc::new(Context::with_attachment_dir(
-            Arc::new(storage),
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            TursoStorage::open(dir.path().join("test.db"))
+                .await
+                .unwrap(),
+        );
+        let ctx = Arc::new(Context::new(
+            storage,
             Arc::new(StubEmbedder),
             dir.path().join("attachments"),
         ));
@@ -185,6 +188,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(info["database_engine"], "embed");
         assert!(info["database_path"].as_str().unwrap().ends_with("test.db"));
         assert!(info["database_size_bytes"].as_u64().unwrap() > 0);
         assert!(info["attachments_path"]

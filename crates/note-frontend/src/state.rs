@@ -90,7 +90,31 @@ pub struct DuplicateCheckTerm {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SystemInfo {
-    pub database_path: String,
-    pub database_size_bytes: u64,
+    pub database_engine: String,
+    pub database_path: Option<String>,
+    pub database_size_bytes: Option<u64>,
     pub attachments_path: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SystemInfo;
+
+    #[test]
+    fn system_info_accepts_backends_without_filesystem_metadata() {
+        let info: SystemInfo = serde_json::from_str(
+            r#"{
+                "database_engine": "pg",
+                "database_path": null,
+                "database_size_bytes": null,
+                "attachments_path": "/var/lib/agent-note/attachments"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(info.database_engine, "pg");
+        assert_eq!(info.database_path, None);
+        assert_eq!(info.database_size_bytes, None);
+        assert_eq!(info.attachments_path, "/var/lib/agent-note/attachments");
+    }
 }

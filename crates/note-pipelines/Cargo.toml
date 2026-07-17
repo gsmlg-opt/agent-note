@@ -7,7 +7,6 @@ edition.workspace = true
 anyhow = "1.0.103"
 chrono = "0.4.45"
 flate2 = "1.1.5"
-libsql = "0.9.30"
 note-core = { version = "0.1.0", path = "../note-core" }
 note-embedding = { version = "0.1.0", path = "../note-embedding" }
 note-storage = { version = "0.1.0", path = "../note-storage" }
@@ -20,5 +19,6 @@ uuid = { version = "1.23.4", features = ["v4"] }
 
 [dev-dependencies]
 async-trait = "0.1.89"
+note-storage-turso = { version = "0.1.0", path = "../note-storage-turso" }
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["full"] }

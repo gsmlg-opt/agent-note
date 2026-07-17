@@ -17,23 +17,25 @@ pub async fn define_label_key_with_type(
     if key.trim().is_empty() {
         return Err(anyhow::Error::new(LabelKeyValidationError::EmptyKey));
     }
-    let conn = ctx.storage.connect()?;
-    note_storage::insert_label_key_with_type(&conn, key, description, value_type).await
+    let session = ctx.storage().session().await?;
+    Ok(session
+        .insert_label_key_with_type(key, description, value_type)
+        .await?)
 }
 
 pub async fn list_label_keys(ctx: &Context) -> anyhow::Result<Vec<LabelKey>> {
-    let conn = ctx.storage.connect()?;
-    note_storage::list_label_keys(&conn).await
+    let session = ctx.storage().session().await?;
+    Ok(session.list_label_keys().await?)
 }
 
 pub async fn label_note_counts(ctx: &Context) -> anyhow::Result<Vec<(String, usize)>> {
-    let conn = ctx.storage.connect()?;
-    note_storage::label_note_counts(&conn).await
+    let session = ctx.storage().session().await?;
+    Ok(session.label_note_counts().await?)
 }
 
 pub async fn update_label_key(ctx: &Context, key: &str, description: &str) -> anyhow::Result<()> {
-    let conn = ctx.storage.connect()?;
-    note_storage::update_label_key(&conn, key, description).await
+    let session = ctx.storage().session().await?;
+    Ok(session.update_label_key(key, description).await?)
 }
 
 pub async fn update_label_key_with_type(
@@ -42,8 +44,10 @@ pub async fn update_label_key_with_type(
     description: &str,
     value_type: LabelValueType,
 ) -> anyhow::Result<()> {
-    let conn = ctx.storage.connect()?;
-    note_storage::update_label_key_with_type(&conn, key, description, value_type).await
+    let session = ctx.storage().session().await?;
+    Ok(session
+        .update_label_key_with_type(key, description, value_type)
+        .await?)
 }
 
 pub fn parse_label_value_type(input: &str) -> anyhow::Result<LabelValueType> {
@@ -52,6 +56,6 @@ pub fn parse_label_value_type(input: &str) -> anyhow::Result<LabelValueType> {
 }
 
 pub async fn delete_label_key(ctx: &Context, key: &str) -> anyhow::Result<()> {
-    let conn = ctx.storage.connect()?;
-    note_storage::delete_label_key(&conn, key).await
+    let session = ctx.storage().session().await?;
+    Ok(session.delete_label_key(key).await?)
 }

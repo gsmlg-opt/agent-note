@@ -59,27 +59,30 @@ pub fn mcp_router(ctx: Arc<Context>) -> Router {
 mod tests {
     use super::*;
     use note_embedding::StubEmbedder;
-    use note_storage::Storage;
+    use note_storage::StorageBackend;
+    use note_storage_turso::TursoStorage;
     use tempfile::TempDir;
 
     // Returns the TempDir guard alongside the Context so the caller keeps it
     // alive: dropping it deletes the DB directory (mirrors stdio.rs tests).
-    async fn test_context() -> (Context, TempDir) {
+    async fn test_context() -> (Context, Arc<dyn StorageBackend>, TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
-            .await
-            .unwrap();
-        let ctx = Context::with_attachment_dir(
-            Arc::new(storage),
+        let backend: Arc<dyn StorageBackend> = Arc::new(
+            TursoStorage::open(dir.path().join("test.db"))
+                .await
+                .unwrap(),
+        );
+        let ctx = Context::new(
+            backend.clone(),
             Arc::new(StubEmbedder),
             dir.path().join("attachments"),
         );
-        (ctx, dir)
+        (ctx, backend, dir)
     }
 
     #[tokio::test]
     async fn mcp_router_builds() {
-        let (ctx, _dir) = test_context().await;
+        let (ctx, _backend, _dir) = test_context().await;
         // Building the router must not panic; the type asserts it is an axum::Router.
         let _router: Router = mcp_router(Arc::new(ctx));
     }

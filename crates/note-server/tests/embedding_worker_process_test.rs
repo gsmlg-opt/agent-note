@@ -10,7 +10,9 @@ use tokio::process::{Child, Command};
 #[tokio::test]
 async fn embedding_worker_child_process_embeds_text() {
     let ipc_name = test_ipc_name("child");
-    let mut child = spawn_worker(&ipc_name, &[]).await;
+    // Internal workers do not own application storage, so their early-return path must stay ahead
+    // of runtime database configuration and validation.
+    let mut child = spawn_worker(&ipc_name, &[("NOTE_DB_ENGINE", "pg")]).await;
     let client = connect_with_retry(&ipc_name).await;
 
     let handshake = client

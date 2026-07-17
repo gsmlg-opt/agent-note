@@ -106,7 +106,7 @@ async fn unsupported_marked_schema_is_rejected_without_modification() {
 }
 
 #[tokio::test]
-async fn fresh_database_contains_the_logical_schema_without_diskann_objects() {
+async fn fresh_database_contains_the_logical_schema_for_exact_linear_retrieval() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("schema.db");
     drop(TursoStorage::open(&path).await.unwrap());
@@ -176,7 +176,6 @@ async fn fresh_database_contains_the_logical_schema_without_diskann_objects() {
     assert!(!indexes
         .iter()
         .any(|index| index == "idx_note_chunk_embedding"));
-    assert!(!schema_sql.contains("libsql_vector_idx"));
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ use axum::response::IntoResponse;
 use axum::Router;
 use note_embedding::{ProcessWorkerConfig, ProcessWorkerRuntime, StubEmbedder, WorkerConfig};
 use note_pipelines::{Context, EmbeddingJobNotifier, ProcessEmbeddingJobStatus};
-use note_storage::Storage;
+use note_storage::StorageBackend;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -23,8 +23,6 @@ use tokio::sync::{watch, Notify};
 
 const DEFAULT_EMBEDDING_POLL_MS: u64 = 1000;
 const TRASH_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const DEFAULT_DB_PATH: &str = "./dev-data/notes.db";
-const DEFAULT_ATTACHMENTS_DIR: &str = "./dev-data/attachments";
 const DEV_FRONTEND_URL: &str = "http://0.0.0.0:6221";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,18 +95,8 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn db_path_from_env() -> String {
-    std::env::var("NOTE_DB_PATH").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string())
-}
-
-fn attachments_dir_from_env() -> PathBuf {
-    std::env::var("NOTE_ATTACHMENTS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ATTACHMENTS_DIR))
-}
-
-fn ensure_data_directories(db_path: &str, attachments_dir: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = Path::new(db_path)
+fn ensure_data_directories(db_path: &Path, attachments_dir: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = db_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
@@ -266,54 +254,29 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let stdio_mode = args.iter().any(|a| a == "--stdio");
-    let db_path = db_path_from_env();
-    let attachments_dir = attachments_dir_from_env();
-    ensure_data_directories(&db_path, &attachments_dir)?;
+    let config = note_server::config::load_runtime_config()?;
+    config.validate_supported()?;
+    ensure_data_directories(&config.database_path, &config.attachments_dir)?;
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(note_storage_turso::TursoStorage::open(&config.database_path).await?);
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
-    let optimize_vector_index_mode = args.iter().any(|a| a == "--optimize-vector-index");
-    let vacuum_mode = args.iter().any(|a| a == "--vacuum");
-
-    if vacuum_mode && !optimize_vector_index_mode {
-        anyhow::bail!("--vacuum requires --optimize-vector-index");
-    }
-
-    if optimize_vector_index_mode {
-        eprintln!("opening database for vector index maintenance");
-        let storage = Storage::open_local(&db_path).await?;
-        eprintln!(
-            "optimizing chunk vector index with compress_neighbors=float8 and max_neighbors=20"
-        );
-        if storage.optimize_chunk_vector_index().await? {
-            eprintln!("chunk vector index rebuilt");
-        } else {
-            eprintln!("chunk vector index already uses the optimized configuration");
-        }
-        if vacuum_mode {
-            eprintln!("vacuuming database to release unused pages");
-            storage.vacuum().await?;
-            eprintln!("database vacuum complete");
-        }
-        return Ok(());
-    }
 
     if export_mode {
-        let storage = Storage::open_local(&db_path).await?;
-        let ctx = Context::with_attachment_dir(
-            Arc::new(storage),
+        let ctx = Context::new(
+            storage.clone(),
             Arc::new(StubEmbedder),
-            attachments_dir,
+            config.attachments_dir.clone(),
         );
         println!("{}", note_pipelines::export_json(&ctx).await?);
         return Ok(());
     }
 
     if import_mode {
-        let storage = Storage::open_local(&db_path).await?;
-        let ctx = Context::with_attachment_dir(
-            Arc::new(storage),
+        let ctx = Context::new(
+            storage.clone(),
             Arc::new(StubEmbedder),
-            attachments_dir,
+            config.attachments_dir.clone(),
         );
         let mut input = String::new();
         std::io::stdin().lock().read_to_string(&mut input)?;
@@ -329,17 +292,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if stdio_mode {
-        // stdio is single-client — no connection pool needed (docs/design.md §9).
-        let storage = Storage::open_local(&db_path).await?;
         let embedding = start_embedding_runtime().await?;
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
-        let ctx = Arc::new(Context::with_embedding_job_notifier_and_attachment_dir(
-            Arc::new(storage),
+        let ctx = Arc::new(Context::with_embedding_job_notifier(
+            storage.clone(),
             embedding.embedder.clone(),
             notifier,
-            attachments_dir.clone(),
+            config.attachments_dir.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
         let trash_retention = tokio::spawn(run_trash_retention(
@@ -359,19 +320,15 @@ async fn main() -> anyhow::Result<()> {
             process_runtime.shutdown().await;
         }
     } else {
-        // Axum is the only process that needs connection pooling (docs/design.md §2).
-        // TODO: size the pool deliberately once concurrency requirements are clearer (docs/design.md §9
-        // open decision) — starting with a single shared Storage handle is a placeholder, not a final answer.
-        let storage = Storage::open_local(&db_path).await?;
         let embedding = start_embedding_runtime().await?;
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
-        let ctx = Arc::new(Context::with_embedding_job_notifier_and_attachment_dir(
-            Arc::new(storage),
+        let ctx = Arc::new(Context::with_embedding_job_notifier(
+            storage.clone(),
             embedding.embedder.clone(),
             notifier,
-            attachments_dir.clone(),
+            config.attachments_dir.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
         let trash_retention = tokio::spawn(run_trash_retention(
@@ -503,18 +460,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_data_paths_use_dev_data() {
-        assert_eq!(DEFAULT_DB_PATH, "./dev-data/notes.db");
-        assert_eq!(DEFAULT_ATTACHMENTS_DIR, "./dev-data/attachments");
-    }
-
-    #[test]
     fn data_directories_are_created_before_storage_opens() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("dev-data/notes.db");
         let attachments_dir = temp.path().join("dev-data/attachments");
 
-        ensure_data_directories(db_path.to_str().unwrap(), &attachments_dir).unwrap();
+        ensure_data_directories(&db_path, &attachments_dir).unwrap();
 
         assert!(db_path.parent().unwrap().is_dir());
         assert!(attachments_dir.is_dir());

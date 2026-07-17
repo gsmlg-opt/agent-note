@@ -1,5 +1,6 @@
-use crate::{enqueue_missing_chunk_embeddings, list_all_notes, parse_label_value_type, Context};
+use crate::{enqueue_missing_chunk_embeddings, parse_label_value_type, Context};
 use note_core::{decode_attachment_content, encode_attachment_content, NoteAttachment};
+use note_storage::{NewNote, TransactionMode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -90,8 +91,9 @@ pub struct ImportStats {
 }
 
 pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
-    let conn = ctx.storage.connect()?;
-    let label_keys = note_storage::list_label_keys(&conn)
+    let session = ctx.storage().session().await?;
+    let label_keys = session
+        .list_label_keys()
         .await?
         .into_iter()
         .map(|label_key| ExportLabelKey {
@@ -100,8 +102,11 @@ pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
             value_type: label_key.value_type.as_str().to_string(),
         })
         .collect();
-    let notes = list_all_notes(ctx)
-        .await?
+    let mut notes = session.list_all_notes().await?;
+    for note in &mut notes {
+        crate::attachment_files::hydrate_note_attachments(ctx, note)?;
+    }
+    let notes = notes
         .into_iter()
         .map(|note| ExportNote {
             id: note.id,
@@ -134,40 +139,38 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
     if !matches!(data.version, 1 | 2) {
         anyhow::bail!("unsupported export version: {}", data.version);
     }
-    let conn = ctx.storage.connect()?;
-    let mut known_keys: HashSet<String> = note_storage::list_label_keys(&conn)
+    let session = ctx.storage().session().await?;
+    let mut known_keys: HashSet<String> = session
+        .list_label_keys()
         .await?
         .into_iter()
         .map(|label_key| label_key.key)
         .collect();
+    drop(session);
     let mut stats = ImportStats::default();
     let mut prepared_attachments = Vec::new();
 
-    let tx_result = async {
-        let tx = conn.transaction().await?;
+    let transaction = ctx.storage().begin(TransactionMode::Deferred).await?;
+    let transaction_result = async {
         for label_key in data.label_keys {
             if known_keys.insert(label_key.key.clone()) {
                 let value_type = parse_label_value_type(&label_key.value_type)?;
-                note_storage::insert_label_key_with_type(
-                    &tx,
-                    &label_key.key,
-                    &label_key.description,
-                    value_type,
-                )
-                .await?;
+                transaction
+                    .insert_label_key_with_type(&label_key.key, &label_key.description, value_type)
+                    .await?;
                 stats.label_keys_added += 1;
             }
         }
 
         for note in data.notes {
-            if note_storage::note_exists(&tx, &note.id).await? {
+            if transaction.note_exists(&note.id).await? {
                 stats.notes_skipped += 1;
                 continue;
             }
 
             for (key, _) in &note.labels {
                 if !key.is_empty() && known_keys.insert(key.clone()) {
-                    note_storage::insert_label_key(&tx, key, "").await?;
+                    transaction.insert_label_key(key, "").await?;
                     stats.label_keys_added += 1;
                 }
             }
@@ -179,30 +182,33 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let prepared =
                 crate::attachment_files::prepare_note_attachments(ctx, &note.id, &attachments)?;
-            note_storage::insert_note_with_attachments_and_deleted_at(
-                &tx,
-                &note.id,
-                &note.title,
-                &note.content,
-                prepared.metadata(),
-                note.created_at,
-                note.updated_at,
-                1,
-                note.deleted_at,
-            )
-            .await?;
-            for (key, value) in &note.labels {
-                note_storage::attach_label(&tx, &note.id, key, value).await?;
-            }
             prepared_attachments.push(prepared);
+            let prepared = prepared_attachments
+                .last()
+                .expect("prepared attachment was just pushed");
+            transaction
+                .insert_note(NewNote {
+                    id: &note.id,
+                    title: &note.title,
+                    content: &note.content,
+                    attachments: prepared.metadata(),
+                    created_at: note.created_at,
+                    updated_at: note.updated_at,
+                    note_revision: 1,
+                    deleted_at: note.deleted_at,
+                })
+                .await?;
+            for (key, value) in &note.labels {
+                transaction.attach_label(&note.id, key, value).await?;
+            }
             stats.notes_added += 1;
         }
-        tx.commit().await?;
         anyhow::Ok(())
     }
     .await;
 
-    if let Err(error) = tx_result {
+    if let Err(error) = crate::save_note::finish_transaction(transaction, transaction_result).await
+    {
         for prepared in &prepared_attachments {
             crate::attachment_files::cleanup_prepared_note_attachments(prepared);
         }

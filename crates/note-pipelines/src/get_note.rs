@@ -2,8 +2,8 @@ use crate::context::Context;
 use note_core::Note;
 
 pub async fn get_note(ctx: &Context, id: &str) -> anyhow::Result<Option<Note>> {
-    let conn = ctx.storage.connect()?;
-    let Some(mut note) = note_storage::get_note(&conn, id).await? else {
+    let session = ctx.storage().session().await?;
+    let Some(mut note) = session.get_note(id).await? else {
         return Ok(None);
     };
     crate::attachment_files::hydrate_note_attachments(ctx, &mut note)?;
@@ -11,6 +11,6 @@ pub async fn get_note(ctx: &Context, id: &str) -> anyhow::Result<Option<Note>> {
 }
 
 pub async fn get_note_markdown(ctx: &Context, id: &str) -> anyhow::Result<Option<String>> {
-    let conn = ctx.storage.connect()?;
-    note_storage::get_note_content(&conn, id).await
+    let session = ctx.storage().session().await?;
+    Ok(session.get_note_content(id).await?)
 }

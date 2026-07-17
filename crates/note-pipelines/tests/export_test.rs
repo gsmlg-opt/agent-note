@@ -1,33 +1,15 @@
+mod support;
+
 use note_core::NoteAttachment;
-use note_embedding::StubEmbedder;
 use note_pipelines::{
     define_label_key, delete_note, export_data, get_note, import_data, import_json, list_all_notes,
-    list_deleted_note_summaries, list_label_keys, save_note, Context, SaveNoteInput,
+    list_deleted_note_summaries, list_label_keys, save_note, SaveNoteInput,
 };
-use note_storage::Storage;
-use std::sync::Arc;
-use tempfile::TempDir;
-
-// Returns the TempDir guard alongside the Context so the caller keeps it alive:
-// dropping it deletes the DB directory and later connect() calls fail with SQLITE_CANTOPEN.
-async fn test_context() -> (Context, TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
-        .await
-        .unwrap();
-    (
-        Context::with_attachment_dir(
-            Arc::new(storage),
-            Arc::new(StubEmbedder),
-            dir.path().join("attachments"),
-        ),
-        dir,
-    )
-}
+use support::test_context;
 
 #[tokio::test]
 async fn export_import_roundtrips_notes_and_label_keys() {
-    let (source, _source_dir) = test_context().await;
+    let (source, _source_backend, _source_dir) = test_context().await;
     define_label_key(&source, "status", "Workflow status")
         .await
         .unwrap();
@@ -90,7 +72,7 @@ async fn export_import_roundtrips_notes_and_label_keys() {
         Some("AJ+Slg==")
     );
 
-    let (target, target_dir) = test_context().await;
+    let (target, _target_backend, target_dir) = test_context().await;
     let stats = import_data(&target, data).await.unwrap();
     assert_eq!(stats.notes_added, 2);
     assert_eq!(stats.notes_skipped, 0);
@@ -145,7 +127,7 @@ async fn export_import_roundtrips_notes_and_label_keys() {
 
 #[tokio::test]
 async fn imports_version_one_text_attachments() {
-    let (ctx, _dir) = test_context().await;
+    let (ctx, _backend, _dir) = test_context().await;
     let input = r#"{
         "version": 1,
         "label_keys": [],
@@ -174,7 +156,7 @@ async fn imports_version_one_text_attachments() {
 
 #[tokio::test]
 async fn rejects_unsupported_export_versions() {
-    let (ctx, _dir) = test_context().await;
+    let (ctx, _backend, _dir) = test_context().await;
     let error = import_json(&ctx, r#"{"version":3,"label_keys":[],"notes":[]}"#)
         .await
         .unwrap_err();
@@ -184,7 +166,7 @@ async fn rejects_unsupported_export_versions() {
 
 #[tokio::test]
 async fn invalid_version_two_attachment_rolls_back_the_import() {
-    let (ctx, dir) = test_context().await;
+    let (ctx, _backend, dir) = test_context().await;
     let input = r#"{
         "version": 2,
         "label_keys": [{"key":"status","description":"Workflow status","value_type":"text"}],

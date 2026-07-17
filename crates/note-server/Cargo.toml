@@ -13,8 +13,10 @@ serde_json = "1.0.150"
 note-core = { path = "../note-core" }
 note-embedding = { version = "0.1.0", path = "../note-embedding" }
 note-storage = { version = "0.1.0", path = "../note-storage" }
+note-storage-turso = { version = "0.1.0", path = "../note-storage-turso" }
 anyhow = "1.0.103"
 chrono = "0.4.45"
+toml = "0.8.23"
 tower-http = { version = "0.7.0", features = ["fs"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }

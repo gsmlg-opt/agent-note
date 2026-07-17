@@ -1,17 +1,20 @@
 use note_embedding::StubEmbedder;
 use note_pipelines::{drain_embedding_jobs, save_note, search_notes, Context, SaveNoteInput};
-use note_storage::Storage;
+use note_storage::StorageBackend;
+use note_storage_turso::TursoStorage;
 use std::sync::Arc;
 use tempfile::TempDir;
 
 async fn test_context() -> (Context, TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
-        .await
-        .unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(
+        TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
     (
-        Context::with_attachment_dir(
-            Arc::new(storage),
+        Context::new(
+            storage,
             Arc::new(StubEmbedder),
             dir.path().join("attachments"),
         ),

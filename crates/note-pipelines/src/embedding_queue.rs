@@ -1,6 +1,6 @@
 use crate::{chunk_content, Context};
 use note_embedding::{DenseVector, SparseVector};
-use note_storage::EmbeddingJob;
+use note_storage::{EmbeddingJob, TransactionMode};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -35,13 +35,13 @@ pub fn chunk_hash(content: &str) -> String {
 }
 
 pub async fn sync_note_embedding_jobs(
-    conn: &libsql::Connection,
+    storage: &dyn note_storage::StorageSession,
     note_id: &str,
     chunks: &[String],
     note_revision: i64,
     now: i64,
 ) -> anyhow::Result<usize> {
-    let existing_chunks = note_storage::list_note_chunks(conn, note_id).await?;
+    let existing_chunks = storage.list_note_chunks(note_id).await?;
     let existing_by_idx: HashMap<i64, note_storage::NoteChunk> = existing_chunks
         .into_iter()
         .map(|chunk| (chunk.chunk_idx, chunk))
@@ -55,14 +55,15 @@ pub async fn sync_note_embedding_jobs(
         let current_hash_known = existing
             .map(|chunk| chunk.content_hash == hash)
             .unwrap_or(true);
-        let has_embedding = note_storage::chunk_embedding_exists(conn, note_id, idx).await?;
+        let has_embedding = storage.chunk_embedding_exists(note_id, idx).await?;
 
-        note_storage::delete_stale_embedding_jobs_for_chunk(conn, note_id, idx, &hash).await?;
+        storage
+            .delete_stale_embedding_jobs_for_chunk(note_id, idx, &hash)
+            .await?;
 
         if current_hash_known && has_embedding {
-            note_storage::upsert_note_chunk(
-                conn,
-                note_storage::UpsertNoteChunk {
+            storage
+                .upsert_note_chunk(note_storage::UpsertNoteChunk {
                     note_id,
                     chunk_idx: idx,
                     content_hash: &hash,
@@ -70,15 +71,13 @@ pub async fn sync_note_embedding_jobs(
                     note_revision,
                     status: CHUNK_STATUS_EMBEDDED,
                     updated_at: now,
-                },
-            )
-            .await?;
+                })
+                .await?;
             continue;
         }
 
-        note_storage::upsert_note_chunk(
-            conn,
-            note_storage::UpsertNoteChunk {
+        storage
+            .upsert_note_chunk(note_storage::UpsertNoteChunk {
                 note_id,
                 chunk_idx: idx,
                 content_hash: &hash,
@@ -86,48 +85,46 @@ pub async fn sync_note_embedding_jobs(
                 note_revision,
                 status: CHUNK_STATUS_PENDING,
                 updated_at: now,
-            },
-        )
-        .await?;
-        note_storage::clear_note_chunk_derived(conn, note_id, idx).await?;
-        note_storage::enqueue_embedding_job(conn, note_id, idx, &hash, content, note_revision, now)
+            })
+            .await?;
+        storage.clear_note_chunk_derived(note_id, idx).await?;
+        storage
+            .enqueue_embedding_job(note_id, idx, &hash, content, note_revision, now)
             .await?;
         queued += 1;
     }
 
     let new_len = chunks.len() as i64;
-    note_storage::clear_note_chunks_from_derived(conn, note_id, new_len).await?;
-    note_storage::delete_embedding_jobs_from_chunk(conn, note_id, new_len).await?;
-    note_storage::delete_note_chunks_from(conn, note_id, new_len).await?;
+    storage
+        .clear_note_chunks_from_derived(note_id, new_len)
+        .await?;
+    storage
+        .delete_embedding_jobs_from_chunk(note_id, new_len)
+        .await?;
+    storage.delete_note_chunks_from(note_id, new_len).await?;
 
     Ok(queued)
 }
 
 pub async fn enqueue_missing_chunk_embeddings(ctx: &Context) -> anyhow::Result<usize> {
-    let conn = ctx.storage.connect()?;
-    let mut rows = conn
-        .query(
-            "SELECT id, content, note_revision FROM notes WHERE deleted_at IS NULL",
-            (),
-        )
-        .await?;
-    let mut notes = Vec::new();
-    while let Some(row) = rows.next().await? {
-        notes.push((
-            row.get::<String>(0)?,
-            row.get::<String>(1)?,
-            row.get::<i64>(2)?,
-        ));
-    }
-    drop(rows);
+    let session = ctx.storage().session().await?;
+    let notes = session.list_active_note_sources().await?;
+    drop(session);
 
     let mut queued = 0;
-    for (id, content, note_revision) in notes {
-        let chunks = chunk_content(&content);
+    for note in notes {
+        let chunks = chunk_content(&note.content);
         let now = chrono::Utc::now().timestamp();
-        let tx = conn.transaction().await?;
-        queued += sync_note_embedding_jobs(&tx, &id, &chunks, note_revision, now).await?;
-        tx.commit().await?;
+        let transaction = ctx.storage().begin(TransactionMode::Deferred).await?;
+        let transaction_result = sync_note_embedding_jobs(
+            transaction.as_ref(),
+            &note.id,
+            &chunks,
+            note.note_revision,
+            now,
+        )
+        .await;
+        queued += crate::save_note::finish_transaction(transaction, transaction_result).await?;
     }
 
     Ok(queued)
@@ -138,27 +135,31 @@ pub async fn backfill_chunk_embeddings(ctx: &Context) -> anyhow::Result<usize> {
 }
 
 pub async fn requeue_processing_embedding_jobs(ctx: &Context) -> anyhow::Result<usize> {
-    let conn = ctx.storage.connect()?;
+    let session = ctx.storage().session().await?;
     let now = chrono::Utc::now().timestamp();
-    Ok(note_storage::requeue_processing_embedding_jobs(&conn, now).await? as usize)
+    Ok(session.requeue_processing_embedding_jobs(now).await? as usize)
 }
 
 pub async fn embedding_dashboard_status(
     ctx: &Context,
 ) -> anyhow::Result<note_storage::EmbeddingDashboardStatus> {
-    let conn = ctx.storage.connect()?;
-    note_storage::embedding_dashboard_status(&conn).await
+    let session = ctx.storage().session().await?;
+    Ok(session.embedding_dashboard_status().await?)
 }
 
 pub async fn process_next_embedding_job(
     ctx: &Context,
 ) -> anyhow::Result<Option<ProcessedEmbeddingJob>> {
-    let conn = ctx.storage.connect()?;
     let now = chrono::Utc::now().timestamp();
-    let mut jobs = note_storage::claim_pending_embedding_jobs(&conn, 1, now).await?;
-    drop(conn);
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let transaction_result = async {
+        let mut jobs = transaction.claim_pending_embedding_jobs(1, now).await?;
+        anyhow::Ok(jobs.pop())
+    }
+    .await;
+    let job = crate::save_note::finish_transaction(transaction, transaction_result).await?;
 
-    let Some(job) = jobs.pop() else {
+    let Some(job) = job else {
         return Ok(None);
     };
 
@@ -190,56 +191,63 @@ async fn complete_embedding_job(
     sparse: SparseVector,
 ) -> anyhow::Result<ProcessedEmbeddingJob> {
     let weights: Vec<(i64, f64)> = sparse.into_iter().map(|(k, v)| (k, v as f64)).collect();
-    let conn = ctx.storage.connect()?;
     let now = chrono::Utc::now().timestamp();
-    let tx = conn.transaction().await?;
-
-    let current = note_storage::get_note_chunk(&tx, &job.note_id, job.chunk_idx).await?;
-    let status = if current.as_ref().is_some_and(|chunk| {
-        chunk.content_hash == job.content_hash && chunk.note_revision == job.note_revision
-    }) {
-        note_storage::clear_note_chunk_derived(&tx, &job.note_id, job.chunk_idx).await?;
-        note_storage::insert_chunk_embedding(&tx, &job.note_id, job.chunk_idx, &dense).await?;
-        note_storage::insert_chunk_sparse_weights(&tx, &job.note_id, job.chunk_idx, &weights)
+    let transaction = ctx.storage().begin(TransactionMode::Deferred).await?;
+    let transaction_result = async {
+        let current = transaction
+            .get_note_chunk(&job.note_id, job.chunk_idx)
             .await?;
-        note_storage::mark_note_chunk_status(
-            &tx,
-            &job.note_id,
-            job.chunk_idx,
-            &job.content_hash,
-            job.note_revision,
-            CHUNK_STATUS_EMBEDDED,
-            now,
-        )
-        .await?;
-        ProcessEmbeddingJobStatus::Completed
-    } else {
-        if let Some(current) = current {
-            if current.content_hash == job.content_hash {
-                note_storage::enqueue_embedding_job(
-                    &tx,
-                    &current.note_id,
-                    current.chunk_idx,
-                    &current.content_hash,
-                    &current.content,
-                    current.note_revision,
+        let status = if current.as_ref().is_some_and(|chunk| {
+            chunk.content_hash == job.content_hash && chunk.note_revision == job.note_revision
+        }) {
+            transaction
+                .clear_note_chunk_derived(&job.note_id, job.chunk_idx)
+                .await?;
+            transaction
+                .insert_chunk_embedding(&job.note_id, job.chunk_idx, &dense)
+                .await?;
+            transaction
+                .insert_chunk_sparse_weights(&job.note_id, job.chunk_idx, &weights)
+                .await?;
+            transaction
+                .mark_note_chunk_status(
+                    &job.note_id,
+                    job.chunk_idx,
+                    &job.content_hash,
+                    job.note_revision,
+                    CHUNK_STATUS_EMBEDDED,
                     now,
                 )
                 .await?;
+            ProcessEmbeddingJobStatus::Completed
+        } else {
+            if let Some(current) = current {
+                if current.content_hash == job.content_hash {
+                    transaction
+                        .enqueue_embedding_job(
+                            &current.note_id,
+                            current.chunk_idx,
+                            &current.content_hash,
+                            &current.content,
+                            current.note_revision,
+                            now,
+                        )
+                        .await?;
+                }
             }
-        }
-        ProcessEmbeddingJobStatus::Stale
-    };
+            ProcessEmbeddingJobStatus::Stale
+        };
 
-    note_storage::delete_embedding_job(&tx, job.id).await?;
-    tx.commit().await?;
-
-    Ok(ProcessedEmbeddingJob {
-        job_id: job.id,
-        note_id: job.note_id,
-        chunk_idx: job.chunk_idx,
-        status,
-    })
+        transaction.delete_embedding_job(job.id).await?;
+        anyhow::Ok(ProcessedEmbeddingJob {
+            job_id: job.id,
+            note_id: job.note_id.clone(),
+            chunk_idx: job.chunk_idx,
+            status,
+        })
+    }
+    .await;
+    crate::save_note::finish_transaction(transaction, transaction_result).await
 }
 
 async fn fail_embedding_job(
@@ -247,38 +255,34 @@ async fn fail_embedding_job(
     job: EmbeddingJob,
     error: &str,
 ) -> anyhow::Result<ProcessedEmbeddingJob> {
-    let conn = ctx.storage.connect()?;
     let now = chrono::Utc::now().timestamp();
-    let tx = conn.transaction().await?;
-    note_storage::fail_embedding_job(
-        &tx,
-        job.id,
-        job.attempts,
-        MAX_EMBEDDING_ATTEMPTS,
-        error,
-        now,
-    )
-    .await?;
-    if job.attempts >= MAX_EMBEDDING_ATTEMPTS {
-        note_storage::mark_note_chunk_status(
-            &tx,
-            &job.note_id,
-            job.chunk_idx,
-            &job.content_hash,
-            job.note_revision,
-            CHUNK_STATUS_FAILED,
-            now,
-        )
-        .await?;
-    }
-    tx.commit().await?;
+    let transaction = ctx.storage().begin(TransactionMode::Deferred).await?;
+    let transaction_result = async {
+        transaction
+            .fail_embedding_job(job.id, job.attempts, MAX_EMBEDDING_ATTEMPTS, error, now)
+            .await?;
+        if job.attempts >= MAX_EMBEDDING_ATTEMPTS {
+            transaction
+                .mark_note_chunk_status(
+                    &job.note_id,
+                    job.chunk_idx,
+                    &job.content_hash,
+                    job.note_revision,
+                    CHUNK_STATUS_FAILED,
+                    now,
+                )
+                .await?;
+        }
 
-    Ok(ProcessedEmbeddingJob {
-        job_id: job.id,
-        note_id: job.note_id,
-        chunk_idx: job.chunk_idx,
-        status: ProcessEmbeddingJobStatus::Failed,
-    })
+        anyhow::Ok(ProcessedEmbeddingJob {
+            job_id: job.id,
+            note_id: job.note_id.clone(),
+            chunk_idx: job.chunk_idx,
+            status: ProcessEmbeddingJobStatus::Failed,
+        })
+    }
+    .await;
+    crate::save_note::finish_transaction(transaction, transaction_result).await
 }
 
 #[cfg(test)]
@@ -286,7 +290,8 @@ mod tests {
     use super::*;
     use crate::{save_note, update_note, SaveNoteInput};
     use note_embedding::{DenseVector, Embedder, SparseVector, StubEmbedder};
-    use note_storage::Storage;
+    use note_storage::StorageBackend;
+    use note_storage_turso::TursoStorage;
     use std::sync::Arc;
     use tokio::sync::Notify;
 
@@ -309,13 +314,13 @@ mod tests {
     #[tokio::test]
     async fn stale_revision_result_is_discarded() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Arc::new(
-            Storage::open_local(dir.path().join("test.db").to_str().unwrap())
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            TursoStorage::open(dir.path().join("test.db"))
                 .await
                 .unwrap(),
         );
         let attachments_dir = dir.path().join("attachments");
-        let write_ctx = Context::with_attachment_dir(
+        let write_ctx = Context::new(
             storage.clone(),
             Arc::new(StubEmbedder),
             attachments_dir.clone(),
@@ -334,7 +339,7 @@ mod tests {
 
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let process_ctx = Arc::new(Context::with_attachment_dir(
+        let process_ctx = Arc::new(Context::new(
             storage.clone(),
             Arc::new(PausingEmbedder {
                 started: started.clone(),
@@ -371,18 +376,24 @@ mod tests {
         let processed = process_task.await.unwrap();
         assert_eq!(processed.status, ProcessEmbeddingJobStatus::Stale);
 
-        let conn = storage.connect().unwrap();
-        assert_eq!(
-            count_rows(&conn, "note_chunk_embeddings", &note.id).await,
-            0
-        );
-        assert_eq!(count_rows(&conn, "note_chunk_sparse", &note.id).await, 0);
-        assert_eq!(count_rows(&conn, "embedding_jobs", &note.id).await, 1);
-    }
-
-    async fn count_rows(conn: &libsql::Connection, table: &str, note_id: &str) -> i64 {
-        let sql = format!("SELECT COUNT(*) FROM {table} WHERE note_id = ?1");
-        let mut rows = conn.query(&sql, libsql::params![note_id]).await.unwrap();
-        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+        let session = storage.session().await.unwrap();
+        assert!(!session.chunk_embedding_exists(&note.id, 0).await.unwrap());
+        assert!(session
+            .dense_search(&vec![0.1; 1024], 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(session
+            .sparse_postings_query(&[42], 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let pending = session
+            .claim_pending_embedding_jobs(10, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].note_id, note.id);
+        assert_eq!(pending[0].content, "new content");
     }
 }

@@ -1,5 +1,6 @@
 use note_storage::{
     NewNote, StorageBackend, StorageErrorKind, StorageTransaction, TransactionMode,
+    UpsertNoteChunk, EMBEDDING_DIMENSION,
 };
 use note_storage_turso::TursoStorage;
 use std::sync::Arc;
@@ -138,4 +139,81 @@ async fn rollback_failures_are_transaction_errors_with_turso_sources() {
     assert_eq!(error.kind(), StorageErrorKind::Transaction);
     let source = std::error::Error::source(&error).expect("Turso source is retained");
     assert!(source.downcast_ref::<turso::Error>().is_some());
+}
+
+#[tokio::test]
+async fn failed_multi_repository_write_rolls_back_all_turso_tables() {
+    let (dir, storage) = storage().await;
+    let session = storage.session().await.unwrap();
+    session
+        .insert_label_key("status", "Workflow status")
+        .await
+        .unwrap();
+
+    let transaction = storage.begin(TransactionMode::Immediate).await.unwrap();
+    insert_note(transaction.as_ref(), "atomic").await;
+    transaction
+        .upsert_note_chunk(UpsertNoteChunk {
+            note_id: "atomic",
+            chunk_idx: 0,
+            content_hash: "hash",
+            content: "content",
+            note_revision: 1,
+            status: "pending",
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    transaction
+        .enqueue_embedding_job("atomic", 0, "hash", "content", 1, 1)
+        .await
+        .unwrap();
+    transaction
+        .insert_chunk_embedding("atomic", 0, &vec![0.0; EMBEDDING_DIMENSION])
+        .await
+        .unwrap();
+    transaction
+        .insert_chunk_sparse_weights("atomic", 0, &[(7, 1.0)])
+        .await
+        .unwrap();
+    transaction
+        .attach_label("atomic", "status", "done")
+        .await
+        .unwrap();
+    let error = transaction
+        .attach_label("atomic", "status", "wip")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    transaction.rollback().await.unwrap();
+
+    let database = turso::Builder::new_local(
+        dir.path()
+            .join("transactions.db")
+            .to_str()
+            .expect("temporary path is UTF-8"),
+    )
+    .build()
+    .await
+    .unwrap();
+    let connection = database.connect().unwrap();
+    for table in [
+        "notes",
+        "note_chunks",
+        "embedding_jobs",
+        "note_chunk_embeddings",
+        "note_chunk_sparse",
+        "note_labels",
+    ] {
+        assert_eq!(table_row_count(&connection, table).await, 0, "{table}");
+    }
+    assert_eq!(table_row_count(&connection, "label_keys").await, 1);
+}
+
+async fn table_row_count(connection: &turso::Connection, table: &str) -> i64 {
+    let mut rows = connection
+        .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+        .await
+        .unwrap();
+    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
 }

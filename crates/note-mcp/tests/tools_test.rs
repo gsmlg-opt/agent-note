@@ -8,28 +8,29 @@ use note_mcp::{
     SemanticSearchToolInput, UpdateNoteToolInput,
 };
 use note_pipelines::{drain_embedding_jobs, update_system_config, Context, EditOp};
-use note_storage::Storage;
+use note_storage::StorageBackend;
+use note_storage_turso::TursoStorage;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-async fn test_context() -> (Context, TempDir) {
+async fn test_context() -> (Context, Arc<dyn StorageBackend>, TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
-        .await
-        .unwrap();
-    (
-        Context::with_attachment_dir(
-            Arc::new(storage),
-            Arc::new(StubEmbedder),
-            dir.path().join("attachments"),
-        ),
-        dir,
-    )
+    let backend: Arc<dyn StorageBackend> = Arc::new(
+        TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let ctx = Context::new(
+        backend.clone(),
+        Arc::new(StubEmbedder),
+        dir.path().join("attachments"),
+    );
+    (ctx, backend, dir)
 }
 
 #[tokio::test]
 async fn save_note_tool_returns_an_id() {
-    let (ctx, _dir) = test_context().await;
+    let (ctx, _backend, _dir) = test_context().await;
     let result = save_note_tool(
         &ctx,
         SaveNoteToolInput {
@@ -46,7 +47,7 @@ async fn save_note_tool_returns_an_id() {
 
 #[tokio::test]
 async fn binary_attachment_roundtrips_through_save_get_update_and_list() {
-    let (ctx, dir) = test_context().await;
+    let (ctx, _backend, dir) = test_context().await;
     let bytes = vec![0x00, 0x9f, 0x92, 0x96, 0xff];
     let attachment = AttachmentData {
         id: "blob".into(),
@@ -102,7 +103,7 @@ async fn binary_attachment_roundtrips_through_save_get_update_and_list() {
 
 #[tokio::test]
 async fn line_edit_preserves_binary_attachment_bytes() {
-    let (ctx, dir) = test_context().await;
+    let (ctx, _backend, dir) = test_context().await;
     let bytes = vec![0x00, 0x9f, 0x92, 0x96, 0xff];
     let saved = save_note_tool(
         &ctx,
@@ -157,7 +158,7 @@ async fn line_edit_preserves_binary_attachment_bytes() {
 
 #[tokio::test]
 async fn delete_note_tool_soft_deletes_once_and_hides_the_note() {
-    let (ctx, _dir) = test_context().await;
+    let (ctx, backend, _dir) = test_context().await;
     let note = save_note_tool(
         &ctx,
         SaveNoteToolInput {
@@ -176,16 +177,13 @@ async fn delete_note_tool_soft_deletes_once_and_hides_the_note() {
         .await
         .unwrap()
         .is_empty());
-    assert!(
-        note_storage::note_exists(&ctx.storage.connect().unwrap(), &note.id)
-            .await
-            .unwrap()
-    );
+    let session = backend.session().await.unwrap();
+    assert!(session.note_exists(&note.id).await.unwrap());
 }
 
 #[tokio::test]
 async fn save_note_tool_honors_duplicate_check_config() {
-    let (ctx, _dir) = test_context().await;
+    let (ctx, _backend, _dir) = test_context().await;
     update_system_config(
         &ctx,
         &SystemConfig {
@@ -225,7 +223,7 @@ async fn save_note_tool_honors_duplicate_check_config() {
 
 #[tokio::test]
 async fn semantic_search_tool_finds_saved_note() {
-    let (ctx, _dir) = test_context().await;
+    let (ctx, _backend, _dir) = test_context().await;
     save_note_tool(
         &ctx,
         SaveNoteToolInput {
@@ -255,7 +253,7 @@ async fn semantic_search_tool_finds_saved_note() {
 
 #[tokio::test]
 async fn semantic_search_tool_filters_by_label() {
-    let (ctx, _dir) = test_context().await;
+    let (ctx, _backend, _dir) = test_context().await;
     save_note_tool(
         &ctx,
         SaveNoteToolInput {

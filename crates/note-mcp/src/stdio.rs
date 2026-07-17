@@ -658,24 +658,27 @@ pub async fn run_stdio(ctx: Arc<Context>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use note_embedding::StubEmbedder;
-    use note_storage::Storage;
+    use note_storage::StorageBackend;
+    use note_storage_turso::TursoStorage;
     use rmcp::model::ErrorCode;
     use serde_json::json;
     use tempfile::TempDir;
 
     // Returns the TempDir guard alongside the Context so the caller keeps it
     // alive: dropping it deletes the DB directory (mirrors note-pipelines tests).
-    async fn test_context() -> (Context, TempDir) {
+    async fn test_context() -> (Context, Arc<dyn StorageBackend>, TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = Storage::open_local(dir.path().join("test.db").to_str().unwrap())
-            .await
-            .unwrap();
-        let ctx = Context::with_attachment_dir(
-            Arc::new(storage),
+        let backend: Arc<dyn StorageBackend> = Arc::new(
+            TursoStorage::open(dir.path().join("test.db"))
+                .await
+                .unwrap(),
+        );
+        let ctx = Context::new(
+            backend.clone(),
             Arc::new(StubEmbedder),
             dir.path().join("attachments"),
         );
-        (ctx, dir)
+        (ctx, backend, dir)
     }
 
     fn attachment_request(
@@ -694,7 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_builds_and_lists_all_tools() {
-        let (ctx, _dir) = test_context().await;
+        let (ctx, _backend, _dir) = test_context().await;
         let server = NoteMcpServer::new(Arc::new(ctx));
         let tools = server.tool_router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
@@ -725,7 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_attachment_inputs_return_invalid_params_without_writes() {
-        let (ctx, dir) = test_context().await;
+        let (ctx, backend, dir) = test_context().await;
         let server = NoteMcpServer::new(Arc::new(ctx));
         for (attachment, expected) in [
             (
@@ -758,10 +761,8 @@ mod tests {
             assert!(error.message.contains(expected), "{}", error.message);
         }
 
-        let notes =
-            note_storage::list_notes(&server.ctx.storage.connect().unwrap(), &[], None, None)
-                .await
-                .unwrap();
+        let session = backend.session().await.unwrap();
+        let notes = session.list_notes(&[], None, None).await.unwrap();
         assert!(notes.is_empty());
         let attachments_dir = dir.path().join("attachments");
         assert!(
@@ -772,7 +773,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_text_and_matching_base64_roundtrip_through_update_and_list() {
-        let (ctx, _dir) = test_context().await;
+        let (ctx, _backend, _dir) = test_context().await;
         let server = NoteMcpServer::new(Arc::new(ctx));
         let saved = server
             .save_note(Parameters(SaveNoteRequest {
@@ -874,7 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn binary_note_response_uses_canonical_base64_and_omits_text() {
-        let (ctx, dir) = test_context().await;
+        let (ctx, _backend, dir) = test_context().await;
         let server = NoteMcpServer::new(Arc::new(ctx));
         let saved = server
             .save_note(Parameters(SaveNoteRequest {
@@ -952,7 +953,7 @@ mod tests {
             .iter()
             .any(|value| value == "content_base64"));
 
-        let (ctx, _dir) = test_context().await;
+        let (ctx, _backend, _dir) = test_context().await;
         let server = NoteMcpServer::new(Arc::new(ctx));
         for name in ["save_note", "update_note"] {
             let tool = server

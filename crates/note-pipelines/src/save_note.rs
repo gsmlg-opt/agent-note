@@ -3,6 +3,7 @@ use note_core::{
     resolve_duplicate_rule, validate_label_value, validate_note_input, DuplicateNoteError, Label,
     LabelValueType, Note, NoteAttachment, NoteInput, ValidationError,
 };
+use note_storage::{NewNote, StorageTransaction, TransactionMode};
 use std::collections::HashMap;
 
 pub struct SaveNoteInput {
@@ -12,10 +13,28 @@ pub struct SaveNoteInput {
     pub labels: Vec<(String, String)>,
 }
 
-pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<Note> {
-    let conn = ctx.storage.connect()?;
+pub(crate) async fn finish_transaction<T>(
+    transaction: Box<dyn StorageTransaction>,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match result {
+        Ok(value) => {
+            transaction.commit().await?;
+            Ok(value)
+        }
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(error.context(format!(
+                "transaction rollback also failed: {rollback_error}"
+            ))),
+        },
+    }
+}
 
-    let existing_label_keys = note_storage::list_label_keys(&conn).await?;
+pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<Note> {
+    let session = ctx.storage().session().await?;
+
+    let existing_label_keys = session.list_label_keys().await?;
     let existing_keys: Vec<String> = existing_label_keys.iter().map(|k| k.key.clone()).collect();
     let label_value_types: HashMap<String, LabelValueType> = existing_label_keys
         .into_iter()
@@ -79,19 +98,21 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
 
     // The note row, labels, chunk hashes, and embedding jobs are committed atomically. Actual
     // embedding is deliberately out-of-process: save returns once the durable queue request exists.
-    let tx_result = async {
-        let tx = conn
-            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
-            .await?;
-        let config = note_storage::get_system_config(&tx).await?;
+    let transaction = match ctx.storage().begin(TransactionMode::Immediate).await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
+            return Err(error.into());
+        }
+    };
+    let transaction_result = async {
+        let config = transaction.get_system_config().await?;
         if config.duplicate_check.enabled {
             for rule in &config.duplicate_check.rules {
                 let Some(labels) = resolve_duplicate_rule(rule, &input.labels) else {
                     continue;
                 };
-                if let Some(existing_note_id) =
-                    note_storage::find_note_with_labels(&tx, &labels).await?
-                {
+                if let Some(existing_note_id) = transaction.find_note_with_labels(&labels).await? {
                     return Err(anyhow::Error::new(DuplicateNoteError {
                         existing_note_id,
                         labels,
@@ -100,17 +121,17 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
             }
         }
         for key in &missing_keys {
-            note_storage::insert_label_key_if_missing(&tx, key, "").await?;
+            transaction.insert_label_key_if_missing(key, "").await?;
         }
         // A missing key may have been created with a non-text type before this immediate
         // transaction acquired the write lock. Validate against the catalog state protected by
         // this transaction before persisting any label values.
-        let current_label_types: HashMap<String, LabelValueType> =
-            note_storage::list_label_keys(&tx)
-                .await?
-                .into_iter()
-                .map(|label_key| (label_key.key, label_key.value_type))
-                .collect();
+        let current_label_types: HashMap<String, LabelValueType> = transaction
+            .list_label_keys()
+            .await?
+            .into_iter()
+            .map(|label_key| (label_key.key, label_key.value_type))
+            .collect();
         for (key, value) in &input.labels {
             let value_type = current_label_types
                 .get(key)
@@ -124,28 +145,31 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
                 }));
             }
         }
-        note_storage::insert_note_with_attachments(
-            &tx,
-            &id,
-            &input.title,
-            &input.content,
-            prepared_attachments.metadata(),
-            now,
-            now,
-            note_revision,
-        )
-        .await?;
-        let queued = crate::sync_note_embedding_jobs(&tx, &id, &chunks, note_revision, now).await?;
+        transaction
+            .insert_note(NewNote {
+                id: &id,
+                title: &input.title,
+                content: &input.content,
+                attachments: prepared_attachments.metadata(),
+                created_at: now,
+                updated_at: now,
+                note_revision,
+                deleted_at: None,
+            })
+            .await?;
+        let queued =
+            crate::sync_note_embedding_jobs(transaction.as_ref(), &id, &chunks, note_revision, now)
+                .await?;
         for (key, value) in &input.labels {
-            note_storage::attach_label(&tx, &id, key, value).await?;
+            transaction.attach_label(&id, key, value).await?;
         }
-        let resolved_labels: Vec<Label> = note_storage::labels_for_note(&tx, &id).await?;
-        tx.commit().await?;
+        let resolved_labels: Vec<Label> = transaction.labels_for_note(&id).await?;
         anyhow::Ok((queued, resolved_labels))
     }
     .await;
 
-    let (queued, resolved_labels) = match tx_result {
+    let finalized = finish_transaction(transaction, transaction_result).await;
+    let (queued, resolved_labels) = match finalized {
         Ok(result) => result,
         Err(error) => {
             crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
