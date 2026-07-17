@@ -1,8 +1,10 @@
 use crate::context::Context;
-use note_core::{parse_label_selectors, rrf_fuse, SearchResult};
+use note_core::{parse_label_selectors, weighted_rrf_fuse, SearchResult};
 use std::collections::HashSet;
 
-const RRF_K: f32 = 60.0; // docs/design.md §5 — tunable, revisit if fusion balance looks off
+const RRF_K: f32 = 60.0;
+const TITLE_RRF_WEIGHT: f32 = 3.0;
+const CONTENT_RRF_WEIGHT: f32 = 1.0;
 
 pub async fn search_notes(
     ctx: &Context,
@@ -51,8 +53,15 @@ pub async fn search_notes_filtered(
         limit
     };
 
+    let title_ranking = session.title_search(query, retrieval_limit).await?;
     let dense_ranking = session.dense_search(&dense, retrieval_limit).await?;
-    let fused = rrf_fuse(&[dense_ranking], RRF_K);
+    let fused = weighted_rrf_fuse(
+        &[
+            (TITLE_RRF_WEIGHT, title_ranking.as_slice()),
+            (CONTENT_RRF_WEIGHT, dense_ranking.as_slice()),
+        ],
+        RRF_K,
+    );
 
     let mut results = vec![];
     for (note_id, score) in fused {
@@ -62,8 +71,8 @@ pub async fn search_notes_filtered(
         {
             continue;
         }
-        // A None here means an index row outlived its note row; it would only occur under index/note
-        // divergence (e.g. a future delete path with a bug).
+        // A None here means a title/dense retrieval row outlived its note row; it would only occur
+        // under index/note divergence (e.g. a future delete path with a bug).
         if let Some(mut note) = session.get_note(&note_id).await? {
             crate::attachment_files::hydrate_note_attachments(ctx, &mut note)?;
             results.push(SearchResult { note, score });

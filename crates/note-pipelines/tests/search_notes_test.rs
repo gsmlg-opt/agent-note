@@ -49,8 +49,8 @@ async fn search_filters_results_by_label() {
     save_note(
         &ctx,
         SaveNoteInput {
-            title: "Rust ownership".into(),
-            content: "Shared searchable content".into(),
+            title: "Shared Rust title".into(),
+            content: "Alpha body".into(),
             attachments: vec![],
             labels: vec![("topic".into(), "rust".into())],
         },
@@ -60,8 +60,8 @@ async fn search_filters_results_by_label() {
     save_note(
         &ctx,
         SaveNoteInput {
-            title: "Ops checklist".into(),
-            content: "Shared searchable content".into(),
+            title: "Shared Ops title".into(),
+            content: "Beta body".into(),
             attachments: vec![],
             labels: vec![("topic".into(), "ops".into())],
         },
@@ -70,15 +70,62 @@ async fn search_filters_results_by_label() {
     .unwrap();
     drain_embedding_jobs(&ctx, 10).await.unwrap();
 
-    let results = search_notes_filtered(
+    let results = search_notes_filtered(&ctx, "Shared", 10, Some("topic=rust".into()))
+        .await
+        .unwrap();
+
+    assert!(results.iter().any(|r| r.note.title == "Shared Rust title"));
+    assert!(!results.iter().any(|r| r.note.title == "Shared Ops title"));
+}
+
+#[tokio::test]
+async fn title_only_match_is_retrieved_without_body_embeddings() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let note = save_note(
         &ctx,
-        "Shared searchable content",
-        10,
-        Some("topic=rust".into()),
+        SaveNoteInput {
+            title: "Quasar handbook".into(),
+            content: "Unrelated body text".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
     )
     .await
     .unwrap();
 
-    assert!(results.iter().any(|r| r.note.title == "Rust ownership"));
-    assert!(!results.iter().any(|r| r.note.title == "Ops checklist"));
+    let results = search_notes(&ctx, "Quasar", 10).await.unwrap();
+
+    assert_eq!(results[0].note.id, note.id);
+}
+
+#[tokio::test]
+async fn rank_one_title_match_outranks_rank_one_content_match() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let title_match = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Needle handbook".into(),
+            content: "Alpha unrelated body".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Other handbook".into(),
+            content: "Needle".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
+
+    let results = search_notes(&ctx, "Needle", 1).await.unwrap();
+
+    assert_eq!(results[0].note.id, title_match.id);
 }

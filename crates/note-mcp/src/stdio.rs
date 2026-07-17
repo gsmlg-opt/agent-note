@@ -611,7 +611,7 @@ impl NoteMcpServer {
         }))
     }
 
-    /// Semantic (hybrid dense+sparse) search over saved notes.
+    /// Weighted title-FTS and dense-content retrieval over saved notes.
     #[tool(
         name = "semantic_search",
         description = "Search saved notes semantically with an optional label selector filter and return the top matches."

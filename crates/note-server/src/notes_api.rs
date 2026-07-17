@@ -1660,6 +1660,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_prefers_a_title_match_over_an_exact_content_match() {
+        let (app, ctx, _dir) = test_app().await;
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Needle handbook","content":"Alpha unrelated body","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Other handbook","content":"Needle","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        note_pipelines::drain_embedding_jobs(&ctx, 10)
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(post("/api/notes/search", r#"{"query":"Needle","limit":1}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let results: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(results[0]["title"], "Needle handbook");
+    }
+
+    #[tokio::test]
     async fn search_filters_by_label() {
         let (app, ctx, _dir) = test_app().await;
         app.clone()
