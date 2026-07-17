@@ -1,7 +1,9 @@
 mod connection;
+mod embedding_jobs;
 mod labels;
 mod notes;
 mod preflight;
+mod retrieval;
 mod settings;
 
 pub use connection::TursoSession;
