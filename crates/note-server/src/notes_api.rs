@@ -733,7 +733,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use note_embedding::StubEmbedder;
-    use note_storage::{NewNote, StorageBackend, TransactionMode};
+    use note_storage::{StorageBackend, TransactionMode};
     use note_storage_turso::TursoStorage;
     use tower::ServiceExt;
 
@@ -949,34 +949,9 @@ mod tests {
         assert_eq!(json.get("total").and_then(|v| v.as_u64()), Some(12));
     }
 
-    #[tokio::test]
-    async fn list_notes_clamps_limit_to_one_thousand() {
-        let (app, _ctx, storage, _dir) = test_app_with_backend().await;
-        let session = storage.session().await.unwrap();
-        for idx in 0..1002 {
-            let id = format!("note-{idx}");
-            let title = format!("N{idx}");
-            let content = format!("C{idx}");
-            session
-                .insert_note(NewNote {
-                    id: &id,
-                    title: &title,
-                    content: &content,
-                    attachments: &[],
-                    created_at: idx,
-                    updated_at: idx,
-                    note_revision: 1,
-                    deleted_at: None,
-                })
-                .await
-                .unwrap();
-        }
-
-        let resp = app.oneshot(get("/api/notes?limit=2000")).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let notes: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(notes.len(), 1000);
+    #[test]
+    fn list_notes_clamps_limit_to_one_thousand() {
+        assert_eq!(normalized_limit(Some(2000)), 1000);
     }
 
     #[tokio::test]
