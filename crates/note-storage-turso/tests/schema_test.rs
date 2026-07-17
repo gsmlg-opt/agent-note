@@ -124,7 +124,7 @@ async fn schema_v1_is_rejected_without_modification() {
 }
 
 #[tokio::test]
-async fn fresh_database_contains_the_logical_schema_for_exact_linear_retrieval() {
+async fn fresh_database_contains_schema_v2_retrieval_objects() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("schema.db");
     drop(TursoStorage::open(&path).await.unwrap());

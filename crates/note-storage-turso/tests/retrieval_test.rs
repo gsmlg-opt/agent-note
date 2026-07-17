@@ -252,7 +252,13 @@ async fn empty_inputs_and_zero_limits_return_no_results() {
 #[tokio::test]
 async fn deleting_a_note_cascades_chunks_jobs_and_retrieval() {
     let fixture = fixture().await;
-    insert_test_note(&fixture.session, "a").await;
+    insert_named_note(
+        &fixture.session,
+        "a",
+        "Distinctive cascade heading",
+        "content",
+    )
+    .await;
     fixture
         .session
         .upsert_note_chunk(UpsertNoteChunk {
@@ -276,9 +282,20 @@ async fn deleting_a_note_cascades_chunks_jobs_and_retrieval() {
         .enqueue_embedding_job("a", 0, "hash", "content", 1, 1)
         .await
         .unwrap();
+    assert_eq!(
+        fixture.session.title_search("cascade", 10).await.unwrap(),
+        vec!["a"]
+    );
+
     fixture.session.soft_delete_note("a", 2).await.unwrap();
     fixture.session.permanently_delete_note("a").await.unwrap();
 
+    let observer = fixture.storage.connect().await.unwrap();
+    assert!(observer
+        .title_search("cascade", 10)
+        .await
+        .unwrap()
+        .is_empty());
     assert!(fixture
         .session
         .list_note_chunks("a")
