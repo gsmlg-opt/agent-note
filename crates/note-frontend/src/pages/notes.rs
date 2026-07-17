@@ -14,6 +14,8 @@ use crate::state::{LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
 const DEFAULT_PAGE_SIZE: usize = 10;
 const MAX_PAGE_SIZE: usize = 1000;
 const PAGE_SIZE_OPTIONS: [usize; 5] = [10, 30, 50, 100, 1000];
+const RETRIEVAL_PLACEHOLDER: &str = "Retrieve by title or content";
+const RETRIEVE_BUTTON_LABEL: &str = "Retrieve";
 
 #[derive(Clone, PartialEq)]
 struct NotesUrlState {
@@ -137,13 +139,13 @@ fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
 }
 
 /// Default page: a table of all notes (title, labels, per-row view/edit/remove actions), with a
-/// search bar that swaps the table for ranked results.
+/// retrieval bar that swaps the table for ranked results.
 #[function_component(NotesPage)]
 pub fn notes_page() -> Html {
     let notes = use_state(Vec::<NoteSummary>::new);
     let total_notes = use_state(|| 0usize);
     let label_keys = use_state(Vec::<LabelKey>::new);
-    // `Some` while a search is active; `None` shows the full table.
+    // `Some` while retrieval is active; `None` shows the full table.
     let results = use_state(|| None::<Vec<SearchResultSummary>>);
     let query = use_state(String::new);
     let loading = use_state(|| true);
@@ -444,11 +446,13 @@ pub fn notes_page() -> Html {
                     <input
                         class="input input-primary"
                         type="text"
-                        placeholder="Search your notes"
+                        placeholder={RETRIEVAL_PLACEHOLDER}
                         value={(*query).clone()}
                         oninput={on_query_input}
                     />
-                    <Button variant={Some("primary".to_string())}>{ "Search" }</Button>
+                    <Button variant={Some("primary".to_string())}>
+                        <>{ RETRIEVE_BUTTON_LABEL }</>
+                    </Button>
                     if results.is_some() || !(*label_filters).is_empty() || !(*query).is_empty() {
                         <button type="button" class="btn btn-ghost" onclick={on_clear}>{ "Clear" }</button>
                     }
@@ -824,5 +828,16 @@ fn search_results_view(
             </ul>
             { pagination_bar(current, total_pages, total, start, end, **page_size, on_page_change, on_page_size_change, on_refresh) }
         </>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrieval_copy_names_title_and_content() {
+        assert_eq!(RETRIEVAL_PLACEHOLDER, "Retrieve by title or content");
+        assert_eq!(RETRIEVE_BUTTON_LABEL, "Retrieve");
     }
 }
