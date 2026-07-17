@@ -9,12 +9,16 @@ mod settings;
 pub use connection::TursoSession;
 
 use connection::map_turso_error;
-use note_storage::{StorageError, StorageErrorKind, StorageResult};
+use note_storage::{
+    BackendInfo, StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
+    StorageTransaction, TransactionMode,
+};
 use preflight::{incompatible_database, preflight_and_reserve, PinnedIo, Preflight};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct TursoStorage {
     database: turso::Database,
+    path: PathBuf,
 }
 
 impl TursoStorage {
@@ -30,13 +34,17 @@ impl TursoStorage {
         path_string: &str,
         state: Preflight,
     ) -> StorageResult<Self> {
+        let absolute_path = absolute_database_path(path)?;
         let (io, state) = PinnedIo::prepare(path, path_string, state)?;
         let database = turso::Builder::new_local(path_string)
             .with_io_impl(io.clone())
             .build()
             .await
             .map_err(|error| map_turso_error("open local database", error))?;
-        let storage = Self { database };
+        let storage = Self {
+            database,
+            path: absolute_path,
+        };
         let session = storage.connect().await?;
 
         match state {
@@ -57,6 +65,30 @@ impl TursoStorage {
     }
 }
 
+#[async_trait::async_trait]
+impl StorageBackend for TursoStorage {
+    async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+        Ok(Box::new(self.connect().await?))
+    }
+
+    async fn begin(&self, mode: TransactionMode) -> StorageResult<Box<dyn StorageTransaction>> {
+        let mut session = self.connect().await?;
+        session.begin_transaction(mode).await?;
+        Ok(Box::new(session))
+    }
+
+    async fn info(&self) -> StorageResult<BackendInfo> {
+        let session = self.connect().await?;
+        let page_count = connection::pragma_i64(&session.connection, "PRAGMA page_count").await?;
+        let page_size = connection::pragma_i64(&session.connection, "PRAGMA page_size").await?;
+        Ok(BackendInfo {
+            engine: "embed".to_string(),
+            location: Some(self.path.clone()),
+            size_bytes: Some(page_count.max(0) as u64 * page_size.max(0) as u64),
+        })
+    }
+}
+
 fn database_path(path: &Path) -> StorageResult<&str> {
     path.to_str().ok_or_else(|| {
         StorageError::new(
@@ -64,6 +96,24 @@ fn database_path(path: &Path) -> StorageResult<&str> {
             format!("database path is not valid UTF-8: {}", path.display()),
         )
     })
+}
+
+fn absolute_database_path(path: &Path) -> StorageResult<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                format!(
+                    "resolve absolute database path for reporting: {}",
+                    path.display()
+                ),
+                error,
+            )
+        })
 }
 
 #[cfg(test)]

@@ -1,4 +1,6 @@
-use note_storage::{StorageError, StorageErrorKind, StorageResult};
+use note_storage::{
+    StorageError, StorageErrorKind, StorageResult, StorageTransaction, TransactionMode,
+};
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,6 +19,7 @@ pub(crate) enum OpenedState {
 
 pub struct TursoSession {
     pub(crate) connection: turso::Connection,
+    pub(crate) transaction_open: bool,
 }
 
 impl TursoSession {
@@ -40,7 +43,39 @@ impl TursoSession {
             ));
         }
 
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            transaction_open: false,
+        })
+    }
+
+    pub(crate) async fn begin_transaction(&mut self, mode: TransactionMode) -> StorageResult<()> {
+        let (sql, context) = match mode {
+            TransactionMode::Deferred => ("BEGIN DEFERRED", "begin deferred storage transaction"),
+            TransactionMode::Immediate => {
+                ("BEGIN IMMEDIATE", "begin immediate storage transaction")
+            }
+        };
+        self.connection
+            .execute(sql, ())
+            .await
+            .map_err(|error| map_turso_error(context, error))?;
+        self.transaction_open = true;
+        Ok(())
+    }
+
+    async fn finalize_transaction(&mut self, sql: &str, context: &str) -> StorageResult<()> {
+        let context = if self.transaction_open {
+            context
+        } else {
+            "finalize storage session without an open transaction"
+        };
+        self.connection
+            .execute(sql, ())
+            .await
+            .map_err(|error| map_transaction_error(context, error))?;
+        self.transaction_open = false;
+        Ok(())
     }
 
     pub(crate) async fn opened_state(&self, path: &Path) -> StorageResult<OpenedState> {
@@ -107,7 +142,20 @@ impl TursoSession {
     }
 }
 
-async fn pragma_i64(connection: &turso::Connection, pragma: &str) -> StorageResult<i64> {
+#[async_trait::async_trait]
+impl StorageTransaction for TursoSession {
+    async fn commit(mut self: Box<Self>) -> StorageResult<()> {
+        self.finalize_transaction("COMMIT", "commit storage transaction")
+            .await
+    }
+
+    async fn rollback(mut self: Box<Self>) -> StorageResult<()> {
+        self.finalize_transaction("ROLLBACK", "rollback storage transaction")
+            .await
+    }
+}
+
+pub(crate) async fn pragma_i64(connection: &turso::Connection, pragma: &str) -> StorageResult<i64> {
     let mut rows = connection
         .query(pragma, ())
         .await
@@ -220,6 +268,10 @@ pub(crate) fn map_turso_error(context: &str, error: turso::Error) -> StorageErro
         _ => StorageErrorKind::Operation,
     };
     StorageError::with_source(kind, context, error)
+}
+
+fn map_transaction_error(context: &str, error: turso::Error) -> StorageError {
+    StorageError::with_source(StorageErrorKind::Transaction, context, error)
 }
 
 fn initialization_error(primary: turso::Error, rollback: Option<turso::Error>) -> StorageError {
