@@ -3,11 +3,12 @@ use std::io::Read as _;
 use std::path::Path;
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
-const APPLICATION_ID: u32 = 0x414E4F54;
-const SCHEMA_VERSION: u32 = 1;
+pub(crate) const APPLICATION_ID: u32 = 0x414E4F54;
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Preflight {
+    Missing,
     Fresh,
     Existing,
 }
@@ -15,7 +16,7 @@ pub(crate) enum Preflight {
 pub(crate) fn preflight(path: &Path) -> StorageResult<Preflight> {
     match std::fs::metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Preflight::Fresh);
+            return Ok(Preflight::Missing);
         }
         Err(error) => return Err(io_error(path, error)),
         Ok(metadata) if metadata.len() == 0 => return Ok(Preflight::Fresh),
@@ -37,22 +38,49 @@ pub(crate) fn preflight(path: &Path) -> StorageResult<Preflight> {
     let user_version = u32::from_be_bytes(header[60..64].try_into().unwrap());
     let application_id = u32::from_be_bytes(header[68..72].try_into().unwrap());
     if application_id != APPLICATION_ID {
-        return Err(StorageError::new(
-            StorageErrorKind::IncompatibleDatabase,
-            format!(
-                "{} is not an agent-note database; remove the legacy test database and restart",
-                path.display()
-            ),
-        ));
+        return Err(incompatible_database(path));
     }
     if user_version != SCHEMA_VERSION {
-        return Err(StorageError::new(
-            StorageErrorKind::UnsupportedSchema,
-            format!("unsupported agent-note schema version {user_version}"),
-        ));
+        return Err(unsupported_schema(user_version));
     }
 
     Ok(Preflight::Existing)
+}
+
+pub(crate) fn preflight_and_reserve(path: &Path) -> StorageResult<Preflight> {
+    loop {
+        match preflight(path)? {
+            Preflight::Missing => {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    Ok(_) => return Ok(Preflight::Fresh),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(io_error(path, error)),
+                }
+            }
+            state => return Ok(state),
+        }
+    }
+}
+
+pub(crate) fn incompatible_database(path: &Path) -> StorageError {
+    StorageError::new(
+        StorageErrorKind::IncompatibleDatabase,
+        format!(
+            "{} is not an agent-note database; remove the legacy test database and restart",
+            path.display()
+        ),
+    )
+}
+
+pub(crate) fn unsupported_schema(user_version: u32) -> StorageError {
+    StorageError::new(
+        StorageErrorKind::UnsupportedSchema,
+        format!("unsupported agent-note schema version {user_version}"),
+    )
 }
 
 fn io_error(path: &Path, error: std::io::Error) -> StorageError {

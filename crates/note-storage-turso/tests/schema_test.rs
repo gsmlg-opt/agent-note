@@ -188,6 +188,19 @@ async fn repeated_open_is_safe() {
     database_header(&path);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_first_open_is_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("concurrent.db");
+
+    let (first, second) = tokio::join!(TursoStorage::open(&path), TursoStorage::open(&path));
+
+    drop(first.unwrap());
+    drop(second.unwrap());
+    database_header(&path);
+    TursoStorage::open(&path).await.unwrap();
+}
+
 #[tokio::test]
 async fn configured_sessions_and_initialization_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
