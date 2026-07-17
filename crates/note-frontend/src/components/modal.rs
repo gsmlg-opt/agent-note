@@ -14,6 +14,7 @@ pub struct ModalProps {
 /// the panel's controls. Render it conditionally (mount when open).
 #[function_component(Modal)]
 pub fn modal(props: &ModalProps) -> Html {
+    let backdrop_ref = use_node_ref();
     let panel_ref = use_node_ref();
 
     {
@@ -28,10 +29,16 @@ pub fn modal(props: &ModalProps) -> Html {
 
     let on_backdrop = {
         let on_close = props.on_close.clone();
+        let backdrop_ref = backdrop_ref.clone();
         Callback::from(move |e: MouseEvent| {
             // Only dismiss when the backdrop itself is clicked — not a click bubbling up from the
-            // panel or its buttons.
-            if e.target() == e.current_target() {
+            // panel or its buttons. Yew delegates events from the app root, so `current_target`
+            // does not identify the element whose callback is running.
+            let clicked_backdrop = e
+                .target_dyn_into::<web_sys::Element>()
+                .zip(backdrop_ref.cast::<web_sys::Element>())
+                .is_some_and(|(target, backdrop)| target == backdrop);
+            if clicked_backdrop {
                 on_close.emit(());
             }
         })
@@ -47,7 +54,7 @@ pub fn modal(props: &ModalProps) -> Html {
     };
 
     html! {
-        <div class="app-modal-backdrop" onclick={on_backdrop}>
+        <div ref={backdrop_ref} class="app-modal-backdrop" onclick={on_backdrop}>
             <div
                 ref={panel_ref}
                 class="app-modal-panel"
