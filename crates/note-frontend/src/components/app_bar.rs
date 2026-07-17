@@ -4,7 +4,7 @@ use yew_router::prelude::*;
 use crate::components::icons;
 use crate::routes::Route;
 
-/// Primary application navigation. It is a sidebar on desktop and a compact bar on narrow screens.
+/// Primary application navigation in a full-width header with a centered inner row.
 #[function_component(AppBar)]
 pub fn app_bar() -> Html {
     let route = use_route::<Route>().unwrap_or(Route::NotFound);
@@ -19,26 +19,29 @@ pub fn app_bar() -> Html {
     let system_active = route == Route::System;
 
     html! {
-        <aside class="app-bar" aria-label="Primary navigation">
+        <header class="app-bar">
             <div class="app-bar-inner">
                 <Link<Route> to={Route::Home} classes={classes!("app-brand")}>
                     { "agent-note" }
                 </Link<Route>>
-                <div class="app-nav-group">
-                    <nav class="app-nav">
+                <nav class="app-nav-group" aria-label="Primary navigation">
+                    <div class="app-nav">
                         <Link<Route> to={Route::Home} classes={nav_classes(home_active)}>{ "Home" }</Link<Route>>
                         <Link<Route> to={Route::Notes} classes={nav_classes(notes_active)}>{ "Notes" }</Link<Route>>
                         <Link<Route> to={Route::NewNote} classes={nav_classes(new_note_active)}>{ "New note" }</Link<Route>>
                         <Link<Route> to={Route::Labels} classes={nav_classes(labels_active)}>{ "Labels" }</Link<Route>>
                         <Link<Route> to={Route::Trash} classes={nav_classes(trash_active)}>{ "Trash" }</Link<Route>>
-                    </nav>
-                    <Link<Route> to={Route::System} classes={nav_classes_with(system_active, "nav-link-system")}>
+                    </div>
+                    <Link<Route>
+                        to={Route::System}
+                        classes={nav_classes_with(system_active, "nav-link-system")}
+                    >
                         { icons::settings() }
                         <span>{ "System" }</span>
                     </Link<Route>>
-                </div>
+                </nav>
             </div>
-        </aside>
+        </header>
     }
 }
 
