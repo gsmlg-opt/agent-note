@@ -1,5 +1,8 @@
 mod connection;
+mod labels;
+mod notes;
 mod preflight;
+mod settings;
 
 pub use connection::TursoSession;
 

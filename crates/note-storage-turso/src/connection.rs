@@ -16,7 +16,7 @@ pub(crate) enum OpenedState {
 }
 
 pub struct TursoSession {
-    connection: turso::Connection,
+    pub(crate) connection: turso::Connection,
 }
 
 impl TursoSession {
@@ -210,19 +210,16 @@ fn verify_checkpoint_result(path: &Path, busy: i64) -> StorageResult<()> {
 }
 
 pub(crate) fn map_turso_error(context: &str, error: turso::Error) -> StorageError {
-    StorageError::with_source(turso_error_kind(&error), context, error)
-}
-
-fn turso_error_kind(error: &turso::Error) -> StorageErrorKind {
-    match error {
-        turso::Error::Busy(_) | turso::Error::BusySnapshot(_) => StorageErrorKind::Conflict,
+    let kind = match &error {
         turso::Error::Constraint(_) => StorageErrorKind::Constraint,
+        turso::Error::Busy(_) | turso::Error::BusySnapshot(_) => StorageErrorKind::Conflict,
         turso::Error::Corrupt(_) | turso::Error::NotAdb(_) => StorageErrorKind::Corrupt,
-        turso::Error::Readonly(_) | turso::Error::DatabaseFull(_) | turso::Error::IoError(..) => {
+        turso::Error::IoError(_, _) | turso::Error::Readonly(_) | turso::Error::DatabaseFull(_) => {
             StorageErrorKind::Unavailable
         }
         _ => StorageErrorKind::Operation,
-    }
+    };
+    StorageError::with_source(kind, context, error)
 }
 
 fn initialization_error(primary: turso::Error, rollback: Option<turso::Error>) -> StorageError {
@@ -230,12 +227,12 @@ fn initialization_error(primary: turso::Error, rollback: Option<turso::Error>) -
     if let Some(rollback) = rollback {
         message.push_str(&format!("; rollback also failed: {rollback}"));
     }
-    StorageError::with_source(turso_error_kind(&primary), message, primary)
+    map_turso_error(&message, primary)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{turso_error_kind, verify_checkpoint_result, StorageErrorKind};
+    use super::{map_turso_error, verify_checkpoint_result, StorageErrorKind};
     use crate::TursoStorage;
 
     async fn pragma_value(connection: &turso::Connection, pragma: &str) -> i64 {
@@ -264,11 +261,15 @@ mod tests {
     #[test]
     fn busy_driver_errors_are_conflicts() {
         assert_eq!(
-            turso_error_kind(&turso::Error::Busy("locked".into())),
+            map_turso_error("busy", turso::Error::Busy("locked".into())).kind(),
             StorageErrorKind::Conflict
         );
         assert_eq!(
-            turso_error_kind(&turso::Error::BusySnapshot("stale snapshot".into())),
+            map_turso_error(
+                "busy snapshot",
+                turso::Error::BusySnapshot("stale snapshot".into())
+            )
+            .kind(),
             StorageErrorKind::Conflict
         );
     }
