@@ -1,48 +1,8 @@
 use libsql::Connection;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoteChunk {
-    pub note_id: String,
-    pub chunk_idx: i64,
-    pub content_hash: String,
-    pub content: String,
-    pub note_revision: i64,
-    pub status: String,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddingJob {
-    pub id: i64,
-    pub note_id: String,
-    pub chunk_idx: i64,
-    pub content_hash: String,
-    pub content: String,
-    pub note_revision: i64,
-    pub attempts: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcessingEmbeddingNote {
-    pub id: String,
-    pub title: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddingDashboardStatus {
-    pub embedded_note_count: usize,
-    pub processing_note: Option<ProcessingEmbeddingNote>,
-}
-
-pub struct UpsertNoteChunk<'a> {
-    pub note_id: &'a str,
-    pub chunk_idx: i64,
-    pub content_hash: &'a str,
-    pub content: &'a str,
-    pub note_revision: i64,
-    pub status: &'a str,
-    pub updated_at: i64,
-}
+pub use crate::records::{
+    EmbeddingDashboardStatus, EmbeddingJob, NoteChunk, ProcessingEmbeddingNote, UpsertNoteChunk,
+};
 
 pub async fn embedding_dashboard_status(
     conn: &Connection,
