@@ -5,7 +5,7 @@ pub use connection::TursoSession;
 
 use connection::map_turso_error;
 use note_storage::{StorageError, StorageErrorKind, StorageResult};
-use preflight::{incompatible_database, preflight_and_reserve, Preflight};
+use preflight::{incompatible_database, preflight_and_reserve, PinnedIo, Preflight};
 use std::path::Path;
 
 pub struct TursoStorage {
@@ -15,18 +15,19 @@ pub struct TursoStorage {
 impl TursoStorage {
     pub async fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         let path = path.as_ref();
+        let path_string = database_path(path)?;
         let state = preflight_and_reserve(path)?;
-        Self::open_preflighted(path, state).await
+        Self::open_preflighted(path, path_string, state).await
     }
 
-    async fn open_preflighted(path: &Path, state: Preflight) -> StorageResult<Self> {
-        let path_string = path.to_str().ok_or_else(|| {
-            StorageError::new(
-                StorageErrorKind::Operation,
-                format!("database path is not valid UTF-8: {}", path.display()),
-            )
-        })?;
+    async fn open_preflighted(
+        path: &Path,
+        path_string: &str,
+        state: Preflight,
+    ) -> StorageResult<Self> {
+        let (io, state) = PinnedIo::prepare(path, path_string, state)?;
         let database = turso::Builder::new_local(path_string)
+            .with_io_impl(io.clone())
             .build()
             .await
             .map_err(|error| map_turso_error("open local database", error))?;
@@ -42,12 +43,22 @@ impl TursoStorage {
             Preflight::Missing => return Err(incompatible_database(path)),
         }
 
+        io.verify_ready(path)?;
         Ok(storage)
     }
 
     pub async fn connect(&self) -> StorageResult<TursoSession> {
         TursoSession::configured(&self.database).await
     }
+}
+
+fn database_path(path: &Path) -> StorageResult<&str> {
+    path.to_str().ok_or_else(|| {
+        StorageError::new(
+            StorageErrorKind::Operation,
+            format!("database path is not valid UTF-8: {}", path.display()),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -72,17 +83,43 @@ mod tests {
         while rows.next().await.unwrap().is_some() {}
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn stale_fresh_preflight_rejects_actual_unmarked_database_without_writes() {
+    async fn invalid_utf8_path_is_rejected_without_creating_a_file() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(OsString::from_vec(b"invalid-\xff.db".to_vec()));
+
+        let error = match TursoStorage::open(&path).await {
+            Ok(_) => panic!("invalid UTF-8 path was accepted"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), StorageErrorKind::Operation);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_fresh_preflight_does_not_convert_a_rollback_database_to_wal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replaced.db");
         create_unmarked_database(&path).await;
-        let before = std::fs::read(&path).unwrap();
+        let mut before = std::fs::read(&path).unwrap();
+        before[18] = 1;
+        before[19] = 1;
+        std::fs::write(&path, &before).unwrap();
 
-        let error = match TursoStorage::open_preflighted(&path, Preflight::Fresh).await {
-            Ok(_) => panic!("stale fresh eligibility initialized an unmarked database"),
-            Err(error) => error,
-        };
+        let error =
+            match TursoStorage::open_preflighted(&path, path.to_str().unwrap(), Preflight::Fresh)
+                .await
+            {
+                Ok(_) => panic!("stale fresh eligibility initialized an unmarked database"),
+                Err(error) => error,
+            };
 
         assert_eq!(error.kind(), StorageErrorKind::IncompatibleDatabase);
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -95,7 +132,13 @@ mod tests {
         create_unmarked_database(&path).await;
         let before = std::fs::read(&path).unwrap();
 
-        let error = match TursoStorage::open_preflighted(&path, Preflight::Existing).await {
+        let error = match TursoStorage::open_preflighted(
+            &path,
+            path.to_str().unwrap(),
+            Preflight::Existing,
+        )
+        .await
+        {
             Ok(_) => panic!("stale existing eligibility accepted an unmarked database"),
             Err(error) => error,
         };
@@ -110,7 +153,7 @@ mod tests {
         let path = dir.path().join("initialized.db");
         drop(TursoStorage::open(&path).await.unwrap());
 
-        TursoStorage::open_preflighted(&path, Preflight::Fresh)
+        TursoStorage::open_preflighted(&path, path.to_str().unwrap(), Preflight::Fresh)
             .await
             .unwrap();
     }

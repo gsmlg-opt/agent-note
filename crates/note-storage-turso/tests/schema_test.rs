@@ -31,7 +31,7 @@ async fn fresh_database_is_marked_and_reopens() {
 }
 
 #[tokio::test]
-async fn unmarked_sqlite_database_is_rejected_without_modification() {
+async fn rollback_journal_unmarked_database_is_rejected_without_modification() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy.db");
     let database = turso::Builder::new_local(path.to_str().unwrap())
@@ -46,7 +46,10 @@ async fn unmarked_sqlite_database_is_rejected_without_modification() {
     connection.cacheflush().unwrap();
     drop(connection);
     drop(database);
-    let before = std::fs::read(&path).unwrap();
+    let mut before = std::fs::read(&path).unwrap();
+    before[18] = 1;
+    before[19] = 1;
+    std::fs::write(&path, &before).unwrap();
 
     let error = match TursoStorage::open(&path).await {
         Ok(_) => panic!("unmarked database was accepted"),
