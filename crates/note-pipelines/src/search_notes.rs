@@ -5,6 +5,9 @@ use std::collections::HashSet;
 const RRF_K: f32 = 60.0;
 const TITLE_RRF_WEIGHT: f32 = 3.0;
 const CONTENT_RRF_WEIGHT: f32 = 1.0;
+const RETRIEVAL_OVERFETCH_FACTOR: usize = 32;
+const MIN_RETRIEVAL_CANDIDATES: usize = 128;
+const MAX_RETRIEVAL_CANDIDATES: usize = 4_096;
 
 pub async fn search_notes(
     ctx: &Context,
@@ -47,11 +50,9 @@ pub async fn search_notes_filtered(
         }
         Some(ids)
     };
-    let retrieval_limit = if allowed_note_ids.is_some() {
-        limit.saturating_mul(32).max(128)
-    } else {
-        limit
-    };
+    let retrieval_limit = limit
+        .saturating_mul(RETRIEVAL_OVERFETCH_FACTOR)
+        .clamp(MIN_RETRIEVAL_CANDIDATES, MAX_RETRIEVAL_CANDIDATES);
 
     let title_ranking = session.title_search(query, retrieval_limit).await?;
     let dense_ranking = session.dense_search(&dense, retrieval_limit).await?;

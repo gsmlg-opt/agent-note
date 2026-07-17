@@ -129,3 +129,55 @@ async fn rank_one_title_match_outranks_rank_one_content_match() {
 
     assert_eq!(results[0].note.id, title_match.id);
 }
+
+#[tokio::test]
+async fn fusion_overfetches_candidates_before_applying_requested_limit() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let both_channels = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Needle handbook".into(),
+            content: "Needle".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
+    save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Needle Needle Needle handbook".into(),
+            content: "Alpha unrelated body".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let results = search_notes(&ctx, "Needle", 1).await.unwrap();
+
+    assert_eq!(results[0].note.id, both_channels.id);
+}
+
+#[tokio::test]
+async fn huge_limit_is_bounded_before_storage_retrieval() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Quasar handbook".into(),
+            content: "Unrelated body text".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let results = search_notes(&ctx, "Quasar", usize::MAX).await.unwrap();
+
+    assert_eq!(results[0].note.id, note.id);
+}
