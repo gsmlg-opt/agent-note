@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/note-core",
     "crates/note-storage",
+    "crates/note-storage-turso",
     "crates/note-embedding",
     "crates/note-pipelines",
     "crates/note-mcp",
