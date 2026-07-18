@@ -2,14 +2,16 @@ use aws_config::{retry::RetryConfig, BehaviorVersion, Region};
 use aws_sdk_s3::{
     error::{ProvideErrorMetadata, SdkError},
     primitives::ByteStream,
+    types::{Delete, ObjectIdentifier},
     Client,
 };
+use note_core::NoteAttachment;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{Arc, Mutex as StdMutex, Weak},
 };
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const S3_PAGE_SIZE: i32 = 1_000;
 const S3_DELETE_BATCH_SIZE: usize = 1_000;
@@ -36,6 +38,15 @@ pub struct S3AttachmentStore {
 #[derive(Default)]
 struct NoteCoordination {
     locks: StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+}
+
+struct PreparedS3Set {
+    store: S3AttachmentStore,
+    note_id: String,
+    staging_prefix: String,
+    staged_keys: Vec<String>,
+    metadata: Vec<NoteAttachment>,
+    _note_guard: OwnedMutexGuard<()>,
 }
 
 impl fmt::Debug for S3AttachmentConfig {
@@ -130,6 +141,238 @@ impl S3AttachmentStore {
             .await
             .map_err(|error| safe_sdk_error("put object", &error))?;
         Ok(())
+    }
+
+    async fn prepare_set(
+        &self,
+        note_id: &str,
+        attachments: &[NoteAttachment],
+    ) -> anyhow::Result<PreparedS3Set> {
+        validate_note_id(note_id)?;
+        let note_guard = self.coordination.lock_for(note_id).lock_owned().await;
+        let mut canonical = Vec::with_capacity(attachments.len());
+        let mut canonical_set = HashSet::with_capacity(attachments.len());
+        let mut metadata = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let relative = crate::path::canonical_relative_path(&attachment.path)?;
+            if !canonical_set.insert(relative.clone()) {
+                anyhow::bail!("duplicate attachment path");
+            }
+            canonical.push(relative);
+            metadata.push(NoteAttachment {
+                id: attachment.id.clone(),
+                path: attachment.path.clone(),
+                mime: attachment.mime.clone(),
+                description: attachment.description.clone(),
+                content: Vec::new(),
+            });
+        }
+
+        let staging_prefix = staging_prefix(
+            &self.prefix,
+            note_id,
+            &uuid::Uuid::new_v4().simple().to_string(),
+        )?;
+        let mut uploaded = Vec::new();
+        for (attachment, relative) in attachments.iter().zip(canonical) {
+            let key = format!("{staging_prefix}{relative}");
+            // The request may have committed remotely even if its response is
+            // lost, so include the current key in idempotent cleanup first.
+            uploaded.push(key.clone());
+            if let Err(error) = self.put(&key, &attachment.content).await {
+                let cleanup = self.delete_keys(&uploaded).await;
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => {
+                        Err(error.context(format!("staging cleanup also failed: {cleanup_error}")))
+                    }
+                };
+            }
+        }
+
+        Ok(PreparedS3Set {
+            store: self.clone(),
+            note_id: note_id.to_string(),
+            staging_prefix,
+            staged_keys: uploaded,
+            metadata,
+            _note_guard: note_guard,
+        })
+    }
+
+    async fn read_key(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| safe_sdk_error("get object", &error))?;
+        let bytes = output
+            .body
+            .collect()
+            .await
+            .map_err(|_| anyhow::anyhow!("S3 get object body failed (stream)"))?;
+        Ok(bytes.into_bytes().to_vec())
+    }
+
+    async fn delete_keys(&self, keys: &[String]) -> anyhow::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let objects = keys
+            .iter()
+            .map(|key| ObjectIdentifier::builder().key(key).build())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| anyhow::anyhow!("S3 delete objects failed (invalid key)"))?;
+        let delete = Delete::builder()
+            .set_objects(Some(objects))
+            .quiet(true)
+            .build()
+            .map_err(|_| anyhow::anyhow!("S3 delete objects failed (invalid request)"))?;
+        let output = self
+            .client
+            .delete_objects()
+            .bucket(&self.bucket)
+            .delete(delete)
+            .send()
+            .await
+            .map_err(|error| safe_sdk_error("delete objects", &error))?;
+        if !output.errors().is_empty() {
+            anyhow::bail!(
+                "S3 delete objects failed for {} object(s)",
+                output.errors().len()
+            );
+        }
+        Ok(())
+    }
+
+    async fn list_keys_single_page(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let output = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_keys(S3_PAGE_SIZE)
+            .send()
+            .await
+            .map_err(|error| safe_sdk_error("list objects", &error))?;
+        Ok(output
+            .contents()
+            .iter()
+            .filter_map(|object| object.key())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    async fn publish_set(&self, prepared: PreparedS3Set) -> anyhow::Result<()> {
+        let publish_result = async {
+            for attachment in &prepared.metadata {
+                let relative = crate::path::canonical_relative_path(&attachment.path)?;
+                let source_key = format!("{}{relative}", prepared.staging_prefix);
+                let destination_key = final_key(&self.prefix, &prepared.note_id, &attachment.path)?;
+                self.client
+                    .copy_object()
+                    .copy_source(copy_source(&self.bucket, &source_key))
+                    .bucket(&self.bucket)
+                    .key(destination_key)
+                    .send()
+                    .await
+                    .map_err(|error| safe_sdk_error("copy object", &error))?;
+            }
+            self.delete_keys(&prepared.staged_keys).await
+        }
+        .await;
+
+        if let Err(error) = publish_result {
+            let staging_location = format!("s3://{}/{}", self.bucket, prepared.staging_prefix);
+            eprintln!(
+                "S3 attachment publication failed after database commit; \
+                 staged objects retained at {staging_location}"
+            );
+            return Err(error.context(format!(
+                "database committed; staged objects retained at {staging_location}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn safe_location(&self) -> String {
+        let suffix = if self.prefix.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", self.prefix)
+        };
+        format!("s3://{}{suffix}", self.bucket)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::PreparedAttachmentSet for PreparedS3Set {
+    fn metadata(&self) -> &[NoteAttachment] {
+        &self.metadata
+    }
+
+    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
+        let store = self.store.clone();
+        store.publish_set(*self).await
+    }
+
+    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
+        self.store.delete_keys(&self.staged_keys).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::AttachmentStore for S3AttachmentStore {
+    async fn prepare(
+        &self,
+        note_id: &str,
+        attachments: &[NoteAttachment],
+    ) -> anyhow::Result<Box<dyn crate::PreparedAttachmentSet>> {
+        Ok(Box::new(self.prepare_set(note_id, attachments).await?))
+    }
+
+    async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        validate_note_id(note_id)?;
+        let note_lock = self.coordination.lock_for(note_id);
+        let _guard = note_lock.lock().await;
+        self.read_key(&final_key(&self.prefix, note_id, path)?)
+            .await
+    }
+
+    async fn hydrate(
+        &self,
+        note_id: &str,
+        attachments: &mut [NoteAttachment],
+    ) -> anyhow::Result<()> {
+        validate_note_id(note_id)?;
+        let note_lock = self.coordination.lock_for(note_id);
+        let _guard = note_lock.lock().await;
+        for attachment in attachments {
+            attachment.content = self
+                .read_key(&final_key(&self.prefix, note_id, &attachment.path)?)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {
+        validate_note_id(note_id)?;
+        let note_lock = self.coordination.lock_for(note_id);
+        let _guard = note_lock.lock().await;
+        let keys = self
+            .list_keys_single_page(&final_prefix(&self.prefix, note_id)?)
+            .await?;
+        self.delete_keys(&keys).await
+    }
+
+    fn info(&self) -> crate::AttachmentStoreInfo {
+        crate::AttachmentStoreInfo {
+            engine: "s3".into(),
+            location: Some(self.safe_location()),
+        }
     }
 }
 
@@ -252,7 +495,7 @@ mod tests {
         time::Duration,
     };
     use wiremock::{
-        matchers::{header_regex, method, path},
+        matchers::{body_string_contains, header_regex, method, path, path_regex},
         Mock, MockServer, Request, Respond, ResponseTemplate,
     };
 
@@ -471,6 +714,66 @@ mod tests {
         store.put("retry/file.txt", b"payload").await.unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_failed_put_deletes_the_current_staging_key() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("cleanup-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("cleanup-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/private-name\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(503).set_body_string("private server detail"))
+            .expect(4)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agent-note/"))
+            .and(body_string_contains("private-name.txt</Key>"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<DeleteResult></DeleteResult>", "application/xml"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        let attachment = NoteAttachment {
+            id: "private-id".into(),
+            path: "private-name.txt".into(),
+            mime: "text/plain".into(),
+            description: String::new(),
+            content: b"private content".to_vec(),
+        };
+        let error = store
+            .prepare_set("note-1", &[attachment])
+            .await
+            .err()
+            .expect("ambiguous PUT must fail");
+
+        let rendered = error.to_string();
+        assert_eq!(rendered, "S3 put object failed (service)");
+        for secret in [
+            "private-name.txt",
+            "private server detail",
+            "cleanup-access",
+            "cleanup-secret",
+            &server.uri(),
+        ] {
+            assert!(!rendered.contains(secret));
+        }
     }
 
     #[test]
