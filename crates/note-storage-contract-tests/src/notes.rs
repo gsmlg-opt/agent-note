@@ -80,7 +80,11 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     assert_eq!(note.content, "Updated body");
     assert_eq!(note.created_at, 100);
     assert_eq!(note.updated_at, 110);
+    assert_eq!(note.attachments.len(), 1);
     assert_eq!(note.attachments[0].id, "updated");
+    assert_eq!(note.attachments[0].path, "updated.txt");
+    assert_eq!(note.attachments[0].mime, "text/plain");
+    assert_eq!(note.attachments[0].description, "updated metadata");
     assert!(note.attachments[0].content.is_empty());
     assert_eq!(
         session
@@ -217,6 +221,8 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     );
 
     for (id, created_at, priority, status) in [
+        ("contract-notes-numeric-low", 400, "1", "ready"),
+        ("contract-notes-numeric-ten", 350, "10", "ready"),
         ("contract-notes-newer", 300, "5", "ready"),
         ("contract-notes-middle", 200, "3", "ready"),
         ("contract-notes-other", 150, "9", "blocked"),
@@ -245,7 +251,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     }
 
     let selectors = parse_label_selectors("contract-notes-priority>=2&contract-notes-status=ready");
-    assert_eq!(session.count_notes(&selectors).await.unwrap(), 3);
+    assert_eq!(session.count_notes(&selectors).await.unwrap(), 4);
     let selected = session
         .list_notes(&selectors, Some(2), Some(1))
         .await
@@ -255,14 +261,14 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .iter()
             .map(|note| note.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["contract-notes-middle", "contract-notes-active"]
+        vec!["contract-notes-newer", "contract-notes-middle"]
     );
     let summaries = session
         .list_note_summaries(&selectors, Some(1), Some(1))
         .await
         .unwrap();
     assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0].id, "contract-notes-middle");
+    assert_eq!(summaries[0].id, "contract-notes-newer");
     let unbounded = session
         .list_notes(&selectors, Some(-1), Some(-10))
         .await
@@ -273,6 +279,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .map(|note| note.id.as_str())
             .collect::<Vec<_>>(),
         vec![
+            "contract-notes-numeric-ten",
             "contract-notes-newer",
             "contract-notes-middle",
             "contract-notes-active"
@@ -288,6 +295,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .map(|note| note.id.as_str())
             .collect::<Vec<_>>(),
         vec![
+            "contract-notes-numeric-ten",
             "contract-notes-newer",
             "contract-notes-middle",
             "contract-notes-active"
@@ -306,7 +314,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap()
         .is_none());
-    assert_eq!(session.count_notes(&selectors).await.unwrap(), 2);
+    assert_eq!(session.count_notes(&selectors).await.unwrap(), 3);
     assert!(session
         .list_notes(&selectors, None, None)
         .await
@@ -323,7 +331,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     let counts = session.label_note_counts().await.unwrap();
     assert!(counts
         .iter()
-        .any(|(key, count)| { key == "contract-notes-priority" && *count == 3 }));
+        .any(|(key, count)| { key == "contract-notes-priority" && *count == 5 }));
     assert!(counts
         .iter()
         .any(|(key, count)| { key == "contract-notes-active-only" && *count == 0 }));
@@ -434,15 +442,12 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap()
         .is_empty());
 
-    let sources = session.list_active_note_sources().await.unwrap();
-    let module_sources = sources
+    let module_sources = session
+        .list_active_note_sources()
+        .await
+        .unwrap()
         .into_iter()
-        .filter(|source| {
-            matches!(
-                source.id.as_str(),
-                "contract-notes-active" | "contract-notes-middle" | "contract-notes-newer"
-            )
-        })
+        .filter(|source| source.id.starts_with("contract-notes-"))
         .collect::<Vec<_>>();
     assert_eq!(
         module_sources,
@@ -460,6 +465,16 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             ActiveNoteSource {
                 id: "contract-notes-newer".into(),
                 content: "contract-notes-newer".into(),
+                note_revision: 1,
+            },
+            ActiveNoteSource {
+                id: "contract-notes-numeric-low".into(),
+                content: "contract-notes-numeric-low".into(),
+                note_revision: 1,
+            },
+            ActiveNoteSource {
+                id: "contract-notes-numeric-ten".into(),
+                content: "contract-notes-numeric-ten".into(),
                 note_revision: 1,
             },
         ]

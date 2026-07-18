@@ -185,8 +185,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     )
     .await;
     let punctuation = session.title_search("(alpha / beta):", 10).await.unwrap();
-    assert!(punctuation.contains(&"contract-retrieval-punctuation-a".to_string()));
-    assert!(punctuation.contains(&"contract-retrieval-punctuation-b".to_string()));
+    assert_eq!(
+        punctuation,
+        vec![
+            "contract-retrieval-punctuation-a",
+            "contract-retrieval-punctuation-b"
+        ]
+    );
     assert!(session.title_search("   ", 10).await.unwrap().is_empty());
     assert!(session
         .title_search(r#""():-"#, 10)
@@ -276,6 +281,31 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap()
         .is_empty());
+    assert_eq!(
+        session
+            .get_deleted_note_content_and_revision("contract-retrieval-cascade")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        session
+            .permanently_delete_note("contract-retrieval-cascade")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        session
+            .restore_note("contract-retrieval-cascade", 2)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(!session
+        .chunk_embedding_exists("contract-retrieval-cascade", 0)
+        .await
+        .unwrap());
     assert!(session
         .title_search("Cascade", 10)
         .await
@@ -289,6 +319,39 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .all(|id| id != "contract-retrieval-cascade"));
     assert!(session
         .claim_pending_embedding_jobs(100, 10)
+        .await
+        .unwrap()
+        .iter()
+        .all(|job| job.note_id != "contract-retrieval-cascade"));
+
+    insert_note(
+        session.as_ref(),
+        "contract-retrieval-cascade",
+        "Reused clean note",
+        "fresh body",
+    )
+    .await;
+    assert_eq!(
+        session.title_search("Reused", 10).await.unwrap(),
+        vec!["contract-retrieval-cascade"]
+    );
+    assert!(session
+        .title_search("Cascade", 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!session
+        .chunk_embedding_exists("contract-retrieval-cascade", 0)
+        .await
+        .unwrap());
+    assert!(session
+        .dense_search(&unit(0), 20)
+        .await
+        .unwrap()
+        .iter()
+        .all(|id| id != "contract-retrieval-cascade"));
+    assert!(session
+        .claim_pending_embedding_jobs(100, 11)
         .await
         .unwrap()
         .iter()

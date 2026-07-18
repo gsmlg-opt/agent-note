@@ -1,5 +1,5 @@
 use crate::unit;
-use note_storage::{NewNote, StorageBackend, UpsertNoteChunk};
+use note_storage::{NewNote, NoteChunk, NoteUpdate, StorageBackend, UpsertNoteChunk};
 use std::sync::Arc;
 
 async fn insert_note(storage: &dyn note_storage::StorageSession, id: &str, title: &str) {
@@ -63,11 +63,27 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap();
     assert_eq!(
-        chunks
-            .iter()
-            .map(|chunk| chunk.chunk_idx)
-            .collect::<Vec<_>>(),
-        vec![0, 1]
+        chunks,
+        vec![
+            NoteChunk {
+                note_id: "contract-embedding-chunks".into(),
+                chunk_idx: 0,
+                content_hash: "hash-0".into(),
+                content: "content-0".into(),
+                note_revision: 1,
+                status: "embedded".into(),
+                updated_at: 10,
+            },
+            NoteChunk {
+                note_id: "contract-embedding-chunks".into(),
+                chunk_idx: 1,
+                content_hash: "hash-1".into(),
+                content: "content-1".into(),
+                note_revision: 1,
+                status: "pending".into(),
+                updated_at: 11,
+            },
+        ]
     );
     let chunk = session
         .get_note_chunk("contract-embedding-chunks", 1)
@@ -165,6 +181,42 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
 
     insert_note(
         session.as_ref(),
+        "contract-embedding-claim-tie",
+        "Claim tie",
+    )
+    .await;
+    for chunk_idx in 0..2 {
+        session
+            .enqueue_embedding_job(
+                "contract-embedding-claim-tie",
+                chunk_idx,
+                &format!("tie-{chunk_idx}"),
+                "tie",
+                1,
+                19,
+            )
+            .await
+            .unwrap();
+    }
+    let tied = session
+        .claim_pending_embedding_jobs(10, 20)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|job| job.note_id == "contract-embedding-claim-tie")
+        .collect::<Vec<_>>();
+    assert_eq!(tied.len(), 2);
+    assert!(tied[0].id < tied[1].id);
+    assert_eq!(
+        tied.iter().map(|job| job.chunk_idx).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    for job in tied {
+        session.delete_embedding_job(job.id).await.unwrap();
+    }
+
+    insert_note(
+        session.as_ref(),
         "contract-embedding-idempotent",
         "Idempotent",
     )
@@ -211,20 +263,27 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         )
         .await
         .unwrap();
-    assert!(session
-        .claim_pending_embedding_jobs(100, 24)
-        .await
-        .unwrap()
-        .iter()
-        .all(|job| job.id != idempotent.id));
+    let while_processing = session.claim_pending_embedding_jobs(100, 24).await.unwrap();
+    assert!(while_processing.iter().all(|job| {
+        !(job.note_id == "contract-embedding-idempotent"
+            && job.chunk_idx == 0
+            && job.content_hash == "same-hash")
+    }));
     session.requeue_processing_embedding_jobs(25).await.unwrap();
-    let idempotent_reclaimed = session
+    let matching_reclaimed = session
         .claim_pending_embedding_jobs(100, 26)
         .await
         .unwrap()
         .into_iter()
-        .find(|job| job.id == idempotent.id)
-        .unwrap();
+        .filter(|job| {
+            job.note_id == "contract-embedding-idempotent"
+                && job.chunk_idx == 0
+                && job.content_hash == "same-hash"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching_reclaimed.len(), 1);
+    let idempotent_reclaimed = &matching_reclaimed[0];
+    assert_eq!(idempotent_reclaimed.id, idempotent.id);
     assert_eq!(idempotent_reclaimed.content, "updated");
     assert_eq!(idempotent_reclaimed.note_revision, 2);
     session
@@ -328,6 +387,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         ("contract-embedding-dashboard-complete", "Complete"),
         ("contract-embedding-dashboard-partial", "Partial"),
         ("contract-embedding-dashboard-deleted", "Deleted"),
+        ("contract-embedding-dashboard-stale", "Stale revision"),
     ] {
         insert_note(session.as_ref(), id, title).await;
     }
@@ -364,6 +424,25 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         "contract-embedding-dashboard-deleted",
         0,
         "deleted",
+        "embedded",
+    )
+    .await;
+    session
+        .update_note(NoteUpdate {
+            id: "contract-embedding-dashboard-stale",
+            title: "Stale revision",
+            content: "Content",
+            attachments: &[],
+            updated_at: 2,
+            note_revision: 2,
+        })
+        .await
+        .unwrap();
+    upsert_chunk(
+        session.as_ref(),
+        "contract-embedding-dashboard-stale",
+        0,
+        "stale-revision",
         "embedded",
     )
     .await;
