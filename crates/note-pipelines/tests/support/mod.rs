@@ -1,3 +1,9 @@
+#[allow(dead_code)]
+mod events;
+
+#[allow(unused_imports)]
+pub use events::*;
+
 use note_attachments::FilesystemAttachmentStore;
 use note_embedding::StubEmbedder;
 use note_pipelines::Context;

@@ -14,7 +14,10 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use support::test_context;
+use support::{
+    event_log, test_context, ControlledAttachmentStore, EventLog, EventNotifier,
+    EventStorageBackend,
+};
 
 use note_core::{
     DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SystemConfig,
@@ -126,6 +129,298 @@ async fn recording_context() -> (
     let attachments = Arc::new(RecordingAttachmentStore::default());
     let ctx = Context::new(backend.clone(), Arc::new(StubEmbedder), attachments.clone());
     (ctx, backend, attachments, dir)
+}
+
+async fn controlled_context(
+    with_notifier: bool,
+) -> (
+    Context,
+    Arc<dyn StorageBackend>,
+    Arc<ControlledAttachmentStore>,
+    EventLog,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let raw_backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let events = event_log();
+    let backend: Arc<dyn StorageBackend> = Arc::new(EventStorageBackend::new(
+        raw_backend.clone(),
+        events.clone(),
+    ));
+    let attachments = Arc::new(ControlledAttachmentStore::new(
+        backend.clone(),
+        events.clone(),
+    ));
+    let ctx = if with_notifier {
+        Context::with_embedding_job_notifier(
+            backend,
+            Arc::new(StubEmbedder),
+            Arc::new(EventNotifier::new(events.clone())),
+            attachments.clone(),
+        )
+    } else {
+        Context::new(backend, Arc::new(StubEmbedder), attachments.clone())
+    };
+    (ctx, raw_backend, attachments, events, dir)
+}
+
+fn one_attachment() -> Vec<NoteAttachment> {
+    vec![NoteAttachment {
+        id: "file".into(),
+        path: "./file.txt".into(),
+        mime: "text/plain".into(),
+        description: String::new(),
+        content: b"payload".to_vec(),
+    }]
+}
+
+#[tokio::test]
+async fn save_and_update_order_attachment_finalization_around_the_database_transaction() {
+    let (ctx, _backend, _attachments, events, _dir) = controlled_context(true).await;
+
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Before".into(),
+            content: "Initial content".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            format!("prepare:{}:missing", note.id),
+            "begin".into(),
+            "commit".into(),
+            format!("publish:{}:Before", note.id),
+            "wake".into(),
+        ]
+    );
+
+    events.lock().unwrap().clear();
+    update_note(
+        &ctx,
+        &note.id,
+        SaveNoteInput {
+            title: "After".into(),
+            content: "Updated content".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            format!("prepare:{}:Before", note.id),
+            "begin".into(),
+            "commit".into(),
+            format!("publish:{}:After", note.id),
+            "wake".into(),
+        ]
+    );
+}
+
+async fn enable_duplicate_series_rule(ctx: &Context) {
+    update_system_config(
+        ctx,
+        &SystemConfig {
+            duplicate_check: DuplicateCheckConfig {
+                enabled: true,
+                rules: vec![DuplicateCheckRule {
+                    terms: vec![DuplicateCheckTerm {
+                        key: "series".into(),
+                        value: Some("same".into()),
+                    }],
+                }],
+            },
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn save_existing_duplicate(ctx: &Context) {
+    save_note(
+        ctx,
+        SaveNoteInput {
+            title: "Existing".into(),
+            content: "Existing content".into(),
+            attachments: one_attachment(),
+            labels: vec![("series".into(), "same".into())],
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn save_transaction_failure_rolls_back_then_aborts_prepared_attachments() {
+    let (ctx, _backend, _attachments, events, _dir) = controlled_context(false).await;
+    enable_duplicate_series_rule(&ctx).await;
+    save_existing_duplicate(&ctx).await;
+    events.lock().unwrap().clear();
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Duplicate".into(),
+            content: "Duplicate content".into(),
+            attachments: one_attachment(),
+            labels: vec![("series".into(), "same".into())],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.downcast_ref::<DuplicateNoteError>().is_some());
+    let events = events.lock().unwrap().clone();
+    assert!(events[0].starts_with("prepare:"));
+    assert!(events[0].ends_with(":missing"));
+    assert_eq!(events[1], "begin");
+    assert_eq!(events[2], "rollback");
+    assert!(events[3].starts_with("abort:"));
+}
+
+#[tokio::test]
+async fn attachment_publish_failure_keeps_the_committed_note_but_does_not_wake_the_worker() {
+    let (ctx, backend, attachments, events, _dir) = controlled_context(true).await;
+    attachments.fail_publish();
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Committed".into(),
+            content: "Queue work only after publication".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "controlled publish failure");
+    let events = events.lock().unwrap().clone();
+    assert_eq!(events[1], "begin");
+    assert_eq!(events[2], "commit");
+    assert!(events[3].contains(":Committed"));
+    assert!(!events.iter().any(|event| event == "wake"));
+    assert_eq!(
+        backend
+            .session()
+            .await
+            .unwrap()
+            .list_all_notes()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn permanent_delete_and_purge_remove_attachments_only_after_database_deletion() {
+    let (ctx, backend, _attachments, events, _dir) = controlled_context(false).await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete".into(),
+            content: "Permanent deletion".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(delete_note(&ctx, &note.id).await.unwrap());
+    events.lock().unwrap().clear();
+
+    assert!(note_pipelines::permanently_delete_note(&ctx, &note.id)
+        .await
+        .unwrap());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![format!("remove:{}:absent=true", note.id)]
+    );
+    events.lock().unwrap().clear();
+    assert!(!note_pipelines::permanently_delete_note(&ctx, "missing")
+        .await
+        .unwrap());
+    assert!(events.lock().unwrap().is_empty());
+
+    let expired = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Expired".into(),
+            content: "Purge deletion".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    backend
+        .session()
+        .await
+        .unwrap()
+        .soft_delete_note(&expired.id, now.saturating_sub(TRASH_RETENTION_SECONDS))
+        .await
+        .unwrap();
+    events.lock().unwrap().clear();
+
+    assert_eq!(purge_expired_deleted_notes(&ctx, now).await.unwrap(), 1);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "begin".into(),
+            "commit".into(),
+            format!("remove:{}:absent=true", expired.id),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn abort_failure_adds_context_without_hiding_the_primary_transaction_error() {
+    let (ctx, _backend, attachments, events, _dir) = controlled_context(false).await;
+    enable_duplicate_series_rule(&ctx).await;
+    save_existing_duplicate(&ctx).await;
+    events.lock().unwrap().clear();
+    attachments.fail_abort();
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Duplicate".into(),
+            content: "Duplicate content".into(),
+            attachments: one_attachment(),
+            labels: vec![("series".into(), "same".into())],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let chain = format!("{error:#}");
+    assert!(chain.contains("attachment abort also failed"));
+    assert!(chain.contains("controlled abort failure"));
+    assert!(error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DuplicateNoteError>().is_some()));
+    let events = events.lock().unwrap();
+    assert_eq!(events[1], "begin");
+    assert_eq!(events[2], "rollback");
+    assert!(events[3].starts_with("abort:"));
 }
 
 #[tokio::test]

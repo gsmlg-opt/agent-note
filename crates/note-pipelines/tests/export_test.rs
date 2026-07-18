@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use support::test_context;
+use support::{event_log, test_context, ControlledAttachmentStore, EventStorageBackend};
 
 struct CountingAttachmentStore {
     inner: FilesystemAttachmentStore,
@@ -91,6 +91,82 @@ async fn import_prepares_distinct_notes_together_and_skips_duplicate_ids_before_
     let prepares = attachments.prepares.lock().unwrap();
     assert_eq!(prepares.get("note-a"), Some(&1));
     assert_eq!(prepares.get("note-b"), Some(&1));
+}
+
+async fn controlled_import_context() -> (
+    Context,
+    Arc<ControlledAttachmentStore>,
+    support::EventLog,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let raw_backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let events = event_log();
+    let backend: Arc<dyn StorageBackend> =
+        Arc::new(EventStorageBackend::new(raw_backend, events.clone()));
+    let attachments = Arc::new(ControlledAttachmentStore::new(
+        backend.clone(),
+        events.clone(),
+    ));
+    let ctx = Context::new(backend, Arc::new(StubEmbedder), attachments.clone());
+    (ctx, attachments, events, dir)
+}
+
+#[tokio::test]
+async fn import_precommit_error_rolls_back_then_aborts_every_prepared_set() {
+    let (ctx, _attachments, events, _dir) = controlled_import_context().await;
+    let input = r#"{
+        "version": 2,
+        "label_keys": [{"key":"invalid","description":"","value_type":"not-a-type"}],
+        "notes": [
+            {"id":"note-a","title":"A","content":"first","attachments":[],"created_at":1,"updated_at":1,"labels":[]},
+            {"id":"note-b","title":"B","content":"second","attachments":[],"created_at":1,"updated_at":1,"labels":[]}
+        ]
+    }"#;
+
+    let error = import_json(&ctx, input).await.unwrap_err();
+
+    assert!(error.to_string().contains("invalid label value type"));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            String::from("prepare:note-a:missing"),
+            String::from("prepare:note-b:missing"),
+            String::from("begin"),
+            String::from("rollback"),
+            String::from("abort:note-a:marker=false"),
+            String::from("abort:note-b:marker=false"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn import_race_aborts_the_skipped_candidate_only_after_commit() {
+    let (ctx, attachments, events, _dir) = controlled_import_context().await;
+    attachments.race_note_on_prepare("race-note");
+    attachments.observe_committed_label_on_abort("committed-marker");
+    let input = r#"{
+        "version": 2,
+        "label_keys": [{"key":"committed-marker","description":"","value_type":"text"}],
+        "notes": [
+            {"id":"race-note","title":"Imported","content":"skip after recheck","attachments":[],"created_at":1,"updated_at":1,"labels":[]}
+        ]
+    }"#;
+
+    let stats = import_json(&ctx, input).await.unwrap();
+
+    assert_eq!(stats.notes_added, 0);
+    assert_eq!(stats.notes_skipped, 1);
+    assert_eq!(stats.label_keys_added, 1);
+    let events = events.lock().unwrap();
+    assert_eq!(events[0], "prepare:race-note:missing");
+    assert_eq!(events[1], "begin");
+    assert_eq!(events[2], "commit");
+    assert_eq!(events[3], "abort:race-note:marker=true");
 }
 
 #[tokio::test]
