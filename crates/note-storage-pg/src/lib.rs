@@ -1,4 +1,6 @@
 mod connection;
+mod labels;
+mod notes;
 
 pub use connection::PgSession;
 use connection::{map_connect_error, map_sqlx_error};

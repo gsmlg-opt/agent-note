@@ -1,0 +1,592 @@
+#[allow(dead_code)]
+mod support;
+
+use note_core::{parse_label_selectors, LabelValueType, NoteAttachment};
+use note_storage::{LabelRepository, NewNote, NoteUpdate, NotesRepository, StorageErrorKind};
+use note_storage_pg::PgStorage;
+use serde_json::Value;
+use support::{configured_url_or_skip, TestDatabase};
+
+#[tokio::test]
+async fn notes_and_labels_follow_repository_semantics() {
+    let Some(admin_url) = configured_url_or_skip("notes_and_labels_follow_repository_semantics")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    database.provision_vector().await;
+    let storage = PgStorage::connect(&database.url, 4)
+        .await
+        .expect("connect PostgreSQL storage");
+    let session = storage
+        .connect_session()
+        .await
+        .expect("connect PostgreSQL session");
+
+    let attachment = NoteAttachment {
+        id: "meta".into(),
+        path: "meta.json".into(),
+        mime: "application/json".into(),
+        description: "metadata".into(),
+        content: b"must not be stored".to_vec(),
+    };
+    session
+        .insert_note(NewNote {
+            id: "pg-jsonb",
+            title: "JSON metadata",
+            content: "active body",
+            attachments: std::slice::from_ref(&attachment),
+            created_at: 100,
+            updated_at: 101,
+            note_revision: 4,
+            deleted_at: None,
+        })
+        .await
+        .expect("insert active note");
+    session
+        .insert_note(NewNote {
+            id: "deleted",
+            title: "Deleted",
+            content: "deleted body",
+            attachments: &[],
+            created_at: 50,
+            updated_at: 51,
+            note_revision: 2,
+            deleted_at: Some(700),
+        })
+        .await
+        .expect("insert deleted note");
+
+    assert_eq!(
+        session.get_note_revision("pg-jsonb").await.unwrap(),
+        Some(4)
+    );
+    assert_eq!(session.get_note_revision("deleted").await.unwrap(), None);
+    assert!(session.note_exists("pg-jsonb").await.unwrap());
+    assert!(session.note_exists("deleted").await.unwrap());
+    assert_eq!(
+        session.get_note_content("pg-jsonb").await.unwrap(),
+        Some("active body".into())
+    );
+    assert_eq!(session.get_note_content("deleted").await.unwrap(), None);
+
+    let note = session.get_note("pg-jsonb").await.unwrap().unwrap();
+    assert_eq!(note.title, "JSON metadata");
+    assert_eq!(note.content, "active body");
+    assert_eq!(note.created_at, 100);
+    assert_eq!(note.updated_at, 101);
+    assert_eq!(note.deleted_at, None);
+    assert_eq!(note.attachments.len(), 1);
+    assert_eq!(note.attachments[0].id, "meta");
+    assert_eq!(note.attachments[0].path, "meta.json");
+    assert_eq!(note.attachments[0].mime, "application/json");
+    assert_eq!(note.attachments[0].description, "metadata");
+    assert!(note.attachments[0].content.is_empty());
+
+    let inspection_pool = database.inspect_pool().await;
+    let (kind, path, stored): (Option<String>, Option<String>, Value) = sqlx::query_as(
+        "SELECT jsonb_typeof(attachments), attachments->0->>'path', attachments
+         FROM notes WHERE id = 'pg-jsonb'",
+    )
+    .fetch_one(&inspection_pool)
+    .await
+    .expect("inspect attachment JSONB representation");
+    assert_eq!(kind.as_deref(), Some("array"));
+    assert_eq!(path.as_deref(), Some("meta.json"));
+    let object = stored
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(Value::as_object)
+        .expect("stored attachment object");
+    assert!(!object.contains_key("content"));
+    assert!(!object.contains_key("content_base64"));
+
+    let updated_attachment = NoteAttachment {
+        id: "updated".into(),
+        path: "updated.txt".into(),
+        mime: "text/plain".into(),
+        description: "updated metadata".into(),
+        content: b"also not stored".to_vec(),
+    };
+    assert_eq!(
+        session
+            .update_note(NoteUpdate {
+                id: "pg-jsonb",
+                title: "Updated",
+                content: "updated body",
+                attachments: std::slice::from_ref(&updated_attachment),
+                updated_at: 110,
+                note_revision: 5,
+            })
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        session
+            .update_note(NoteUpdate {
+                id: "deleted",
+                title: "Must not change",
+                content: "must not change",
+                attachments: &[],
+                updated_at: 800,
+                note_revision: 9,
+            })
+            .await
+            .unwrap(),
+        0
+    );
+    let note = session.get_note("pg-jsonb").await.unwrap().unwrap();
+    assert_eq!(note.title, "Updated");
+    assert_eq!(note.content, "updated body");
+    assert_eq!(note.created_at, 100);
+    assert_eq!(note.updated_at, 110);
+    assert_eq!(note.attachments[0].id, "updated");
+    assert!(note.attachments[0].content.is_empty());
+
+    session
+        .insert_label_key_with_type("priority", "Priority", LabelValueType::Number)
+        .await
+        .unwrap();
+    session
+        .insert_label_key_with_type("status", "Status", LabelValueType::Text)
+        .await
+        .unwrap();
+    session
+        .insert_label_key("active-only", "Active marker")
+        .await
+        .unwrap();
+    session
+        .update_label_key("priority", "Updated priority")
+        .await
+        .unwrap();
+    session
+        .insert_label_key_if_missing("priority", "Must not replace")
+        .await
+        .unwrap();
+    session
+        .update_label_key_with_type("status", "Version status", LabelValueType::Version)
+        .await
+        .unwrap();
+    let keys = session.list_label_keys().await.unwrap();
+    assert_eq!(
+        keys.iter()
+            .map(|key| (key.key.as_str(), key.description.as_str(), key.value_type))
+            .collect::<Vec<_>>(),
+        vec![
+            ("active-only", "Active marker", LabelValueType::Text),
+            ("priority", "Updated priority", LabelValueType::Number),
+            ("status", "Version status", LabelValueType::Version),
+        ]
+    );
+    session
+        .update_label_key_with_type("status", "Status", LabelValueType::Text)
+        .await
+        .unwrap();
+
+    let duplicate_key = session
+        .insert_label_key("priority", "Duplicate")
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate_key.kind(), StorageErrorKind::Constraint);
+    let unknown_key = session
+        .attach_label("pg-jsonb", "missing", "value")
+        .await
+        .unwrap_err();
+    assert_eq!(unknown_key.kind(), StorageErrorKind::Operation);
+    assert_eq!(unknown_key.to_string(), "unknown label key: missing");
+
+    for (key, value) in [
+        ("priority", "2"),
+        ("status", "ready"),
+        ("active-only", "yes"),
+    ] {
+        session.attach_label("pg-jsonb", key, value).await.unwrap();
+    }
+    let labels = session.labels_for_note("pg-jsonb").await.unwrap();
+    assert_eq!(labels.len(), 3);
+    assert!(labels.iter().any(|label| {
+        label.key == "priority"
+            && label.value == "2"
+            && label.description == "Updated priority"
+            && label.value_type == LabelValueType::Number
+    }));
+    let duplicate_attachment = session
+        .attach_label("pg-jsonb", "status", "other")
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate_attachment.kind(), StorageErrorKind::Constraint);
+
+    let expected = Some("pg-jsonb".to_string());
+    assert_eq!(
+        session
+            .find_note_with_labels(&[
+                ("status".into(), "ready".into()),
+                ("priority".into(), "2".into()),
+            ])
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        session
+            .find_note_with_labels(&[
+                ("priority".into(), "2".into()),
+                ("status".into(), "ready".into()),
+            ])
+            .await
+            .unwrap(),
+        Some("pg-jsonb".into())
+    );
+    assert_eq!(
+        session
+            .find_note_with_labels(&[
+                ("priority".into(), "2".into()),
+                ("priority".into(), "2".into()),
+            ])
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(session.find_note_with_labels(&[]).await.unwrap(), None);
+
+    for (id, created_at, priority, status) in [
+        ("numeric-low", 400, "1", "ready"),
+        ("numeric-ten", 350, "10", "ready"),
+        ("newer", 300, "5", "ready"),
+        ("middle", 200, "3", "ready"),
+        ("other", 150, "9", "blocked"),
+    ] {
+        session
+            .insert_note(NewNote {
+                id,
+                title: id,
+                content: id,
+                attachments: &[],
+                created_at,
+                updated_at: created_at,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        session
+            .attach_label(id, "priority", priority)
+            .await
+            .unwrap();
+        session.attach_label(id, "status", status).await.unwrap();
+    }
+
+    let selectors = parse_label_selectors("priority>=2&status=ready");
+    assert_eq!(session.count_notes(&selectors).await.unwrap(), 4);
+    assert_eq!(
+        session
+            .list_notes(&selectors, Some(2), Some(1))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["newer", "middle"]
+    );
+    assert_eq!(
+        session
+            .list_note_summaries(&selectors, Some(1), Some(1))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["newer"]
+    );
+    let expected_unbounded = vec!["numeric-ten", "newer", "middle", "pg-jsonb"];
+    assert_eq!(
+        session
+            .list_notes(&selectors, Some(-1), Some(-10))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        expected_unbounded
+    );
+    assert_eq!(
+        session
+            .list_note_summaries(&selectors, Some(-1), Some(-10))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["numeric-ten", "newer", "middle", "pg-jsonb"]
+    );
+    assert_eq!(
+        session
+            .list_notes(&[], Some(-1), Some(-10))
+            .await
+            .unwrap()
+            .len(),
+        6
+    );
+    assert_eq!(
+        session
+            .list_note_summaries(&[], Some(-1), Some(-10))
+            .await
+            .unwrap()
+            .len(),
+        6
+    );
+    assert_eq!(session.list_all_notes().await.unwrap().len(), 7);
+
+    assert_eq!(session.soft_delete_note("pg-jsonb", 500).await.unwrap(), 1);
+    assert_eq!(session.soft_delete_note("pg-jsonb", 501).await.unwrap(), 0);
+    assert!(session.get_note("pg-jsonb").await.unwrap().is_none());
+    assert_eq!(
+        session
+            .get_deleted_note_content_and_revision("pg-jsonb")
+            .await
+            .unwrap(),
+        Some(("updated body".into(), 5))
+    );
+    let deleted_summaries = session.list_deleted_note_summaries().await.unwrap();
+    assert_eq!(deleted_summaries[0].id, "deleted");
+    assert_eq!(deleted_summaries[1].id, "pg-jsonb");
+    assert_eq!(deleted_summaries[1].deleted_at, Some(500));
+    assert_eq!(
+        session
+            .update_note(NoteUpdate {
+                id: "pg-jsonb",
+                title: "Must not update",
+                content: "Must not update",
+                attachments: &[],
+                updated_at: 600,
+                note_revision: 9,
+            })
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(session.count_notes(&selectors).await.unwrap(), 3);
+    assert_eq!(
+        session
+            .find_note_with_labels(&[("active-only".into(), "yes".into())])
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(session
+        .label_note_counts()
+        .await
+        .unwrap()
+        .contains(&("active-only".into(), 0)));
+    assert_eq!(session.restore_note("pg-jsonb", 6).await.unwrap(), 1);
+    assert_eq!(session.restore_note("pg-jsonb", 7).await.unwrap(), 0);
+    assert_eq!(
+        session.get_note_revision("pg-jsonb").await.unwrap(),
+        Some(6)
+    );
+
+    for (id, deleted_at) in [
+        ("expired-b", 700),
+        ("expired-a", 700),
+        ("expired-old", 699),
+        ("expired-new", 701),
+    ] {
+        session
+            .insert_note(NewNote {
+                id,
+                title: id,
+                content: id,
+                attachments: &[],
+                created_at: 1,
+                updated_at: 1,
+                note_revision: 1,
+                deleted_at: Some(deleted_at),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session.list_expired_deleted_note_ids(700).await.unwrap(),
+        vec!["expired-old", "deleted", "expired-a", "expired-b"]
+    );
+
+    assert_eq!(session.permanently_delete_note("newer").await.unwrap(), 0);
+    sqlx::query(
+        "INSERT INTO note_chunks (
+             note_id, chunk_idx, chunk_hash, content, note_revision, status, updated_at
+         ) VALUES
+             ('pg-jsonb', 0, 'zero', 'zero', 6, 'ready', 1),
+             ('pg-jsonb', 1, 'one', 'one', 6, 'ready', 1),
+             ('pg-jsonb', 2, 'two', 'two', 6, 'ready', 1)",
+    )
+    .execute(&inspection_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO note_chunk_embeddings (note_id, chunk_idx, embedding)
+         VALUES
+             ('pg-jsonb', 0, array_fill(0::real, ARRAY[1024])::vector),
+             ('pg-jsonb', 1, array_fill(0::real, ARRAY[1024])::vector),
+             ('pg-jsonb', 2, array_fill(0::real, ARRAY[1024])::vector)",
+    )
+    .execute(&inspection_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO embedding_jobs (
+             note_id, chunk_idx, chunk_hash, content, note_revision,
+             status, attempts, created_at, updated_at
+         ) VALUES ('pg-jsonb', 0, 'zero', 'zero', 6, 'pending', 0, 1, 1)",
+    )
+    .execute(&inspection_pool)
+    .await
+    .unwrap();
+    session
+        .clear_note_chunk_derived("pg-jsonb", 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint
+             FROM note_chunk_embeddings
+             WHERE note_id = 'pg-jsonb'",
+        )
+        .fetch_one(&inspection_pool)
+        .await
+        .unwrap(),
+        2
+    );
+    session
+        .clear_note_chunks_from_derived("pg-jsonb", 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint
+             FROM note_chunk_embeddings
+             WHERE note_id = 'pg-jsonb'",
+        )
+        .fetch_one(&inspection_pool)
+        .await
+        .unwrap(),
+        1
+    );
+    session.clear_note_search_data("pg-jsonb").await.unwrap();
+    for table in ["note_chunk_embeddings", "embedding_jobs", "note_chunks"] {
+        let query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*)::bigint FROM {table} WHERE note_id = 'pg-jsonb'"
+        )));
+        assert_eq!(query.fetch_one(&inspection_pool).await.unwrap(), 0);
+    }
+
+    sqlx::query(
+        "INSERT INTO note_chunks (
+             note_id, chunk_idx, chunk_hash, content, note_revision, status, updated_at
+         ) VALUES ('other', 0, 'other', 'other', 1, 'ready', 1)",
+    )
+    .execute(&inspection_pool)
+    .await
+    .unwrap();
+    session.soft_delete_note("other", 800).await.unwrap();
+    assert_eq!(session.permanently_delete_note("other").await.unwrap(), 1);
+    assert!(session.labels_for_note("other").await.unwrap().is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM note_chunks WHERE note_id = 'other'",
+        )
+        .fetch_one(&inspection_pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    assert_eq!(
+        session
+            .list_active_note_sources()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|source| (source.id, source.content, source.note_revision))
+            .collect::<Vec<_>>(),
+        vec![
+            ("middle".into(), "middle".into(), 1),
+            ("newer".into(), "newer".into(), 1),
+            ("numeric-low".into(), "numeric-low".into(), 1),
+            ("numeric-ten".into(), "numeric-ten".into(), 1),
+            ("pg-jsonb".into(), "updated body".into(), 6),
+        ]
+    );
+
+    session.clear_note_labels("pg-jsonb").await.unwrap();
+    assert!(session
+        .labels_for_note("pg-jsonb")
+        .await
+        .unwrap()
+        .is_empty());
+    session.delete_label_key("active-only").await.unwrap();
+    assert!(!session
+        .list_label_keys()
+        .await
+        .unwrap()
+        .iter()
+        .any(|key| key.key == "active-only"));
+
+    inspection_pool.close().await;
+    drop(session);
+    database
+        .cleanup(Some(&storage))
+        .await
+        .expect("clean isolated PostgreSQL test database");
+}
+
+#[tokio::test]
+async fn malformed_attachment_json_is_an_operation_error() {
+    let Some(admin_url) = configured_url_or_skip("malformed_attachment_json_is_an_operation_error")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    database.provision_vector().await;
+    let storage = PgStorage::connect(&database.url, 2)
+        .await
+        .expect("connect PostgreSQL storage");
+    let session = storage.connect_session().await.unwrap();
+    session
+        .insert_note(NewNote {
+            id: "malformed",
+            title: "Malformed",
+            content: "body",
+            attachments: &[],
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+
+    let inspection_pool = database.inspect_pool().await;
+    sqlx::query("UPDATE notes SET attachments = '{\"not\":\"an array\"}'::jsonb WHERE id = $1")
+        .bind("malformed")
+        .execute(&inspection_pool)
+        .await
+        .unwrap();
+    let error = session.get_note("malformed").await.unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Operation);
+
+    session
+        .insert_label_key("malformed-type", "Malformed type")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE label_keys SET value_type = 'unknown' WHERE key = 'malformed-type'")
+        .execute(&inspection_pool)
+        .await
+        .unwrap();
+    let error = session.list_label_keys().await.unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Operation);
+
+    inspection_pool.close().await;
+    drop(session);
+    database.cleanup(Some(&storage)).await.unwrap();
+}
