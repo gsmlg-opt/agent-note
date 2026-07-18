@@ -207,24 +207,30 @@ max_retries = 3
 
 `api_key_env` names an environment variable that contains the bearer token; it never contains the
 secret itself. Set `EMBEDDING_API_KEY` in the server process environment for the example above.
-Omit `api_key_env` for a service that requires no authentication. When it is configured, a missing
-or blank named environment value is a startup error.
+Omit `api_key_env` for a service that requires no authentication. Normal remote HTTP or MCP server
+startup resolves the named variable and fails when its value is missing or blank. `--import` and
+`--export` do not resolve that value and remain embedding-service offline even when the named
+variable is absent.
 
-The adapter posts input batches to `/v1/embeddings` with `encoding_format = "float"` and does not
-send `dimensions`. Each response must contain exactly one uniquely indexed, finite
-1,024-component vector per input. Connection failures, timeouts, HTTP 429, and HTTP 5xx responses
-are retried with bounded backoff; other transport errors and HTTP statuses fail immediately.
-`max_retries` is the number of retries after the initial request and must be at most `10`. A
-successful response body is limited to 1 MiB. Unauthenticated HTTP error bodies are limited to
-4 KiB, while authenticated response bodies are redacted.
+The adapter preserves any non-root path in `base_url`, normalizes its trailing slash, and appends
+the `v1/embeddings` suffix. The root example above therefore posts to
+`http://embedding.internal:8000/v1/embeddings`; a base URL ending in `/gateway` or `/gateway/`
+would post to `/gateway/v1/embeddings`. Requests use `encoding_format = "float"` and do not send
+`dimensions`. Each response must contain exactly one uniquely indexed, finite 1,024-component
+vector per input. Connection failures, timeouts, HTTP 429, and HTTP 5xx responses are retried with
+bounded backoff; other transport errors and HTTP statuses fail immediately. `max_retries` is the
+number of retries after the initial request and must be at most `10`. A successful response body is
+limited to 1 MiB. Unauthenticated HTTP error bodies are limited to 4 KiB, while authenticated
+response bodies are redacted.
 
 The default local engine and an OpenAI-compatible engine using model `bge-m3` share the fingerprint
-`bge-m3:1024`. On startup, an unchanged fingerprint preserves the existing vectors. A changed
-fingerprint atomically deletes old vectors, replaces existing embedding jobs, and queues one
-pending job for every active body chunk before the scheduler starts. Import and export still load
-the mandatory configuration and storage adapters, but use the deterministic stub internally and
-never contact the configured embedding service; import queues missing chunks for later processing
-by a normal server run.
+`bge-m3:1024`. Reconciliation has three states. A missing stored fingerprint, including in a legacy
+database, adopts the configured fingerprint without deleting existing vectors or jobs. An equal
+stored fingerprint leaves them unchanged. A present but different fingerprint atomically deletes
+old vectors, replaces existing embedding jobs, and queues one pending job for every active body
+chunk before the scheduler starts. Import and export still load the mandatory configuration and
+storage adapters, but use the deterministic stub internally and never contact the configured
+embedding service; import queues missing chunks for later processing by a normal server run.
 
 A blank retrieval query returns no results before embedding or storage access. Normal note saves
 reject blank content; if an import contains blank note content, it produces no chunks or embedding

@@ -159,13 +159,18 @@ order:
   optional `region`, optional `endpoint`, and `force_path_style`, with `NOTE_S3_BUCKET`,
   `NOTE_S3_PREFIX`, `AWS_REGION`, `NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE` fallbacks.
 
-The OpenAI-compatible adapter posts batches to `/v1/embeddings` with `encoding_format = "float"`
-and no `dimensions` field. `api_key_env` is optional and names the environment variable containing
-the bearer token; omission means no authentication. Responses must contain exactly one uniquely
-indexed, finite 1,024-component vector per input. The adapter retries connection failures,
-timeouts, HTTP 429, and HTTP 5xx with bounded backoff. `max_retries` counts retries after the
-initial request and cannot exceed `10`. Successful response bodies are limited to 1 MiB;
-unauthenticated error bodies are limited to 4 KiB and authenticated error bodies are redacted.
+The OpenAI-compatible adapter preserves the normalized `base_url` path, removes a trailing empty
+segment, and appends `v1/embeddings`. A root `base_url = "http://embedding.internal:8000"`
+therefore produces `http://embedding.internal:8000/v1/embeddings`, while `/gateway` and
+`/gateway/` both produce `/gateway/v1/embeddings`. Requests use `encoding_format = "float"` and no
+`dimensions` field. `api_key_env` is optional and names the environment variable containing the
+bearer token; omission means no authentication. Normal remote HTTP and MCP startup resolves that
+variable and rejects a missing or blank value. Import and export do not resolve it and remain
+embedding-service offline. Responses must contain exactly one uniquely indexed, finite
+1,024-component vector per input. The adapter retries connection failures, timeouts, HTTP 429, and
+HTTP 5xx with bounded backoff. `max_retries` counts retries after the initial request and cannot
+exceed `10`. Successful response bodies are limited to 1 MiB; unauthenticated error bodies are
+limited to 4 KiB and authenticated error bodies are redacted.
 
 The reserved S3 adapter targets S3-compatible object storage. Its values are parsed into a typed
 active variant and receive basic active-variant checks now; full service, credential, connectivity,
@@ -228,9 +233,11 @@ non-disposable data before upgrading so recovery or deliberate import remains po
 
   `api_key_env` is optional; omit it for no authentication.
 - **Fingerprint lifecycle**: local BGE-M3 and remote model `bge-m3` both identify their vector
-  space as `bge-m3:1024`. Startup preserves vectors when the fingerprint is unchanged. When it
-  changes, one storage transaction removes old vectors and jobs, queues one pending job for every
-  active chunk, and records the new fingerprint before the scheduler starts.
+  space as `bge-m3:1024`. A missing stored fingerprint, including in a legacy database, adopts the
+  configured fingerprint without deleting existing vectors or jobs. An equal stored fingerprint
+  preserves them unchanged. A present but different fingerprint causes one storage transaction to
+  remove old vectors and jobs, queue one pending job for every active chunk, and record the new
+  fingerprint before the scheduler starts.
 - **Endpoint-free paths**: a blank retrieval query returns no results before embedding or storage
   access. Normal note saves reject blank content; blank imported note content creates no chunks or
   embedding jobs. Import and export use the deterministic stub and never contact the configured
