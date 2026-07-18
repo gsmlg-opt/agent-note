@@ -52,7 +52,10 @@ async fn fresh_database_without_vector_extension_is_rejected() {
     assert!(error
         .to_string()
         .contains("PostgreSQL extension vector is not installed"));
-    database.cleanup(None).await;
+    database
+        .cleanup(None)
+        .await
+        .expect("explicit cleanup without leaked connections");
 }
 
 #[tokio::test]
@@ -127,7 +130,10 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
     );
 
     inspection.close().await;
-    database.cleanup(Some(&storage)).await;
+    database
+        .cleanup(Some(&storage))
+        .await
+        .expect("explicit cleanup without leaked connections");
 }
 
 #[tokio::test]
@@ -146,7 +152,10 @@ async fn repeated_connect_is_safe() {
         .await
         .expect("second connection");
 
-    database.cleanup(Some(&second)).await;
+    database
+        .cleanup(Some(&second))
+        .await
+        .expect("explicit cleanup without leaked connections");
 }
 
 #[tokio::test]
@@ -165,7 +174,10 @@ async fn backend_info_is_credential_free() {
     assert_eq!(info.location, None);
     assert_eq!(info.size_bytes, None);
 
-    database.cleanup(Some(&storage)).await;
+    database
+        .cleanup(Some(&storage))
+        .await
+        .expect("explicit cleanup without leaked connections");
 }
 
 #[tokio::test]
@@ -213,9 +225,9 @@ async fn cancelling_cleanup_future_runs_the_drop_guard() {
 }
 
 #[tokio::test]
-async fn cleanup_detects_unknown_connections_then_drop_guard_force_cleans() {
+async fn cleanup_reports_unknown_connections_after_removing_database() {
     let Some(admin_url) =
-        configured_url_or_skip("cleanup_detects_unknown_connections_then_drop_guard_force_cleans")
+        configured_url_or_skip("cleanup_reports_unknown_connections_after_removing_database")
     else {
         return;
     };
@@ -223,23 +235,17 @@ async fn cleanup_detects_unknown_connections_then_drop_guard_force_cleans() {
     let database_name = database.database_name().to_owned();
     let unknown_pool = database.inspect_pool().await;
 
-    let cleanup = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(database.cleanup(None));
-    })
-    .join();
-
+    let cleanup = database.cleanup(None).await;
     assert!(
-        cleanup.is_err(),
-        "explicit cleanup must reject unknown live connections"
+        cleanup
+            .expect_err("explicit cleanup must report unknown live connections")
+            .remaining_connections()
+            >= 1
     );
     unknown_pool.close().await;
     assert!(
         !database_exists(&admin_url, &database_name).await,
-        "Drop fallback must force-clean after explicit cleanup panics"
+        "explicit cleanup must remove the database after reporting leaked connections"
     );
 }
 

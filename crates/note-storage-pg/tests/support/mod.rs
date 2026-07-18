@@ -23,6 +23,29 @@ pub struct TestDatabase {
     armed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupError {
+    remaining_connections: i64,
+}
+
+impl CleanupError {
+    pub fn remaining_connections(self) -> i64 {
+        self.remaining_connections
+    }
+}
+
+impl std::fmt::Display for CleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "isolated PostgreSQL test database had {} live connection(s) before cleanup",
+            self.remaining_connections
+        )
+    }
+}
+
+impl std::error::Error for CleanupError {}
+
 impl TestDatabase {
     pub async fn create(admin_url: &str) -> Self {
         let database_name = format!("agent_note_test_{}", Uuid::new_v4().simple());
@@ -75,7 +98,7 @@ impl TestDatabase {
         &self.database_name
     }
 
-    pub async fn cleanup(mut self, storage: Option<&PgStorage>) {
+    pub async fn cleanup(mut self, storage: Option<&PgStorage>) -> Result<(), CleanupError> {
         if let Some(storage) = storage {
             storage.close().await;
         }
@@ -94,10 +117,16 @@ impl TestDatabase {
         .fetch_one(&admin_pool)
         .await
         .unwrap_or_else(|_| panic!("count isolated PostgreSQL test connections"));
-        assert_eq!(
-            connection_count, 0,
-            "isolated PostgreSQL test database still has live connections"
-        );
+
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+             FROM pg_stat_activity
+             WHERE datname = $1 AND pid <> pg_backend_pid()",
+        )
+        .bind(&self.database_name)
+        .execute(&admin_pool)
+        .await
+        .unwrap_or_else(|_| panic!("terminate isolated PostgreSQL test connections"));
 
         sqlx::query(AssertSqlSafe(format!(
             r#"DROP DATABASE IF EXISTS "{}" WITH (FORCE)"#,
@@ -108,6 +137,14 @@ impl TestDatabase {
         .unwrap_or_else(|_| panic!("drop isolated PostgreSQL test database"));
         admin_pool.close().await;
         self.armed = false;
+
+        if connection_count == 0 {
+            Ok(())
+        } else {
+            Err(CleanupError {
+                remaining_connections: connection_count,
+            })
+        }
     }
 }
 
