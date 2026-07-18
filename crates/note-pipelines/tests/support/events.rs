@@ -169,6 +169,7 @@ impl_forward_repository! {
             now: i64,
         ) -> u64;
         fn requeue_processing_embedding_jobs(now: i64) -> u64;
+        fn reset_embeddings_for_regeneration(now: i64) -> u64;
     }
 }
 
@@ -184,6 +185,8 @@ impl_forward_repository! {
     SettingsRepository {
         fn get_system_config() -> note_core::SystemConfig;
         fn set_system_config(config: &note_core::SystemConfig) -> ();
+        fn get_embedding_fingerprint() -> Option<String>;
+        fn set_embedding_fingerprint(fingerprint: &str) -> ();
     }
 }
 
