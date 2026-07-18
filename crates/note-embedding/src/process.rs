@@ -2,7 +2,7 @@ use crate::rpc::{
     default_capabilities, unix_time_ms, EmbedInput, EmbedRequest, HandshakeRequest, RpcErrorKind,
     DEFAULT_EMBEDDING_DIMENSION, DEFAULT_MAX_RESPONSE_BYTES,
 };
-use crate::worker::{connect_client, embedding_threads_from_env};
+use crate::worker::{connect_client, embedding_threads_from_env, model_path_from_env_value};
 use crate::{DenseVector, Embedder, EmbeddingRpcClient};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,10 +31,7 @@ impl ProcessWorkerConfig {
         Ok(Self {
             worker_exe: std::env::current_exe()?,
             ipc_name: default_ipc_name(),
-            model_path: std::env::var("NOTE_MODEL_PATH")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
+            model_path: model_path_from_env_value(std::env::var_os("NOTE_MODEL_PATH")),
             queue_capacity: env_usize("NOTE_EMBEDDING_WORKER_QUEUE", 8),
             embedding_threads: embedding_threads_from_env()?,
             max_restarts: env_usize("NOTE_EMBEDDING_WORKER_MAX_RESTARTS", 5),
