@@ -2380,12 +2380,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "note-storage-contract-tests"
+version = "0.1.0"
+dependencies = [
+ "note-core",
+ "note-storage",
+ "tokio",
+]
+
+[[package]]
 name = "note-storage-turso"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "note-core",
  "note-storage",
+ "note-storage-contract-tests",
  "serde",
  "serde_json",
  "tempfile",
