@@ -4,6 +4,7 @@ mod path;
 mod s3;
 
 pub use filesystem::FilesystemAttachmentStore;
+pub use s3::{S3AttachmentConfig, S3AttachmentStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentStoreInfo {
