@@ -23,7 +23,7 @@ pub async fn search_notes_filtered(
     limit: usize,
     label: Option<String>,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    if limit == 0 {
+    if limit == 0 || query.trim().is_empty() {
         return Ok(Vec::new());
     }
 

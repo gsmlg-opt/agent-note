@@ -348,6 +348,38 @@ async fn export_import_roundtrips_notes_and_label_keys() {
 }
 
 #[tokio::test]
+async fn blank_imported_content_creates_no_chunks_or_embedding_jobs() {
+    let (ctx, backend, _dir) = test_context().await;
+    let input = r#"{
+        "version": 2,
+        "label_keys": [],
+        "notes": [{
+            "id": "blank-legacy",
+            "title": "Title only",
+            "content": " \n\t",
+            "attachments": [],
+            "created_at": 1000,
+            "updated_at": 1000,
+            "labels": []
+        }]
+    }"#;
+
+    let stats = import_json(&ctx, input).await.unwrap();
+    assert_eq!(stats.embedding_jobs_queued, 0);
+    let session = backend.session().await.unwrap();
+    assert!(session
+        .list_note_chunks("blank-legacy")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(session
+        .claim_pending_embedding_jobs(10, chrono::Utc::now().timestamp())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn imports_version_one_text_attachments() {
     let (ctx, _backend, _dir) = test_context().await;
     let input = r#"{
