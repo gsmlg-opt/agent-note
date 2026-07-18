@@ -1,7 +1,10 @@
 use std::path::{Component, Path, PathBuf};
 
 pub(crate) fn canonical_relative_path(value: &str) -> anyhow::Result<String> {
-    if value.is_empty() || value.contains('\\') {
+    let bytes = value.as_bytes();
+    let has_windows_drive_prefix =
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if value.is_empty() || value.contains('\\') || has_windows_drive_prefix {
         anyhow::bail!("invalid attachment path");
     }
 
@@ -62,6 +65,10 @@ mod tests {
             "../secret",
             "/absolute",
             r"C:\secret",
+            "C:/secret",
+            "C:secret",
+            "c:/secret",
+            "c:secret",
             r"dir\secret",
         ] {
             assert!(

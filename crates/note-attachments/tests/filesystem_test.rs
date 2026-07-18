@@ -124,7 +124,13 @@ async fn platform_prefix_attachment_paths_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let store = FilesystemAttachmentStore::new(dir.path().join("attachments"));
 
-    for path in [r"C:\Windows\secret.txt", r"\\server\share\secret.txt"] {
+    for path in [
+        r"C:\Windows\secret.txt",
+        "C:/Windows/secret.txt",
+        "C:Windows/secret.txt",
+        "c:/Windows/secret.txt",
+        r"\\server\share\secret.txt",
+    ] {
         let error = store
             .prepare("note-1", &[attachment(path, b"content")])
             .await
