@@ -4,10 +4,23 @@ pub use connection::PgSession;
 use connection::{map_connect_error, map_sqlx_error};
 use note_storage::{BackendInfo, StorageError, StorageErrorKind, StorageResult, TransactionMode};
 use sqlx::postgres::PgPoolOptions;
+use std::fmt;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-#[derive(Debug)]
 pub struct PgStorage {
     pool: sqlx::PgPool,
+    immediate_gate: Arc<Mutex<()>>,
+}
+
+impl fmt::Debug for PgStorage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgStorage")
+            .field("engine", &"pg")
+            .field("closed", &self.pool.is_closed())
+            .finish()
+    }
 }
 
 impl PgStorage {
@@ -44,7 +57,10 @@ impl PgStorage {
             .await
             .map_err(map_migrate_error)?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            immediate_gate: Arc::new(Mutex::new(())),
+        })
     }
 
     pub async fn close(&self) {
@@ -56,7 +72,7 @@ impl PgStorage {
     }
 
     pub async fn begin_session(&self, mode: TransactionMode) -> StorageResult<PgSession> {
-        PgSession::begin(self.pool.clone(), mode).await
+        PgSession::begin(self.pool.clone(), mode, self.immediate_gate.clone()).await
     }
 
     pub fn backend_info(&self) -> BackendInfo {

@@ -2,9 +2,14 @@ use note_storage::{StorageError, StorageErrorKind, StorageResult, TransactionMod
 use sqlx::pool::PoolConnection;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::ops::{Deref, DerefMut};
-use tokio::sync::{Mutex, MutexGuard};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
+use tokio::time::{sleep, timeout_at, Instant};
 
 const IMMEDIATE_ADVISORY_LOCK_KEY: i64 = 0x4147_4E54_4E4F_5445;
+pub(crate) const IMMEDIATE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const IMMEDIATE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -16,6 +21,7 @@ enum PgConnectionState {
 #[derive(Debug)]
 pub struct PgSession {
     state: Mutex<Option<PgConnectionState>>,
+    immediate_guard: Option<OwnedMutexGuard<()>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -62,26 +68,69 @@ impl PgSession {
             .map_err(|error| map_sqlx_error("acquire PostgreSQL session", error))?;
         Ok(Self {
             state: Mutex::new(Some(PgConnectionState::Session(connection))),
+            immediate_guard: None,
         })
     }
 
-    pub(crate) async fn begin(pool: PgPool, mode: TransactionMode) -> StorageResult<Self> {
-        let mut transaction = pool
-            .begin()
-            .await
-            .map_err(|error| map_transaction_error("begin PostgreSQL transaction", error))?;
-        if mode == TransactionMode::Immediate {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(IMMEDIATE_ADVISORY_LOCK_KEY)
-                .execute(&mut *transaction)
+    pub(crate) async fn begin(
+        pool: PgPool,
+        mode: TransactionMode,
+        immediate_gate: Arc<Mutex<()>>,
+    ) -> StorageResult<Self> {
+        Self::begin_with_timeout(pool, mode, immediate_gate, IMMEDIATE_LOCK_TIMEOUT).await
+    }
+
+    async fn begin_with_timeout(
+        pool: PgPool,
+        mode: TransactionMode,
+        immediate_gate: Arc<Mutex<()>>,
+        lock_timeout: Duration,
+    ) -> StorageResult<Self> {
+        if mode == TransactionMode::Deferred {
+            let transaction = pool
+                .begin()
                 .await
-                .map_err(|error| {
-                    map_transaction_error("acquire immediate PostgreSQL advisory lock", error)
-                })?;
+                .map_err(|error| map_transaction_error("begin PostgreSQL transaction", error))?;
+            return Ok(Self {
+                state: Mutex::new(Some(PgConnectionState::Transaction(transaction))),
+                immediate_guard: None,
+            });
         }
-        Ok(Self {
-            state: Mutex::new(Some(PgConnectionState::Transaction(transaction))),
-        })
+
+        let immediate_guard = immediate_gate.lock_owned().await;
+        let deadline = Instant::now() + lock_timeout;
+        loop {
+            let mut transaction = timeout_at(deadline, pool.begin())
+                .await
+                .map_err(|_| immediate_lock_timeout_error())?
+                .map_err(|error| map_transaction_error("begin PostgreSQL transaction", error))?;
+            let acquired: bool = timeout_at(
+                deadline,
+                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                    .bind(IMMEDIATE_ADVISORY_LOCK_KEY)
+                    .fetch_one(&mut *transaction),
+            )
+            .await
+            .map_err(|_| immediate_lock_timeout_error())?
+            .map_err(|error| {
+                map_transaction_error("acquire immediate PostgreSQL advisory lock", error)
+            })?;
+            if acquired {
+                return Ok(Self {
+                    state: Mutex::new(Some(PgConnectionState::Transaction(transaction))),
+                    immediate_guard: Some(immediate_guard),
+                });
+            }
+
+            transaction.rollback().await.map_err(|error| {
+                map_transaction_error("rollback PostgreSQL advisory lock attempt", error)
+            })?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(immediate_lock_timeout_error());
+            }
+            sleep(IMMEDIATE_LOCK_RETRY_INTERVAL.min(remaining)).await;
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -104,15 +153,16 @@ impl PgSession {
         Box::new(self).finish(false).await
     }
 
-    pub(crate) async fn finish(self: Box<Self>, commit: bool) -> StorageResult<()> {
+    pub(crate) async fn finish(mut self: Box<Self>, commit: bool) -> StorageResult<()> {
         let state = self.state.lock().await.take();
         let Some(PgConnectionState::Transaction(transaction)) = state else {
+            self.immediate_guard.take();
             return Err(StorageError::new(
                 StorageErrorKind::Transaction,
                 "finalize PostgreSQL storage session without an open transaction",
             ));
         };
-        if commit {
+        let result = if commit {
             transaction
                 .commit()
                 .await
@@ -122,8 +172,17 @@ impl PgSession {
                 .rollback()
                 .await
                 .map_err(|error| map_transaction_error("rollback PostgreSQL transaction", error))
-        }
+        };
+        self.immediate_guard.take();
+        result
     }
+}
+
+fn immediate_lock_timeout_error() -> StorageError {
+    StorageError::new(
+        StorageErrorKind::Conflict,
+        "timed out waiting for PostgreSQL immediate transaction lock",
+    )
 }
 
 pub(crate) fn map_connect_error(error: sqlx::Error) -> StorageError {
@@ -170,15 +229,19 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use sqlx::{AssertSqlSafe, Executor, PgPool};
     use std::error::Error as _;
-    use std::io;
+    use std::io::{self, Write as _};
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
     use tokio::time::timeout;
 
     async fn test_pool(test_name: &str, max_connections: u32) -> Option<PgPool> {
         let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
-            eprintln!(
+            let stderr = io::stderr();
+            writeln!(
+                stderr.lock(),
                 "skipping {test_name}: TEST_DATABASE_URL is not set; no external database was accessed"
-            );
+            )
+            .expect("write safe PostgreSQL test skip notice");
             return None;
         };
 
@@ -189,6 +252,30 @@ mod tests {
                 .await
                 .expect("connect to TEST_DATABASE_URL"),
         )
+    }
+
+    fn immediate_gate() -> Arc<Mutex<()>> {
+        Arc::new(Mutex::new(()))
+    }
+
+    fn storage_from_pool(pool: PgPool) -> Arc<crate::PgStorage> {
+        Arc::new(crate::PgStorage {
+            pool,
+            immediate_gate: immediate_gate(),
+        })
+    }
+
+    fn advisory_test_mutex() -> &'static Mutex<()> {
+        static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    async fn begin_for_test(
+        pool: PgPool,
+        mode: TransactionMode,
+        gate: Arc<Mutex<()>>,
+    ) -> StorageResult<PgSession> {
+        PgSession::begin_with_timeout(pool, mode, gate, Duration::from_secs(2)).await
     }
 
     async fn assert_real_error_kind(pool: &PgPool, sql: &str, expected: StorageErrorKind) {
@@ -231,7 +318,7 @@ mod tests {
         pool.execute("CREATE TEMP TABLE drop_rollback_test (value integer NOT NULL)")
             .await
             .unwrap();
-        let session = PgSession::begin(pool.clone(), TransactionMode::Deferred)
+        let session = begin_for_test(pool.clone(), TransactionMode::Deferred, immediate_gate())
             .await
             .unwrap();
         {
@@ -258,9 +345,10 @@ mod tests {
         };
 
         let (first, second) = timeout(Duration::from_secs(2), async {
+            let gate = immediate_gate();
             tokio::join!(
-                PgSession::begin(pool.clone(), TransactionMode::Deferred),
-                PgSession::begin(pool.clone(), TransactionMode::Deferred)
+                begin_for_test(pool.clone(), TransactionMode::Deferred, gate.clone()),
+                begin_for_test(pool.clone(), TransactionMode::Deferred, gate)
             )
         })
         .await
@@ -272,8 +360,12 @@ mod tests {
         pool.close().await;
     }
 
-    async fn assert_immediate_serialization(pool: &PgPool, commit_holder: bool) {
-        let holder = PgSession::begin(pool.clone(), TransactionMode::Immediate)
+    async fn assert_immediate_serialization(
+        pool: &PgPool,
+        gate: Arc<Mutex<()>>,
+        commit_holder: bool,
+    ) {
+        let holder = begin_for_test(pool.clone(), TransactionMode::Immediate, gate.clone())
             .await
             .unwrap();
         {
@@ -291,7 +383,7 @@ mod tests {
 
         let pool_for_waiter = pool.clone();
         let mut waiter = tokio::spawn(async move {
-            PgSession::begin(pool_for_waiter, TransactionMode::Immediate).await
+            begin_for_test(pool_for_waiter, TransactionMode::Immediate, gate).await
         });
         assert!(
             timeout(Duration::from_millis(100), &mut waiter)
@@ -323,10 +415,182 @@ mod tests {
         else {
             return;
         };
+        let _test_guard = advisory_test_mutex().lock().await;
 
-        assert_immediate_serialization(&pool, true).await;
-        assert_immediate_serialization(&pool, false).await;
+        let gate = immediate_gate();
+        assert_immediate_serialization(&pool, gate.clone(), true).await;
+        assert_immediate_serialization(&pool, gate, false).await;
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn queued_immediate_burst_does_not_starve_an_ordinary_session() {
+        let Some(pool) = test_pool(
+            "queued_immediate_burst_does_not_starve_an_ordinary_session",
+            2,
+        )
+        .await
+        else {
+            return;
+        };
+        let _test_guard = advisory_test_mutex().lock().await;
+        let storage = storage_from_pool(pool);
+        let holder = storage
+            .begin_session(TransactionMode::Immediate)
+            .await
+            .unwrap();
+
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let storage = storage.clone();
+            waiters.push(tokio::spawn(async move {
+                storage.begin_session(TransactionMode::Immediate).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let ordinary = timeout(Duration::from_millis(200), storage.connect_session())
+            .await
+            .expect("queued immediate transactions must not occupy pool connections")
+            .expect("ordinary session must connect");
+        drop(ordinary);
+
+        for waiter in waiters {
+            waiter.abort();
+            let _ = waiter.await;
+        }
+        holder.rollback().await.unwrap();
+        storage.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_immediate_releases_the_application_gate() {
+        let Some(pool) = test_pool(
+            "cancelling_a_queued_immediate_releases_the_application_gate",
+            2,
+        )
+        .await
+        else {
+            return;
+        };
+        let _test_guard = advisory_test_mutex().lock().await;
+        let storage = storage_from_pool(pool);
+        let holder = storage
+            .begin_session(TransactionMode::Immediate)
+            .await
+            .unwrap();
+        let storage_for_waiter = storage.clone();
+        let waiter = tokio::spawn(async move {
+            storage_for_waiter
+                .begin_session(TransactionMode::Immediate)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        let ordinary = timeout(Duration::from_millis(200), storage.connect_session())
+            .await
+            .expect("a cancelled immediate waiter must not starve the pool")
+            .unwrap();
+        drop(ordinary);
+        holder.rollback().await.unwrap();
+
+        let next = timeout(
+            Duration::from_secs(2),
+            storage.begin_session(TransactionMode::Immediate),
+        )
+        .await
+        .expect("a cancelled waiter must release its application gate")
+        .unwrap();
+        drop(next);
+        let after_drop = timeout(
+            Duration::from_secs(2),
+            storage.begin_session(TransactionMode::Immediate),
+        )
+        .await
+        .expect("dropping an immediate transaction must release its application gate")
+        .unwrap();
+        after_drop.rollback().await.unwrap();
+        storage.close().await;
+    }
+
+    #[tokio::test]
+    async fn external_lock_wait_releases_pool_connections_and_has_a_safe_deadline() {
+        let Some(external_pool) = test_pool(
+            "external_lock_wait_releases_pool_connections_and_has_a_safe_deadline",
+            1,
+        )
+        .await
+        else {
+            return;
+        };
+        let Some(storage_pool) = test_pool(
+            "external_lock_wait_releases_pool_connections_and_has_a_safe_deadline",
+            1,
+        )
+        .await
+        else {
+            external_pool.close().await;
+            return;
+        };
+        let _test_guard = advisory_test_mutex().lock().await;
+        let storage = storage_from_pool(storage_pool);
+
+        let mut external_holder = external_pool.begin().await.unwrap();
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(IMMEDIATE_ADVISORY_LOCK_KEY)
+            .fetch_one(&mut *external_holder)
+            .await
+            .unwrap();
+        assert!(acquired);
+
+        let pool_for_waiter = storage.pool.clone();
+        let gate_for_waiter = storage.immediate_gate.clone();
+        let mut waiter = tokio::spawn(async move {
+            PgSession::begin_with_timeout(
+                pool_for_waiter,
+                TransactionMode::Immediate,
+                gate_for_waiter,
+                Duration::from_millis(200),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let ordinary = timeout(Duration::from_millis(100), storage.connect_session()).await;
+        let deadline_result = timeout(Duration::from_millis(500), &mut waiter).await;
+
+        external_holder.rollback().await.unwrap();
+        let waiter_cleanup = if deadline_result.is_err() {
+            Some(timeout(Duration::from_secs(2), &mut waiter).await)
+        } else {
+            None
+        };
+
+        ordinary
+            .expect("an advisory retry must release its pool connection")
+            .expect("ordinary session must connect while the external lock is held");
+        let error = deadline_result
+            .expect("the bounded advisory wait must finish before the test timeout")
+            .expect("advisory waiter task must not panic")
+            .expect_err("the bounded advisory wait must return an error");
+        assert_eq!(error.kind(), StorageErrorKind::Conflict);
+        assert!(error.source().is_none());
+        let display = error.to_string();
+        assert!(!display.contains("postgresql://"));
+        assert!(!display.contains("postgres"));
+        assert!(waiter_cleanup.is_none());
+
+        let session = timeout(
+            Duration::from_secs(2),
+            storage.begin_session(TransactionMode::Immediate),
+        )
+        .await
+        .expect("production immediate begin must finish after external lock release")
+        .expect("immediate transaction must succeed after external lock release");
+        session.rollback().await.unwrap();
+        storage.close().await;
+        external_pool.close().await;
     }
 
     #[tokio::test]
@@ -362,6 +626,7 @@ mod tests {
     async fn finalizing_an_empty_session_state_returns_a_transaction_error() {
         let session = PgSession {
             state: Mutex::new(None),
+            immediate_guard: None,
         };
         let error = Box::new(session).finish(true).await.unwrap_err();
         assert_eq!(error.kind(), StorageErrorKind::Transaction);
@@ -472,5 +737,22 @@ mod tests {
         let mapped = map_connect_error(sqlx::Error::PoolTimedOut);
         assert_eq!(mapped.kind(), StorageErrorKind::Unavailable);
         assert!(mapped.source().is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_debug_does_not_expose_database_credentials() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://debug-user:debug-password@127.0.0.1/debug-db")
+            .unwrap();
+        let storage = crate::PgStorage {
+            pool,
+            immediate_gate: immediate_gate(),
+        };
+
+        let debug = format!("{storage:?}");
+        assert!(!debug.contains("debug-user"));
+        assert!(!debug.contains("debug-password"));
+        assert!(!debug.contains("debug-db"));
+        assert!(!debug.contains("postgresql://"));
     }
 }
