@@ -493,6 +493,61 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn reject_postgres_startup(listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        const SSL_REQUEST_CODE: u32 = 80_877_103;
+
+        let (mut stream, _) = listener.accept().await?;
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).await?;
+        let packet_len = u32::from_be_bytes(header) as usize;
+        if packet_len < 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid PostgreSQL startup packet length",
+            ));
+        }
+        let mut body = vec![0_u8; packet_len - 4];
+        stream.read_exact(&mut body).await?;
+
+        let request_code = u32::from_be_bytes(body[..4].try_into().unwrap());
+        if request_code == SSL_REQUEST_CODE {
+            stream.write_all(b"N").await?;
+            stream.read_exact(&mut header).await?;
+            let packet_len = u32::from_be_bytes(header) as usize;
+            if packet_len < 8 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid PostgreSQL startup packet length",
+                ));
+            }
+            body.resize(packet_len - 4, 0);
+            stream.read_exact(&mut body).await?;
+        }
+
+        let mut payload = b"SERROR\0C28P01\0Mcontrolled authentication rejection\0".to_vec();
+        payload.push(0);
+        let mut error_packet = Vec::with_capacity(payload.len() + 5);
+        error_packet.push(b'E');
+        error_packet.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+        error_packet.extend_from_slice(&payload);
+        stream.write_all(&error_packet).await?;
+        stream.shutdown().await
+    }
+
+    async fn await_postgres_peer(mut peer: tokio::task::JoinHandle<std::io::Result<()>>) {
+        match tokio::time::timeout(Duration::from_secs(2), &mut peer).await {
+            Ok(result) => result
+                .expect("controlled PostgreSQL peer task must not panic")
+                .expect("controlled PostgreSQL peer must complete its exchange"),
+            Err(_) => {
+                peer.abort();
+                let _ = peer.await;
+                panic!("controlled PostgreSQL peer did not finish");
+            }
+        }
+    }
 
     #[test]
     fn data_directories_are_created_only_for_local_adapters() {
@@ -568,23 +623,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreachable_pg_errors_do_not_render_credentials() {
+    async fn pg_connection_errors_are_bounded_and_do_not_render_credentials() {
         const USERNAME: &str = "do-not-render-this-user";
         const PASSWORD: &str = "do-not-render-this-secret";
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        drop(listener);
+        let peer = tokio::spawn(reject_postgres_startup(listener));
         let url = format!("postgresql://{USERNAME}:{PASSWORD}@{address}/notes");
 
-        let error = build_storage(&DatabaseConfig::Pg {
-            url: url.clone(),
-            max_connections: 1,
-        })
-        .await
-        .err()
-        .expect("refused PostgreSQL connection must fail");
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            build_storage(&DatabaseConfig::Pg {
+                url: url.clone(),
+                max_connections: 1,
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        await_postgres_peer(peer).await;
+        let error = result
+            .expect("controlled PostgreSQL rejection must finish within five seconds")
+            .err()
+            .expect("controlled PostgreSQL peer must reject the connection");
         let rendered = format!("{error:#}");
 
+        assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
+        assert_eq!(rendered, "connect to PostgreSQL");
         assert!(!rendered.contains(&url), "{rendered}");
         assert!(!rendered.contains(USERNAME), "{rendered}");
         assert!(!rendered.contains(PASSWORD), "{rendered}");
