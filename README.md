@@ -156,7 +156,10 @@ are:
   (`NOTE_EMBEDDING_API_KEY_ENV`), `timeout_secs` (`NOTE_EMBEDDING_TIMEOUT_SECS`, default `30`), and
   `max_retries` (`NOTE_EMBEDDING_MAX_RETRIES`, default `3`).
 - `[attachments]`: `engine` (`NOTE_ATTACHMENTS_ENGINE`, default `filesystem`); for `filesystem`,
-  `path` (`NOTE_ATTACHMENTS_DIR`, default `attachments`).
+  `path` (`NOTE_ATTACHMENTS_DIR`, default `attachments`). For `s3`, `bucket`
+  (`NOTE_S3_BUCKET`), `prefix` (`NOTE_S3_PREFIX`, default empty), optional `region`
+  (`AWS_REGION`), optional `endpoint` (`NOTE_S3_ENDPOINT`), and `force_path_style`
+  (`NOTE_S3_FORCE_PATH_STYLE`, default `false`).
 
 ### PostgreSQL
 
@@ -255,29 +258,50 @@ then manually repair or publish bytes or remove orphan data as appropriate. Erro
 logged, but there is no built-in retry or reconciliation command, worker, or durable outbox.
 Publication failure after database commit must not be treated as a database rollback.
 
-The following S3 attachment values are parsed into a typed active variant and receive basic
-active-variant checks now. Full service, credential, connectivity, and operational validation is
-deferred until the S3 adapter is activated by its implementation plan. A mode that needs it returns
-a precise “not implemented yet” error rather than silently falling back.
+### S3 attachments
+
+The S3 adapter supports AWS S3 and compatible object stores such as MinIO. A local MinIO
+configuration can use:
 
 ```toml
 [attachments]
 engine = "s3"
-bucket = "agent-note-example"
-prefix = "notes"
-# region = "us-east-1"
-# endpoint = "http://object-store.example.invalid"
-force_path_style = false
+bucket = "agent-note"
+prefix = "attachments"
+region = "us-east-1"
+endpoint = "http://127.0.0.1:9000"
+force_path_style = true
 ```
 
-The corresponding fallbacks are `NOTE_S3_BUCKET`, `NOTE_S3_PREFIX`, `AWS_REGION`,
-`NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE`. S3 configuration is intended for S3-compatible
-object storage; it does not create the bucket.
+For AWS S3, normally omit `endpoint` and leave `force_path_style = false`. MinIO and similar local
+services use their service endpoint and commonly require path-style addressing. `region` is
+optional; omitting it uses the standard AWS region provider chain. The bucket must already exist.
+
+Credentials never belong in TOML. They come from the standard AWS credential provider chain,
+including `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, shared AWS
+profiles, web identity, container credentials, and instance roles. The adapter allows four total
+SDK attempts—the initial request and at most three retries—for failures the SDK classifies as
+transient.
+
+Final object keys are `<prefix>/<note-id>/<canonical-relative-path>`, or
+`<note-id>/<canonical-relative-path>` when `prefix` is empty. A write first uploads the complete
+attachment set beneath a unique `.staging` prefix. After the database transaction commits, it
+copies every staged object to its final key, removes obsolete final keys, and then removes staging.
+Listing consumes every continuation token, and each delete request contains at most 1,000 keys.
+One attachment read issues one `GetObject`; full note and export hydration read every attachment
+declared by the note metadata.
+
+The database and S3 do not share a transaction. Permanent deletion commits the database removal
+before object cleanup, so a cleanup failure can leave safe orphan objects. Final publication also
+happens after the database commit. If it fails, committed metadata can be temporarily unreadable;
+the safe staging location is retained for manual repair. This release has no durable outbox or
+reconciler, so inspect database and object state before retrying or repairing an operation.
 
 The System API reports backend-neutral `database_engine`, optional `database_path` and
 `database_size_bytes`, `attachments_engine` and optional `attachments_location`, plus the three
 safe embedding fields described above. It does not expose database credentials or embedding
-authentication.
+authentication. For S3 it reports only engine `s3` and `s3://bucket/prefix`; it never exposes
+endpoint user information, profiles, access keys, secret keys, or session tokens.
 
 ## Exact hybrid retrieval
 

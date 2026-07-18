@@ -33,7 +33,7 @@ implementation details are left to the builder.
   OpenAI-compatible HTTP               PostgreSQL external adapter
                           │
                   Attachment adapter
-                  filesystem today; S3 reserved
+                  filesystem or S3-compatible object storage
 ```
 
 stdio is the same binary, selected by an entrypoint flag, and calls pipelines directly — never
@@ -155,7 +155,7 @@ order:
   `NOTE_EMBEDDING_API_KEY_ENV`, `NOTE_EMBEDDING_TIMEOUT_SECS`, and
   `NOTE_EMBEDDING_MAX_RETRIES` fallbacks.
 - `[attachments]`: `engine` (`NOTE_ATTACHMENTS_ENGINE`, default `filesystem`). Filesystem uses
-  `path` (`NOTE_ATTACHMENTS_DIR`, default `attachments`). Reserved S3 uses `bucket`, `prefix`,
+  `path` (`NOTE_ATTACHMENTS_DIR`, default `attachments`). S3 uses `bucket`, `prefix`,
   optional `region`, optional `endpoint`, and `force_path_style`, with `NOTE_S3_BUCKET`,
   `NOTE_S3_PREFIX`, `AWS_REGION`, `NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE` fallbacks.
 
@@ -172,10 +172,40 @@ HTTP 5xx with bounded backoff. `max_retries` counts retries after the initial re
 exceed `10`. Successful response bodies are limited to 1 MiB; unauthenticated error bodies are
 limited to 4 KiB and authenticated error bodies are redacted.
 
-The reserved S3 adapter targets S3-compatible object storage. Its values are parsed into a typed
-active variant and receive basic active-variant checks now; full service, credential, connectivity,
-and operational validation is deferred until that adapter activates. A mode that constructs it
-returns a precise not-implemented error rather than silently falling back.
+The S3 adapter targets AWS S3 and compatible object storage. For example, a local MinIO
+configuration is:
+
+```toml
+[attachments]
+engine = "s3"
+bucket = "agent-note"
+prefix = "attachments"
+region = "us-east-1"
+endpoint = "http://127.0.0.1:9000"
+force_path_style = true
+```
+
+AWS S3 normally omits `endpoint` and leaves `force_path_style = false`; MinIO and similar local
+services provide an endpoint and commonly require path style. `region` may be omitted to use the
+standard AWS region provider chain. Credentials are never stored in TOML. They come from the
+standard AWS credential chain, including `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional
+`AWS_SESSION_TOKEN`, shared profiles, web identity, container credentials, and instance roles.
+
+Final object keys are `<prefix>/<note-id>/<canonical-relative-path>`, or
+`<note-id>/<canonical-relative-path>` for an empty prefix. Writes upload a complete set beneath a
+unique `.staging` prefix, commit note metadata, copy every expected object to its final key, remove
+obsolete final keys, and remove staging. The AWS SDK permits four total attempts (the initial
+request plus at most three retries) for SDK-classified transient failures. List operations consume
+every continuation token, and delete requests contain at most 1,000 keys. A single attachment read
+issues one `GetObject`; note and export hydration read every object declared by note metadata.
+
+S3 publication and deletion preserve the same database boundary as the filesystem adapter.
+Permanent deletion commits the database removal before object cleanup, so failure can leave safe
+orphan objects. Publication happens after database commit and failure can leave committed metadata
+temporarily unreadable; the safe staging location is retained for manual repair. There is no
+durable outbox or reconciler in this release. Backend-neutral System information reports only
+engine `s3` and `s3://bucket/prefix`, never endpoint user information, profiles, access keys,
+secret keys, or session tokens.
 
 `note-storage-pg` is the complete external database adapter. Before Agent Note starts, the operator
 must provision pgvector in the selected database:

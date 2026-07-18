@@ -51,3 +51,49 @@ jobs:
         run: cargo test -p note-storage-turso
       - name: Run PostgreSQL storage suite
         run: cargo test -p note-storage-pg
+
+  s3-integration:
+    name: S3 integration (MinIO)
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_EC2_METADATA_DISABLED: "true"
+      NOTE_TEST_MINIO_ENDPOINT: http://127.0.0.1:9000
+      NOTE_TEST_MINIO_BUCKET: agent-note-tests
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO
+        run: |
+          docker run -d --name agent-note-minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-07-18T21-56-31Z server /data
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl --fail --silent \
+              http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs agent-note-minio
+            exit 1
+          fi
+          docker run --rm --network host \
+            -e MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000 \
+            minio/mc:RELEASE.2025-07-21T05-28-08Z \
+            mb --ignore-existing local/agent-note-tests
+      - name: Test S3 attachment adapter
+        run: cargo test --locked -p note-attachments --test s3_minio_test -- --nocapture
+      - name: Test S3 import and export
+        run: cargo test --locked -p note-pipelines --test s3_export_test -- --nocapture
+      - name: Print MinIO logs on failure
+        if: failure()
+        run: docker logs agent-note-minio
