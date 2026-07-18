@@ -46,6 +46,14 @@ struct PreparedS3Set {
     staging_prefix: String,
     staged_keys: Vec<String>,
     metadata: Vec<NoteAttachment>,
+    note_guard: Option<OwnedMutexGuard<()>>,
+    cleanup_armed: bool,
+}
+
+struct S3CleanupWork {
+    store: S3AttachmentStore,
+    staged_keys: Vec<String>,
+    staging_location: String,
     _note_guard: OwnedMutexGuard<()>,
 }
 
@@ -149,7 +157,6 @@ impl S3AttachmentStore {
         attachments: &[NoteAttachment],
     ) -> anyhow::Result<PreparedS3Set> {
         validate_note_id(note_id)?;
-        let note_guard = self.coordination.lock_for(note_id).lock_owned().await;
         let mut canonical = Vec::with_capacity(attachments.len());
         let mut canonical_set = HashSet::with_capacity(attachments.len());
         let mut metadata = Vec::with_capacity(attachments.len());
@@ -168,21 +175,33 @@ impl S3AttachmentStore {
             });
         }
 
+        let note_guard = self.coordination.lock_for(note_id).lock_owned().await;
         let staging_prefix = staging_prefix(
             &self.prefix,
             note_id,
             &uuid::Uuid::new_v4().simple().to_string(),
         )?;
-        let mut uploaded = Vec::new();
+        let mut prepared = PreparedS3Set {
+            store: self.clone(),
+            note_id: note_id.to_string(),
+            staging_prefix,
+            staged_keys: Vec::new(),
+            metadata,
+            note_guard: Some(note_guard),
+            cleanup_armed: true,
+        };
         for (attachment, relative) in attachments.iter().zip(canonical) {
-            let key = format!("{staging_prefix}{relative}");
+            let key = format!("{}{relative}", prepared.staging_prefix);
             // The request may have committed remotely even if its response is
             // lost, so include the current key in idempotent cleanup first.
-            uploaded.push(key.clone());
+            prepared.staged_keys.push(key.clone());
             if let Err(error) = self.put(&key, &attachment.content).await {
-                let cleanup = self.delete_keys(&uploaded).await;
+                let cleanup = prepared.schedule_cleanup()?.await;
                 return match cleanup {
-                    Ok(()) => Err(error),
+                    Ok(Ok(())) => Err(error),
+                    Ok(Err(cleanup_error)) => {
+                        Err(error.context(format!("staging cleanup also failed: {cleanup_error}")))
+                    }
                     Err(cleanup_error) => {
                         Err(error.context(format!("staging cleanup also failed: {cleanup_error}")))
                     }
@@ -190,14 +209,7 @@ impl S3AttachmentStore {
             }
         }
 
-        Ok(PreparedS3Set {
-            store: self.clone(),
-            note_id: note_id.to_string(),
-            staging_prefix,
-            staged_keys: uploaded,
-            metadata,
-            _note_guard: note_guard,
-        })
+        Ok(prepared)
     }
 
     async fn read_key(&self, key: &str) -> anyhow::Result<Vec<u8>> {
@@ -266,33 +278,41 @@ impl S3AttachmentStore {
             .collect())
     }
 
-    async fn publish_set(&self, prepared: PreparedS3Set) -> anyhow::Result<()> {
-        let publish_result = async {
-            for attachment in &prepared.metadata {
-                let relative = crate::path::canonical_relative_path(&attachment.path)?;
-                let source_key = format!("{}{relative}", prepared.staging_prefix);
-                let destination_key = final_key(&self.prefix, &prepared.note_id, &attachment.path)?;
-                self.client
-                    .copy_object()
-                    .copy_source(copy_source(&self.bucket, &source_key))
-                    .bucket(&self.bucket)
-                    .key(destination_key)
-                    .send()
-                    .await
-                    .map_err(|error| safe_sdk_error("copy object", &error))?;
+    async fn publish_set(&self, prepared: Box<PreparedS3Set>) -> anyhow::Result<()> {
+        for attachment in &prepared.metadata {
+            let relative = crate::path::canonical_relative_path(&attachment.path)?;
+            let source_key = format!("{}{relative}", prepared.staging_prefix);
+            let destination_key = final_key(&self.prefix, &prepared.note_id, &attachment.path)?;
+            if let Err(error) = self
+                .client
+                .copy_object()
+                .copy_source(copy_source(&self.bucket, &source_key))
+                .bucket(&self.bucket)
+                .key(destination_key)
+                .send()
+                .await
+                .map_err(|error| safe_sdk_error("copy object", &error))
+            {
+                let staging_location = prepared.staging_location();
+                eprintln!(
+                    "S3 attachment publication failed after database commit; \
+                     staged objects retained at {staging_location}"
+                );
+                return Err(error.context(format!(
+                    "database committed; staged objects retained at {staging_location}"
+                )));
             }
-            self.delete_keys(&prepared.staged_keys).await
         }
-        .await;
 
-        if let Err(error) = publish_result {
-            let staging_location = format!("s3://{}/{}", self.bucket, prepared.staging_prefix);
+        if let Err(error) = self.delete_keys(&prepared.staged_keys).await {
+            let staging_location = prepared.staging_location();
             eprintln!(
-                "S3 attachment publication failed after database commit; \
-                 staged objects retained at {staging_location}"
+                "S3 attachment publication copied final objects after database commit; \
+                 staging cleanup uncertain at {staging_location}"
             );
             return Err(error.context(format!(
-                "database committed; staged objects retained at {staging_location}"
+                "database committed; final objects copied; \
+                 staging cleanup uncertain at {staging_location}"
             )));
         }
         Ok(())
@@ -308,19 +328,95 @@ impl S3AttachmentStore {
     }
 }
 
+impl PreparedS3Set {
+    fn staging_location(&self) -> String {
+        format!("s3://{}/{}", self.store.bucket, self.staging_prefix)
+    }
+
+    fn take_cleanup_work(&mut self) -> Option<S3CleanupWork> {
+        if !self.cleanup_armed {
+            return None;
+        }
+        self.cleanup_armed = false;
+        let note_guard = self.note_guard.take()?;
+        if self.staged_keys.is_empty() {
+            drop(note_guard);
+            return None;
+        }
+        Some(S3CleanupWork {
+            store: self.store.clone(),
+            staged_keys: std::mem::take(&mut self.staged_keys),
+            staging_location: self.staging_location(),
+            _note_guard: note_guard,
+        })
+    }
+
+    fn schedule_cleanup(&mut self) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow::anyhow!("S3 staging cleanup could not be scheduled"))?;
+        let work = self.take_cleanup_work();
+        Ok(runtime.spawn(async move {
+            let Some(work) = work else {
+                return Ok(());
+            };
+            work.run().await
+        }))
+    }
+}
+
+impl S3CleanupWork {
+    async fn run(self) -> anyhow::Result<()> {
+        let result = self.store.delete_keys(&self.staged_keys).await;
+        if let Err(error) = result.as_ref() {
+            eprintln!(
+                "S3 staged attachment cleanup failed at {}: {error}",
+                self.staging_location
+            );
+        }
+        result
+    }
+}
+
+impl Drop for PreparedS3Set {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        let staging_location = self.staging_location();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.cleanup_armed = false;
+            eprintln!("S3 staged attachment cleanup could not be scheduled at {staging_location}");
+            return;
+        };
+        if let Some(work) = self.take_cleanup_work() {
+            runtime.spawn(async move {
+                let _ = work.run().await;
+            });
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::PreparedAttachmentSet for PreparedS3Set {
     fn metadata(&self) -> &[NoteAttachment] {
         &self.metadata
     }
 
-    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
+    async fn publish(mut self: Box<Self>) -> anyhow::Result<()> {
+        // The database is already committed. From this point onward, caller
+        // cancellation must neither stop publication nor invoke pre-commit
+        // staging cleanup.
+        self.cleanup_armed = false;
         let store = self.store.clone();
-        store.publish_set(*self).await
+        tokio::spawn(async move { store.publish_set(self).await })
+            .await
+            .map_err(|_| anyhow::anyhow!("S3 attachment publication task failed"))?
     }
 
-    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
-        self.store.delete_keys(&self.staged_keys).await
+    async fn abort(mut self: Box<Self>) -> anyhow::Result<()> {
+        self.schedule_cleanup()?
+            .await
+            .map_err(|_| anyhow::anyhow!("S3 staging cleanup task failed"))?
     }
 }
 
@@ -331,7 +427,13 @@ impl crate::AttachmentStore for S3AttachmentStore {
         note_id: &str,
         attachments: &[NoteAttachment],
     ) -> anyhow::Result<Box<dyn crate::PreparedAttachmentSet>> {
-        Ok(Box::new(self.prepare_set(note_id, attachments).await?))
+        let store = self.clone();
+        let note_id = note_id.to_string();
+        let attachments = attachments.to_vec();
+        let prepared = tokio::spawn(async move { store.prepare_set(&note_id, &attachments).await })
+            .await
+            .map_err(|_| anyhow::anyhow!("S3 attachment preparation task failed"))??;
+        Ok(Box::new(prepared))
     }
 
     async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
@@ -557,6 +659,50 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct BlockFirstResponse {
+        calls: Arc<AtomicUsize>,
+        reached: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+        response: ResponseTemplate,
+    }
+
+    impl Respond for BlockFirstResponse {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                if let Some(reached) = self
+                    .reached
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let _ = reached.send(());
+                }
+                return self.response.clone().set_delay(Duration::from_millis(500));
+            }
+            self.response.clone()
+        }
+    }
+
+    fn block_first_response(
+        response: ResponseTemplate,
+    ) -> (
+        BlockFirstResponse,
+        tokio::sync::oneshot::Receiver<()>,
+        Arc<AtomicUsize>,
+    ) {
+        let (reached_sender, reached_receiver) = tokio::sync::oneshot::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            BlockFirstResponse {
+                calls: calls.clone(),
+                reached: Arc::new(Mutex::new(Some(reached_sender))),
+                response,
+            },
+            reached_receiver,
+            calls,
+        )
+    }
+
     async fn test_store(endpoint: String) -> S3AttachmentStore {
         S3AttachmentStore::new(S3AttachmentConfig {
             bucket: "agent-note".into(),
@@ -773,6 +919,380 @@ mod tests {
             &server.uri(),
         ] {
             assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_publish_keeps_the_note_locked_until_ordered_publication_finishes() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("publish-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("publish-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let (copy_response, copy_reached, copy_calls) =
+            block_first_response(ResponseTemplate::new(200));
+
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/note-1/file.txt"))
+            .respond_with(copy_response)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agent-note/"))
+            .and(body_string_contains(".staging/note-1/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<DeleteResult></DeleteResult>", "application/xml"),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        let first = store
+            .prepare_set(
+                "note-1",
+                &[NoteAttachment {
+                    id: "file".into(),
+                    path: "file.txt".into(),
+                    mime: "text/plain".into(),
+                    description: String::new(),
+                    content: b"old".to_vec(),
+                }],
+            )
+            .await
+            .unwrap();
+        let publish = tokio::spawn(async move {
+            let prepared: Box<dyn crate::PreparedAttachmentSet> = Box::new(first);
+            prepared.publish().await
+        });
+        tokio::time::timeout(Duration::from_secs(2), copy_reached)
+            .await
+            .expect("first copy must start")
+            .expect("copy responder must signal");
+        publish.abort();
+        assert!(publish.await.unwrap_err().is_cancelled());
+
+        let second_store = store.clone();
+        let mut second = tokio::spawn(async move {
+            second_store
+                .prepare_set(
+                    "note-1",
+                    &[NoteAttachment {
+                        id: "file".into(),
+                        path: "file.txt".into(),
+                        mime: "text/plain".into(),
+                        description: String::new(),
+                        content: b"new".to_vec(),
+                    }],
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "the next same-note prepare must wait for detached publication"
+        );
+
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second prepare must proceed after first publication")
+            .unwrap()
+            .unwrap();
+        let prepared: Box<dyn crate::PreparedAttachmentSet> = Box::new(second);
+        prepared.publish().await.unwrap();
+        assert_eq!(copy_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_prepare_detaches_cleanup_and_holds_the_note_lock() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("prepare-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("prepare-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let (put_response, put_reached, _) = block_first_response(ResponseTemplate::new(200));
+        let (delete_response, delete_reached, _) = block_first_response(
+            ResponseTemplate::new(200)
+                .set_body_raw("<DeleteResult></DeleteResult>", "application/xml"),
+        );
+
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(put_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agent-note/"))
+            .and(body_string_contains("file.txt</Key>"))
+            .respond_with(delete_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        let preparing_store = store.clone();
+        let preparing = tokio::spawn(async move {
+            crate::AttachmentStore::prepare(
+                &preparing_store,
+                "note-1",
+                &[NoteAttachment {
+                    id: "file".into(),
+                    path: "file.txt".into(),
+                    mime: "text/plain".into(),
+                    description: String::new(),
+                    content: b"payload".to_vec(),
+                }],
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), put_reached)
+            .await
+            .expect("PUT must start")
+            .expect("PUT responder must signal");
+        preparing.abort();
+        assert!(matches!(preparing.await, Err(error) if error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(2), delete_reached)
+            .await
+            .expect("cancelled prepare must schedule cleanup")
+            .expect("delete responder must signal");
+
+        let second_store = store.clone();
+        let mut second = tokio::spawn(async move { second_store.prepare_set("note-1", &[]).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "cleanup must retain the note lock"
+        );
+        let mut second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second prepare must proceed after cleanup")
+            .unwrap()
+            .unwrap();
+        second.schedule_cleanup().unwrap().await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_abort_detaches_cleanup_and_holds_the_note_lock() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("abort-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("abort-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let (delete_response, delete_reached, _) = block_first_response(
+            ResponseTemplate::new(200)
+                .set_body_raw("<DeleteResult></DeleteResult>", "application/xml"),
+        );
+
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agent-note/"))
+            .and(body_string_contains("file.txt</Key>"))
+            .respond_with(delete_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        let prepared = store
+            .prepare_set(
+                "note-1",
+                &[NoteAttachment {
+                    id: "file".into(),
+                    path: "file.txt".into(),
+                    mime: "text/plain".into(),
+                    description: String::new(),
+                    content: b"payload".to_vec(),
+                }],
+            )
+            .await
+            .unwrap();
+        let aborting = tokio::spawn(async move {
+            let prepared: Box<dyn crate::PreparedAttachmentSet> = Box::new(prepared);
+            prepared.abort().await
+        });
+        tokio::time::timeout(Duration::from_secs(2), delete_reached)
+            .await
+            .expect("abort cleanup must start")
+            .expect("delete responder must signal");
+        aborting.abort();
+        assert!(aborting.await.unwrap_err().is_cancelled());
+
+        let second_store = store.clone();
+        let mut second = tokio::spawn(async move { second_store.prepare_set("note-1", &[]).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "detached abort must retain the note lock"
+        );
+        let mut second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second prepare must proceed after abort cleanup")
+            .unwrap()
+            .unwrap();
+        second.schedule_cleanup().unwrap().await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_errors_report_copy_and_cleanup_phases_without_secrets() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("phase-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("phase-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+
+        let copy_server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/private-name\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&copy_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/note-1/private-name.txt"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                "<Error><Code>PrivateCopyCode</Code><Message>private copy body</Message></Error>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&copy_server)
+            .await;
+        let copy_store = test_store(copy_server.uri()).await;
+        let prepared = copy_store
+            .prepare_set(
+                "note-1",
+                &[NoteAttachment {
+                    id: "private-id".into(),
+                    path: "private-name.txt".into(),
+                    mime: "text/plain".into(),
+                    description: String::new(),
+                    content: b"private content".to_vec(),
+                }],
+            )
+            .await
+            .unwrap();
+        let prepared: Box<dyn crate::PreparedAttachmentSet> = Box::new(prepared);
+        let copy_error = prepared.publish().await.unwrap_err();
+        let copy_rendered = format!("{copy_error:#}");
+        assert!(copy_rendered.contains("staged objects retained at s3://agent-note/.staging/"));
+        assert!(!copy_rendered.contains("staging cleanup uncertain"));
+        assert_eq!(
+            copy_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.method.as_str() == "POST")
+                .count(),
+            0
+        );
+
+        let cleanup_server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/private-name\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&cleanup_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/note-1/private-name.txt"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&cleanup_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agent-note/"))
+            .respond_with(ResponseTemplate::new(503).set_body_raw(
+                "<Error><Code>PrivateDeleteCode</Code><Message>private delete body</Message></Error>",
+                "application/xml",
+            ))
+            .expect(4)
+            .mount(&cleanup_server)
+            .await;
+        let cleanup_store = test_store(cleanup_server.uri()).await;
+        let prepared = cleanup_store
+            .prepare_set(
+                "note-1",
+                &[NoteAttachment {
+                    id: "private-id".into(),
+                    path: "private-name.txt".into(),
+                    mime: "text/plain".into(),
+                    description: String::new(),
+                    content: b"private content".to_vec(),
+                }],
+            )
+            .await
+            .unwrap();
+        let prepared: Box<dyn crate::PreparedAttachmentSet> = Box::new(prepared);
+        let cleanup_error = prepared.publish().await.unwrap_err();
+        let cleanup_rendered = format!("{cleanup_error:#}");
+        assert!(cleanup_rendered
+            .contains("final objects copied; staging cleanup uncertain at s3://agent-note/"));
+        assert!(!cleanup_rendered.contains("staged objects retained"));
+
+        for rendered in [&copy_rendered, &cleanup_rendered] {
+            for secret in [
+                "private-name.txt",
+                "private copy body",
+                "PrivateCopyCode",
+                "private delete body",
+                "PrivateDeleteCode",
+                "phase-access",
+                "phase-secret",
+                &copy_server.uri(),
+                &cleanup_server.uri(),
+            ] {
+                assert!(!rendered.contains(secret));
+            }
         }
     }
 

@@ -69,6 +69,22 @@ async fn list_keys(fixture: &Fixture, prefix: &str) -> Vec<String> {
     }
 }
 
+async fn wait_for_no_keys(fixture: &Fixture) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if list_keys(fixture, &format!("{}/", fixture.prefix))
+                .await
+                .is_empty()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("staging cleanup must finish");
+}
+
 fn attachment(path: &str, content: &[u8]) -> NoteAttachment {
     NoteAttachment {
         id: path.to_string(),
@@ -160,6 +176,8 @@ async fn direct_read_fetches_only_the_requested_object() {
         fixture.store.read("note-1", "./wanted.txt").await.unwrap(),
         b"wanted"
     );
+    fixture.store.remove_note("note-1").await.unwrap();
+    wait_for_no_keys(&fixture).await;
 }
 
 #[tokio::test]
@@ -237,6 +255,29 @@ async fn different_note_sets_can_be_prepared_together_for_import() {
     .unwrap();
     first.abort().await.unwrap();
     second.abort().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_an_unresolved_set_eventually_removes_its_staging_objects() {
+    let Some(fixture) = fixture().await else {
+        eprintln!("skipped: NOTE_TEST_MINIO_ENDPOINT is unset");
+        return;
+    };
+    let prepared = fixture
+        .store
+        .prepare("note-1", &[attachment("./file.txt", b"payload")])
+        .await
+        .unwrap();
+    assert_eq!(
+        list_keys(&fixture, &format!("{}/", fixture.prefix))
+            .await
+            .len(),
+        1
+    );
+
+    drop(prepared);
+
+    wait_for_no_keys(&fixture).await;
 }
 
 #[tokio::test]
