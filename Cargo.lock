@@ -2602,6 +2602,7 @@ name = "note-storage-pg"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "note-core",
  "note-storage",
  "note-storage-contract-tests",

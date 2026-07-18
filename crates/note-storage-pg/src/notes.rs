@@ -1,9 +1,10 @@
 use crate::connection::map_sqlx_error;
 use crate::PgSession;
+use futures_util::TryStreamExt;
 use note_core::{label_matches_selector, LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
-    ActiveNoteSource, LabelRepository, NewNote, NoteUpdate, NotesRepository, StorageError,
-    StorageErrorKind, StorageResult,
+    ActiveNoteSource, NewNote, NoteUpdate, NotesRepository, StorageError, StorageErrorKind,
+    StorageResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,23 +53,36 @@ impl NotesRepository for PgSession {
     }
 
     async fn get_note(&self, id: &str) -> StorageResult<Option<Note>> {
-        let row = {
-            let mut connection = self.connection().await?;
-            sqlx::query_as::<_, NoteRow>(
-                "SELECT id, title, content, attachments, created_at, updated_at, deleted_at
-                 FROM notes
-                 WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(id)
-            .fetch_optional(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx_error("query note", error))?
-        };
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let labels = self.labels_for_note(&row.id).await?;
-        Ok(Some(row.into_note(labels)?))
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, NoteRow>(
+            "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
+                    n.deleted_at, labels.labels
+             FROM notes n
+             CROSS JOIN LATERAL (
+                 SELECT COALESCE(
+                     jsonb_agg(
+                         jsonb_build_object(
+                             'key', lk.key,
+                             'value', nl.value,
+                             'description', lk.description,
+                             'value_type', lk.value_type
+                         )
+                         ORDER BY lk.key
+                     ),
+                     '[]'::jsonb
+                 ) AS labels
+                 FROM note_labels nl
+                 JOIN label_keys lk ON lk.id = nl.label_key_id
+                 WHERE nl.note_id = n.id
+             ) labels
+             WHERE n.id = $1 AND n.deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query note", error))?
+        .map(NoteRow::into_note)
+        .transpose()
     }
 
     async fn get_note_content(&self, id: &str) -> StorageResult<Option<String>> {
@@ -242,39 +256,42 @@ impl NotesRepository for PgSession {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<Note>> {
-        let rows = self
-            .active_note_rows(selectors.is_empty(), limit, offset)
-            .await?;
-        let mut notes = Vec::with_capacity(rows.len());
-        for row in rows {
-            let labels = self.labels_for_note(&row.id).await?;
-            notes.push(row.into_note(labels)?);
+        if selectors.is_empty() {
+            let rows = self.active_note_page(limit, offset).await?;
+            return rows.into_iter().map(NoteRow::into_note).collect();
         }
-        if !selectors.is_empty() {
-            notes.retain(|note| note_matches_selectors(note, selectors));
-            notes = paginate(notes, limit, offset);
-        }
-        Ok(notes)
+        self.stream_matching_notes(selectors, limit, offset).await
     }
 
     async fn list_all_notes(&self) -> StorageResult<Vec<Note>> {
-        let rows = {
-            let mut connection = self.connection().await?;
-            sqlx::query_as::<_, NoteRow>(
-                "SELECT id, title, content, attachments, created_at, updated_at, deleted_at
-                 FROM notes
-                 ORDER BY created_at DESC",
-            )
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx_error("query all notes", error))?
-        };
-        let mut notes = Vec::with_capacity(rows.len());
-        for row in rows {
-            let labels = self.labels_for_note(&row.id).await?;
-            notes.push(row.into_note(labels)?);
-        }
-        Ok(notes)
+        let mut connection = self.connection().await?;
+        let rows = sqlx::query_as::<_, NoteRow>(
+            "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
+                    n.deleted_at, labels.labels
+             FROM notes n
+             CROSS JOIN LATERAL (
+                 SELECT COALESCE(
+                     jsonb_agg(
+                         jsonb_build_object(
+                             'key', lk.key,
+                             'value', nl.value,
+                             'description', lk.description,
+                             'value_type', lk.value_type
+                         )
+                         ORDER BY lk.key
+                     ),
+                     '[]'::jsonb
+                 ) AS labels
+                 FROM note_labels nl
+                 JOIN label_keys lk ON lk.id = nl.label_key_id
+                 WHERE nl.note_id = n.id
+             ) labels
+             ORDER BY n.created_at DESC, n.id ASC",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query all notes", error))?;
+        rows.into_iter().map(NoteRow::into_note).collect()
     }
 
     async fn list_note_summaries(
@@ -283,65 +300,56 @@ impl NotesRepository for PgSession {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<NoteListItem>> {
-        let rows = self
-            .active_summary_rows(selectors.is_empty(), limit, offset)
-            .await?;
-        let mut notes = Vec::with_capacity(rows.len());
-        for row in rows {
-            notes.push(NoteListItem {
-                labels: self.labels_for_note(&row.id).await?,
-                id: row.id,
-                title: row.title,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-                deleted_at: row.deleted_at,
-            });
+        if selectors.is_empty() {
+            let rows = self.active_summary_page(limit, offset).await?;
+            return rows.into_iter().map(SummaryRow::into_summary).collect();
         }
-        if !selectors.is_empty() {
-            notes.retain(|note| summary_matches_selectors(note, selectors));
-            notes = paginate(notes, limit, offset);
-        }
-        Ok(notes)
+        self.stream_matching_summaries(selectors, limit, offset)
+            .await
     }
 
     async fn list_deleted_note_summaries(&self) -> StorageResult<Vec<NoteListItem>> {
-        let rows = {
-            let mut connection = self.connection().await?;
-            sqlx::query_as::<_, SummaryRow>(
-                "SELECT id, title, created_at, updated_at, deleted_at
-                 FROM notes
-                 WHERE deleted_at IS NOT NULL
-                 ORDER BY deleted_at DESC, id",
-            )
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx_error("query deleted note summaries", error))?
-        };
-        let mut notes = Vec::with_capacity(rows.len());
-        for row in rows {
-            notes.push(NoteListItem {
-                labels: self.labels_for_note(&row.id).await?,
-                id: row.id,
-                title: row.title,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-                deleted_at: row.deleted_at,
-            });
-        }
-        Ok(notes)
+        let mut connection = self.connection().await?;
+        let rows = sqlx::query_as::<_, SummaryRow>(
+            "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at, labels.labels
+             FROM notes n
+             CROSS JOIN LATERAL (
+                 SELECT COALESCE(
+                     jsonb_agg(
+                         jsonb_build_object(
+                             'key', lk.key,
+                             'value', nl.value,
+                             'description', lk.description,
+                             'value_type', lk.value_type
+                         )
+                         ORDER BY lk.key
+                     ),
+                     '[]'::jsonb
+                 ) AS labels
+                 FROM note_labels nl
+                 JOIN label_keys lk ON lk.id = nl.label_key_id
+                 WHERE nl.note_id = n.id
+             ) labels
+             WHERE n.deleted_at IS NOT NULL
+             ORDER BY n.deleted_at DESC, n.id ASC",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query deleted note summaries", error))?;
+        rows.into_iter().map(SummaryRow::into_summary).collect()
     }
 
     async fn count_notes(&self, selectors: &[LabelSelector]) -> StorageResult<usize> {
-        if !selectors.is_empty() {
-            return Ok(self.list_note_summaries(selectors, None, None).await?.len());
+        if selectors.is_empty() {
+            let mut connection = self.connection().await?;
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*)::bigint FROM notes WHERE deleted_at IS NULL")
+                    .fetch_one(&mut *connection)
+                    .await
+                    .map_err(|error| map_sqlx_error("count notes", error))?;
+            return Ok(count.max(0) as usize);
         }
-        let mut connection = self.connection().await?;
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM notes WHERE deleted_at IS NULL")
-                .fetch_one(&mut *connection)
-                .await
-                .map_err(|error| map_sqlx_error("count notes", error))?;
-        Ok(count.max(0) as usize)
+        self.count_matching_summaries(selectors).await
     }
 
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>> {
@@ -367,70 +375,238 @@ impl NotesRepository for PgSession {
 }
 
 impl PgSession {
-    async fn active_note_rows(
+    async fn active_note_page(
         &self,
-        paginate_in_sql: bool,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<NoteRow>> {
         let mut connection = self.connection().await?;
-        if paginate_in_sql {
-            sqlx::query_as::<_, NoteRow>(
-                "SELECT id, title, content, attachments, created_at, updated_at, deleted_at
-                 FROM notes
-                 WHERE deleted_at IS NULL
-                 ORDER BY created_at DESC
-                 LIMIT $1 OFFSET $2",
-            )
-            .bind(normalize_limit(limit))
-            .bind(offset.unwrap_or(0).max(0))
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx_error("query notes", error))
-        } else {
-            sqlx::query_as::<_, NoteRow>(
-                "SELECT id, title, content, attachments, created_at, updated_at, deleted_at
-                 FROM notes
-                 WHERE deleted_at IS NULL
-                 ORDER BY created_at DESC",
-            )
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx_error("query notes", error))
-        }
+        sqlx::query_as::<_, NoteRow>(
+            "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
+                    n.deleted_at, labels.labels
+             FROM notes n
+             CROSS JOIN LATERAL (
+                 SELECT COALESCE(
+                     jsonb_agg(
+                         jsonb_build_object(
+                             'key', lk.key,
+                             'value', nl.value,
+                             'description', lk.description,
+                             'value_type', lk.value_type
+                         )
+                         ORDER BY lk.key
+                     ),
+                     '[]'::jsonb
+                 ) AS labels
+                 FROM note_labels nl
+                 JOIN label_keys lk ON lk.id = nl.label_key_id
+                 WHERE nl.note_id = n.id
+             ) labels
+             WHERE n.deleted_at IS NULL
+             ORDER BY n.created_at DESC, n.id ASC
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(normalize_limit(limit))
+        .bind(offset.unwrap_or(0).max(0))
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query notes", error))
     }
 
-    async fn active_summary_rows(
+    async fn stream_matching_notes(
         &self,
-        paginate_in_sql: bool,
+        selectors: &[LabelSelector],
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> StorageResult<Vec<Note>> {
+        let mut connection = self.connection().await?;
+        let mut rows = sqlx::query_as::<_, NoteRow>(
+            "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
+                    n.deleted_at, labels.labels
+             FROM notes n
+             CROSS JOIN LATERAL (
+                 SELECT COALESCE(
+                     jsonb_agg(
+                         jsonb_build_object(
+                             'key', lk.key,
+                             'value', nl.value,
+                             'description', lk.description,
+                             'value_type', lk.value_type
+                         )
+                         ORDER BY lk.key
+                     ),
+                     '[]'::jsonb
+                 ) AS labels
+                 FROM note_labels nl
+                 JOIN label_keys lk ON lk.id = nl.label_key_id
+                 WHERE nl.note_id = n.id
+             ) labels
+             WHERE n.deleted_at IS NULL
+             ORDER BY n.created_at DESC, n.id ASC",
+        )
+        .fetch(&mut *connection);
+        let skip = normalize_offset_usize(offset);
+        let take = normalize_limit_usize(limit);
+        let mut matched = 0usize;
+        let mut notes = Vec::new();
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|error| map_sqlx_error("read notes", error))?
+        {
+            let note = row.into_note()?;
+            if !note_matches_selectors(&note, selectors) {
+                continue;
+            }
+            if matched < skip {
+                matched = matched.saturating_add(1);
+                continue;
+            }
+            if take == Some(notes.len()) {
+                break;
+            }
+            notes.push(note);
+            if take == Some(notes.len()) {
+                break;
+            }
+        }
+        Ok(notes)
+    }
+
+    async fn active_summary_page(
+        &self,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<SummaryRow>> {
         let mut connection = self.connection().await?;
-        if paginate_in_sql {
-            sqlx::query_as::<_, SummaryRow>(
-                "SELECT id, title, created_at, updated_at, deleted_at
-                 FROM notes
-                 WHERE deleted_at IS NULL
-                 ORDER BY created_at DESC
-                 LIMIT $1 OFFSET $2",
-            )
-            .bind(normalize_limit(limit))
-            .bind(offset.unwrap_or(0).max(0))
-            .fetch_all(&mut *connection)
+        sqlx::query_as::<_, SummaryRow>(
+            "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at, labels.labels
+             FROM notes n
+             CROSS JOIN LATERAL (
+                 SELECT COALESCE(
+                     jsonb_agg(
+                         jsonb_build_object(
+                             'key', lk.key,
+                             'value', nl.value,
+                             'description', lk.description,
+                             'value_type', lk.value_type
+                         )
+                         ORDER BY lk.key
+                     ),
+                     '[]'::jsonb
+                 ) AS labels
+                 FROM note_labels nl
+                 JOIN label_keys lk ON lk.id = nl.label_key_id
+                 WHERE nl.note_id = n.id
+             ) labels
+             WHERE n.deleted_at IS NULL
+             ORDER BY n.created_at DESC, n.id ASC
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(normalize_limit(limit))
+        .bind(offset.unwrap_or(0).max(0))
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query note summaries", error))
+    }
+
+    async fn stream_matching_summaries(
+        &self,
+        selectors: &[LabelSelector],
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> StorageResult<Vec<NoteListItem>> {
+        let mut connection = self.connection().await?;
+        let mut rows = sqlx::query_as::<_, SummaryRow>(
+            "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at, labels.labels
+             FROM notes n
+             CROSS JOIN LATERAL (
+                 SELECT COALESCE(
+                     jsonb_agg(
+                         jsonb_build_object(
+                             'key', lk.key,
+                             'value', nl.value,
+                             'description', lk.description,
+                             'value_type', lk.value_type
+                         )
+                         ORDER BY lk.key
+                     ),
+                     '[]'::jsonb
+                 ) AS labels
+                 FROM note_labels nl
+                 JOIN label_keys lk ON lk.id = nl.label_key_id
+                 WHERE nl.note_id = n.id
+             ) labels
+             WHERE n.deleted_at IS NULL
+             ORDER BY n.created_at DESC, n.id ASC",
+        )
+        .fetch(&mut *connection);
+        let skip = normalize_offset_usize(offset);
+        let take = normalize_limit_usize(limit);
+        let mut matched = 0usize;
+        let mut notes = Vec::new();
+        while let Some(row) = rows
+            .try_next()
             .await
-            .map_err(|error| map_sqlx_error("query note summaries", error))
-        } else {
-            sqlx::query_as::<_, SummaryRow>(
-                "SELECT id, title, created_at, updated_at, deleted_at
-                 FROM notes
-                 WHERE deleted_at IS NULL
-                 ORDER BY created_at DESC",
-            )
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx_error("query note summaries", error))
+            .map_err(|error| map_sqlx_error("read note summaries", error))?
+        {
+            let note = row.into_summary()?;
+            if !summary_matches_selectors(&note, selectors) {
+                continue;
+            }
+            if matched < skip {
+                matched = matched.saturating_add(1);
+                continue;
+            }
+            if take == Some(notes.len()) {
+                break;
+            }
+            notes.push(note);
+            if take == Some(notes.len()) {
+                break;
+            }
         }
+        Ok(notes)
+    }
+
+    async fn count_matching_summaries(&self, selectors: &[LabelSelector]) -> StorageResult<usize> {
+        let mut connection = self.connection().await?;
+        let mut rows = sqlx::query_as::<_, SummaryRow>(
+            "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at, labels.labels
+             FROM notes n
+             CROSS JOIN LATERAL (
+                 SELECT COALESCE(
+                     jsonb_agg(
+                         jsonb_build_object(
+                             'key', lk.key,
+                             'value', nl.value,
+                             'description', lk.description,
+                             'value_type', lk.value_type
+                         )
+                         ORDER BY lk.key
+                     ),
+                     '[]'::jsonb
+                 ) AS labels
+                 FROM note_labels nl
+                 JOIN label_keys lk ON lk.id = nl.label_key_id
+                 WHERE nl.note_id = n.id
+             ) labels
+             WHERE n.deleted_at IS NULL
+             ORDER BY n.created_at DESC, n.id ASC",
+        )
+        .fetch(&mut *connection);
+        let mut count = 0usize;
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|error| map_sqlx_error("read note summaries for count", error))?
+        {
+            let note = row.into_summary()?;
+            if summary_matches_selectors(&note, selectors) {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
     }
 }
 
@@ -443,16 +619,17 @@ struct NoteRow {
     created_at: i64,
     updated_at: i64,
     deleted_at: Option<i64>,
+    labels: Value,
 }
 
 impl NoteRow {
-    fn into_note(self, labels: Vec<note_core::Label>) -> StorageResult<Note> {
+    fn into_note(self) -> StorageResult<Note> {
         Ok(Note {
             id: self.id,
             title: self.title,
             content: self.content,
             attachments: deserialize_attachments(self.attachments)?,
-            labels,
+            labels: deserialize_labels(self.labels)?,
             created_at: self.created_at,
             updated_at: self.updated_at,
             deleted_at: self.deleted_at,
@@ -467,6 +644,20 @@ struct SummaryRow {
     created_at: i64,
     updated_at: i64,
     deleted_at: Option<i64>,
+    labels: Value,
+}
+
+impl SummaryRow {
+    fn into_summary(self) -> StorageResult<NoteListItem> {
+        Ok(NoteListItem {
+            id: self.id,
+            title: self.title,
+            labels: deserialize_labels(self.labels)?,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            deleted_at: self.deleted_at,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -476,6 +667,14 @@ struct StoredAttachment {
     mime: String,
     #[serde(default)]
     description: String,
+}
+
+#[derive(Deserialize)]
+struct StoredLabel {
+    key: String,
+    value: String,
+    description: String,
+    value_type: String,
 }
 
 fn serialize_attachments(attachments: &[NoteAttachment]) -> StorageResult<Value> {
@@ -517,6 +716,30 @@ fn deserialize_attachments(value: Value) -> StorageResult<Vec<NoteAttachment>> {
         .collect())
 }
 
+fn deserialize_labels(value: Value) -> StorageResult<Vec<note_core::Label>> {
+    let labels: Vec<StoredLabel> = serde_json::from_value(value).map_err(|error| {
+        StorageError::with_source(
+            StorageErrorKind::Operation,
+            "deserialize note labels",
+            error,
+        )
+    })?;
+    labels
+        .into_iter()
+        .map(|label| {
+            Ok(note_core::Label {
+                key: label.key,
+                value: label.value,
+                description: label.description,
+                value_type: label
+                    .value_type
+                    .parse()
+                    .map_err(|error| StorageError::new(StorageErrorKind::Operation, error))?,
+            })
+        })
+        .collect()
+}
+
 fn note_matches_selectors(note: &Note, selectors: &[LabelSelector]) -> bool {
     selectors.iter().all(|selector| {
         note.labels
@@ -533,24 +756,14 @@ fn summary_matches_selectors(note: &NoteListItem, selectors: &[LabelSelector]) -
     })
 }
 
-fn paginate<T>(items: Vec<T>, limit: Option<i64>, offset: Option<i64>) -> Vec<T> {
-    let start = offset.unwrap_or(0).max(0) as usize;
-    if start >= items.len() {
-        return Vec::new();
-    }
-    let end = limit
-        .and_then(|limit| {
-            if limit < 0 {
-                None
-            } else {
-                Some(start.saturating_add(limit as usize))
-            }
-        })
-        .unwrap_or(items.len())
-        .min(items.len());
-    items.into_iter().skip(start).take(end - start).collect()
-}
-
 fn normalize_limit(limit: Option<i64>) -> Option<i64> {
     limit.and_then(|limit| (limit >= 0).then_some(limit))
+}
+
+fn normalize_limit_usize(limit: Option<i64>) -> Option<usize> {
+    normalize_limit(limit).map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))
+}
+
+fn normalize_offset_usize(offset: Option<i64>) -> usize {
+    usize::try_from(offset.unwrap_or(0).max(0)).unwrap_or(usize::MAX)
 }

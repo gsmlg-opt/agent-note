@@ -302,6 +302,74 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         ]
     );
 
+    for id in [
+        "contract-notes-tie-c",
+        "contract-notes-tie-a",
+        "contract-notes-tie-b",
+    ] {
+        session
+            .insert_note(NewNote {
+                id,
+                title: id,
+                content: id,
+                attachments: &[],
+                created_at: 1_000,
+                updated_at: 1_000,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+    }
+    let first_page = session.list_notes(&[], Some(2), Some(0)).await.unwrap();
+    let second_page = session.list_notes(&[], Some(1), Some(2)).await.unwrap();
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|note| note.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["contract-notes-tie-a", "contract-notes-tie-b"]
+    );
+    assert_eq!(second_page[0].id, "contract-notes-tie-c");
+    assert!(first_page.iter().all(|first| first.id != second_page[0].id));
+    assert_eq!(
+        session
+            .list_note_summaries(&[], Some(3), Some(0))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec![
+            "contract-notes-tie-a",
+            "contract-notes-tie-b",
+            "contract-notes-tie-c",
+        ]
+    );
+    assert_eq!(
+        session
+            .list_all_notes()
+            .await
+            .unwrap()
+            .into_iter()
+            .take(3)
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec![
+            "contract-notes-tie-a",
+            "contract-notes-tie-b",
+            "contract-notes-tie-c",
+        ]
+    );
+    for id in [
+        "contract-notes-tie-a",
+        "contract-notes-tie-b",
+        "contract-notes-tie-c",
+    ] {
+        session.soft_delete_note(id, 450).await.unwrap();
+        session.permanently_delete_note(id).await.unwrap();
+    }
+
     assert_eq!(
         session
             .soft_delete_note("contract-notes-active", 500)

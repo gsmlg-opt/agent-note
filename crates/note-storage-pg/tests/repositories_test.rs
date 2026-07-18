@@ -211,6 +211,18 @@ async fn notes_and_labels_follow_repository_semantics() {
             && label.description == "Updated priority"
             && label.value_type == LabelValueType::Number
     }));
+    assert_eq!(
+        session
+            .get_note("pg-jsonb")
+            .await
+            .unwrap()
+            .unwrap()
+            .labels
+            .into_iter()
+            .map(|label| label.key)
+            .collect::<Vec<_>>(),
+        vec!["active-only", "priority", "status"]
+    );
     let duplicate_attachment = session
         .attach_label("pg-jsonb", "status", "other")
         .await
@@ -337,6 +349,103 @@ async fn notes_and_labels_follow_repository_semantics() {
         6
     );
     assert_eq!(session.list_all_notes().await.unwrap().len(), 7);
+
+    for id in ["tie-c", "tie-a", "tie-b"] {
+        session
+            .insert_note(NewNote {
+                id,
+                title: id,
+                content: id,
+                attachments: &[],
+                created_at: 1_000,
+                updated_at: 1_000,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session
+            .list_notes(&[], Some(2), Some(0))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["tie-a", "tie-b"]
+    );
+    assert_eq!(
+        session
+            .list_notes(&[], Some(1), Some(2))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["tie-c"]
+    );
+    assert_eq!(
+        session
+            .list_note_summaries(&[], Some(3), Some(0))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["tie-a", "tie-b", "tie-c"]
+    );
+    for id in ["tie-a", "tie-b", "tie-c"] {
+        session.soft_delete_note(id, 450).await.unwrap();
+        session.permanently_delete_note(id).await.unwrap();
+    }
+
+    for index in 0..5 {
+        let id = format!("selector-noise-{index}");
+        session
+            .insert_note(NewNote {
+                id: &id,
+                title: &id,
+                content: &id,
+                attachments: &[],
+                created_at: 900 - index,
+                updated_at: 900 - index,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        session.attach_label(&id, "priority", "9").await.unwrap();
+        session
+            .attach_label(&id, "status", "blocked")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session
+            .list_notes(&selectors, Some(1), Some(0))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["numeric-ten"]
+    );
+    assert_eq!(
+        session
+            .list_note_summaries(&selectors, Some(1), Some(1))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["newer"]
+    );
+    for index in 0..5 {
+        let id = format!("selector-noise-{index}");
+        session.soft_delete_note(&id, 450).await.unwrap();
+        session.permanently_delete_note(&id).await.unwrap();
+    }
 
     assert_eq!(session.soft_delete_note("pg-jsonb", 500).await.unwrap(), 1);
     assert_eq!(session.soft_delete_note("pg-jsonb", 501).await.unwrap(), 0);
@@ -579,11 +688,21 @@ async fn malformed_attachment_json_is_an_operation_error() {
         .insert_label_key("malformed-type", "Malformed type")
         .await
         .unwrap();
+    session
+        .attach_label("malformed", "malformed-type", "value")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE notes SET attachments = '[]'::jsonb WHERE id = 'malformed'")
+        .execute(&inspection_pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE label_keys SET value_type = 'unknown' WHERE key = 'malformed-type'")
         .execute(&inspection_pool)
         .await
         .unwrap();
     let error = session.list_label_keys().await.unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Operation);
+    let error = session.get_note("malformed").await.unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::Operation);
 
     inspection_pool.close().await;
