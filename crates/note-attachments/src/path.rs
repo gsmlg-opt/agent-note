@@ -1,25 +1,30 @@
 use std::path::{Component, Path, PathBuf};
 
-pub(crate) fn canonical_attachment_path(
-    root: &Path,
-    attachment_path: &str,
-) -> anyhow::Result<PathBuf> {
-    let bytes = attachment_path.as_bytes();
-    let has_windows_drive_prefix =
-        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    if has_windows_drive_prefix || attachment_path.starts_with(r"\\") {
+pub(crate) fn canonical_relative_path(value: &str) -> anyhow::Result<String> {
+    if value.is_empty() || value.contains('\\') {
         anyhow::bail!("invalid attachment path");
     }
 
-    let mut path = root.to_path_buf();
-    for component in Path::new(attachment_path).components() {
+    let mut parts = Vec::new();
+    for component in Path::new(value).components() {
         match component {
-            Component::Normal(part) => path.push(part),
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("attachment path is not UTF-8"))?;
+                parts.push(part);
+            }
             Component::CurDir => {}
-            _ => anyhow::bail!("invalid attachment path"),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("invalid attachment path");
+            }
         }
     }
-    Ok(path)
+
+    if parts.is_empty() {
+        anyhow::bail!("attachment path is empty");
+    }
+    Ok(parts.join("/"))
 }
 
 pub(crate) fn note_directory(root: &Path, note_id: &str) -> anyhow::Result<PathBuf> {
@@ -31,4 +36,38 @@ pub(crate) fn note_directory(root: &Path, note_id: &str) -> anyhow::Result<PathB
         anyhow::bail!("invalid note id");
     }
     Ok(root.join(note_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_relative_paths_drop_only_current_directory_components() {
+        assert_eq!(
+            canonical_relative_path("./docs/read me.txt").unwrap(),
+            "docs/read me.txt"
+        );
+        assert_eq!(
+            canonical_relative_path("docs/./read.md").unwrap(),
+            "docs/read.md"
+        );
+    }
+
+    #[test]
+    fn canonical_relative_paths_reject_unsafe_or_empty_inputs() {
+        for value in [
+            "",
+            ".",
+            "../secret",
+            "/absolute",
+            r"C:\secret",
+            r"dir\secret",
+        ] {
+            assert!(
+                canonical_relative_path(value).is_err(),
+                "{value:?} must fail"
+            );
+        }
+    }
 }

@@ -1,5 +1,7 @@
 mod filesystem;
 mod path;
+#[cfg_attr(not(test), allow(dead_code))]
+mod s3;
 
 pub use filesystem::FilesystemAttachmentStore;
 

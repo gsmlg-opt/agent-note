@@ -1,12 +1,12 @@
 use crate::{
-    path::{canonical_attachment_path, note_directory},
+    path::{canonical_relative_path, note_directory},
     AttachmentStore, AttachmentStoreInfo, PreparedAttachmentSet,
 };
 use note_core::NoteAttachment;
 use std::{
     collections::HashMap,
     io::ErrorKind,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex, Weak},
 };
 use tokio::{
@@ -81,8 +81,9 @@ impl FilesystemAttachmentStore {
         if !existing_safe_directory(note_dir).await? {
             anyhow::bail!("attachment note directory does not exist");
         }
-        let path_on_disk = canonical_attachment_path(note_dir, path)?;
-        reject_symlink_components(note_dir, path).await?;
+        let relative_path = canonical_relative_path(path)?;
+        let path_on_disk = attachment_path_on_disk(note_dir, &relative_path);
+        reject_symlink_components(note_dir, &relative_path).await?;
         Ok(fs::read(path_on_disk).await?)
     }
 }
@@ -125,7 +126,8 @@ impl AttachmentStore for FilesystemAttachmentStore {
 
         let write_result = async {
             for attachment in attachments {
-                let path = canonical_attachment_path(staging.path(), &attachment.path)?;
+                let relative_path = canonical_relative_path(&attachment.path)?;
+                let path = attachment_path_on_disk(staging.path(), &relative_path);
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent).await?;
                 }
@@ -374,23 +376,25 @@ fn existing_safe_directory_blocking(path: &Path) -> anyhow::Result<bool> {
     }
 }
 
+fn attachment_path_on_disk(root: &Path, relative_path: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    for segment in relative_path.split('/') {
+        path.push(segment);
+    }
+    path
+}
+
 async fn reject_symlink_components(note_dir: &Path, attachment_path: &str) -> anyhow::Result<()> {
     let mut path = note_dir.to_path_buf();
-    for component in Path::new(attachment_path).components() {
-        match component {
-            Component::Normal(part) => {
-                path.push(part);
-                match fs::symlink_metadata(&path).await {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        anyhow::bail!("attachment path must not contain a symlink")
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-                    Err(error) => return Err(error.into()),
-                }
+    for segment in attachment_path.split('/') {
+        path.push(segment);
+        match fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("attachment path must not contain a symlink")
             }
-            Component::CurDir => {}
-            _ => anyhow::bail!("invalid attachment path"),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(())
