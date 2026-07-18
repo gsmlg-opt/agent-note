@@ -97,8 +97,10 @@ impl PgSession {
             });
         }
 
-        let immediate_guard = immediate_gate.lock_owned().await;
         let deadline = Instant::now() + lock_timeout;
+        let immediate_guard = timeout_at(deadline, immediate_gate.lock_owned())
+            .await
+            .map_err(|_| immediate_lock_timeout_error())?;
         loop {
             let mut transaction = timeout_at(deadline, pool.begin())
                 .await
@@ -122,9 +124,12 @@ impl PgSession {
                 });
             }
 
-            transaction.rollback().await.map_err(|error| {
-                map_transaction_error("rollback PostgreSQL advisory lock attempt", error)
-            })?;
+            timeout_at(deadline, transaction.rollback())
+                .await
+                .map_err(|_| immediate_lock_timeout_error())?
+                .map_err(|error| {
+                    map_transaction_error("rollback PostgreSQL advisory lock attempt", error)
+                })?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(immediate_lock_timeout_error());
@@ -421,6 +426,71 @@ mod tests {
         assert_immediate_serialization(&pool, gate.clone(), true).await;
         assert_immediate_serialization(&pool, gate, false).await;
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn local_gate_wait_obeys_acquisition_deadline_and_releases_queue() {
+        let Some(pool) = test_pool(
+            "local_gate_wait_obeys_acquisition_deadline_and_releases_queue",
+            2,
+        )
+        .await
+        else {
+            return;
+        };
+        let _test_guard = advisory_test_mutex().lock().await;
+        let storage = storage_from_pool(pool);
+        let holder = storage
+            .begin_session(TransactionMode::Immediate)
+            .await
+            .unwrap();
+
+        let pool_for_waiter = storage.pool.clone();
+        let gate_for_waiter = storage.immediate_gate.clone();
+        let started = Instant::now();
+        let mut waiter = tokio::spawn(async move {
+            PgSession::begin_with_timeout(
+                pool_for_waiter,
+                TransactionMode::Immediate,
+                gate_for_waiter,
+                Duration::from_millis(150),
+            )
+            .await
+        });
+        let bounded = timeout(Duration::from_millis(400), &mut waiter).await;
+        let elapsed = started.elapsed();
+
+        holder.rollback().await.unwrap();
+        if bounded.is_err() {
+            let cleanup = timeout(Duration::from_secs(2), &mut waiter)
+                .await
+                .expect("unbounded waiter must finish after releasing its holder")
+                .expect("waiter task must not panic");
+            if let Ok(session) = cleanup {
+                session.rollback().await.unwrap();
+            }
+        }
+
+        let error = bounded
+            .expect("local gate wait must obey the end-to-end acquisition deadline")
+            .expect("waiter task must not panic")
+            .expect_err("local gate deadline must return an error while holder stays active");
+        assert_eq!(error.kind(), StorageErrorKind::Conflict);
+        assert!(error.source().is_none());
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "local gate timeout exceeded its test upper bound: {elapsed:?}"
+        );
+
+        let next = timeout(
+            Duration::from_secs(2),
+            storage.begin_session(TransactionMode::Immediate),
+        )
+        .await
+        .expect("timed-out gate waiter must leave no queued state")
+        .unwrap();
+        next.rollback().await.unwrap();
+        storage.close().await;
     }
 
     #[tokio::test]
