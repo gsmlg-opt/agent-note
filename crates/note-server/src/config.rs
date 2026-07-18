@@ -81,7 +81,7 @@ impl std::fmt::Debug for DatabaseConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum EmbeddingConfig {
     Local {
         model_path: Option<PathBuf>,
@@ -93,6 +93,28 @@ pub enum EmbeddingConfig {
         timeout_secs: u64,
         max_retries: u32,
     },
+}
+
+impl std::fmt::Debug for EmbeddingConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local { model_path } => formatter
+                .debug_struct("Local")
+                .field("model_path", model_path)
+                .finish(),
+            Self::OpenAi {
+                model,
+                timeout_secs,
+                max_retries,
+                ..
+            } => formatter
+                .debug_struct("OpenAi")
+                .field("model", model)
+                .field("timeout_secs", timeout_secs)
+                .field("max_retries", max_retries)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,12 +415,21 @@ fn resolve_embedding(
             if max_retries > 10 {
                 anyhow::bail!("embedding.max_retries must be at most 10");
             }
+            let api_key_env = match file
+                .api_key_env
+                .or_else(|| env.embedding_api_key_env.clone())
+            {
+                Some(name) => Some(
+                    require_string("embedding.api_key_env", Some(name))?
+                        .trim()
+                        .to_owned(),
+                ),
+                None => None,
+            };
             Ok(EmbeddingConfig::OpenAi {
                 base_url,
                 model,
-                api_key_env: file
-                    .api_key_env
-                    .or_else(|| env.embedding_api_key_env.clone()),
+                api_key_env,
                 timeout_secs,
                 max_retries,
             })
@@ -1015,6 +1046,38 @@ url = "postgresql://agent:{PASSWORD}@database/notes
     }
 
     #[test]
+    fn runtime_debug_output_redacts_openai_connection_and_credential_name() {
+        const URL_SENTINEL: &str = "openai-user:openai-password@embedding.example";
+        const API_KEY_ENV_SENTINEL: &str = "EMBEDDING_API_KEY_SENTINEL";
+        let config = RuntimeConfig {
+            config_path: "/tmp/config.toml".into(),
+            database: DatabaseConfig::Embed {
+                path: "/tmp/notes.db".into(),
+            },
+            embedding: EmbeddingConfig::OpenAi {
+                base_url: format!("https://{URL_SENTINEL}"),
+                model: "bge-m3".into(),
+                api_key_env: Some(API_KEY_ENV_SENTINEL.into()),
+                timeout_secs: 30,
+                max_retries: 3,
+            },
+            attachments: AttachmentConfig::Filesystem {
+                path: "/tmp/attachments".into(),
+            },
+        };
+
+        let rendered = format!("{config:?}");
+
+        assert!(!rendered.contains(URL_SENTINEL), "{rendered}");
+        assert!(!rendered.contains("openai-password"), "{rendered}");
+        assert!(!rendered.contains(API_KEY_ENV_SENTINEL), "{rendered}");
+        assert!(rendered.contains("OpenAi"), "{rendered}");
+        assert!(rendered.contains("bge-m3"), "{rendered}");
+        assert!(rendered.contains("timeout_secs"), "{rendered}");
+        assert!(rendered.contains("max_retries"), "{rendered}");
+    }
+
+    #[test]
     fn api_key_env_is_kept_as_a_name_without_reading_its_value() {
         let dir = tempfile::tempdir().unwrap();
         write_config(
@@ -1038,6 +1101,44 @@ api_key_env = "SECRET_THAT_IS_NOT_READ"
                 timeout_secs: 30,
                 max_retries: 3,
             }
+        );
+    }
+
+    #[test]
+    fn api_key_env_name_is_trimmed_and_blank_names_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "trimmed.toml",
+            r#"[embedding]
+engine = "openai"
+base_url = "https://embedding.example"
+api_key_env = "  EMBEDDING_API_KEY  "
+"#,
+        );
+
+        let config = resolve_explicit(dir.path(), "trimmed.toml").unwrap();
+        assert!(matches!(
+            config.embedding,
+            EmbeddingConfig::OpenAi {
+                api_key_env: Some(ref name),
+                ..
+            } if name == "EMBEDDING_API_KEY"
+        ));
+
+        write_config(
+            dir.path(),
+            "blank.toml",
+            r#"[embedding]
+engine = "openai"
+base_url = "https://embedding.example"
+api_key_env = " \t "
+"#,
+        );
+        let error = resolve_explicit(dir.path(), "blank.toml").unwrap_err();
+        assert!(
+            error.to_string().contains("embedding.api_key_env"),
+            "{error:#}"
         );
     }
 

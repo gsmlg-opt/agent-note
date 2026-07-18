@@ -108,8 +108,12 @@ fn resolve_bearer_token(
     let Some(variable) = api_key_env else {
         return Ok(None);
     };
+    let variable = variable.trim();
+    if variable.is_empty() {
+        anyhow::bail!("embedding API key environment variable name is blank");
+    }
     match get_env(variable) {
-        Some(value) if !value.trim().is_empty() => Ok(Some(value)),
+        Some(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_owned())),
         _ => anyhow::bail!("embedding API key environment variable {variable} is missing or blank"),
     }
 }
@@ -575,18 +579,21 @@ mod tests {
             None
         );
         assert_eq!(
-            resolve_bearer_token(Some("EMBEDDING_API_KEY"), |name| {
-                (name == "EMBEDDING_API_KEY").then(|| "secret-token".into())
+            resolve_bearer_token(Some("  EMBEDDING_API_KEY \n"), |name| {
+                (name == "EMBEDDING_API_KEY").then(|| " \tsecret-token\r\n".into())
             })
             .unwrap(),
             Some("secret-token".into())
         );
 
         for value in [None, Some(" \t\n".into())] {
-            let error =
-                resolve_bearer_token(Some("EMBEDDING_API_KEY"), |_| value.clone()).unwrap_err();
+            let error = resolve_bearer_token(Some("  EMBEDDING_API_KEY \n"), |_| value.clone())
+                .unwrap_err();
             let rendered = error.to_string();
             assert!(rendered.contains("EMBEDDING_API_KEY"), "{rendered}");
+            assert!(!rendered.contains("  EMBEDDING_API_KEY"), "{rendered}");
+            assert!(!rendered.contains('\n'), "{rendered}");
+            assert!(!rendered.contains('\t'), "{rendered}");
             assert!(!rendered.contains("unrelated-secret"), "{rendered}");
         }
     }
