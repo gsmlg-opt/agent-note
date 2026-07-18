@@ -318,11 +318,10 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .iter()
         .all(|id| id != "contract-retrieval-cascade"));
     assert!(session
-        .claim_pending_embedding_jobs(100, 10)
+        .claim_pending_embedding_jobs(1, 10)
         .await
         .unwrap()
-        .iter()
-        .all(|job| job.note_id != "contract-retrieval-cascade"));
+        .is_empty());
 
     insert_note(
         session.as_ref(),
@@ -351,9 +350,8 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .iter()
         .all(|id| id != "contract-retrieval-cascade"));
     assert!(session
-        .claim_pending_embedding_jobs(100, 11)
+        .claim_pending_embedding_jobs(1, 11)
         .await
         .unwrap()
-        .iter()
-        .all(|job| job.note_id != "contract-retrieval-cascade"));
+        .is_empty());
 }

@@ -39,8 +39,24 @@ async fn upsert_chunk(
         .unwrap();
 }
 
+async fn assert_job_queue_empty(storage: &dyn note_storage::StorageSession, now: i64) {
+    assert_eq!(
+        storage
+            .requeue_processing_embedding_jobs(now)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(storage
+        .claim_pending_embedding_jobs(1, now)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     let session = storage.session().await.unwrap();
+    assert_job_queue_empty(session.as_ref(), 1).await;
     insert_note(session.as_ref(), "contract-embedding-chunks", "Chunks").await;
     upsert_chunk(
         session.as_ref(),
@@ -144,12 +160,23 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap();
     assert_eq!(first_claim.chunk_idx, 1);
     assert_eq!(first_claim.attempts, 1);
-    assert!(session
+    let second_claim = session
         .claim_pending_embedding_jobs(1, 14)
         .await
         .unwrap()
-        .iter()
-        .all(|job| job.id != first_claim.id));
+        .pop()
+        .unwrap();
+    assert_ne!(second_claim.id, first_claim.id);
+    assert_eq!(second_claim.note_id, "contract-embedding-jobs");
+    assert_eq!(second_claim.chunk_idx, 0);
+    assert_eq!(second_claim.content_hash, "hash-a");
+    assert_eq!(second_claim.content, "replacement");
+    assert_eq!(second_claim.note_revision, 2);
+    assert_eq!(second_claim.attempts, 1);
+    assert_eq!(
+        session.delete_embedding_job(second_claim.id).await.unwrap(),
+        1
+    );
     assert_eq!(
         session
             .fail_embedding_job(first_claim.id, first_claim.attempts, 2, "retry", 15)
@@ -158,7 +185,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         1
     );
     let retry = session
-        .claim_pending_embedding_jobs(10, 16)
+        .claim_pending_embedding_jobs(1, 16)
         .await
         .unwrap()
         .into_iter()
@@ -173,11 +200,12 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         1
     );
     assert!(session
-        .claim_pending_embedding_jobs(10, 18)
+        .claim_pending_embedding_jobs(1, 18)
         .await
         .unwrap()
-        .iter()
-        .all(|job| job.id != retry.id));
+        .is_empty());
+    assert_eq!(session.delete_embedding_job(retry.id).await.unwrap(), 1);
+    assert_job_queue_empty(session.as_ref(), 18).await;
 
     insert_note(
         session.as_ref(),
@@ -198,13 +226,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .await
             .unwrap();
     }
-    let tied = session
-        .claim_pending_embedding_jobs(10, 20)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|job| job.note_id == "contract-embedding-claim-tie")
-        .collect::<Vec<_>>();
+    let tied = session.claim_pending_embedding_jobs(2, 20).await.unwrap();
     assert_eq!(tied.len(), 2);
     assert!(tied[0].id < tied[1].id);
     assert_eq!(
@@ -214,6 +236,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     for job in tied {
         session.delete_embedding_job(job.id).await.unwrap();
     }
+    assert_job_queue_empty(session.as_ref(), 20).await;
 
     insert_note(
         session.as_ref(),
@@ -244,12 +267,14 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap();
     let idempotent = session
-        .claim_pending_embedding_jobs(100, 22)
+        .claim_pending_embedding_jobs(1, 22)
         .await
         .unwrap()
-        .into_iter()
-        .find(|job| job.note_id == "contract-embedding-idempotent")
+        .pop()
         .unwrap();
+    assert_eq!(idempotent.note_id, "contract-embedding-idempotent");
+    assert_eq!(idempotent.chunk_idx, 0);
+    assert_eq!(idempotent.content_hash, "same-hash");
     assert_eq!(idempotent.content, "updated");
     assert_eq!(idempotent.note_revision, 2);
     session
@@ -263,33 +288,32 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         )
         .await
         .unwrap();
-    let while_processing = session.claim_pending_embedding_jobs(100, 24).await.unwrap();
-    assert!(while_processing.iter().all(|job| {
-        !(job.note_id == "contract-embedding-idempotent"
-            && job.chunk_idx == 0
-            && job.content_hash == "same-hash")
-    }));
-    session.requeue_processing_embedding_jobs(25).await.unwrap();
-    let matching_reclaimed = session
-        .claim_pending_embedding_jobs(100, 26)
+    assert!(session
+        .claim_pending_embedding_jobs(1, 24)
         .await
         .unwrap()
-        .into_iter()
-        .filter(|job| {
-            job.note_id == "contract-embedding-idempotent"
-                && job.chunk_idx == 0
-                && job.content_hash == "same-hash"
-        })
-        .collect::<Vec<_>>();
+        .is_empty());
+    assert_eq!(
+        session.requeue_processing_embedding_jobs(25).await.unwrap(),
+        1
+    );
+    let mut matching_reclaimed = session.claim_pending_embedding_jobs(2, 26).await.unwrap();
     assert_eq!(matching_reclaimed.len(), 1);
-    let idempotent_reclaimed = &matching_reclaimed[0];
+    let idempotent_reclaimed = matching_reclaimed.pop().unwrap();
     assert_eq!(idempotent_reclaimed.id, idempotent.id);
+    assert_eq!(
+        idempotent_reclaimed.note_id,
+        "contract-embedding-idempotent"
+    );
+    assert_eq!(idempotent_reclaimed.chunk_idx, 0);
+    assert_eq!(idempotent_reclaimed.content_hash, "same-hash");
     assert_eq!(idempotent_reclaimed.content, "updated");
     assert_eq!(idempotent_reclaimed.note_revision, 2);
     session
         .delete_embedding_job(idempotent_reclaimed.id)
         .await
         .unwrap();
+    assert_job_queue_empty(session.as_ref(), 26).await;
 
     insert_note(session.as_ref(), "contract-embedding-stale", "Stale").await;
     for (hash, now) in [("old", 30), ("current", 31)] {
@@ -313,7 +337,10 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .unwrap(),
         0
     );
-    session.requeue_processing_embedding_jobs(34).await.unwrap();
+    assert_eq!(
+        session.requeue_processing_embedding_jobs(34).await.unwrap(),
+        1
+    );
     assert_eq!(
         session
             .delete_stale_embedding_jobs_for_chunk("contract-embedding-stale", 0, "current")
@@ -322,13 +349,15 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         1
     );
     let current = session
-        .claim_pending_embedding_jobs(100, 35)
+        .claim_pending_embedding_jobs(1, 35)
         .await
         .unwrap()
-        .into_iter()
-        .find(|job| job.note_id == "contract-embedding-stale" && job.content_hash == "current")
+        .pop()
         .unwrap();
+    assert_eq!(current.note_id, "contract-embedding-stale");
+    assert_eq!(current.content_hash, "current");
     session.delete_embedding_job(current.id).await.unwrap();
+    assert_job_queue_empty(session.as_ref(), 35).await;
 
     insert_note(session.as_ref(), "contract-embedding-trailing", "Trailing").await;
     for (chunk_idx, now) in [(1, 40), (2, 41)] {
@@ -359,14 +388,17 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .unwrap(),
         1
     );
-    session.requeue_processing_embedding_jobs(43).await.unwrap();
+    assert_eq!(
+        session.requeue_processing_embedding_jobs(43).await.unwrap(),
+        1
+    );
     let trailing_reclaimed = session
-        .claim_pending_embedding_jobs(100, 44)
+        .claim_pending_embedding_jobs(1, 44)
         .await
         .unwrap()
-        .into_iter()
-        .find(|job| job.id == trailing_processing.id)
+        .pop()
         .unwrap();
+    assert_eq!(trailing_reclaimed.id, trailing_processing.id);
     assert_eq!(
         session
             .delete_embedding_job(trailing_reclaimed.id)
@@ -381,13 +413,19 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .unwrap(),
         0
     );
+    assert_job_queue_empty(session.as_ref(), 44).await;
 
     let dashboard_before = session.embedding_dashboard_status().await.unwrap();
+    assert_eq!(dashboard_before.processing_note, None);
     for (id, title) in [
         ("contract-embedding-dashboard-complete", "Complete"),
         ("contract-embedding-dashboard-partial", "Partial"),
         ("contract-embedding-dashboard-deleted", "Deleted"),
         ("contract-embedding-dashboard-stale", "Stale revision"),
+        (
+            "contract-embedding-dashboard-processing",
+            "Processing contract",
+        ),
     ] {
         insert_note(session.as_ref(), id, title).await;
     }
@@ -446,6 +484,14 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         "embedded",
     )
     .await;
+    upsert_chunk(
+        session.as_ref(),
+        "contract-embedding-dashboard-processing",
+        0,
+        "processing",
+        "pending",
+    )
+    .await;
     session
         .soft_delete_note("contract-embedding-dashboard-deleted", 40)
         .await
@@ -455,6 +501,55 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         dashboard.embedded_note_count,
         dashboard_before.embedded_note_count + 1
     );
+    assert_eq!(dashboard.processing_note, None);
+    session
+        .enqueue_embedding_job(
+            "contract-embedding-dashboard-processing",
+            0,
+            "processing",
+            "content-0",
+            1,
+            45,
+        )
+        .await
+        .unwrap();
+    let dashboard_job = session
+        .claim_pending_embedding_jobs(1, 46)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        dashboard_job.note_id,
+        "contract-embedding-dashboard-processing"
+    );
+    let dashboard_processing = session.embedding_dashboard_status().await.unwrap();
+    assert_eq!(
+        dashboard_processing.embedded_note_count,
+        dashboard.embedded_note_count
+    );
+    let processing_note = dashboard_processing.processing_note.unwrap();
+    assert_eq!(
+        processing_note.id,
+        "contract-embedding-dashboard-processing"
+    );
+    assert_eq!(processing_note.title, "Processing contract");
+    assert_eq!(
+        session
+            .delete_embedding_job(dashboard_job.id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        session
+            .embedding_dashboard_status()
+            .await
+            .unwrap()
+            .processing_note,
+        None
+    );
+    assert_job_queue_empty(session.as_ref(), 46).await;
     session
         .clear_note_search_data("contract-embedding-dashboard-complete")
         .await
@@ -526,10 +621,5 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap()
         .iter()
         .all(|id| id != "contract-embedding-clear"));
-    assert!(session
-        .claim_pending_embedding_jobs(100, 100)
-        .await
-        .unwrap()
-        .iter()
-        .all(|job| job.note_id != "contract-embedding-clear"));
+    assert_job_queue_empty(session.as_ref(), 100).await;
 }

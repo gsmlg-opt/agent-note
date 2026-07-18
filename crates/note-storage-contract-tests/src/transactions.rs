@@ -147,11 +147,10 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap()
         .is_empty());
     assert!(observer
-        .claim_pending_embedding_jobs(100, 2)
+        .claim_pending_embedding_jobs(1, 2)
         .await
         .unwrap()
-        .iter()
-        .all(|job| job.note_id != "contract-transactions-atomic"));
+        .is_empty());
 
     let first = storage.begin(TransactionMode::Immediate).await.unwrap();
     let second_storage = storage.clone();

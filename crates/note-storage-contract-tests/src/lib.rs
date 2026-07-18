@@ -7,6 +7,10 @@ mod transactions;
 use note_storage::StorageBackend;
 use std::sync::Arc;
 
+/// Runs the contracts once against a fresh database.
+///
+/// Fixed IDs and global settings are intentional, so the backend must not
+/// contain prior data and this function must not be called twice on it.
 pub async fn run_storage_contracts(storage: Arc<dyn StorageBackend>) {
     notes::run(storage.clone()).await;
     embedding::run(storage.clone()).await;
