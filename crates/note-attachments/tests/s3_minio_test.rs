@@ -281,6 +281,37 @@ async fn dropping_an_unresolved_set_eventually_removes_its_staging_objects() {
 }
 
 #[tokio::test]
+async fn large_attachment_round_trip_preserves_the_owned_body() {
+    let Some(fixture) = fixture().await else {
+        eprintln!("skipped: NOTE_TEST_MINIO_ENDPOINT is unset");
+        return;
+    };
+    let content = (0..4 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let prepared = fixture
+        .store
+        .prepare(
+            "note-large",
+            &[attachment("./large.bin", content.as_slice())],
+        )
+        .await
+        .unwrap();
+    prepared.publish().await.unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .read("note-large", "./large.bin")
+            .await
+            .unwrap(),
+        content
+    );
+    fixture.store.remove_note("note-large").await.unwrap();
+    wait_for_no_keys(&fixture).await;
+}
+
+#[tokio::test]
 async fn store_info_exposes_only_the_bucket_and_prefix() {
     let Some(fixture) = fixture().await else {
         eprintln!("skipped: NOTE_TEST_MINIO_ENDPOINT is unset");

@@ -139,28 +139,33 @@ impl S3AttachmentStore {
         })
     }
 
-    async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    async fn put_owned(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
         self.client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .body(ByteStream::from(bytes.to_vec()))
+            .body(ByteStream::from(bytes))
             .send()
             .await
             .map_err(|error| safe_sdk_error("put object", &error))?;
         Ok(())
     }
 
+    #[cfg(test)]
+    async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        self.put_owned(key, bytes.to_vec()).await
+    }
+
     async fn prepare_set(
         &self,
-        note_id: &str,
-        attachments: &[NoteAttachment],
+        note_id: String,
+        attachments: Vec<NoteAttachment>,
     ) -> anyhow::Result<PreparedS3Set> {
-        validate_note_id(note_id)?;
+        validate_note_id(&note_id)?;
         let mut canonical = Vec::with_capacity(attachments.len());
         let mut canonical_set = HashSet::with_capacity(attachments.len());
         let mut metadata = Vec::with_capacity(attachments.len());
-        for attachment in attachments {
+        for attachment in &attachments {
             let relative = crate::path::canonical_relative_path(&attachment.path)?;
             if !canonical_set.insert(relative.clone()) {
                 anyhow::bail!("duplicate attachment path");
@@ -175,33 +180,30 @@ impl S3AttachmentStore {
             });
         }
 
-        let note_guard = self.coordination.lock_for(note_id).lock_owned().await;
+        let note_guard = self.coordination.lock_for(&note_id).lock_owned().await;
         let staging_prefix = staging_prefix(
             &self.prefix,
-            note_id,
+            &note_id,
             &uuid::Uuid::new_v4().simple().to_string(),
         )?;
         let mut prepared = PreparedS3Set {
             store: self.clone(),
-            note_id: note_id.to_string(),
+            note_id,
             staging_prefix,
             staged_keys: Vec::new(),
             metadata,
             note_guard: Some(note_guard),
             cleanup_armed: true,
         };
-        for (attachment, relative) in attachments.iter().zip(canonical) {
+        for (attachment, relative) in attachments.into_iter().zip(canonical) {
             let key = format!("{}{relative}", prepared.staging_prefix);
             // The request may have committed remotely even if its response is
             // lost, so include the current key in idempotent cleanup first.
             prepared.staged_keys.push(key.clone());
-            if let Err(error) = self.put(&key, &attachment.content).await {
-                let cleanup = prepared.schedule_cleanup()?.await;
+            if let Err(error) = self.put_owned(&key, attachment.content).await {
+                let cleanup = await_cleanup(prepared.schedule_cleanup()?).await;
                 return match cleanup {
-                    Ok(Ok(())) => Err(error),
-                    Ok(Err(cleanup_error)) => {
-                        Err(error.context(format!("staging cleanup also failed: {cleanup_error}")))
-                    }
+                    Ok(()) => Err(error),
                     Err(cleanup_error) => {
                         Err(error.context(format!("staging cleanup also failed: {cleanup_error}")))
                     }
@@ -377,6 +379,14 @@ impl S3CleanupWork {
     }
 }
 
+async fn await_cleanup(cleanup: tokio::task::JoinHandle<anyhow::Result<()>>) -> anyhow::Result<()> {
+    cleanup.await.map_err(safe_cleanup_join_error)?
+}
+
+fn safe_cleanup_join_error(_error: tokio::task::JoinError) -> anyhow::Error {
+    anyhow::anyhow!("S3 staging cleanup task failed")
+}
+
 impl Drop for PreparedS3Set {
     fn drop(&mut self) {
         if !self.cleanup_armed {
@@ -414,9 +424,7 @@ impl crate::PreparedAttachmentSet for PreparedS3Set {
     }
 
     async fn abort(mut self: Box<Self>) -> anyhow::Result<()> {
-        self.schedule_cleanup()?
-            .await
-            .map_err(|_| anyhow::anyhow!("S3 staging cleanup task failed"))?
+        await_cleanup(self.schedule_cleanup()?).await
     }
 }
 
@@ -430,7 +438,7 @@ impl crate::AttachmentStore for S3AttachmentStore {
         let store = self.clone();
         let note_id = note_id.to_string();
         let attachments = attachments.to_vec();
-        let prepared = tokio::spawn(async move { store.prepare_set(&note_id, &attachments).await })
+        let prepared = tokio::spawn(async move { store.prepare_set(note_id, attachments).await })
             .await
             .map_err(|_| anyhow::anyhow!("S3 attachment preparation task failed"))??;
         Ok(Box::new(prepared))
@@ -904,7 +912,7 @@ mod tests {
             content: b"private content".to_vec(),
         };
         let error = store
-            .prepare_set("note-1", &[attachment])
+            .prepare_set("note-1".into(), vec![attachment])
             .await
             .err()
             .expect("ambiguous PUT must fail");
@@ -966,8 +974,8 @@ mod tests {
         let store = test_store(server.uri()).await;
         let first = store
             .prepare_set(
-                "note-1",
-                &[NoteAttachment {
+                "note-1".into(),
+                vec![NoteAttachment {
                     id: "file".into(),
                     path: "file.txt".into(),
                     mime: "text/plain".into(),
@@ -992,8 +1000,8 @@ mod tests {
         let mut second = tokio::spawn(async move {
             second_store
                 .prepare_set(
-                    "note-1",
-                    &[NoteAttachment {
+                    "note-1".into(),
+                    vec![NoteAttachment {
                         id: "file".into(),
                         path: "file.txt".into(),
                         mime: "text/plain".into(),
@@ -1083,7 +1091,8 @@ mod tests {
             .expect("delete responder must signal");
 
         let second_store = store.clone();
-        let mut second = tokio::spawn(async move { second_store.prepare_set("note-1", &[]).await });
+        let mut second =
+            tokio::spawn(async move { second_store.prepare_set("note-1".into(), vec![]).await });
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut second)
                 .await
@@ -1135,8 +1144,8 @@ mod tests {
         let store = test_store(server.uri()).await;
         let prepared = store
             .prepare_set(
-                "note-1",
-                &[NoteAttachment {
+                "note-1".into(),
+                vec![NoteAttachment {
                     id: "file".into(),
                     path: "file.txt".into(),
                     mime: "text/plain".into(),
@@ -1158,7 +1167,8 @@ mod tests {
         assert!(aborting.await.unwrap_err().is_cancelled());
 
         let second_store = store.clone();
-        let mut second = tokio::spawn(async move { second_store.prepare_set("note-1", &[]).await });
+        let mut second =
+            tokio::spawn(async move { second_store.prepare_set("note-1".into(), vec![]).await });
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut second)
                 .await
@@ -1207,8 +1217,8 @@ mod tests {
         let copy_store = test_store(copy_server.uri()).await;
         let prepared = copy_store
             .prepare_set(
-                "note-1",
-                &[NoteAttachment {
+                "note-1".into(),
+                vec![NoteAttachment {
                     id: "private-id".into(),
                     path: "private-name.txt".into(),
                     mime: "text/plain".into(),
@@ -1261,8 +1271,8 @@ mod tests {
         let cleanup_store = test_store(cleanup_server.uri()).await;
         let prepared = cleanup_store
             .prepare_set(
-                "note-1",
-                &[NoteAttachment {
+                "note-1".into(),
+                vec![NoteAttachment {
                     id: "private-id".into(),
                     path: "private-name.txt".into(),
                     mime: "text/plain".into(),
@@ -1294,6 +1304,16 @@ mod tests {
                 assert!(!rendered.contains(secret));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_join_errors_have_a_fixed_safe_message() {
+        let cleanup = tokio::spawn(std::future::pending::<()>());
+        cleanup.abort();
+        let join_error = cleanup.await.unwrap_err();
+
+        let rendered = safe_cleanup_join_error(join_error).to_string();
+        assert_eq!(rendered, "S3 staging cleanup task failed");
     }
 
     #[test]
