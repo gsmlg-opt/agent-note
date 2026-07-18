@@ -1,7 +1,8 @@
 mod connection;
 
+pub use connection::PgSession;
 use connection::{map_connect_error, map_sqlx_error};
-use note_storage::{BackendInfo, StorageError, StorageErrorKind, StorageResult};
+use note_storage::{BackendInfo, StorageError, StorageErrorKind, StorageResult, TransactionMode};
 use sqlx::postgres::PgPoolOptions;
 
 #[derive(Debug)]
@@ -48,6 +49,14 @@ impl PgStorage {
 
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    pub async fn connect_session(&self) -> StorageResult<PgSession> {
+        PgSession::connect(&self.pool).await
+    }
+
+    pub async fn begin_session(&self, mode: TransactionMode) -> StorageResult<PgSession> {
+        PgSession::begin(self.pool.clone(), mode).await
     }
 
     pub fn backend_info(&self) -> BackendInfo {
