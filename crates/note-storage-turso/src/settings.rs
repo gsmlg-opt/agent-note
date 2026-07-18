@@ -4,6 +4,7 @@ use note_core::SystemConfig;
 use note_storage::{SettingsRepository, StorageError, StorageErrorKind, StorageResult};
 
 const SYSTEM_CONFIG_KEY: &str = "system_config";
+const EMBEDDING_FINGERPRINT_KEY: &str = "embedding_fingerprint";
 
 #[async_trait::async_trait]
 impl SettingsRepository for TursoSession {
@@ -51,6 +52,43 @@ impl SettingsRepository for TursoSession {
             )
             .await
             .map_err(|error| map_turso_error("store system config", error))?;
+        Ok(())
+    }
+
+    async fn get_embedding_fingerprint(&self) -> StorageResult<Option<String>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                turso::params![EMBEDDING_FINGERPRINT_KEY],
+            )
+            .await
+            .map_err(|error| map_turso_error("query embedding fingerprint", error))?;
+        rows.next()
+            .await
+            .map_err(|error| map_turso_error("read embedding fingerprint", error))?
+            .map(|row| {
+                row.get::<String>(0)
+                    .map_err(|error| map_turso_error("decode embedding fingerprint", error))
+            })
+            .transpose()
+    }
+
+    async fn set_embedding_fingerprint(&self, fingerprint: &str) -> StorageResult<()> {
+        if fingerprint.trim().is_empty() {
+            return Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "embedding fingerprint must not be blank",
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                turso::params![EMBEDDING_FINGERPRINT_KEY, fingerprint],
+            )
+            .await
+            .map_err(|error| map_turso_error("store embedding fingerprint", error))?;
         Ok(())
     }
 }

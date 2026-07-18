@@ -379,6 +379,48 @@ impl EmbeddingRepository for TursoSession {
             .await
             .map_err(|error| map_turso_error("requeue processing embedding jobs", error))
     }
+
+    async fn reset_embeddings_for_regeneration(&self, now: i64) -> StorageResult<u64> {
+        self.connection
+            .execute("DELETE FROM note_chunk_embeddings", ())
+            .await
+            .map_err(|error| map_turso_error("clear chunk embeddings for regeneration", error))?;
+        self.connection
+            .execute("DELETE FROM embedding_jobs", ())
+            .await
+            .map_err(|error| map_turso_error("clear embedding jobs for regeneration", error))?;
+        self.connection
+            .execute(
+                "UPDATE note_chunks
+                 SET status = 'pending', updated_at = ?1
+                 WHERE EXISTS (
+                     SELECT 1 FROM notes
+                     WHERE notes.id = note_chunks.note_id
+                       AND notes.deleted_at IS NULL
+                 )",
+                turso::params![now],
+            )
+            .await
+            .map_err(|error| {
+                map_turso_error("mark active chunks pending for regeneration", error)
+            })?;
+        self.connection
+            .execute(
+                "INSERT INTO embedding_jobs (
+                     note_id, chunk_idx, chunk_hash, content, note_revision,
+                     status, attempts, error, created_at, updated_at
+                 )
+                 SELECT
+                     chunks.note_id, chunks.chunk_idx, chunks.chunk_hash, chunks.content,
+                     chunks.note_revision, 'pending', 0, NULL, ?1, ?1
+                 FROM note_chunks AS chunks
+                 JOIN notes ON notes.id = chunks.note_id
+                 WHERE notes.deleted_at IS NULL",
+                turso::params![now],
+            )
+            .await
+            .map_err(|error| map_turso_error("queue embeddings for regeneration", error))
+    }
 }
 
 fn decode_note_chunk(row: &turso::Row) -> StorageResult<NoteChunk> {
