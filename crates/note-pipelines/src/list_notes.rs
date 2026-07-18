@@ -18,6 +18,7 @@ pub async fn list_notes(ctx: &Context, params: ListNotesParams) -> anyhow::Resul
     let mut notes = session
         .list_notes(&selectors, params.limit, params.offset)
         .await?;
+    drop(session);
     for note in &mut notes {
         crate::hydrate_note_attachments(ctx, note).await?;
     }
@@ -27,6 +28,7 @@ pub async fn list_notes(ctx: &Context, params: ListNotesParams) -> anyhow::Resul
 pub async fn list_all_notes(ctx: &Context) -> anyhow::Result<Vec<Note>> {
     let session = ctx.storage().session().await?;
     let mut notes = session.list_all_notes().await?;
+    drop(session);
     for note in &mut notes {
         crate::hydrate_note_attachments(ctx, note).await?;
     }

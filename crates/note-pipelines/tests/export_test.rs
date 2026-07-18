@@ -59,7 +59,7 @@ impl AttachmentStore for CountingAttachmentStore {
 }
 
 #[tokio::test]
-async fn import_prepares_distinct_notes_together_and_skips_duplicate_ids_before_prepare() {
+async fn import_batch_prepares_distinct_notes_that_coexist_and_skips_duplicate_ids() {
     let dir = tempfile::tempdir().unwrap();
     let backend: Arc<dyn StorageBackend> = Arc::new(
         note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
@@ -83,7 +83,7 @@ async fn import_prepares_distinct_notes_together_and_skips_duplicate_ids_before_
 
     let stats = tokio::time::timeout(std::time::Duration::from_secs(2), import_json(&ctx, input))
         .await
-        .expect("distinct notes must prepare concurrently without a duplicate-ID lock")
+        .expect("distinct prepared sets must coexist without a duplicate-ID lock")
         .unwrap();
 
     assert_eq!(stats.notes_added, 2);
@@ -167,6 +167,66 @@ async fn import_race_aborts_the_skipped_candidate_only_after_commit() {
     assert_eq!(events[1], "begin");
     assert_eq!(events[2], "commit");
     assert_eq!(events[3], "abort:race-note:marker=true");
+}
+
+#[tokio::test]
+async fn cancelling_import_during_finalization_does_not_cancel_the_remaining_batch() {
+    let (ctx, attachments, events, _dir) = controlled_import_context().await;
+    attachments.block_publish("note-a");
+    let mut import = Box::pin(import_json(
+        &ctx,
+        r#"{
+            "version": 2,
+            "label_keys": [],
+            "notes": [
+                {"id":"note-a","title":"A","content":"first","attachments":[],"created_at":1,"updated_at":1,"labels":[]},
+                {"id":"note-b","title":"B","content":"second","attachments":[],"created_at":1,"updated_at":1,"labels":[]},
+                {"id":"note-c","title":"C","content":"third","attachments":[],"created_at":1,"updated_at":1,"labels":[]}
+            ]
+        }"#,
+    ));
+
+    let blocked_publish = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        attachments.wait_for_blocked_publish(),
+    );
+    tokio::select! {
+        result = &mut import => panic!("import finished before blocked publication: {result:?}"),
+        result = blocked_publish => {
+            result.expect("first publication must start after the import transaction commits");
+        }
+    }
+    assert!(events.lock().unwrap().iter().any(|event| event == "commit"));
+    drop(import);
+    attachments.release_blocked_publish();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let published = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.starts_with("publish:"))
+                .count();
+            if published == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("detached finalization must publish every committed attachment set");
+
+    let events = events.lock().unwrap();
+    for note_id in ["note-a", "note-b", "note-c"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with(&format!("publish:{note_id}:")))
+                .count(),
+            1
+        );
+    }
 }
 
 #[tokio::test]

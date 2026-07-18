@@ -175,6 +175,7 @@ pub async fn delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
 pub async fn permanently_delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
     let session = ctx.storage().session().await?;
     let deleted = session.permanently_delete_note(id).await? > 0;
+    drop(session);
     if deleted {
         ctx.attachments().remove_note(id).await?;
     }

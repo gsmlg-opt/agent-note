@@ -14,6 +14,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use tokio::sync::Notify;
 
 pub type EventLog = Arc<Mutex<Vec<String>>>;
 
@@ -210,6 +211,9 @@ pub struct ControlledAttachmentStore {
     fail_abort: AtomicBool,
     race_note_ids: Mutex<HashSet<String>>,
     committed_marker: Mutex<Option<String>>,
+    blocked_publish_note: Mutex<Option<String>>,
+    publish_started: Arc<Notify>,
+    publish_release: Arc<Notify>,
 }
 
 impl ControlledAttachmentStore {
@@ -221,6 +225,9 @@ impl ControlledAttachmentStore {
             fail_abort: AtomicBool::new(false),
             race_note_ids: Mutex::new(HashSet::new()),
             committed_marker: Mutex::new(None),
+            blocked_publish_note: Mutex::new(None),
+            publish_started: Arc::new(Notify::new()),
+            publish_release: Arc::new(Notify::new()),
         }
     }
 
@@ -242,6 +249,18 @@ impl ControlledAttachmentStore {
     pub fn observe_committed_label_on_abort(&self, key: &str) {
         *self.committed_marker.lock().unwrap() = Some(key.to_string());
     }
+
+    pub fn block_publish(&self, note_id: &str) {
+        *self.blocked_publish_note.lock().unwrap() = Some(note_id.to_string());
+    }
+
+    pub async fn wait_for_blocked_publish(&self) {
+        self.publish_started.notified().await;
+    }
+
+    pub fn release_blocked_publish(&self) {
+        self.publish_release.notify_one();
+    }
 }
 
 struct ControlledPreparedSet {
@@ -252,6 +271,9 @@ struct ControlledPreparedSet {
     fail_publish: bool,
     fail_abort: bool,
     committed_marker: Option<String>,
+    block_publish: bool,
+    publish_started: Arc<Notify>,
+    publish_release: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -305,6 +327,9 @@ impl AttachmentStore for ControlledAttachmentStore {
             fail_publish: self.fail_publish.load(Ordering::SeqCst),
             fail_abort: self.fail_abort.load(Ordering::SeqCst),
             committed_marker: self.committed_marker.lock().unwrap().clone(),
+            block_publish: self.blocked_publish_note.lock().unwrap().as_deref() == Some(note_id),
+            publish_started: self.publish_started.clone(),
+            publish_release: self.publish_release.clone(),
         }))
     }
 
@@ -341,6 +366,10 @@ impl PreparedAttachmentSet for ControlledPreparedSet {
     }
 
     async fn publish(self: Box<Self>) -> anyhow::Result<()> {
+        if self.block_publish {
+            self.publish_started.notify_one();
+            self.publish_release.notified().await;
+        }
         let session = self.backend.session().await?;
         let state = session
             .list_all_notes()

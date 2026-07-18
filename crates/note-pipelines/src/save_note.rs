@@ -88,6 +88,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
             missing_keys.push(key.clone());
         }
     }
+    drop(session);
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();

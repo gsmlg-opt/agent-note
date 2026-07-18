@@ -505,7 +505,69 @@ async fn get_note_attachment_reads_only_the_selected_object() {
         .await
         .unwrap()
         .is_none());
+    assert!(get_note_attachment(&ctx, "note-1", "../file.txt")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(get_note_attachment(&ctx, "note-1", "")
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(attachments.reads.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn get_note_attachment_matches_forward_and_backslash_separators() {
+    let (ctx, _backend, attachments, _dir) = recording_context().await;
+    import_json(
+        &ctx,
+        r#"{
+            "version": 2,
+            "label_keys": [],
+            "notes": [
+                {
+                    "id":"forward-note",
+                    "title":"Forward",
+                    "content":"Forward storage path",
+                    "attachments":[{"id":"file","path":"./dir/file.txt","mime":"text/plain","content":"forward"}],
+                    "created_at":1,
+                    "updated_at":1,
+                    "labels":[]
+                },
+                {
+                    "id":"back-note",
+                    "title":"Back",
+                    "content":"Backslash storage path",
+                    "attachments":[{"id":"file","path":".\\dir\\file.txt","mime":"text/plain","content":"back"}],
+                    "created_at":1,
+                    "updated_at":1,
+                    "labels":[]
+                }
+            ]
+        }"#,
+    )
+    .await
+    .unwrap();
+    attachments.reads.lock().unwrap().clear();
+
+    let forward = get_note_attachment(&ctx, "forward-note", r"dir\file.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let back = get_note_attachment(&ctx, "back-note", "dir/file.txt")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(forward.content, b"forward");
+    assert_eq!(back.content, b"back");
+    assert_eq!(
+        *attachments.reads.lock().unwrap(),
+        vec![
+            ("forward-note".into(), "./dir/file.txt".into()),
+            ("back-note".into(), r".\dir\file.txt".into()),
+        ]
+    );
 }
 
 #[tokio::test]

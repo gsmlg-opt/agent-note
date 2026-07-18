@@ -133,14 +133,16 @@ fn validate_attachments(attachments: &[NoteAttachment]) -> Result<(), Validation
     Ok(())
 }
 
-fn normalize_attachment_path(path: &str) -> String {
+/// Converts relative attachment path separators to `/` and removes empty and `.` components.
+pub fn normalize_attachment_path(path: &str) -> String {
     path.split(['/', '\\'])
         .filter(|part| !part.is_empty() && *part != ".")
         .collect::<Vec<_>>()
         .join("/")
 }
 
-fn is_relative_attachment_path(path: &str) -> bool {
+/// Returns whether an attachment path is relative and contains no parent traversal.
+pub fn is_relative_attachment_path(path: &str) -> bool {
     if path.starts_with('/') || path.starts_with('\\') || path.contains("://") {
         return false;
     }
@@ -238,6 +240,14 @@ mod tests {
             Err(ValidationError::InvalidAttachmentPath(
                 "../secret.json".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn normalizes_attachment_path_separators_consistently() {
+        assert_eq!(
+            normalize_attachment_path(r"./folder\child/file.txt"),
+            "folder/child/file.txt"
         );
     }
 

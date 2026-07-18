@@ -109,6 +109,7 @@ pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
         })
         .collect();
     let mut notes = session.list_all_notes().await?;
+    drop(session);
     for note in &mut notes {
         crate::hydrate_note_attachments(ctx, note).await?;
     }
@@ -159,9 +160,9 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
         .collect();
     let mut stats = ImportStats::default();
     let mut seen_note_ids = HashSet::new();
-    let mut prepared_notes = Vec::new();
+    let mut candidate_notes = Vec::new();
 
-    for mut note in notes {
+    for note in notes {
         if !seen_note_ids.insert(note.id.clone()) {
             stats.notes_skipped += 1;
             continue;
@@ -173,10 +174,15 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
             }
             Ok(false) => {}
             Err(error) => {
-                return Err(abort_import_notes(prepared_notes, error.into()).await);
+                return Err(error.into());
             }
         }
+        candidate_notes.push(note);
+    }
+    drop(session);
 
+    let mut prepared_notes = Vec::with_capacity(candidate_notes.len());
+    for mut note in candidate_notes {
         let encoded_attachments = std::mem::take(&mut note.attachments);
         let attachments = match encoded_attachments
             .into_iter()
@@ -199,7 +205,6 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
             attachments: prepared,
         });
     }
-    drop(session);
 
     let transaction = match ctx.storage().begin(TransactionMode::Deferred).await {
         Ok(transaction) => transaction,
@@ -261,6 +266,21 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
         return Err(abort_import_notes(prepared_notes, error).await);
     }
 
+    // A Tokio task keeps running when its JoinHandle is dropped. Spawn the whole post-commit
+    // batch so cancellation of the import caller cannot strand later prepared attachment sets.
+    let finalization = tokio::spawn(finalize_import_attachments(prepared_notes, inserted));
+    finalization
+        .await
+        .map_err(|_| anyhow::anyhow!("attachment finalization task failed"))??;
+
+    stats.embedding_jobs_queued = enqueue_missing_chunk_embeddings(ctx).await?;
+    Ok(stats)
+}
+
+async fn finalize_import_attachments(
+    prepared_notes: Vec<PreparedImportNote>,
+    inserted: Vec<bool>,
+) -> anyhow::Result<()> {
     let mut attachment_error: Option<anyhow::Error> = None;
     for (prepared, should_publish) in prepared_notes.into_iter().zip(inserted) {
         let result = if should_publish {
@@ -280,9 +300,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
     if let Some(error) = attachment_error {
         return Err(error);
     }
-
-    stats.embedding_jobs_queued = enqueue_missing_chunk_embeddings(ctx).await?;
-    Ok(stats)
+    Ok(())
 }
 
 pub async fn export_json(ctx: &Context) -> anyhow::Result<String> {
