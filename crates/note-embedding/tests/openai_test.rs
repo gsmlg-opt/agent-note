@@ -368,6 +368,32 @@ async fn unauthenticated_http_error_body_is_bounded_and_marked_truncated() {
 }
 
 #[tokio::test]
+async fn oversized_success_content_length_is_rejected_before_parsing() {
+    let server = MockServer::start().await;
+    let mut oversized_body = b"secret oversized body".to_vec();
+    oversized_body.resize(1024 * 1024 + 1, b'x');
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = OpenAiCompatibleEmbedder::new(config(&server))
+        .unwrap()
+        .embed("oversized")
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("embedding response exceeds maximum size"),
+        "{error}"
+    );
+    assert!(!error.contains("secret"), "{error}");
+    assert!(error.len() < 200, "error was {} bytes", error.len());
+}
+
+#[tokio::test]
 async fn base_path_and_trailing_slash_are_preserved_when_appending_endpoint() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -397,6 +423,8 @@ fn constructor_rejects_invalid_or_unsafe_urls_without_echoing_them() {
         ("https://user:secret@example.com", "credentials"),
         ("https://example.com?secret=query", "query"),
         ("https://example.com#secret-fragment", "fragment"),
+        ("ftp://example.com/secret-input", "scheme"),
+        ("custom-secret://example.com/path", "scheme"),
     ] {
         let mut cfg = standalone_config(base_url);
         cfg.bearer_token = Some("header-secret".into());

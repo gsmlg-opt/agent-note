@@ -7,6 +7,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_RETRIES: u32 = 10;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
+// The default RPC batch is 16 BGE-M3 vectors (16,384 JSON floats). One MiB leaves ample
+// serialization overhead while keeping an untrusted compatible endpoint strictly bounded.
+const MAX_SUCCESS_BODY_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuccessBodyReadError {
+    TooLarge,
+    ReadFailed,
+}
 
 #[derive(Clone)]
 pub struct OpenAiCompatibleConfig {
@@ -47,6 +56,9 @@ impl OpenAiCompatibleEmbedder {
     pub fn new(config: OpenAiCompatibleConfig) -> Result<Self> {
         let mut endpoint =
             Url::parse(&config.base_url).map_err(|_| anyhow!("embedding base URL is invalid"))?;
+        if !matches!(endpoint.scheme(), "http" | "https") {
+            bail!("embedding base URL scheme must be http or https");
+        }
         if !endpoint.username().is_empty() || endpoint.password().is_some() {
             bail!("embedding base URL credentials are not allowed");
         }
@@ -110,14 +122,12 @@ impl OpenAiCompatibleEmbedder {
 
             match builder.send().await {
                 Ok(response) if response.status().is_success() => {
-                    let response = response
-                        .json::<EmbeddingResponse>()
-                        .await
-                        .map_err(|_| anyhow!("embedding response was not valid JSON"))?;
+                    let response = parse_success_response(response).await?;
                     return validate_response_items(texts.len(), response.data);
                 }
                 Ok(response) => {
                     if retryable_status(response.status()) && attempt < self.max_retries {
+                        drop(response);
                         sleep_before_retry(attempt.saturating_add(1)).await;
                         continue;
                     }
@@ -222,6 +232,48 @@ fn transport_error(error: &reqwest::Error) -> anyhow::Error {
     }
 }
 
+async fn parse_success_response(response: Response) -> Result<EmbeddingResponse> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SUCCESS_BODY_BYTES as u64)
+    {
+        bail!("embedding response exceeds maximum size");
+    }
+
+    let body =
+        match read_bounded_success_stream(response.bytes_stream(), MAX_SUCCESS_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(SuccessBodyReadError::TooLarge) => {
+                bail!("embedding response exceeds maximum size")
+            }
+            Err(SuccessBodyReadError::ReadFailed) => {
+                bail!("embedding response could not be read")
+            }
+        };
+    serde_json::from_slice(&body).map_err(|_| anyhow!("embedding response was not valid JSON"))
+}
+
+async fn read_bounded_success_stream<S, T, E>(
+    stream: S,
+    max_bytes: usize,
+) -> std::result::Result<Vec<u8>, SuccessBodyReadError>
+where
+    S: futures::Stream<Item = std::result::Result<T, E>>,
+    T: AsRef<[u8]>,
+{
+    futures::pin_mut!(stream);
+    let mut body = Vec::with_capacity(max_bytes.min(64 * 1024));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| SuccessBodyReadError::ReadFailed)?;
+        let chunk = chunk.as_ref();
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
+            return Err(SuccessBodyReadError::TooLarge);
+        }
+        body.extend_from_slice(chunk);
+    }
+    Ok(body)
+}
+
 async fn http_error(response: Response, authenticated: bool) -> anyhow::Error {
     let status = response.status();
     if authenticated {
@@ -286,5 +338,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("non-finite component"));
+    }
+
+    #[tokio::test]
+    async fn bounded_success_stream_rejects_chunked_body_past_limit() {
+        let stream = futures::stream::iter([
+            Ok::<_, ()>(b"1234".to_vec()),
+            Ok(b"5678".to_vec()),
+            Ok(b"9".to_vec()),
+        ]);
+
+        let error = read_bounded_success_stream(stream, 8).await.unwrap_err();
+
+        assert_eq!(error, SuccessBodyReadError::TooLarge);
+    }
+
+    #[tokio::test]
+    async fn bounded_success_stream_allows_body_at_exact_limit() {
+        let stream = futures::stream::iter([Ok::<_, ()>(b"1234".to_vec()), Ok(b"5678".to_vec())]);
+
+        let body = read_bounded_success_stream(stream, 8).await.unwrap();
+
+        assert_eq!(body, b"12345678");
     }
 }
