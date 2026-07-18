@@ -11,6 +11,13 @@ const CHUNK_STATUS_FAILED: &str = "failed";
 const MAX_EMBEDDING_ATTEMPTS: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FingerprintReconciliation {
+    Initialized,
+    Unchanged,
+    Regenerated { queued_jobs: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessEmbeddingJobStatus {
     Completed,
     Stale,
@@ -32,6 +39,43 @@ pub fn chunk_hash(content: &str) -> String {
         write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
     }
     out
+}
+
+pub async fn reconcile_embedding_fingerprint(
+    storage: &dyn note_storage::StorageBackend,
+    configured_fingerprint: &str,
+    now: i64,
+) -> anyhow::Result<FingerprintReconciliation> {
+    if configured_fingerprint.trim().is_empty() {
+        anyhow::bail!("embedding fingerprint must not be blank");
+    }
+
+    let transaction = storage.begin(TransactionMode::Immediate).await?;
+    let result = async {
+        match transaction.get_embedding_fingerprint().await? {
+            None => {
+                transaction
+                    .set_embedding_fingerprint(configured_fingerprint)
+                    .await?;
+                anyhow::Ok(FingerprintReconciliation::Initialized)
+            }
+            Some(stored) if stored == configured_fingerprint => {
+                anyhow::Ok(FingerprintReconciliation::Unchanged)
+            }
+            Some(_) => {
+                let queued_jobs = transaction.reset_embeddings_for_regeneration(now).await?;
+                let queued_jobs = usize::try_from(queued_jobs)
+                    .map_err(|_| anyhow::anyhow!("queued embedding job count exceeds usize"))?;
+                transaction
+                    .set_embedding_fingerprint(configured_fingerprint)
+                    .await?;
+                anyhow::Ok(FingerprintReconciliation::Regenerated { queued_jobs })
+            }
+        }
+    }
+    .await;
+
+    crate::save_note::finish_transaction(transaction, result).await
 }
 
 pub async fn sync_note_embedding_jobs(
