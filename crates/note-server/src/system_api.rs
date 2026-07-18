@@ -96,10 +96,45 @@ mod tests {
     use note_core::NoteAttachment;
     use note_embedding::StubEmbedder;
     use note_pipelines::{save_note, SaveNoteInput};
-    use note_storage::StorageBackend;
+    use note_storage::{
+        BackendInfo, StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
+        StorageTransaction, TransactionMode,
+    };
     use note_storage_turso::TursoStorage;
     use std::io::Read;
     use tower::ServiceExt;
+
+    struct InfoBackend {
+        _connection_url: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for InfoBackend {
+        async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "session not used by system info",
+            ))
+        }
+
+        async fn begin(
+            &self,
+            _mode: TransactionMode,
+        ) -> StorageResult<Box<dyn StorageTransaction>> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "transaction not used by system info",
+            ))
+        }
+
+        async fn info(&self) -> StorageResult<BackendInfo> {
+            Ok(BackendInfo {
+                engine: "pg".into(),
+                location: None,
+                size_bytes: None,
+            })
+        }
+    }
 
     async fn test_app() -> (Router, Arc<Context>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -199,6 +234,36 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("attachments"));
+    }
+
+    #[tokio::test]
+    async fn info_reports_pg_without_local_database_fields_or_credentials() {
+        const PASSWORD: &str = "do-not-render-this-secret";
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(InfoBackend {
+            _connection_url: format!("postgresql://agent:{PASSWORD}@database/notes"),
+        });
+        let ctx = Arc::new(Context::new(
+            storage,
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("attachments"),
+            )),
+        ));
+        let app = system_router().with_state(ctx);
+
+        let response = app
+            .oneshot(request("GET", "/api/system/info", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(info["database_engine"], "pg");
+        assert!(info["database_path"].is_null());
+        assert!(info["database_size_bytes"].is_null());
+        assert!(!String::from_utf8_lossy(&bytes).contains(PASSWORD));
     }
 
     #[tokio::test]

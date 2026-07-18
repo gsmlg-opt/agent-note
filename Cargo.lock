@@ -2553,6 +2553,7 @@ name = "note-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "flate2",
@@ -2564,6 +2565,7 @@ dependencies = [
  "note-mcp",
  "note-pipelines",
  "note-storage",
+ "note-storage-pg",
  "note-storage-turso",
  "pulldown-cmark 0.12.2",
  "serde",

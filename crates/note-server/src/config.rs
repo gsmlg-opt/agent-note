@@ -326,6 +326,9 @@ fn resolve_database(
                 10,
                 "NOTE_DB_MAX_CONNECTIONS",
             )?;
+            if max_connections == 0 {
+                anyhow::bail!("database.max_connections must be greater than zero");
+            }
             Ok(DatabaseConfig::Pg {
                 url,
                 max_connections,
@@ -691,6 +694,24 @@ force_path_style = true
                 force_path_style: true,
             }
         );
+    }
+
+    #[test]
+    fn active_pg_config_rejects_zero_max_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "config.toml",
+            r#"[database]
+engine = "pg"
+url = "postgresql://localhost/notes"
+max_connections = 0
+"#,
+        );
+
+        let error = resolve_explicit(dir.path(), "config.toml").unwrap_err();
+
+        assert!(error.to_string().contains("database.max_connections"));
     }
 
     #[test]

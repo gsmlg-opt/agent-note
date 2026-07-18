@@ -125,14 +125,17 @@ fn ensure_data_directories(config: &RuntimeConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn open_storage(config: &DatabaseConfig) -> anyhow::Result<Arc<dyn StorageBackend>> {
+async fn build_storage(config: &DatabaseConfig) -> anyhow::Result<Arc<dyn StorageBackend>> {
     match config {
         DatabaseConfig::Embed { path } => Ok(Arc::new(
             note_storage_turso::TursoStorage::open(path).await?,
         )),
-        DatabaseConfig::Pg { .. } => {
-            anyhow::bail!("PostgreSQL storage adapter is not implemented yet")
-        }
+        DatabaseConfig::Pg {
+            url,
+            max_connections,
+        } => Ok(Arc::new(
+            note_storage_pg::PgStorage::connect(url, *max_connections).await?,
+        )),
     }
 }
 
@@ -297,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
     let stdio_mode = args.iter().any(|a| a == "--stdio");
     let config = note_server::config::load_runtime_config()?;
     ensure_data_directories(&config)?;
-    let storage = open_storage(&config.database).await?;
+    let storage = build_storage(&config.database).await?;
     let attachments = open_attachments(&config.attachments)?;
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
@@ -541,19 +544,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_external_adapters_return_precise_errors() {
-        let pg = open_storage(&DatabaseConfig::Pg {
-            url: "postgresql://localhost/notes".into(),
-            max_connections: 10,
+    async fn embed_storage_opens_only_the_configured_turso_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured_path = temp.path().join("configured/notes.db");
+        let default_path = temp.path().join("dev-data/notes.db");
+        let config = RuntimeConfig {
+            config_path: temp.path().join("config.toml"),
+            database: DatabaseConfig::Embed {
+                path: configured_path.clone(),
+            },
+            embedding: EmbeddingConfig::Local { model_path: None },
+            attachments: AttachmentConfig::Filesystem {
+                path: temp.path().join("attachments"),
+            },
+        };
+
+        ensure_data_directories(&config).unwrap();
+        let storage = build_storage(&config.database).await.unwrap();
+        storage.session().await.unwrap();
+
+        assert!(configured_path.exists());
+        assert!(!default_path.exists());
+    }
+
+    #[tokio::test]
+    async fn unreachable_pg_errors_do_not_render_credentials() {
+        const USERNAME: &str = "do-not-render-this-user";
+        const PASSWORD: &str = "do-not-render-this-secret";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("postgresql://{USERNAME}:{PASSWORD}@{address}/notes");
+
+        let error = build_storage(&DatabaseConfig::Pg {
+            url: url.clone(),
+            max_connections: 1,
         })
         .await
         .err()
-        .expect("PostgreSQL must remain reserved");
-        assert_eq!(
-            pg.to_string(),
-            "PostgreSQL storage adapter is not implemented yet"
-        );
+        .expect("refused PostgreSQL connection must fail");
+        let rendered = format!("{error:#}");
 
+        assert!(!rendered.contains(&url), "{rendered}");
+        assert!(!rendered.contains(USERNAME), "{rendered}");
+        assert!(!rendered.contains(PASSWORD), "{rendered}");
+    }
+
+    #[test]
+    fn reserved_external_adapters_return_precise_errors() {
         let s3 = open_attachments(&AttachmentConfig::S3 {
             bucket: "notes".into(),
             prefix: String::new(),
@@ -567,7 +605,10 @@ mod tests {
             s3.to_string(),
             "S3 attachment adapter is not implemented yet"
         );
+    }
 
+    #[tokio::test]
+    async fn reserved_external_embedding_returns_precise_error() {
         let openai = start_embedding_runtime(&EmbeddingConfig::OpenAi {
             base_url: "http://localhost:8080".into(),
             model: "bge-m3".into(),
