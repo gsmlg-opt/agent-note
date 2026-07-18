@@ -226,14 +226,16 @@ number of retries after the initial request and must be at most `10`. A successf
 limited to 1 MiB. Unauthenticated HTTP error bodies are limited to 4 KiB, while authenticated
 response bodies are redacted.
 
-The default local engine and an OpenAI-compatible engine using model `bge-m3` share the fingerprint
-`bge-m3:1024`. Reconciliation has three states. A missing stored fingerprint, including in a legacy
-database, adopts the configured fingerprint without deleting existing vectors or jobs. An equal
-stored fingerprint leaves them unchanged. A present but different fingerprint atomically deletes
-old vectors, replaces existing embedding jobs, and queues one pending job for every active body
-chunk before the scheduler starts. Import and export still load the mandatory configuration and
-storage adapters, but use the deterministic stub internally and never contact the configured
-embedding service; import queues missing chunks for later processing by a normal server run.
+The local engine without `model_path` uses the deterministic stub and reports fingerprint
+`stub:1024`. A local engine with `model_path` and an OpenAI-compatible engine using model `bge-m3`
+share the real vector-space fingerprint `bge-m3:1024`. Reconciliation has three states. A missing
+stored fingerprint, including in a legacy database, adopts the configured fingerprint without
+deleting existing vectors or jobs. An equal stored fingerprint leaves them unchanged. A present
+but different fingerprint—including switching from the stub to BGE-M3—atomically deletes old
+vectors, replaces existing embedding jobs, and queues one pending job for every active body chunk
+before the scheduler starts. Import and export still load the mandatory configuration and storage
+adapters, but use the deterministic stub internally and never contact the configured embedding
+service; import queues missing chunks for later processing by a normal server run.
 
 A blank retrieval query returns no results before embedding or storage access. Normal note saves
 reject blank content; if an import contains blank note content, it produces no chunks or embedding

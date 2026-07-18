@@ -117,7 +117,7 @@ impl std::fmt::Debug for EmbeddingConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AttachmentConfig {
     Filesystem {
         path: PathBuf,
@@ -129,6 +129,31 @@ pub enum AttachmentConfig {
         endpoint: Option<String>,
         force_path_style: bool,
     },
+}
+
+impl std::fmt::Debug for AttachmentConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Filesystem { path } => formatter
+                .debug_struct("Filesystem")
+                .field("path", path)
+                .finish(),
+            Self::S3 {
+                bucket,
+                prefix,
+                region,
+                endpoint,
+                force_path_style,
+            } => formatter
+                .debug_struct("S3")
+                .field("bucket", bucket)
+                .field("prefix", prefix)
+                .field("region", region)
+                .field("endpoint", &endpoint.as_ref().map(|_| "<redacted>"))
+                .field("force_path_style", force_path_style)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1075,6 +1100,33 @@ url = "postgresql://agent:{PASSWORD}@database/notes
         assert!(rendered.contains("bge-m3"), "{rendered}");
         assert!(rendered.contains("timeout_secs"), "{rendered}");
         assert!(rendered.contains("max_retries"), "{rendered}");
+    }
+
+    #[test]
+    fn runtime_debug_output_redacts_s3_endpoint() {
+        const ENDPOINT_SENTINEL: &str = "s3-user:s3-password@minio.example:9000";
+        let config = RuntimeConfig {
+            config_path: "/tmp/config.toml".into(),
+            database: DatabaseConfig::Embed {
+                path: "/tmp/notes.db".into(),
+            },
+            embedding: EmbeddingConfig::Local { model_path: None },
+            attachments: AttachmentConfig::S3 {
+                bucket: "agent-note".into(),
+                prefix: "attachments".into(),
+                region: Some("us-east-1".into()),
+                endpoint: Some(format!("https://{ENDPOINT_SENTINEL}")),
+                force_path_style: true,
+            },
+        };
+
+        for rendered in [format!("{:?}", config.attachments), format!("{config:?}")] {
+            assert!(!rendered.contains(ENDPOINT_SENTINEL), "{rendered}");
+            assert!(!rendered.contains("s3-password"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains("agent-note"), "{rendered}");
+            assert!(rendered.contains("attachments"), "{rendered}");
+        }
     }
 
     #[test]

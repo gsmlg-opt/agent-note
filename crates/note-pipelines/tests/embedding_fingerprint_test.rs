@@ -118,12 +118,12 @@ async fn matching_fingerprint_preserves_exact_vectors_and_jobs() {
 }
 
 #[tokio::test]
-async fn changed_fingerprint_atomically_resets_vectors_and_replaces_jobs() {
+async fn replacing_the_stub_with_bge_m3_resets_vectors_and_requeues_active_chunks() {
     let (_dir, storage) = storage().await;
     seed_embedded_chunk_with_job(&storage).await;
     let session = storage.session().await.unwrap();
     session
-        .set_embedding_fingerprint("other-model:1024")
+        .set_embedding_fingerprint("stub:1024")
         .await
         .unwrap();
     let old_job = session

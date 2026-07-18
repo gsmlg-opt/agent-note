@@ -262,12 +262,13 @@ non-disposable data before upgrading so recovery or deliberate import remains po
   ```
 
   `api_key_env` is optional; omit it for no authentication.
-- **Fingerprint lifecycle**: local BGE-M3 and remote model `bge-m3` both identify their vector
-  space as `bge-m3:1024`. A missing stored fingerprint, including in a legacy database, adopts the
-  configured fingerprint without deleting existing vectors or jobs. An equal stored fingerprint
-  preserves them unchanged. A present but different fingerprint causes one storage transaction to
-  remove old vectors and jobs, queue one pending job for every active chunk, and record the new
-  fingerprint before the scheduler starts.
+- **Fingerprint lifecycle**: local mode without `model_path` identifies the deterministic stub as
+  `stub:1024`. Local BGE-M3 with `model_path` and remote model `bge-m3` both identify their real
+  vector space as `bge-m3:1024`. A missing stored fingerprint, including in a legacy database,
+  adopts the configured fingerprint without deleting existing vectors or jobs. An equal stored
+  fingerprint preserves them unchanged. A present but different fingerprint—including a switch
+  from the stub to BGE-M3—causes one storage transaction to remove old vectors and jobs, queue one
+  pending job for every active chunk, and record the new fingerprint before the scheduler starts.
 - **Endpoint-free paths**: a blank retrieval query returns no results before embedding or storage
   access. Normal note saves reject blank content; blank imported note content creates no chunks or
   embedding jobs. Import and export use the deterministic stub and never contact the configured

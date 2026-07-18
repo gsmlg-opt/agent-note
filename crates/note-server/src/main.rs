@@ -68,10 +68,11 @@ async fn start_embedding_runtime(config: &EmbeddingConfig) -> anyhow::Result<Run
         EmbeddingConfig::Local { model_path } => {
             let worker_config =
                 with_resolved_model_path(ProcessWorkerConfig::from_env()?, model_path);
+            let info = local_embedding_info(&worker_config);
             let process_runtime = ProcessWorkerRuntime::start(worker_config).await?;
             Ok(RunningEmbedding {
                 embedder: process_runtime.embedder(),
-                info: EmbeddingBackendInfo::local_bge_m3(),
+                info,
                 process_runtime: Some(Box::new(process_runtime)),
                 wake: Arc::new(Notify::new()),
             })
@@ -100,6 +101,14 @@ async fn start_embedding_runtime(config: &EmbeddingConfig) -> anyhow::Result<Run
                 wake: Arc::new(Notify::new()),
             })
         }
+    }
+}
+
+fn local_embedding_info(worker_config: &ProcessWorkerConfig) -> EmbeddingBackendInfo {
+    if worker_config.model_path.is_some() {
+        EmbeddingBackendInfo::local_bge_m3()
+    } else {
+        EmbeddingBackendInfo::local_stub()
     }
 }
 
@@ -657,6 +666,22 @@ mod tests {
             assert!(!rendered.contains('\t'), "{rendered}");
             assert!(!rendered.contains("unrelated-secret"), "{rendered}");
         }
+    }
+
+    #[test]
+    fn local_embedding_metadata_distinguishes_stub_from_bge_m3() {
+        let mut worker_config = ProcessWorkerConfig::from_env().unwrap();
+        worker_config.model_path = None;
+        assert_eq!(
+            local_embedding_info(&worker_config),
+            EmbeddingBackendInfo::local_stub()
+        );
+
+        worker_config.model_path = Some(PathBuf::from("/models/bge-m3.onnx"));
+        assert_eq!(
+            local_embedding_info(&worker_config),
+            EmbeddingBackendInfo::local_bge_m3()
+        );
     }
 
     #[tokio::test]

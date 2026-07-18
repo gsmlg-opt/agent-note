@@ -479,6 +479,14 @@ fn standalone_config(base_url: &str) -> OpenAiCompatibleConfig {
 #[test]
 fn embedding_backend_metadata_uses_trimmed_model_and_stable_fingerprint() {
     assert_eq!(
+        EmbeddingBackendInfo::local_stub(),
+        EmbeddingBackendInfo {
+            engine: "local".into(),
+            model: "stub".into(),
+            fingerprint: "stub:1024".into(),
+        }
+    );
+    assert_eq!(
         EmbeddingBackendInfo::local_bge_m3(),
         EmbeddingBackendInfo {
             engine: "local".into(),

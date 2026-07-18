@@ -18,6 +18,14 @@ pub fn embedding_fingerprint(model: &str) -> String {
 }
 
 impl EmbeddingBackendInfo {
+    pub fn local_stub() -> Self {
+        Self {
+            engine: "local".into(),
+            model: "stub".into(),
+            fingerprint: embedding_fingerprint("stub"),
+        }
+    }
+
     pub fn local_bge_m3() -> Self {
         Self {
             engine: "local".into(),
