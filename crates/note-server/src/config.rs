@@ -19,7 +19,7 @@ engine = "filesystem"
 path = "attachments"
 "#;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     database: Option<FileDatabaseConfig>,
@@ -27,7 +27,7 @@ struct FileConfig {
     attachments: Option<FileAttachmentConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileDatabaseConfig {
     engine: Option<String>,
@@ -36,7 +36,7 @@ struct FileDatabaseConfig {
     max_connections: Option<u32>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileEmbeddingConfig {
     engine: Option<String>,
@@ -47,7 +47,7 @@ struct FileEmbeddingConfig {
     max_retries: Option<u32>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileAttachmentConfig {
     engine: Option<String>,
@@ -59,10 +59,25 @@ struct FileAttachmentConfig {
     force_path_style: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DatabaseConfig {
     Embed { path: PathBuf },
     Pg { url: String, max_connections: u32 },
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Embed { path } => formatter.debug_struct("Embed").field("path", path).finish(),
+            Self::Pg {
+                max_connections, ..
+            } => formatter
+                .debug_struct("Pg")
+                .field("url", &"<redacted>")
+                .field("max_connections", max_connections)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +114,7 @@ pub struct RuntimeConfig {
     pub attachments: AttachmentConfig,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct EnvValues {
     config_path: Option<PathBuf>,
     database_engine: Option<String>,
@@ -125,25 +140,42 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     let cwd = std::env::current_dir().context("resolve current working directory")?;
     let env = EnvValues {
         config_path: std::env::var_os("NOTE_CONFIG_PATH").map(PathBuf::from),
-        database_engine: std::env::var("NOTE_DB_ENGINE").ok(),
+        database_engine: read_string_env("NOTE_DB_ENGINE")?,
         database_path: std::env::var_os("NOTE_DB_PATH").map(PathBuf::from),
-        database_url: std::env::var("DATABASE_URL").ok(),
-        database_max_connections: std::env::var("NOTE_DB_MAX_CONNECTIONS").ok(),
-        embedding_engine: std::env::var("NOTE_EMBEDDING_ENGINE").ok(),
-        embedding_base_url: std::env::var("NOTE_EMBEDDING_BASE_URL").ok(),
-        embedding_model: std::env::var("NOTE_EMBEDDING_MODEL").ok(),
-        embedding_api_key_env: std::env::var("NOTE_EMBEDDING_API_KEY_ENV").ok(),
-        embedding_timeout_secs: std::env::var("NOTE_EMBEDDING_TIMEOUT_SECS").ok(),
-        embedding_max_retries: std::env::var("NOTE_EMBEDDING_MAX_RETRIES").ok(),
-        attachments_engine: std::env::var("NOTE_ATTACHMENTS_ENGINE").ok(),
+        database_url: read_string_env("DATABASE_URL")?,
+        database_max_connections: read_string_env("NOTE_DB_MAX_CONNECTIONS")?,
+        embedding_engine: read_string_env("NOTE_EMBEDDING_ENGINE")?,
+        embedding_base_url: read_string_env("NOTE_EMBEDDING_BASE_URL")?,
+        embedding_model: read_string_env("NOTE_EMBEDDING_MODEL")?,
+        embedding_api_key_env: read_string_env("NOTE_EMBEDDING_API_KEY_ENV")?,
+        embedding_timeout_secs: read_string_env("NOTE_EMBEDDING_TIMEOUT_SECS")?,
+        embedding_max_retries: read_string_env("NOTE_EMBEDDING_MAX_RETRIES")?,
+        attachments_engine: read_string_env("NOTE_ATTACHMENTS_ENGINE")?,
         attachments_dir: std::env::var_os("NOTE_ATTACHMENTS_DIR").map(PathBuf::from),
-        s3_bucket: std::env::var("NOTE_S3_BUCKET").ok(),
-        s3_prefix: std::env::var("NOTE_S3_PREFIX").ok(),
-        aws_region: std::env::var("AWS_REGION").ok(),
-        s3_endpoint: std::env::var("NOTE_S3_ENDPOINT").ok(),
-        s3_force_path_style: std::env::var("NOTE_S3_FORCE_PATH_STYLE").ok(),
+        s3_bucket: read_string_env("NOTE_S3_BUCKET")?,
+        s3_prefix: read_string_env("NOTE_S3_PREFIX")?,
+        aws_region: read_string_env("AWS_REGION")?,
+        s3_endpoint: read_string_env("NOTE_S3_ENDPOINT")?,
+        s3_force_path_style: read_string_env("NOTE_S3_FORCE_PATH_STYLE")?,
     };
     resolve_runtime_config(&cwd, env, cfg!(debug_assertions))
+}
+
+fn read_string_env(variable: &str) -> anyhow::Result<Option<String>> {
+    decode_string_env(variable, std::env::var(variable))
+}
+
+fn decode_string_env(
+    variable: &str,
+    result: Result<String, std::env::VarError>,
+) -> anyhow::Result<Option<String>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("environment variable {variable} is not valid Unicode")
+        }
+    }
 }
 
 fn resolve_runtime_config(
@@ -197,9 +229,36 @@ fn load_file_config(
             return Err(error).with_context(|| format!("read config file {}", path.display()));
         }
     };
-    let config = toml::from_str(&contents)
-        .with_context(|| format!("parse config file {}", path.display()))?;
+    let config = parse_file_config(&contents, &path)?;
     Ok((config, path))
+}
+
+fn parse_file_config(contents: &str, path: &Path) -> anyhow::Result<FileConfig> {
+    toml::from_str(contents).map_err(|error: toml::de::Error| {
+        let location = error
+            .span()
+            .map(|span| line_and_column(contents, span.start))
+            .map(|(line, column)| format!(" at line {line}, column {column}"))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "parse config file {}{location}: {}",
+            path.display(),
+            error.message()
+        )
+    })
+}
+
+fn line_and_column(contents: &str, offset: usize) -> (usize, usize) {
+    let prefix = &contents[..offset];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map(|(_, line)| line)
+        .unwrap_or(prefix)
+        .chars()
+        .count()
+        + 1;
+    (line, column)
 }
 
 fn generate_default_config(path: &Path) -> anyhow::Result<()> {
@@ -233,12 +292,14 @@ fn resolve_database(
     env: &EnvValues,
     config_base: &Path,
 ) -> anyhow::Result<DatabaseConfig> {
-    match file
-        .engine
-        .as_deref()
-        .or(env.database_engine.as_deref())
-        .unwrap_or("embed")
-    {
+    let (engine, source) = select_engine(
+        file.engine.as_deref(),
+        env.database_engine.as_deref(),
+        "embed",
+        "config field database.engine",
+        "environment variable NOTE_DB_ENGINE",
+    );
+    match engine {
         "embed" => {
             let path = file
                 .path
@@ -265,7 +326,7 @@ fn resolve_database(
                 max_connections,
             })
         }
-        other => anyhow::bail!("unknown database engine {other:?}"),
+        _ => anyhow::bail!("unknown database engine selected by {source}"),
     }
 }
 
@@ -273,12 +334,14 @@ fn resolve_embedding(
     file: FileEmbeddingConfig,
     env: &EnvValues,
 ) -> anyhow::Result<EmbeddingConfig> {
-    match file
-        .engine
-        .as_deref()
-        .or(env.embedding_engine.as_deref())
-        .unwrap_or("local")
-    {
+    let (engine, source) = select_engine(
+        file.engine.as_deref(),
+        env.embedding_engine.as_deref(),
+        "local",
+        "config field embedding.engine",
+        "environment variable NOTE_EMBEDDING_ENGINE",
+    );
+    match engine {
         "local" => Ok(EmbeddingConfig::Local),
         "openai" => {
             let base_url = require_string(
@@ -315,7 +378,7 @@ fn resolve_embedding(
                 max_retries,
             })
         }
-        other => anyhow::bail!("unknown embedding engine {other:?}"),
+        _ => anyhow::bail!("unknown embedding engine selected by {source}"),
     }
 }
 
@@ -324,12 +387,14 @@ fn resolve_attachments(
     env: &EnvValues,
     config_base: &Path,
 ) -> anyhow::Result<AttachmentConfig> {
-    match file
-        .engine
-        .as_deref()
-        .or(env.attachments_engine.as_deref())
-        .unwrap_or("filesystem")
-    {
+    let (engine, source) = select_engine(
+        file.engine.as_deref(),
+        env.attachments_engine.as_deref(),
+        "filesystem",
+        "config field attachments.engine",
+        "environment variable NOTE_ATTACHMENTS_ENGINE",
+    );
+    match engine {
         "filesystem" => {
             let path = file
                 .path
@@ -363,7 +428,21 @@ fn resolve_attachments(
                 force_path_style,
             })
         }
-        other => anyhow::bail!("unknown attachments engine {other:?}"),
+        _ => anyhow::bail!("unknown attachments engine selected by {source}"),
+    }
+}
+
+fn select_engine<'a>(
+    file: Option<&'a str>,
+    env: Option<&'a str>,
+    default: &'a str,
+    file_source: &'static str,
+    env_source: &'static str,
+) -> (&'a str, &'static str) {
+    match (file, env) {
+        (Some(engine), _) => (engine, file_source),
+        (None, Some(engine)) => (engine, env_source),
+        (None, None) => (default, "built-in default"),
     }
 }
 
@@ -466,6 +545,33 @@ path = "winner-attachments"
                 path: dir.path().join("dev-data/winner.db"),
             }
         );
+    }
+
+    #[test]
+    fn concurrent_generation_accepts_one_atomic_winner() {
+        const THREADS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().join(DEFAULT_CONFIG_PATH));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+
+        let handles = (0..THREADS)
+            .map(|_| {
+                let path = std::sync::Arc::clone(&path);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    generate_default_config(&path)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        assert_eq!(std::fs::read_to_string(&*path).unwrap(), DEFAULT_DEV_CONFIG);
+        let config = resolve_runtime_config(dir.path(), EnvValues::default(), false).unwrap();
+        assert_eq!(config.config_path, *path);
     }
 
     #[test]
@@ -730,6 +836,50 @@ path = ""
     }
 
     #[test]
+    fn malformed_toml_errors_do_not_expose_source_credentials() {
+        const PASSWORD: &str = "known-password-must-not-leak";
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "config.toml",
+            &format!(
+                r#"[database]
+engine = "pg"
+url = "postgresql://agent:{PASSWORD}@database/notes
+"#
+            ),
+        );
+
+        let error = resolve_explicit(dir.path(), "config.toml").unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(!rendered.contains(PASSWORD), "{rendered}");
+        assert!(rendered.contains("config.toml"), "{rendered}");
+        assert!(rendered.contains("line 3, column"), "{rendered}");
+    }
+
+    #[test]
+    fn debug_output_redacts_database_credentials() {
+        const PASSWORD: &str = "known-debug-password";
+        let config = RuntimeConfig {
+            config_path: "/tmp/config.toml".into(),
+            database: DatabaseConfig::Pg {
+                url: format!("postgresql://agent:{PASSWORD}@database/notes"),
+                max_connections: 10,
+            },
+            embedding: EmbeddingConfig::Local,
+            attachments: AttachmentConfig::Filesystem {
+                path: "/tmp/attachments".into(),
+            },
+        };
+
+        for rendered in [format!("{:?}", config.database), format!("{config:?}")] {
+            assert!(!rendered.contains(PASSWORD), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+        }
+    }
+
+    #[test]
     fn api_key_env_is_kept_as_a_name_without_reading_its_value() {
         let dir = tempfile::tempdir().unwrap();
         write_config(
@@ -761,19 +911,28 @@ api_key_env = "SECRET_THAT_IS_NOT_READ"
         let dir = tempfile::tempdir().unwrap();
         write_config(dir.path(), "config.toml", "");
 
-        for env in [
-            EnvValues {
-                database_engine: Some("sqlite".into()),
-                ..EnvValues::default()
-            },
-            EnvValues {
-                embedding_engine: Some("ollama".into()),
-                ..EnvValues::default()
-            },
-            EnvValues {
-                attachments_engine: Some("gcs".into()),
-                ..EnvValues::default()
-            },
+        for (env, expected) in [
+            (
+                EnvValues {
+                    database_engine: Some("sqlite".into()),
+                    ..EnvValues::default()
+                },
+                "environment variable NOTE_DB_ENGINE",
+            ),
+            (
+                EnvValues {
+                    embedding_engine: Some("ollama".into()),
+                    ..EnvValues::default()
+                },
+                "environment variable NOTE_EMBEDDING_ENGINE",
+            ),
+            (
+                EnvValues {
+                    attachments_engine: Some("gcs".into()),
+                    ..EnvValues::default()
+                },
+                "environment variable NOTE_ATTACHMENTS_ENGINE",
+            ),
         ] {
             let error = resolve_runtime_config(
                 dir.path(),
@@ -784,18 +943,30 @@ api_key_env = "SECRET_THAT_IS_NOT_READ"
                 false,
             )
             .unwrap_err();
-            assert!(error.to_string().contains("unknown"));
+            assert!(error.to_string().contains(expected), "{error:#}");
         }
 
-        write_config(
-            dir.path(),
-            "config.toml",
-            r#"[database]
-engine = "sqlite"
-"#,
-        );
-        let file = resolve_explicit(dir.path(), "config.toml").unwrap_err();
-        assert!(file.to_string().contains("sqlite"));
+        for (name, contents, expected) in [
+            (
+                "database.toml",
+                "[database]\nengine = \"sqlite\"\n",
+                "config field database.engine",
+            ),
+            (
+                "embedding.toml",
+                "[embedding]\nengine = \"ollama\"\n",
+                "config field embedding.engine",
+            ),
+            (
+                "attachments.toml",
+                "[attachments]\nengine = \"gcs\"\n",
+                "config field attachments.engine",
+            ),
+        ] {
+            write_config(dir.path(), name, contents);
+            let error = resolve_explicit(dir.path(), name).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
     }
 
     #[test]
@@ -843,6 +1014,31 @@ engine = "sqlite"
 
             assert!(error.to_string().contains("invalid"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn missing_string_environment_values_are_omitted() {
+        let value =
+            decode_string_env("NOTE_DB_ENGINE", Err(std::env::VarError::NotPresent)).unwrap();
+
+        assert_eq!(value, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_string_environment_values_name_only_the_variable() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let invalid = std::ffi::OsString::from_vec(b"known-env-secret-\xff".to_vec());
+        let error = decode_string_env("DATABASE_URL", Err(std::env::VarError::NotUnicode(invalid)))
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert_eq!(
+            rendered,
+            "environment variable DATABASE_URL is not valid Unicode"
+        );
+        assert!(!rendered.contains("known-env-secret"), "{rendered}");
     }
 
     fn write_config(root: &Path, relative_path: &str, contents: &str) {
