@@ -2,6 +2,7 @@ mod connection;
 mod embedding_jobs;
 mod labels;
 mod notes;
+mod retrieval;
 mod settings;
 
 pub use connection::PgSession;
