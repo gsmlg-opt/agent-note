@@ -6,7 +6,9 @@ mod system_api;
 use axum::extract::DefaultBodyLimit;
 use axum::response::IntoResponse;
 use axum::Router;
-use note_attachments::{AttachmentStore, FilesystemAttachmentStore};
+use note_attachments::{
+    AttachmentStore, FilesystemAttachmentStore, S3AttachmentConfig, S3AttachmentStore,
+};
 use note_embedding::{
     EmbeddingBackendInfo, OpenAiCompatibleConfig, OpenAiCompatibleEmbedder, ProcessWorkerConfig,
     ProcessWorkerRuntime, StubEmbedder, WorkerConfig,
@@ -208,14 +210,29 @@ async fn build_storage(config: &DatabaseConfig) -> anyhow::Result<Arc<dyn Storag
     }
 }
 
-fn open_attachments(config: &AttachmentConfig) -> anyhow::Result<Arc<dyn AttachmentStore>> {
+async fn build_attachment_store(
+    config: &AttachmentConfig,
+) -> anyhow::Result<Arc<dyn AttachmentStore>> {
     match config {
         AttachmentConfig::Filesystem { path } => {
             Ok(Arc::new(FilesystemAttachmentStore::new(path.clone())))
         }
-        AttachmentConfig::S3 { .. } => {
-            anyhow::bail!("S3 attachment adapter is not implemented yet")
-        }
+        AttachmentConfig::S3 {
+            bucket,
+            prefix,
+            region,
+            endpoint,
+            force_path_style,
+        } => Ok(Arc::new(
+            S3AttachmentStore::new(S3AttachmentConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                region: region.clone(),
+                endpoint: endpoint.clone(),
+                force_path_style: *force_path_style,
+            })
+            .await?,
+        )),
     }
 }
 
@@ -370,7 +387,7 @@ async fn main() -> anyhow::Result<()> {
     let config = note_server::config::load_runtime_config()?;
     ensure_data_directories(&config)?;
     let storage = build_storage(&config.database).await?;
-    let attachments = open_attachments(&config.attachments)?;
+    let attachments = build_attachment_store(&config.attachments).await?;
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
 
@@ -571,6 +588,50 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct TestEnvGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_attachment_config_constructs_a_safe_backend() {
+        let _env = TestEnvGuard::set("AWS_EC2_METADATA_DISABLED", "true");
+        let store = build_attachment_store(&AttachmentConfig::S3 {
+            bucket: "agent-note".into(),
+            prefix: "attachments".into(),
+            region: Some("us-east-1".into()),
+            endpoint: Some("http://minio.internal:9000".into()),
+            force_path_style: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.info(),
+            note_attachments::AttachmentStoreInfo {
+                engine: "s3".into(),
+                location: Some("s3://agent-note/attachments".into()),
+            }
+        );
+    }
 
     #[test]
     fn bearer_token_resolution_is_optional_and_rejects_missing_or_blank_values() {
@@ -861,23 +922,6 @@ mod tests {
         assert!(!rendered.contains(&url), "{rendered}");
         assert!(!rendered.contains(USERNAME), "{rendered}");
         assert!(!rendered.contains(PASSWORD), "{rendered}");
-    }
-
-    #[test]
-    fn reserved_external_adapters_return_precise_errors() {
-        let s3 = open_attachments(&AttachmentConfig::S3 {
-            bucket: "notes".into(),
-            prefix: String::new(),
-            region: None,
-            endpoint: None,
-            force_path_style: false,
-        })
-        .err()
-        .expect("S3 must remain reserved");
-        assert_eq!(
-            s3.to_string(),
-            "S3 attachment adapter is not implemented yet"
-        );
     }
 
     #[test]

@@ -92,7 +92,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use flate2::read::GzDecoder;
     use http_body_util::BodyExt;
-    use note_attachments::FilesystemAttachmentStore;
+    use note_attachments::{FilesystemAttachmentStore, S3AttachmentConfig, S3AttachmentStore};
     use note_core::NoteAttachment;
     use note_embedding::{
         EmbeddingBackendInfo, OpenAiCompatibleConfig, OpenAiCompatibleEmbedder, StubEmbedder,
@@ -242,6 +242,44 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("attachments"));
+    }
+
+    #[tokio::test]
+    async fn info_reports_safe_s3_location_without_endpoint_or_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            TursoStorage::open(dir.path().join("test.db"))
+                .await
+                .unwrap(),
+        );
+        let attachments: Arc<dyn note_attachments::AttachmentStore> = Arc::new(
+            S3AttachmentStore::new(S3AttachmentConfig {
+                bucket: "agent-note".into(),
+                prefix: "attachments".into(),
+                region: Some("us-east-1".into()),
+                endpoint: Some("http://minio.internal:9000".into()),
+                force_path_style: true,
+            })
+            .await
+            .unwrap(),
+        );
+        let ctx = Arc::new(Context::new(storage, Arc::new(StubEmbedder), attachments));
+        let response = system_router()
+            .with_state(ctx)
+            .oneshot(request("GET", "/api/system/info", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(info["attachments_engine"], "s3");
+        assert_eq!(info["attachments_location"], "s3://agent-note/attachments");
+        let rendered = serde_json::to_string(&info).unwrap();
+        assert!(!rendered.contains("minio.internal"));
+        assert!(!rendered.contains("AWS_ACCESS_KEY_ID"));
+        assert!(!rendered.contains("AWS_SECRET_ACCESS_KEY"));
+        assert!(!rendered.contains("minioadmin"));
     }
 
     #[tokio::test]
