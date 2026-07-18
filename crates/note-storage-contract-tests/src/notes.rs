@@ -252,6 +252,16 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
 
     let selectors = parse_label_selectors("contract-notes-priority>=2&contract-notes-status=ready");
     assert_eq!(session.count_notes(&selectors).await.unwrap(), 4);
+    assert!(session
+        .list_notes(&selectors, Some(0), Some(0))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(session
+        .list_note_summaries(&selectors, Some(0), Some(0))
+        .await
+        .unwrap()
+        .is_empty());
     let selected = session
         .list_notes(&selectors, Some(2), Some(1))
         .await

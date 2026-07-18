@@ -256,6 +256,9 @@ impl NotesRepository for PgSession {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<Note>> {
+        if normalize_limit(limit) == Some(0) {
+            return Ok(Vec::new());
+        }
         if selectors.is_empty() {
             let rows = self.active_note_page(limit, offset).await?;
             return rows.into_iter().map(NoteRow::into_note).collect();
@@ -300,6 +303,9 @@ impl NotesRepository for PgSession {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<NoteListItem>> {
+        if normalize_limit(limit) == Some(0) {
+            return Ok(Vec::new());
+        }
         if selectors.is_empty() {
             let rows = self.active_summary_page(limit, offset).await?;
             return rows.into_iter().map(SummaryRow::into_summary).collect();
@@ -462,9 +468,6 @@ impl PgSession {
                 matched = matched.saturating_add(1);
                 continue;
             }
-            if take == Some(notes.len()) {
-                break;
-            }
             notes.push(note);
             if take == Some(notes.len()) {
                 break;
@@ -558,9 +561,6 @@ impl PgSession {
                 matched = matched.saturating_add(1);
                 continue;
             }
-            if take == Some(notes.len()) {
-                break;
-            }
             notes.push(note);
             if take == Some(notes.len()) {
                 break;
@@ -591,8 +591,7 @@ impl PgSession {
                  JOIN label_keys lk ON lk.id = nl.label_key_id
                  WHERE nl.note_id = n.id
              ) labels
-             WHERE n.deleted_at IS NULL
-             ORDER BY n.created_at DESC, n.id ASC",
+             WHERE n.deleted_at IS NULL",
         )
         .fetch(&mut *connection);
         let mut count = 0usize;

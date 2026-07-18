@@ -681,6 +681,12 @@ async fn malformed_attachment_json_is_an_operation_error() {
         .execute(&inspection_pool)
         .await
         .unwrap();
+    let selector = parse_label_selectors("missing=value");
+    assert!(session
+        .list_notes(&selector, Some(0), Some(0))
+        .await
+        .unwrap()
+        .is_empty());
     let error = session.get_note("malformed").await.unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::Operation);
 
@@ -702,6 +708,11 @@ async fn malformed_attachment_json_is_an_operation_error() {
         .unwrap();
     let error = session.list_label_keys().await.unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::Operation);
+    assert!(session
+        .list_note_summaries(&selector, Some(0), Some(0))
+        .await
+        .unwrap()
+        .is_empty());
     let error = session.get_note("malformed").await.unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::Operation);
 
