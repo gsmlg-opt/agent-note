@@ -65,14 +65,15 @@ struct RunningEmbedding {
 }
 
 async fn start_embedding_runtime(config: &EmbeddingConfig) -> anyhow::Result<RunningEmbedding> {
-    if matches!(config, EmbeddingConfig::OpenAi { .. }) {
-        anyhow::bail!("OpenAI-compatible embedding adapter is not implemented yet");
-    }
+    let EmbeddingConfig::Local { model_path } = config else {
+        anyhow::bail!("OpenAI-compatible embedding adapter is not implemented yet")
+    };
 
     match EmbeddingExecutionMode::from_env()? {
         EmbeddingExecutionMode::Process => {
-            let process_runtime =
-                ProcessWorkerRuntime::start(ProcessWorkerConfig::from_env()?).await?;
+            let worker_config =
+                with_resolved_model_path(ProcessWorkerConfig::from_env()?, model_path);
+            let process_runtime = ProcessWorkerRuntime::start(worker_config).await?;
             Ok(RunningEmbedding {
                 embedder: process_runtime.embedder(),
                 process_runtime: Some(process_runtime),
@@ -86,6 +87,14 @@ async fn start_embedding_runtime(config: &EmbeddingConfig) -> anyhow::Result<Run
             anyhow::bail!("NOTE_EMBEDDING_MODE=remote is reserved but not implemented yet")
         }
     }
+}
+
+fn with_resolved_model_path(
+    mut worker_config: ProcessWorkerConfig,
+    model_path: &Option<PathBuf>,
+) -> ProcessWorkerConfig {
+    worker_config.model_path = model_path.clone();
+    worker_config
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -492,7 +501,7 @@ mod tests {
             database: DatabaseConfig::Embed {
                 path: db_path.clone(),
             },
-            embedding: EmbeddingConfig::Local,
+            embedding: EmbeddingConfig::Local { model_path: None },
             attachments: AttachmentConfig::Filesystem {
                 path: attachments_dir.clone(),
             },
@@ -573,6 +582,22 @@ mod tests {
             openai.to_string(),
             "OpenAI-compatible embedding adapter is not implemented yet"
         );
+    }
+
+    #[test]
+    fn resolved_local_model_path_overwrites_process_worker_environment_value() {
+        let mut worker_config = ProcessWorkerConfig::from_env().unwrap();
+        worker_config.model_path = Some("ambient-model.onnx".into());
+        let resolved = Some(PathBuf::from("/config/models/bge-m3.onnx"));
+
+        let worker_config = with_resolved_model_path(worker_config, &resolved);
+
+        assert_eq!(worker_config.model_path, resolved);
+
+        let mut worker_config = ProcessWorkerConfig::from_env().unwrap();
+        worker_config.model_path = Some("ambient-model.onnx".into());
+        let worker_config = with_resolved_model_path(worker_config, &None);
+        assert_eq!(worker_config.model_path, None);
     }
 
     #[test]

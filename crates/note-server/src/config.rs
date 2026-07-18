@@ -40,6 +40,7 @@ struct FileDatabaseConfig {
 #[serde(deny_unknown_fields)]
 struct FileEmbeddingConfig {
     engine: Option<String>,
+    model_path: Option<PathBuf>,
     base_url: Option<String>,
     model: Option<String>,
     api_key_env: Option<String>,
@@ -82,7 +83,9 @@ impl std::fmt::Debug for DatabaseConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmbeddingConfig {
-    Local,
+    Local {
+        model_path: Option<PathBuf>,
+    },
     OpenAi {
         base_url: String,
         model: String,
@@ -122,6 +125,7 @@ struct EnvValues {
     database_url: Option<String>,
     database_max_connections: Option<String>,
     embedding_engine: Option<String>,
+    embedding_model_path: Option<PathBuf>,
     embedding_base_url: Option<String>,
     embedding_model: Option<String>,
     embedding_api_key_env: Option<String>,
@@ -145,6 +149,7 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
         database_url: read_string_env("DATABASE_URL")?,
         database_max_connections: read_string_env("NOTE_DB_MAX_CONNECTIONS")?,
         embedding_engine: read_string_env("NOTE_EMBEDDING_ENGINE")?,
+        embedding_model_path: std::env::var_os("NOTE_MODEL_PATH").map(PathBuf::from),
         embedding_base_url: read_string_env("NOTE_EMBEDDING_BASE_URL")?,
         embedding_model: read_string_env("NOTE_EMBEDDING_MODEL")?,
         embedding_api_key_env: read_string_env("NOTE_EMBEDDING_API_KEY_ENV")?,
@@ -191,7 +196,7 @@ fn resolve_runtime_config(
     let file_attachments = file.attachments.unwrap_or_default();
 
     let database = resolve_database(file_database, &env, config_base)?;
-    let embedding = resolve_embedding(file_embedding, &env)?;
+    let embedding = resolve_embedding(file_embedding, &env, config_base)?;
     let attachments = resolve_attachments(file_attachments, &env, config_base)?;
 
     Ok(RuntimeConfig {
@@ -333,6 +338,7 @@ fn resolve_database(
 fn resolve_embedding(
     file: FileEmbeddingConfig,
     env: &EnvValues,
+    config_base: &Path,
 ) -> anyhow::Result<EmbeddingConfig> {
     let (engine, source) = select_engine(
         file.engine.as_deref(),
@@ -342,7 +348,15 @@ fn resolve_embedding(
         "environment variable NOTE_EMBEDDING_ENGINE",
     );
     match engine {
-        "local" => Ok(EmbeddingConfig::Local),
+        "local" => {
+            let model_path = file.model_path.or_else(|| env.embedding_model_path.clone());
+            if let Some(path) = model_path.as_deref() {
+                require_path("embedding.model_path", path)?;
+            }
+            Ok(EmbeddingConfig::Local {
+                model_path: model_path.map(|path| resolve_path(config_base, path)),
+            })
+        }
         "openai" => {
             let base_url = require_string(
                 "embedding.base_url",
@@ -515,7 +529,10 @@ mod tests {
                 path: dir.path().join("dev-data/notes.db"),
             }
         );
-        assert_eq!(config.embedding, EmbeddingConfig::Local);
+        assert_eq!(
+            config.embedding,
+            EmbeddingConfig::Local { model_path: None }
+        );
         assert_eq!(
             config.attachments,
             AttachmentConfig::Filesystem {
@@ -720,6 +737,92 @@ engine = "filesystem"
     }
 
     #[test]
+    fn local_model_path_uses_file_before_environment_and_resolves_from_config_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "settings/config.toml",
+            r#"[embedding]
+engine = "local"
+model_path = "models/file.onnx"
+"#,
+        );
+
+        let config = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some("settings/config.toml".into()),
+                embedding_model_path: Some("models/environment.onnx".into()),
+                ..EnvValues::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.embedding,
+            EmbeddingConfig::Local {
+                model_path: Some(dir.path().join("settings/models/file.onnx")),
+            }
+        );
+    }
+
+    #[test]
+    fn local_model_path_falls_back_to_environment_and_resolves_from_config_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "settings/config.toml",
+            r#"[embedding]
+engine = "local"
+"#,
+        );
+
+        let config = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some("settings/config.toml".into()),
+                embedding_model_path: Some("models/environment.onnx".into()),
+                ..EnvValues::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.embedding,
+            EmbeddingConfig::Local {
+                model_path: Some(dir.path().join("settings/models/environment.onnx")),
+            }
+        );
+    }
+
+    #[test]
+    fn local_model_path_rejects_an_explicit_blank_value() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "config.toml",
+            r#"[embedding]
+engine = "local"
+model_path = ""
+"#,
+        );
+
+        let error = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some("config.toml".into()),
+                ..EnvValues::default()
+            },
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("embedding.model_path"));
+    }
+
+    #[test]
     fn inactive_adapter_fields_are_not_required() {
         let dir = tempfile::tempdir().unwrap();
         write_config(
@@ -749,7 +852,10 @@ path = "attachments"
         .unwrap();
 
         assert!(matches!(config.database, DatabaseConfig::Embed { .. }));
-        assert_eq!(config.embedding, EmbeddingConfig::Local);
+        assert_eq!(
+            config.embedding,
+            EmbeddingConfig::Local { model_path: None }
+        );
         assert!(matches!(
             config.attachments,
             AttachmentConfig::Filesystem { .. }
@@ -867,7 +973,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
                 url: format!("postgresql://agent:{PASSWORD}@database/notes"),
                 max_connections: 10,
             },
-            embedding: EmbeddingConfig::Local,
+            embedding: EmbeddingConfig::Local { model_path: None },
             attachments: AttachmentConfig::Filesystem {
                 path: "/tmp/attachments".into(),
             },
