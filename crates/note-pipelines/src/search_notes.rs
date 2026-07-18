@@ -29,8 +29,8 @@ pub async fn search_notes_filtered(
 
     let dense = ctx.embedder.embed(query).await?;
 
-    // Keep one session for filtering, retrieval, and hydration so the whole search observes one
-    // configured backend handle.
+    // Use one session for filtering, retrieval, and note metadata collection, then deliberately
+    // release it before attachment hydration performs external I/O.
     let session = ctx.storage().session().await?;
     let selectors = label
         .as_deref()
