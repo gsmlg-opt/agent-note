@@ -1,3 +1,4 @@
+use note_attachments::FilesystemAttachmentStore;
 use note_core::{
     DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SystemConfig,
 };
@@ -23,7 +24,9 @@ async fn test_context() -> (Context, Arc<dyn StorageBackend>, TempDir) {
     let ctx = Context::new(
         backend.clone(),
         Arc::new(StubEmbedder),
-        dir.path().join("attachments"),
+        Arc::new(FilesystemAttachmentStore::new(
+            dir.path().join("attachments"),
+        )),
     );
     (ctx, backend, dir)
 }

@@ -33,7 +33,11 @@ async fn config_roundtrips_and_system_info_reports_storage() {
         info.database_path.as_deref(),
         Some(database_path.to_string_lossy().as_ref())
     );
-    assert_eq!(info.attachments_path, attachments_path.to_string_lossy());
+    assert_eq!(info.attachments_engine, "filesystem");
+    assert_eq!(
+        info.attachments_location.as_deref(),
+        Some(attachments_path.to_string_lossy().as_ref())
+    );
     assert!(info.database_size_bytes.unwrap() > 0);
 }
 

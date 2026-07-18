@@ -93,7 +93,8 @@ pub struct SystemInfo {
     pub database_engine: String,
     pub database_path: Option<String>,
     pub database_size_bytes: Option<u64>,
-    pub attachments_path: String,
+    pub attachments_engine: String,
+    pub attachments_location: Option<String>,
 }
 
 #[cfg(test)]
@@ -107,7 +108,8 @@ mod tests {
                 "database_engine": "pg",
                 "database_path": null,
                 "database_size_bytes": null,
-                "attachments_path": "/var/lib/agent-note/attachments"
+                "attachments_engine": "s3",
+                "attachments_location": null
             }"#,
         )
         .unwrap();
@@ -115,6 +117,7 @@ mod tests {
         assert_eq!(info.database_engine, "pg");
         assert_eq!(info.database_path, None);
         assert_eq!(info.database_size_bytes, None);
-        assert_eq!(info.attachments_path, "/var/lib/agent-note/attachments");
+        assert_eq!(info.attachments_engine, "s3");
+        assert_eq!(info.attachments_location, None);
     }
 }

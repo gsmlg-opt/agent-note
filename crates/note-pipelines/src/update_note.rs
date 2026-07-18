@@ -75,6 +75,7 @@ pub async fn update_note(
     drop(session);
     let chunks = crate::chunk::chunk_content(&input.content);
     let prepared_attachments = ctx.attachments().prepare(id, &input.attachments).await?;
+    let attachment_metadata = prepared_attachments.metadata().to_vec();
 
     let transaction = match ctx.storage().begin(TransactionMode::Deferred).await {
         Ok(transaction) => transaction,
@@ -92,7 +93,7 @@ pub async fn update_note(
                 id,
                 title: &input.title,
                 content: &input.content,
-                attachments: prepared_attachments.metadata(),
+                attachments: &attachment_metadata,
                 updated_at: now,
                 note_revision,
             })

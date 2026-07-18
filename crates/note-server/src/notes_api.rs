@@ -7,10 +7,10 @@ use axum::{
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
-    count_notes, delete_note, embedding_dashboard_status, get_note, get_note_markdown,
-    label_note_counts, list_deleted_note_summaries, list_label_keys, list_note_summaries,
-    permanently_delete_note, restore_notes, save_note, search_notes_filtered, update_note, Context,
-    ListNotesParams, SaveNoteInput,
+    count_notes, delete_note, embedding_dashboard_status, get_note, get_note_attachment,
+    get_note_markdown, label_note_counts, list_deleted_note_summaries, list_label_keys,
+    list_note_summaries, permanently_delete_note, restore_notes, save_note, search_notes_filtered,
+    update_note, Context, ListNotesParams, SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -508,20 +508,9 @@ async fn get_attachment_handler(
     State(ctx): State<Arc<Context>>,
     Path((id, path)): Path<(String, String)>,
 ) -> Result<Response, (axum::http::StatusCode, String)> {
-    let note = get_note(&ctx, &id)
+    let attachment = get_note_attachment(&ctx, &id, &path)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| {
-            (
-                axum::http::StatusCode::NOT_FOUND,
-                "note not found".to_string(),
-            )
-        })?;
-    let requested_path = normalize_attachment_path(&path);
-    let attachment = note
-        .attachments
-        .into_iter()
-        .find(|attachment| normalize_attachment_path(&attachment.path) == requested_path)
         .ok_or_else(|| {
             (
                 axum::http::StatusCode::NOT_FOUND,
@@ -534,12 +523,6 @@ async fn get_attachment_handler(
         .header("x-content-type-options", "nosniff")
         .body(Body::from(attachment.content))
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-fn normalize_attachment_path(path: &str) -> String {
-    path.trim_start_matches("./")
-        .trim_start_matches('/')
-        .to_string()
 }
 
 async fn update_note_handler(
@@ -732,6 +715,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
     use note_storage::{StorageBackend, TransactionMode};
     use note_storage_turso::TursoStorage;
@@ -751,7 +735,9 @@ mod tests {
         let ctx = Arc::new(Context::new(
             storage.clone(),
             Arc::new(StubEmbedder),
-            dir.path().join("attachments"),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("attachments"),
+            )),
         ));
         (notes_router().with_state(ctx.clone()), ctx, storage, dir)
     }
@@ -1363,6 +1349,26 @@ mod tests {
             std::fs::read(dir.path().join("attachments").join(&id).join("blob.bin")).unwrap(),
             [0, 0x9f, 0x92, 0x96, 0xff]
         );
+    }
+
+    #[tokio::test]
+    async fn attachment_download_does_not_read_unrequested_siblings() {
+        let (app, _ctx, dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Two files","content":"C","attachments":[{"id":"good","path":"./good.txt","mime":"text/plain","content":"available"},{"id":"missing","path":"./missing.txt","mime":"text/plain","content":"remove me"}],"labels":[]}"#,
+        )
+        .await;
+        std::fs::remove_file(dir.path().join("attachments").join(&id).join("missing.txt")).unwrap();
+
+        let response = app
+            .oneshot(get(&format!("/api/notes/{id}/attachments/good.txt")))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"available");
     }
 
     #[tokio::test]

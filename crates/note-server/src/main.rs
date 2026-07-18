@@ -6,8 +6,10 @@ mod system_api;
 use axum::extract::DefaultBodyLimit;
 use axum::response::IntoResponse;
 use axum::Router;
+use note_attachments::{AttachmentStore, FilesystemAttachmentStore};
 use note_embedding::{ProcessWorkerConfig, ProcessWorkerRuntime, StubEmbedder, WorkerConfig};
 use note_pipelines::{Context, EmbeddingJobNotifier, ProcessEmbeddingJobStatus};
+use note_server::config::{AttachmentConfig, DatabaseConfig, EmbeddingConfig, RuntimeConfig};
 use note_storage::StorageBackend;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -62,7 +64,11 @@ struct RunningEmbedding {
     wake: Arc<Notify>,
 }
 
-async fn start_embedding_runtime() -> anyhow::Result<RunningEmbedding> {
+async fn start_embedding_runtime(config: &EmbeddingConfig) -> anyhow::Result<RunningEmbedding> {
+    if matches!(config, EmbeddingConfig::OpenAi { .. }) {
+        anyhow::bail!("OpenAI-compatible embedding adapter is not implemented yet");
+    }
+
     match EmbeddingExecutionMode::from_env()? {
         EmbeddingExecutionMode::Process => {
             let process_runtime =
@@ -95,15 +101,41 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn ensure_data_directories(db_path: &Path, attachments_dir: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = db_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)?;
+fn ensure_data_directories(config: &RuntimeConfig) -> anyhow::Result<()> {
+    if let DatabaseConfig::Embed { path } = &config.database {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
     }
-    std::fs::create_dir_all(attachments_dir)?;
+    if let AttachmentConfig::Filesystem { path } = &config.attachments {
+        std::fs::create_dir_all(path)?;
+    }
     Ok(())
+}
+
+async fn open_storage(config: &DatabaseConfig) -> anyhow::Result<Arc<dyn StorageBackend>> {
+    match config {
+        DatabaseConfig::Embed { path } => Ok(Arc::new(
+            note_storage_turso::TursoStorage::open(path).await?,
+        )),
+        DatabaseConfig::Pg { .. } => {
+            anyhow::bail!("PostgreSQL storage adapter is not implemented yet")
+        }
+    }
+}
+
+fn open_attachments(config: &AttachmentConfig) -> anyhow::Result<Arc<dyn AttachmentStore>> {
+    match config {
+        AttachmentConfig::Filesystem { path } => {
+            Ok(Arc::new(FilesystemAttachmentStore::new(path.clone())))
+        }
+        AttachmentConfig::S3 { .. } => {
+            anyhow::bail!("S3 attachment adapter is not implemented yet")
+        }
+    }
 }
 
 fn should_start_dev_frontend(
@@ -255,29 +287,20 @@ async fn main() -> anyhow::Result<()> {
 
     let stdio_mode = args.iter().any(|a| a == "--stdio");
     let config = note_server::config::load_runtime_config()?;
-    config.validate_supported()?;
-    ensure_data_directories(&config.database_path, &config.attachments_dir)?;
-    let storage: Arc<dyn StorageBackend> =
-        Arc::new(note_storage_turso::TursoStorage::open(&config.database_path).await?);
+    ensure_data_directories(&config)?;
+    let storage = open_storage(&config.database).await?;
+    let attachments = open_attachments(&config.attachments)?;
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
 
     if export_mode {
-        let ctx = Context::new(
-            storage.clone(),
-            Arc::new(StubEmbedder),
-            config.attachments_dir.clone(),
-        );
+        let ctx = Context::new(storage.clone(), Arc::new(StubEmbedder), attachments.clone());
         println!("{}", note_pipelines::export_json(&ctx).await?);
         return Ok(());
     }
 
     if import_mode {
-        let ctx = Context::new(
-            storage.clone(),
-            Arc::new(StubEmbedder),
-            config.attachments_dir.clone(),
-        );
+        let ctx = Context::new(storage.clone(), Arc::new(StubEmbedder), attachments.clone());
         let mut input = String::new();
         std::io::stdin().lock().read_to_string(&mut input)?;
         let stats = note_pipelines::import_json(&ctx, &input).await?;
@@ -292,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if stdio_mode {
-        let embedding = start_embedding_runtime().await?;
+        let embedding = start_embedding_runtime(&config.embedding).await?;
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
@@ -300,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
             storage.clone(),
             embedding.embedder.clone(),
             notifier,
-            config.attachments_dir.clone(),
+            attachments.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
         let trash_retention = tokio::spawn(run_trash_retention(
@@ -320,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
             process_runtime.shutdown().await;
         }
     } else {
-        let embedding = start_embedding_runtime().await?;
+        let embedding = start_embedding_runtime(&config.embedding).await?;
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
@@ -328,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
             storage.clone(),
             embedding.embedder.clone(),
             notifier,
-            config.attachments_dir.clone(),
+            attachments.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
         let trash_retention = tokio::spawn(run_trash_retention(
@@ -460,16 +483,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn data_directories_are_created_before_storage_opens() {
+    fn data_directories_are_created_only_for_local_adapters() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("dev-data/notes.db");
         let attachments_dir = temp.path().join("dev-data/attachments");
+        let local = RuntimeConfig {
+            config_path: temp.path().join("config.toml"),
+            database: DatabaseConfig::Embed {
+                path: db_path.clone(),
+            },
+            embedding: EmbeddingConfig::Local,
+            attachments: AttachmentConfig::Filesystem {
+                path: attachments_dir.clone(),
+            },
+        };
 
-        ensure_data_directories(&db_path, &attachments_dir).unwrap();
+        ensure_data_directories(&local).unwrap();
 
         assert!(db_path.parent().unwrap().is_dir());
         assert!(attachments_dir.is_dir());
         assert!(!db_path.exists());
+
+        let external_root = temp.path().join("external-only");
+        let external = RuntimeConfig {
+            config_path: temp.path().join("config.toml"),
+            database: DatabaseConfig::Pg {
+                url: "postgresql://localhost/notes".into(),
+                max_connections: 10,
+            },
+            embedding: EmbeddingConfig::OpenAi {
+                base_url: "http://localhost:8080".into(),
+                model: "bge-m3".into(),
+                api_key_env: None,
+                timeout_secs: 30,
+                max_retries: 3,
+            },
+            attachments: AttachmentConfig::S3 {
+                bucket: "notes".into(),
+                prefix: external_root.to_string_lossy().into_owned(),
+                region: None,
+                endpoint: None,
+                force_path_style: false,
+            },
+        };
+
+        ensure_data_directories(&external).unwrap();
+        assert!(!external_root.exists());
+    }
+
+    #[tokio::test]
+    async fn reserved_external_adapters_return_precise_errors() {
+        let pg = open_storage(&DatabaseConfig::Pg {
+            url: "postgresql://localhost/notes".into(),
+            max_connections: 10,
+        })
+        .await
+        .err()
+        .expect("PostgreSQL must remain reserved");
+        assert_eq!(
+            pg.to_string(),
+            "PostgreSQL storage adapter is not implemented yet"
+        );
+
+        let s3 = open_attachments(&AttachmentConfig::S3 {
+            bucket: "notes".into(),
+            prefix: String::new(),
+            region: None,
+            endpoint: None,
+            force_path_style: false,
+        })
+        .err()
+        .expect("S3 must remain reserved");
+        assert_eq!(
+            s3.to_string(),
+            "S3 attachment adapter is not implemented yet"
+        );
+
+        let openai = start_embedding_runtime(&EmbeddingConfig::OpenAi {
+            base_url: "http://localhost:8080".into(),
+            model: "bge-m3".into(),
+            api_key_env: None,
+            timeout_secs: 30,
+            max_retries: 3,
+        })
+        .await
+        .err()
+        .expect("OpenAI embedding must remain reserved");
+        assert_eq!(
+            openai.to_string(),
+            "OpenAI-compatible embedding adapter is not implemented yet"
+        );
     }
 
     #[test]

@@ -92,6 +92,7 @@ mod tests {
     use axum::{body::Body, http::Request};
     use flate2::read::GzDecoder;
     use http_body_util::BodyExt;
+    use note_attachments::FilesystemAttachmentStore;
     use note_core::NoteAttachment;
     use note_embedding::StubEmbedder;
     use note_pipelines::{save_note, SaveNoteInput};
@@ -110,7 +111,9 @@ mod tests {
         let ctx = Arc::new(Context::new(
             storage,
             Arc::new(StubEmbedder),
-            dir.path().join("attachments"),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("attachments"),
+            )),
         ));
         (system_router().with_state(ctx.clone()), ctx, dir)
     }
@@ -191,7 +194,8 @@ mod tests {
         assert_eq!(info["database_engine"], "embed");
         assert!(info["database_path"].as_str().unwrap().ends_with("test.db"));
         assert!(info["database_size_bytes"].as_u64().unwrap() > 0);
-        assert!(info["attachments_path"]
+        assert_eq!(info["attachments_engine"], "filesystem");
+        assert!(info["attachments_location"]
             .as_str()
             .unwrap()
             .ends_with("attachments"));

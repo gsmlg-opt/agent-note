@@ -2302,6 +2302,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "note-attachments",
  "note-core",
  "note-embedding",
  "note-pipelines",
@@ -2348,6 +2349,7 @@ dependencies = [
  "flate2",
  "http-body-util",
  "mermaid-rs-renderer",
+ "note-attachments",
  "note-core",
  "note-embedding",
  "note-mcp",

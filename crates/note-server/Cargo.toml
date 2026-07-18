@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 note-pipelines = { path = "../note-pipelines" }
 note-mcp = { path = "../note-mcp" }
+note-attachments = { path = "../note-attachments" }
 axum = "0.8.9"
 tokio = { version = "1.52.3", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }

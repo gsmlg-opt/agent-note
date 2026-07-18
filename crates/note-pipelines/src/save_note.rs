@@ -95,6 +95,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     let note_revision = 1;
     let chunks = crate::chunk::chunk_content(&input.content);
     let prepared_attachments = ctx.attachments().prepare(&id, &input.attachments).await?;
+    let attachment_metadata = prepared_attachments.metadata().to_vec();
 
     // The note row, labels, chunk hashes, and embedding jobs are committed atomically. Actual
     // embedding is deliberately out-of-process: save returns once the durable queue request exists.
@@ -153,7 +154,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
                 id: &id,
                 title: &input.title,
                 content: &input.content,
-                attachments: prepared_attachments.metadata(),
+                attachments: &attachment_metadata,
                 created_at: now,
                 updated_at: now,
                 note_revision,

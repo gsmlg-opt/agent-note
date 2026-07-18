@@ -147,6 +147,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
+    use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
     use note_storage::StorageBackend;
     use note_storage_turso::TursoStorage;
@@ -159,7 +160,9 @@ mod tests {
         let ctx = Arc::new(Context::new(
             storage,
             Arc::new(StubEmbedder),
-            dir.path().join("attachments"),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("attachments"),
+            )),
         ));
         (labels_router().with_state(ctx), dir)
     }
