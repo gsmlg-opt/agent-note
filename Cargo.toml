@@ -5,6 +5,7 @@ members = [
     "crates/note-core",
     "crates/note-storage",
     "crates/note-storage-contract-tests",
+    "crates/note-storage-pg",
     "crates/note-storage-turso",
     "crates/note-embedding",
     "crates/note-pipelines",
