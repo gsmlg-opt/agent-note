@@ -85,6 +85,15 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
 - `cd crates/note-frontend && cargo test` — runs the frontend's native logic tests (the frontend is
   excluded from the workspace because it targets wasm; test it from inside its directory).
 
+Run the PostgreSQL suite against a real pgvector-capable server with:
+
+```sh
+TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres cargo test -p note-storage-pg
+```
+
+Without `TEST_DATABASE_URL`, PostgreSQL integration tests emit visible skip notices instead of
+accessing an external database.
+
 ## Run (end to end, dev)
 
 1. Install Trunk once:
@@ -243,10 +252,15 @@ combines them using `weight / (60 + rank)` and breaks equal fused scores by note
 
 The pipeline requests `clamp(requested_limit × 32, 128, 4096)` ranked IDs from each channel before
 fusion, label filtering, hydration, and the requested top-k limit are applied. Dense retrieval uses
-that overfetch length directly. Title FTS physically materializes a fixed pool of up to 4,096 hits,
-batch-filters deleted notes, orders equal BM25 scores by note ID, and returns only the requested
-overfetch length. Fusion therefore receives the same requested ranking length from both channels;
-the larger fixed title pool bounds physical FTS work and makes ties deterministic within that pool.
+that overfetch length directly. Embedded Turso title FTS physically materializes a fixed pool of up
+to 4,096 hits, batch-filters deleted notes, orders equal BM25 scores by note ID, and returns only
+the requested overfetch length. Its larger fixed pool bounds physical FTS work and makes ties
+deterministic within that pool.
+
+PostgreSQL title FTS queries the generated `simple`-configuration `tsvector` through its GIN index,
+filters active notes in SQL, ranks matches with `ts_rank_cd` and a note-ID tie-break, and applies the
+requested overfetch length directly as its SQL `LIMIT`. Both adapters feed the resulting title and
+content rankings into the same weighted RRF pipeline.
 
 Exact dense scanning avoids an approximate-index lifecycle and gives deterministic results; the
 accepted trade-off is linear dense-search cost, which is appropriate for the current personal-notes

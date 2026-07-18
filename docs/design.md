@@ -236,12 +236,16 @@ dense content weight = 1.0
 
 Fusion ordering is deterministic: equal fused scores are broken by note ID. The pipeline requests
 `clamp(requested_limit × 32, 128, 4096)` ranked IDs from each channel so fusion can consider notes
-beyond the requested top-k. Dense retrieval uses that overfetch length directly. Title FTS first
-materializes a fixed bounded pool of up to 4,096 BM25 hits, batch-filters deleted notes, and orders
-score ties by note ID before returning only the requested overfetch length. Fusion therefore still
-receives the requested ranking length from both channels; the fixed title pool is the physical FTS
-work bound needed for deterministic ties within the accepted pool. Label filtering and hydration
-happen after fusion, and iteration stops at the requested result limit.
+beyond the requested top-k. Dense retrieval uses that overfetch length directly. Embedded Turso
+title FTS first materializes a fixed bounded pool of up to 4,096 BM25 hits, batch-filters deleted
+notes, and orders score ties by note ID before returning only the requested overfetch length. That
+fixed pool is Turso's physical FTS work bound for deterministic ties within the accepted pool.
+
+PostgreSQL title FTS queries the generated `simple`-configuration `tsvector` through its GIN index,
+filters active notes in SQL, ranks matches with `ts_rank_cd` and a note-ID tie-break, and applies
+the requested overfetch length directly as its SQL `LIMIT`. Both adapters feed their title and
+content rankings into the same weighted RRF pipeline. Label filtering and hydration happen after
+fusion, and iteration stops at the requested result limit.
 
 Exact scanning avoids approximate-index build and maintenance, produces deterministic results, and
 fits the expected personal-notes corpus. Its accepted trade-off is linear dense-search cost. If
