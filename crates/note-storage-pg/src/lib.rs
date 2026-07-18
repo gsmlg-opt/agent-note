@@ -7,7 +7,10 @@ mod settings;
 
 pub use connection::PgSession;
 use connection::{map_connect_error, map_sqlx_error};
-use note_storage::{BackendInfo, StorageError, StorageErrorKind, StorageResult, TransactionMode};
+use note_storage::{
+    BackendInfo, StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
+    StorageTransaction, TransactionMode,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::fmt;
 use std::sync::Arc;
@@ -86,6 +89,21 @@ impl PgStorage {
             location: None,
             size_bytes: None,
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for PgStorage {
+    async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+        Ok(Box::new(self.connect_session().await?))
+    }
+
+    async fn begin(&self, mode: TransactionMode) -> StorageResult<Box<dyn StorageTransaction>> {
+        Ok(Box::new(self.begin_session(mode).await?))
+    }
+
+    async fn info(&self) -> StorageResult<BackendInfo> {
+        Ok(self.backend_info())
     }
 }
 

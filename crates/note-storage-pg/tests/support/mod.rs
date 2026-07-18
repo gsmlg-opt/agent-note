@@ -31,6 +31,7 @@ pub struct CleanupError {
 }
 
 impl CleanupError {
+    #[allow(dead_code)]
     pub fn remaining_connections(self) -> i64 {
         self.remaining_connections
     }
@@ -49,6 +50,14 @@ impl std::fmt::Display for CleanupError {
 impl std::error::Error for CleanupError {}
 
 impl TestDatabase {
+    #[allow(dead_code)]
+    pub async fn provision_with_vector(test_name: &str) -> Option<Self> {
+        let admin_url = configured_url_or_skip(test_name)?;
+        let database = Self::create(&admin_url).await;
+        database.provision_vector().await;
+        Some(database)
+    }
+
     pub async fn create(admin_url: &str) -> Self {
         let database_name = format!("agent_note_test_{}", Uuid::new_v4().simple());
         let database = Self {
@@ -88,6 +97,7 @@ impl TestDatabase {
         pool.close().await;
     }
 
+    #[allow(dead_code)]
     pub async fn inspect_pool(&self) -> PgPool {
         PgPoolOptions::new()
             .max_connections(1)
@@ -96,6 +106,7 @@ impl TestDatabase {
             .unwrap_or_else(|_| panic!("connect to isolated PostgreSQL test database"))
     }
 
+    #[allow(dead_code)]
     pub fn database_name(&self) -> &str {
         &self.database_name
     }

@@ -1,4 +1,6 @@
-use note_storage::{StorageError, StorageErrorKind, StorageResult, TransactionMode};
+use note_storage::{
+    StorageError, StorageErrorKind, StorageResult, StorageTransaction, TransactionMode,
+};
 use sqlx::pool::PoolConnection;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::ops::{Deref, DerefMut};
@@ -180,6 +182,17 @@ impl PgSession {
         };
         self.immediate_guard.take();
         result
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageTransaction for PgSession {
+    async fn commit(self: Box<Self>) -> StorageResult<()> {
+        self.finish(true).await
+    }
+
+    async fn rollback(self: Box<Self>) -> StorageResult<()> {
+        self.finish(false).await
     }
 }
 
