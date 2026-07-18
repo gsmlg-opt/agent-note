@@ -75,7 +75,7 @@ pub async fn search_notes_filtered(
         // A None here means a title/dense retrieval row outlived its note row; it would only occur
         // under index/note divergence (e.g. a future delete path with a bug).
         if let Some(mut note) = session.get_note(&note_id).await? {
-            crate::attachment_files::hydrate_note_attachments(ctx, &mut note)?;
+            crate::hydrate_note_attachments(ctx, &mut note).await?;
             results.push(SearchResult { note, score });
             if results.len() >= limit {
                 break;

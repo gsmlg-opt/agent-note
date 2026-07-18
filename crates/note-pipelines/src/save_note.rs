@@ -93,16 +93,18 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     let now = chrono::Utc::now().timestamp();
     let note_revision = 1;
     let chunks = crate::chunk::chunk_content(&input.content);
-    let prepared_attachments =
-        crate::attachment_files::prepare_note_attachments(ctx, &id, &input.attachments)?;
+    let prepared_attachments = ctx.attachments().prepare(&id, &input.attachments).await?;
 
     // The note row, labels, chunk hashes, and embedding jobs are committed atomically. Actual
     // embedding is deliberately out-of-process: save returns once the durable queue request exists.
     let transaction = match ctx.storage().begin(TransactionMode::Immediate).await {
         Ok(transaction) => transaction,
         Err(error) => {
-            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
-            return Err(error.into());
+            return Err(crate::note_attachments::abort_with_primary(
+                prepared_attachments,
+                error.into(),
+            )
+            .await);
         }
     };
     let transaction_result = async {
@@ -172,11 +174,12 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     let (queued, resolved_labels) = match finalized {
         Ok(result) => result,
         Err(error) => {
-            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
-            return Err(error);
+            return Err(
+                crate::note_attachments::abort_with_primary(prepared_attachments, error).await,
+            );
         }
     };
-    crate::attachment_files::commit_note_attachments(prepared_attachments)?;
+    prepared_attachments.publish().await?;
     if queued > 0 {
         ctx.wake_embedding_jobs();
     }

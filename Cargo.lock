@@ -2323,6 +2323,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "flate2",
+ "note-attachments",
  "note-core",
  "note-embedding",
  "note-storage",

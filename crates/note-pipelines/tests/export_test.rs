@@ -1,11 +1,97 @@
 mod support;
 
+use note_attachments::{
+    AttachmentStore, AttachmentStoreInfo, FilesystemAttachmentStore, PreparedAttachmentSet,
+};
 use note_core::NoteAttachment;
+use note_embedding::StubEmbedder;
 use note_pipelines::{
     define_label_key, delete_note, export_data, get_note, import_data, import_json, list_all_notes,
-    list_deleted_note_summaries, list_label_keys, save_note, SaveNoteInput,
+    list_deleted_note_summaries, list_label_keys, save_note, Context, SaveNoteInput,
+};
+use note_storage::StorageBackend;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
 };
 use support::test_context;
+
+struct CountingAttachmentStore {
+    inner: FilesystemAttachmentStore,
+    prepares: Mutex<HashMap<String, usize>>,
+}
+
+#[async_trait::async_trait]
+impl AttachmentStore for CountingAttachmentStore {
+    async fn prepare(
+        &self,
+        note_id: &str,
+        attachments: &[NoteAttachment],
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
+        *self
+            .prepares
+            .lock()
+            .unwrap()
+            .entry(note_id.to_string())
+            .or_default() += 1;
+        self.inner.prepare(note_id, attachments).await
+    }
+
+    async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.read(note_id, path).await
+    }
+
+    async fn hydrate(
+        &self,
+        note_id: &str,
+        attachments: &mut [NoteAttachment],
+    ) -> anyhow::Result<()> {
+        self.inner.hydrate(note_id, attachments).await
+    }
+
+    async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {
+        self.inner.remove_note(note_id).await
+    }
+
+    fn info(&self) -> AttachmentStoreInfo {
+        self.inner.info()
+    }
+}
+
+#[tokio::test]
+async fn import_prepares_distinct_notes_together_and_skips_duplicate_ids_before_prepare() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let attachments = Arc::new(CountingAttachmentStore {
+        inner: FilesystemAttachmentStore::new(dir.path().join("attachments")),
+        prepares: Mutex::new(HashMap::new()),
+    });
+    let ctx = Context::new(backend, Arc::new(StubEmbedder), attachments.clone());
+    let input = r#"{
+        "version": 2,
+        "label_keys": [],
+        "notes": [
+            {"id":"note-a","title":"A","content":"first","attachments":[{"id":"a","path":"a.txt","mime":"text/plain","content":"a"}],"created_at":1,"updated_at":1,"labels":[]},
+            {"id":"note-b","title":"B","content":"second","attachments":[{"id":"b","path":"b.txt","mime":"text/plain","content":"b"}],"created_at":1,"updated_at":1,"labels":[]},
+            {"id":"note-a","title":"duplicate","content":"skip","attachments":[{"id":"duplicate","path":"duplicate.txt","mime":"text/plain","content":"duplicate"}],"created_at":1,"updated_at":1,"labels":[]}
+        ]
+    }"#;
+
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(2), import_json(&ctx, input))
+        .await
+        .expect("distinct notes must prepare concurrently without a duplicate-ID lock")
+        .unwrap();
+
+    assert_eq!(stats.notes_added, 2);
+    assert_eq!(stats.notes_skipped, 1);
+    let prepares = attachments.prepares.lock().unwrap();
+    assert_eq!(prepares.get("note-a"), Some(&1));
+    assert_eq!(prepares.get("note-b"), Some(&1));
+}
 
 #[tokio::test]
 async fn export_import_roundtrips_notes_and_label_keys() {

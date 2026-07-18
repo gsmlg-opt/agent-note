@@ -1,4 +1,5 @@
 use crate::{enqueue_missing_chunk_embeddings, parse_label_value_type, Context};
+use note_attachments::PreparedAttachmentSet;
 use note_core::{decode_attachment_content, encode_attachment_content, NoteAttachment};
 use note_storage::{NewNote, TransactionMode};
 use serde::{Deserialize, Serialize};
@@ -90,6 +91,11 @@ pub struct ImportStats {
     pub embedding_jobs_queued: usize,
 }
 
+struct PreparedImportNote {
+    note: ExportNote,
+    attachments: Box<dyn PreparedAttachmentSet>,
+}
+
 pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
     let session = ctx.storage().session().await?;
     let label_keys = session
@@ -104,7 +110,7 @@ pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
         .collect();
     let mut notes = session.list_all_notes().await?;
     for note in &mut notes {
-        crate::attachment_files::hydrate_note_attachments(ctx, note)?;
+        crate::hydrate_note_attachments(ctx, note).await?;
     }
     let notes = notes
         .into_iter()
@@ -139,6 +145,11 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
     if !matches!(data.version, 1 | 2) {
         anyhow::bail!("unsupported export version: {}", data.version);
     }
+    let ExportData {
+        version: _,
+        label_keys,
+        notes,
+    } = data;
     let session = ctx.storage().session().await?;
     let mut known_keys: HashSet<String> = session
         .list_label_keys()
@@ -146,13 +157,59 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
         .into_iter()
         .map(|label_key| label_key.key)
         .collect();
-    drop(session);
     let mut stats = ImportStats::default();
-    let mut prepared_attachments = Vec::new();
+    let mut seen_note_ids = HashSet::new();
+    let mut prepared_notes = Vec::new();
 
-    let transaction = ctx.storage().begin(TransactionMode::Deferred).await?;
+    for mut note in notes {
+        if !seen_note_ids.insert(note.id.clone()) {
+            stats.notes_skipped += 1;
+            continue;
+        }
+        match session.note_exists(&note.id).await {
+            Ok(true) => {
+                stats.notes_skipped += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return Err(abort_import_notes(prepared_notes, error.into()).await);
+            }
+        }
+
+        let encoded_attachments = std::mem::take(&mut note.attachments);
+        let attachments = match encoded_attachments
+            .into_iter()
+            .map(ExportAttachment::into_note_attachment)
+            .collect::<anyhow::Result<Vec<_>>>()
+        {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                return Err(abort_import_notes(prepared_notes, error).await);
+            }
+        };
+        let prepared = match ctx.attachments().prepare(&note.id, &attachments).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(abort_import_notes(prepared_notes, error).await);
+            }
+        };
+        prepared_notes.push(PreparedImportNote {
+            note,
+            attachments: prepared,
+        });
+    }
+    drop(session);
+
+    let transaction = match ctx.storage().begin(TransactionMode::Deferred).await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return Err(abort_import_notes(prepared_notes, error.into()).await);
+        }
+    };
+    let mut inserted = Vec::with_capacity(prepared_notes.len());
     let transaction_result = async {
-        for label_key in data.label_keys {
+        for label_key in label_keys {
             if known_keys.insert(label_key.key.clone()) {
                 let value_type = parse_label_value_type(&label_key.value_type)?;
                 transaction
@@ -162,9 +219,11 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
             }
         }
 
-        for note in data.notes {
+        for prepared in &prepared_notes {
+            let note = &prepared.note;
             if transaction.note_exists(&note.id).await? {
                 stats.notes_skipped += 1;
+                inserted.push(false);
                 continue;
             }
 
@@ -175,23 +234,12 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
                 }
             }
 
-            let attachments = note
-                .attachments
-                .into_iter()
-                .map(ExportAttachment::into_note_attachment)
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let prepared =
-                crate::attachment_files::prepare_note_attachments(ctx, &note.id, &attachments)?;
-            prepared_attachments.push(prepared);
-            let prepared = prepared_attachments
-                .last()
-                .expect("prepared attachment was just pushed");
             transaction
                 .insert_note(NewNote {
                     id: &note.id,
                     title: &note.title,
                     content: &note.content,
-                    attachments: prepared.metadata(),
+                    attachments: prepared.attachments.metadata(),
                     created_at: note.created_at,
                     updated_at: note.updated_at,
                     note_revision: 1,
@@ -202,6 +250,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
                 transaction.attach_label(&note.id, key, value).await?;
             }
             stats.notes_added += 1;
+            inserted.push(true);
         }
         anyhow::Ok(())
     }
@@ -209,14 +258,27 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
 
     if let Err(error) = crate::save_note::finish_transaction(transaction, transaction_result).await
     {
-        for prepared in &prepared_attachments {
-            crate::attachment_files::cleanup_prepared_note_attachments(prepared);
-        }
-        return Err(error);
+        return Err(abort_import_notes(prepared_notes, error).await);
     }
 
-    for prepared in prepared_attachments {
-        crate::attachment_files::commit_note_attachments(prepared)?;
+    let mut attachment_error: Option<anyhow::Error> = None;
+    for (prepared, should_publish) in prepared_notes.into_iter().zip(inserted) {
+        let result = if should_publish {
+            prepared.attachments.publish().await
+        } else {
+            prepared.attachments.abort().await
+        };
+        if let Err(error) = result {
+            attachment_error = Some(match attachment_error {
+                None => error,
+                Some(primary) => primary.context(format!(
+                    "additional attachment finalization failure: {error}"
+                )),
+            });
+        }
+    }
+    if let Some(error) = attachment_error {
+        return Err(error);
     }
 
     stats.embedding_jobs_queued = enqueue_missing_chunk_embeddings(ctx).await?;
@@ -256,4 +318,19 @@ pub async fn import_json(ctx: &Context, input: &str) -> anyhow::Result<ImportSta
 
 fn default_label_value_type() -> String {
     "text".to_string()
+}
+
+async fn abort_import_notes(
+    prepared_notes: Vec<PreparedImportNote>,
+    mut primary: anyhow::Error,
+) -> anyhow::Error {
+    for prepared in prepared_notes {
+        if let Err(abort_error) = prepared.attachments.abort().await {
+            primary = primary.context(format!(
+                "attachment abort also failed for note {}: {abort_error}",
+                prepared.note.id
+            ));
+        }
+    }
+    primary
 }

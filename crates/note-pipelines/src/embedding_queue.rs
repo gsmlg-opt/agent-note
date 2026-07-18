@@ -282,6 +282,7 @@ async fn fail_embedding_job(
 mod tests {
     use super::*;
     use crate::{save_note, update_note, SaveNoteInput};
+    use note_attachments::FilesystemAttachmentStore;
     use note_embedding::{DenseVector, Embedder, StubEmbedder};
     use note_storage::StorageBackend;
     use note_storage_turso::TursoStorage;
@@ -310,12 +311,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let attachments_dir = dir.path().join("attachments");
-        let write_ctx = Context::new(
-            storage.clone(),
-            Arc::new(StubEmbedder),
-            attachments_dir.clone(),
-        );
+        let attachments = Arc::new(FilesystemAttachmentStore::new(
+            dir.path().join("attachments"),
+        ));
+        let write_ctx = Context::new(storage.clone(), Arc::new(StubEmbedder), attachments.clone());
         let note = save_note(
             &write_ctx,
             SaveNoteInput {
@@ -336,7 +335,7 @@ mod tests {
                 started: started.clone(),
                 release: release.clone(),
             }),
-            attachments_dir,
+            attachments,
         ));
         let process_task = {
             let process_ctx = process_ctx.clone();
@@ -391,12 +390,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let attachments_dir = dir.path().join("attachments");
-        let write_ctx = Context::new(
-            storage.clone(),
-            Arc::new(StubEmbedder),
-            attachments_dir.clone(),
-        );
+        let attachments = Arc::new(FilesystemAttachmentStore::new(
+            dir.path().join("attachments"),
+        ));
+        let write_ctx = Context::new(storage.clone(), Arc::new(StubEmbedder), attachments.clone());
         let note = save_note(
             &write_ctx,
             SaveNoteInput {
@@ -417,7 +414,7 @@ mod tests {
                 started: started.clone(),
                 release: release.clone(),
             }),
-            attachments_dir,
+            attachments,
         ));
         let process_task = {
             let process_ctx = process_ctx.clone();

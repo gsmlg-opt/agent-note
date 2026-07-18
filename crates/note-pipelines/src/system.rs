@@ -24,15 +24,23 @@ pub async fn update_system_config(ctx: &Context, config: &SystemConfig) -> anyho
 
 pub async fn get_system_info(ctx: &Context) -> anyhow::Result<SystemInfo> {
     let info = ctx.storage().info().await?;
+    let attachment_info = ctx.attachments().info();
+    let attachments_path = match attachment_info.location {
+        Some(location) if attachment_info.engine == "filesystem" => {
+            absolute_path(Path::new(&location))
+                .to_string_lossy()
+                .into_owned()
+        }
+        Some(location) => location,
+        None => attachment_info.engine,
+    };
     Ok(SystemInfo {
         database_engine: info.engine,
         database_path: info
             .location
             .map(|path| path.to_string_lossy().into_owned()),
         database_size_bytes: info.size_bytes,
-        attachments_path: absolute_path(ctx.attachments_dir())
-            .to_string_lossy()
-            .into_owned(),
+        attachments_path,
     })
 }
 
