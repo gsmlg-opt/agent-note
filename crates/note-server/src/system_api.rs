@@ -94,18 +94,26 @@ mod tests {
     use http_body_util::BodyExt;
     use note_attachments::FilesystemAttachmentStore;
     use note_core::NoteAttachment;
-    use note_embedding::StubEmbedder;
-    use note_pipelines::{save_note, SaveNoteInput};
+    use note_embedding::{
+        EmbeddingBackendInfo, OpenAiCompatibleConfig, OpenAiCompatibleEmbedder, StubEmbedder,
+    };
+    use note_pipelines::{save_note, EmbeddingJobNotifier, SaveNoteInput};
     use note_storage::{
         BackendInfo, StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
         StorageTransaction, TransactionMode,
     };
     use note_storage_turso::TursoStorage;
-    use std::io::Read;
+    use std::{io::Read, time::Duration};
     use tower::ServiceExt;
 
     struct InfoBackend {
         _connection_url: String,
+    }
+
+    struct NoopNotifier;
+
+    impl EmbeddingJobNotifier for NoopNotifier {
+        fn wake(&self) {}
     }
 
     #[async_trait::async_trait]
@@ -237,15 +245,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn info_reports_pg_without_local_database_fields_or_credentials() {
+    async fn info_reports_pg_and_openai_without_local_fields_or_credentials() {
         const PASSWORD: &str = "do-not-render-this-secret";
+        const BASE_URL: &str = "https://embedding.example/private";
+        const TOKEN: &str = "secret-token";
+        const API_KEY_ENV: &str = "EMBEDDING_API_KEY";
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn StorageBackend> = Arc::new(InfoBackend {
             _connection_url: format!("postgresql://agent:{PASSWORD}@database/notes"),
         });
-        let ctx = Arc::new(Context::new(
+        let embedder = OpenAiCompatibleEmbedder::new(OpenAiCompatibleConfig {
+            base_url: BASE_URL.into(),
+            model: "bge-m3".into(),
+            bearer_token: Some(TOKEN.into()),
+            timeout: Duration::from_secs(1),
+            max_retries: 0,
+        })
+        .unwrap();
+        let ctx = Arc::new(Context::with_embedding_job_notifier(
             storage,
-            Arc::new(StubEmbedder),
+            Arc::new(embedder),
+            EmbeddingBackendInfo::openai("bge-m3"),
+            Arc::new(NoopNotifier),
             Arc::new(FilesystemAttachmentStore::new(
                 dir.path().join("attachments"),
             )),
@@ -263,7 +284,15 @@ mod tests {
         assert_eq!(info["database_engine"], "pg");
         assert!(info["database_path"].is_null());
         assert!(info["database_size_bytes"].is_null());
-        assert!(!String::from_utf8_lossy(&bytes).contains(PASSWORD));
+        assert_eq!(info["embedding_engine"], "openai");
+        assert_eq!(info["embedding_model"], "bge-m3");
+        assert_eq!(info["embedding_fingerprint"], "bge-m3:1024");
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!body.contains(PASSWORD));
+        assert!(!body.contains(BASE_URL));
+        assert!(!body.contains(TOKEN));
+        assert!(!body.contains(API_KEY_ENV));
+        assert!(!body.contains("authorization"));
     }
 
     #[tokio::test]

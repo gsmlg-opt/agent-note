@@ -196,6 +196,18 @@ pub fn system_page() -> Html {
                                 <dd>{ location.clone() }</dd>
                             </div>
                         }
+                        <div>
+                            <dt>{ "Embedding engine" }</dt>
+                            <dd>{ info.embedding_engine.clone() }</dd>
+                        </div>
+                        <div>
+                            <dt>{ "Embedding model" }</dt>
+                            <dd>{ info.embedding_model.clone() }</dd>
+                        </div>
+                        <div>
+                            <dt>{ "Embedding fingerprint" }</dt>
+                            <dd>{ info.embedding_fingerprint.clone() }</dd>
+                        </div>
                     </dl>
                 </section>
             }

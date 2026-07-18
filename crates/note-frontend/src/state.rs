@@ -95,6 +95,9 @@ pub struct SystemInfo {
     pub database_size_bytes: Option<u64>,
     pub attachments_engine: String,
     pub attachments_location: Option<String>,
+    pub embedding_engine: String,
+    pub embedding_model: String,
+    pub embedding_fingerprint: String,
 }
 
 #[cfg(test)]
@@ -109,7 +112,10 @@ mod tests {
                 "database_path": null,
                 "database_size_bytes": null,
                 "attachments_engine": "s3",
-                "attachments_location": null
+                "attachments_location": null,
+                "embedding_engine": "openai",
+                "embedding_model": "bge-m3",
+                "embedding_fingerprint": "bge-m3:1024"
             }"#,
         )
         .unwrap();
@@ -119,5 +125,8 @@ mod tests {
         assert_eq!(info.database_size_bytes, None);
         assert_eq!(info.attachments_engine, "s3");
         assert_eq!(info.attachments_location, None);
+        assert_eq!(info.embedding_engine, "openai");
+        assert_eq!(info.embedding_model, "bge-m3");
+        assert_eq!(info.embedding_fingerprint, "bge-m3:1024");
     }
 }

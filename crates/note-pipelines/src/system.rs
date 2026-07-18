@@ -9,6 +9,9 @@ pub struct SystemInfo {
     pub database_size_bytes: Option<u64>,
     pub attachments_engine: String,
     pub attachments_location: Option<String>,
+    pub embedding_engine: String,
+    pub embedding_model: String,
+    pub embedding_fingerprint: String,
 }
 
 pub async fn get_system_config(ctx: &Context) -> anyhow::Result<SystemConfig> {
@@ -25,6 +28,7 @@ pub async fn update_system_config(ctx: &Context, config: &SystemConfig) -> anyho
 pub async fn get_system_info(ctx: &Context) -> anyhow::Result<SystemInfo> {
     let info = ctx.storage().info().await?;
     let attachment_info = ctx.attachments().info();
+    let embedding_info = ctx.embedding_info();
     Ok(SystemInfo {
         database_engine: info.engine,
         database_path: info
@@ -33,5 +37,8 @@ pub async fn get_system_info(ctx: &Context) -> anyhow::Result<SystemInfo> {
         database_size_bytes: info.size_bytes,
         attachments_engine: attachment_info.engine,
         attachments_location: attachment_info.location,
+        embedding_engine: embedding_info.engine.clone(),
+        embedding_model: embedding_info.model.clone(),
+        embedding_fingerprint: embedding_info.fingerprint.clone(),
     })
 }

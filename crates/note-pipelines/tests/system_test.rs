@@ -38,6 +38,9 @@ async fn config_roundtrips_and_system_info_reports_storage() {
         info.attachments_location.as_deref(),
         Some(attachments_path.to_string_lossy().as_ref())
     );
+    assert_eq!(info.embedding_engine, "local");
+    assert_eq!(info.embedding_model, "bge-m3");
+    assert_eq!(info.embedding_fingerprint, "bge-m3:1024");
     assert!(info.database_size_bytes.unwrap() > 0);
 }
 
