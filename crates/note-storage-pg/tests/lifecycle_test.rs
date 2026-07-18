@@ -2,7 +2,7 @@ mod support;
 
 use note_storage::StorageErrorKind;
 use note_storage_pg::PgStorage;
-use support::{configured_url, TestDatabase};
+use support::{configured_url_or_skip, TestDatabase};
 
 #[tokio::test]
 async fn zero_max_connections_is_rejected_before_network_access() {
@@ -37,7 +37,9 @@ async fn unreachable_database_is_unavailable_and_redacts_credentials() {
 
 #[tokio::test]
 async fn fresh_database_without_vector_extension_is_rejected() {
-    let Some(admin_url) = configured_url() else {
+    let Some(admin_url) =
+        configured_url_or_skip("fresh_database_without_vector_extension_is_rejected")
+    else {
         return;
     };
     let database = TestDatabase::create(&admin_url).await;
@@ -55,7 +57,9 @@ async fn fresh_database_without_vector_extension_is_rejected() {
 
 #[tokio::test]
 async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
-    let Some(admin_url) = configured_url() else {
+    let Some(admin_url) =
+        configured_url_or_skip("connect_runs_migrations_with_all_expected_tables_and_indexes")
+    else {
         return;
     };
     let database = TestDatabase::create(&admin_url).await;
@@ -88,29 +92,37 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
         assert!(tables.iter().any(|table| table == expected), "{expected}");
     }
 
-    let indexes: Vec<String> = sqlx::query_scalar(
-        "SELECT indexname
-         FROM pg_indexes
-         WHERE schemaname = 'public'
-         ORDER BY indexname",
+    let indexes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT index_class.relname, access_method.amname
+         FROM pg_index
+         JOIN pg_class index_class ON index_class.oid = pg_index.indexrelid
+         JOIN pg_class table_class ON table_class.oid = pg_index.indrelid
+         JOIN pg_namespace ON pg_namespace.oid = table_class.relnamespace
+         JOIN pg_am access_method ON access_method.oid = index_class.relam
+         WHERE pg_namespace.nspname = 'public'
+         ORDER BY index_class.relname",
     )
     .fetch_all(&inspection)
     .await
     .expect("list migrated indexes");
-    for expected in [
-        "idx_embedding_jobs_status",
-        "idx_note_chunks_hash",
-        "idx_note_chunks_status",
-        "idx_note_labels_key_value",
-        "idx_notes_title_fts",
+    for (expected, access_method) in [
+        ("idx_embedding_jobs_status", "btree"),
+        ("idx_note_chunks_hash", "btree"),
+        ("idx_note_chunks_status", "btree"),
+        ("idx_note_labels_key_value", "btree"),
+        ("idx_notes_title_fts", "gin"),
     ] {
-        assert!(indexes.iter().any(|index| index == expected), "{expected}");
+        assert!(
+            indexes
+                .iter()
+                .any(|(index, method)| index == expected && method == access_method),
+            "{expected} must use {access_method}"
+        );
     }
     assert!(
-        indexes.iter().all(|index| {
-            let lowered = index.to_ascii_lowercase();
-            !lowered.contains("hnsw") && !lowered.contains("ivfflat")
-        }),
+        indexes
+            .iter()
+            .all(|(_, method)| method != "hnsw" && method != "ivfflat"),
         "migration must not create an ANN index"
     );
 
@@ -120,7 +132,7 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
 
 #[tokio::test]
 async fn repeated_connect_is_safe() {
-    let Some(admin_url) = configured_url() else {
+    let Some(admin_url) = configured_url_or_skip("repeated_connect_is_safe") else {
         return;
     };
     let database = TestDatabase::create(&admin_url).await;
@@ -139,7 +151,7 @@ async fn repeated_connect_is_safe() {
 
 #[tokio::test]
 async fn backend_info_is_credential_free() {
-    let Some(admin_url) = configured_url() else {
+    let Some(admin_url) = configured_url_or_skip("backend_info_is_credential_free") else {
         return;
     };
     let database = TestDatabase::create(&admin_url).await;
@@ -154,4 +166,120 @@ async fn backend_info_is_credential_free() {
     assert_eq!(info.size_bytes, None);
 
     database.cleanup(Some(&storage)).await;
+}
+
+#[tokio::test]
+async fn dropping_fixture_force_cleans_the_isolated_database() {
+    let Some(admin_url) =
+        configured_url_or_skip("dropping_fixture_force_cleans_the_isolated_database")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    let database_name = database.database_name().to_owned();
+
+    drop(database);
+
+    let exists = database_exists(&admin_url, &database_name).await;
+    if exists {
+        force_drop_for_failed_assertion(&admin_url, &database_name).await;
+    }
+    assert!(
+        !exists,
+        "fixture Drop must synchronously remove its database"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_cleanup_future_runs_the_drop_guard() {
+    let Some(admin_url) = configured_url_or_skip("cancelling_cleanup_future_runs_the_drop_guard")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    let database_name = database.database_name().to_owned();
+
+    let cleanup = database.cleanup(None);
+    drop(cleanup);
+
+    let exists = database_exists(&admin_url, &database_name).await;
+    if exists {
+        force_drop_for_failed_assertion(&admin_url, &database_name).await;
+    }
+    assert!(
+        !exists,
+        "cancelling cleanup must synchronously force-remove its database"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_detects_unknown_connections_then_drop_guard_force_cleans() {
+    let Some(admin_url) =
+        configured_url_or_skip("cleanup_detects_unknown_connections_then_drop_guard_force_cleans")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    let database_name = database.database_name().to_owned();
+    let unknown_pool = database.inspect_pool().await;
+
+    let cleanup = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(database.cleanup(None));
+    })
+    .join();
+
+    assert!(
+        cleanup.is_err(),
+        "explicit cleanup must reject unknown live connections"
+    );
+    unknown_pool.close().await;
+    assert!(
+        !database_exists(&admin_url, &database_name).await,
+        "Drop fallback must force-clean after explicit cleanup panics"
+    );
+}
+
+async fn database_exists(admin_url: &str, database_name: &str) -> bool {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_url)
+        .await
+        .unwrap_or_else(|_| panic!("connect to PostgreSQL administrative database"));
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(database_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|_| panic!("query isolated PostgreSQL test database"));
+    pool.close().await;
+    exists
+}
+
+async fn force_drop_for_failed_assertion(admin_url: &str, database_name: &str) {
+    use sqlx::AssertSqlSafe;
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_url)
+        .await
+        .unwrap_or_else(|_| panic!("connect to PostgreSQL administrative database"));
+    let _ = sqlx::query(
+        "SELECT pg_terminate_backend(pid)
+         FROM pg_stat_activity
+         WHERE datname = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(database_name)
+    .execute(&pool)
+    .await;
+    sqlx::query(AssertSqlSafe(format!(
+        r#"DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)"#
+    )))
+    .execute(&pool)
+    .await
+    .unwrap_or_else(|_| panic!("drop leaked isolated PostgreSQL test database"));
+    pool.close().await;
 }
