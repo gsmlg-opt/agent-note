@@ -6,8 +6,8 @@ use note_core::{
     LabelValueType, NoteAttachment, SystemConfig,
 };
 use note_storage::{
-    EmbeddingRepository, LabelRepository, NewNote, NoteUpdate, NotesRepository, SettingsRepository,
-    StorageErrorKind, TransactionMode, UpsertNoteChunk,
+    EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteUpdate, NotesRepository,
+    SettingsRepository, StorageErrorKind, TransactionMode, UpsertNoteChunk,
 };
 use note_storage_pg::PgStorage;
 use serde_json::Value;
@@ -788,13 +788,37 @@ async fn embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantic
 
     let chunks = session.list_note_chunks("complete").await.unwrap();
     assert_eq!(
-        chunks
-            .iter()
-            .map(|chunk| chunk.chunk_idx)
-            .collect::<Vec<_>>(),
-        vec![0, 1]
+        chunks,
+        vec![
+            NoteChunk {
+                note_id: "complete".into(),
+                chunk_idx: 0,
+                content_hash: "complete-0".into(),
+                content: "content-0".into(),
+                note_revision: 1,
+                status: "embedded".into(),
+                updated_at: 10,
+            },
+            NoteChunk {
+                note_id: "complete".into(),
+                chunk_idx: 1,
+                content_hash: "complete-1".into(),
+                content: "content-1".into(),
+                note_revision: 1,
+                status: "embedded".into(),
+                updated_at: 11,
+            },
+        ]
     );
-    assert_eq!(chunks[0].content_hash, "complete-0");
+    for expected in &chunks {
+        assert_eq!(
+            session
+                .get_note_chunk("complete", expected.chunk_idx)
+                .await
+                .unwrap(),
+            Some(expected.clone())
+        );
+    }
     let dashboard = session.embedding_dashboard_status().await.unwrap();
     assert_eq!(dashboard.embedded_note_count, 1);
     assert_eq!(dashboard.processing_note, None);
@@ -871,8 +895,9 @@ async fn embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantic
         .unwrap();
     assert_eq!(first.chunk_idx, 1);
     assert_eq!(first.attempts, 1);
+    let tied_updated_at = 34;
     let second = session
-        .claim_pending_embedding_jobs(1, 34)
+        .claim_pending_embedding_jobs(1, tied_updated_at)
         .await
         .unwrap()
         .pop()
@@ -938,6 +963,17 @@ async fn embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantic
             .unwrap(),
         1
     );
+    session
+        .enqueue_embedding_job("stale", 2, "dashboard-tie", "dashboard tie", 2, 41)
+        .await
+        .unwrap();
+    let tied_processing = session
+        .claim_pending_embedding_jobs(1, tied_updated_at)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(second.id < tied_processing.id);
     assert_eq!(
         session
             .embedding_dashboard_status()
@@ -947,6 +983,13 @@ async fn embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantic
             .unwrap()
             .id,
         "processing"
+    );
+    assert_eq!(
+        session
+            .delete_embedding_job(tied_processing.id)
+            .await
+            .unwrap(),
+        1
     );
     assert_eq!(
         session
@@ -1111,10 +1154,16 @@ async fn embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantic
         duplicate_check: DuplicateCheckConfig {
             enabled: true,
             rules: vec![DuplicateCheckRule {
-                terms: vec![DuplicateCheckTerm {
-                    key: "kind".into(),
-                    value: Some("note".into()),
-                }],
+                terms: vec![
+                    DuplicateCheckTerm {
+                        key: "skill-name".into(),
+                        value: None,
+                    },
+                    DuplicateCheckTerm {
+                        key: "kind".into(),
+                        value: Some("skill".into()),
+                    },
+                ],
             }],
         },
     };
