@@ -117,7 +117,6 @@ path = "notes.db"
 
 [embedding]
 engine = "local"
-# model_path = "../models/bge-m3-int8.onnx/model_quantized.onnx"
 
 [attachments]
 engine = "filesystem"
