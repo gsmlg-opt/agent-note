@@ -361,6 +361,46 @@ impl EmbeddingRepository for PgSession {
         .map_err(|error| map_sqlx_error("requeue processing embedding jobs", error))?;
         Ok(result.rows_affected())
     }
+
+    async fn reset_embeddings_for_regeneration(&self, now: i64) -> StorageResult<u64> {
+        let mut connection = self.connection().await?;
+        sqlx::query("DELETE FROM note_chunk_embeddings")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| map_sqlx_error("clear chunk embeddings for regeneration", error))?;
+        sqlx::query("DELETE FROM embedding_jobs")
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| map_sqlx_error("clear embedding jobs for regeneration", error))?;
+        sqlx::query(
+            "UPDATE note_chunks AS chunks
+             SET status = 'pending', updated_at = $1
+             FROM notes
+             WHERE notes.id = chunks.note_id
+               AND notes.deleted_at IS NULL",
+        )
+        .bind(now)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("mark active chunks pending for regeneration", error))?;
+        let result = sqlx::query(
+            "INSERT INTO embedding_jobs (
+                 note_id, chunk_idx, chunk_hash, content, note_revision,
+                 status, attempts, error, created_at, updated_at
+             )
+             SELECT
+                 chunks.note_id, chunks.chunk_idx, chunks.chunk_hash, chunks.content,
+                 chunks.note_revision, 'pending', 0, NULL, $1, $1
+             FROM note_chunks AS chunks
+             JOIN notes ON notes.id = chunks.note_id
+             WHERE notes.deleted_at IS NULL",
+        )
+        .bind(now)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("queue embeddings for regeneration", error))?;
+        Ok(result.rows_affected())
+    }
 }
 
 #[derive(sqlx::FromRow)]
