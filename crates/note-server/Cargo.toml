@@ -20,6 +20,7 @@ anyhow = "1.0.103"
 async-trait = "0.1.89"
 chrono = "0.4.45"
 toml = "0.8.23"
+toml_edit = "0.22.27"
 tempfile = "3.27.0"
 tower-http = { version = "0.7.0", features = ["fs"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

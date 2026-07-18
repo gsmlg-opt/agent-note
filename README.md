@@ -122,12 +122,16 @@ a configuration file before opening storage. `NOTE_CONFIG_PATH` selects it; a re
 resolved from the process working directory. Without that variable, the path is
 `./dev-data/config.toml`.
 
-A debug/dev build atomically creates the implicit `./dev-data/config.toml` when it is missing. It
-never overwrites an existing file. An explicitly selected missing file is always an error, even in
-a debug build, and a release build also rejects a missing implicit file. This is the generated
-development configuration:
+The server atomically creates the implicit `./dev-data/config.toml` when it is missing. An
+explicitly selected missing file is always an error. Existing configuration files that do not
+contain `server.bind_addr` are atomically updated with the resolved value while preserving their
+other settings. An existing bind address is never overwritten. This is the generated
+configuration:
 
 ```toml
+[server]
+bind_addr = "0.0.0.0:6222"
+
 [database]
 engine = "embed"
 path = "notes.db"
@@ -139,6 +143,10 @@ engine = "local"
 engine = "filesystem"
 path = "attachments"
 ```
+
+The HTTP bind address independently uses `server.bind_addr`, then `NOTE_BIND_ADDR`, then
+`0.0.0.0:6222`. The default exposes the REST API and `/mcp` on every network interface; run it only
+on a trusted network or protect it with an authenticating reverse proxy.
 
 All relative path values—including values supplied by environment fallbacks—are resolved from the
 configuration file's parent directory. Each field independently uses configuration file, then its
@@ -352,7 +360,7 @@ attachment responses always include `content_base64` and additionally include `c
 bytes are valid UTF-8. The HTTP server additionally exposes the MCP Streamable HTTP transport at
 `/mcp`.
 
-`note-server` still binds its backend to loopback by default. The Debug Trunk server deliberately
-binds `0.0.0.0:6221`, so the development UI and its proxied endpoints are reachable from the local
-network; run it only on a trusted network. Packaged builds do not start Trunk and retain their
-explicit bind/static-directory configuration.
+`note-server` binds its backend to `0.0.0.0:6222` by default, and the Debug Trunk server binds to
+`0.0.0.0:6221`, so the development UI, REST API, and MCP endpoint are reachable from the local
+network. Run them only on a trusted network. Packaged builds do not start Trunk and retain their
+configured bind/static-directory behavior.

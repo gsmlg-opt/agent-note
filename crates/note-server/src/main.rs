@@ -525,12 +525,10 @@ async fn main() -> anyhow::Result<()> {
             });
         }
 
-        // Default to loopback: a fully-offline, unauthenticated personal app (docs/design.md §1),
-        // and note-mcp's /mcp router defaults to a loopback-only Host allowlist. NOTE_BIND_ADDR
-        // overrides it — the Docker image sets 0.0.0.0:6222 so the container is reachable via `-p`
-        // (container-network isolation makes that safe; exposing it to your LAN is your `-p` choice).
-        let bind_addr =
-            std::env::var("NOTE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:6222".to_string());
+        // The config loader resolves server.bind_addr, then NOTE_BIND_ADDR, then the public
+        // 0.0.0.0:6222 default. Exposing this unauthenticated personal app must be limited to a
+        // trusted network or protected by a reverse proxy.
+        let bind_addr = &config.bind_addr;
         let mut dev_frontend = None;
         let run_result = match tokio::net::TcpListener::bind(&bind_addr).await {
             Err(error) => Err(anyhow::Error::new(error)),
@@ -850,6 +848,7 @@ mod tests {
         let attachments_dir = temp.path().join("dev-data/attachments");
         let local = RuntimeConfig {
             config_path: temp.path().join("config.toml"),
+            bind_addr: "0.0.0.0:6222".into(),
             database: DatabaseConfig::Embed {
                 path: db_path.clone(),
             },
@@ -868,6 +867,7 @@ mod tests {
         let external_root = temp.path().join("external-only");
         let external = RuntimeConfig {
             config_path: temp.path().join("config.toml"),
+            bind_addr: "0.0.0.0:6222".into(),
             database: DatabaseConfig::Pg {
                 url: "postgresql://localhost/notes".into(),
                 max_connections: 10,
@@ -899,6 +899,7 @@ mod tests {
         let default_path = temp.path().join("dev-data/notes.db");
         let config = RuntimeConfig {
             config_path: temp.path().join("config.toml"),
+            bind_addr: "0.0.0.0:6222".into(),
             database: DatabaseConfig::Embed {
                 path: configured_path.clone(),
             },

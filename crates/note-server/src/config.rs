@@ -7,7 +7,11 @@ const DEFAULT_CONFIG_PATH: &str = "dev-data/config.toml";
 const DEFAULT_DATABASE_PATH: &str = "notes.db";
 const DEFAULT_ATTACHMENTS_PATH: &str = "attachments";
 const DEFAULT_EMBEDDING_MODEL: &str = "bge-m3";
-const DEFAULT_DEV_CONFIG: &str = r#"[database]
+const DEFAULT_BIND_ADDR: &str = "0.0.0.0:6222";
+const DEFAULT_DEV_CONFIG: &str = r#"[server]
+bind_addr = "0.0.0.0:6222"
+
+[database]
 engine = "embed"
 path = "notes.db"
 
@@ -22,9 +26,16 @@ path = "attachments"
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
+    server: Option<FileServerConfig>,
     database: Option<FileDatabaseConfig>,
     embedding: Option<FileEmbeddingConfig>,
     attachments: Option<FileAttachmentConfig>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileServerConfig {
+    bind_addr: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -159,6 +170,7 @@ impl std::fmt::Debug for AttachmentConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub config_path: PathBuf,
+    pub bind_addr: String,
     pub database: DatabaseConfig,
     pub embedding: EmbeddingConfig,
     pub attachments: AttachmentConfig,
@@ -167,6 +179,7 @@ pub struct RuntimeConfig {
 #[derive(Default)]
 struct EnvValues {
     config_path: Option<PathBuf>,
+    bind_addr: Option<String>,
     database_engine: Option<String>,
     database_path: Option<PathBuf>,
     database_url: Option<String>,
@@ -191,6 +204,7 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     let cwd = std::env::current_dir().context("resolve current working directory")?;
     let env = EnvValues {
         config_path: std::env::var_os("NOTE_CONFIG_PATH").map(PathBuf::from),
+        bind_addr: read_string_env("NOTE_BIND_ADDR")?,
         database_engine: read_string_env("NOTE_DB_ENGINE")?,
         database_path: std::env::var_os("NOTE_DB_PATH").map(PathBuf::from),
         database_url: read_string_env("DATABASE_URL")?,
@@ -238,16 +252,23 @@ fn resolve_runtime_config(
     let (file, config_path) =
         load_file_config(cwd, env.config_path.as_deref(), generate_implicit_config)?;
     let config_base = config_path.parent().unwrap_or(cwd);
+    let file_server = file.server.unwrap_or_default();
     let file_database = file.database.unwrap_or_default();
     let file_embedding = file.embedding.unwrap_or_default();
     let file_attachments = file.attachments.unwrap_or_default();
 
+    let bind_addr = file_server
+        .bind_addr
+        .or_else(|| env.bind_addr.clone())
+        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
     let database = resolve_database(file_database, &env, config_base)?;
     let embedding = resolve_embedding(file_embedding, &env, config_base)?;
     let attachments = resolve_attachments(file_attachments, &env, config_base)?;
+    persist_missing_bind_addr(&config_path, &bind_addr)?;
 
     Ok(RuntimeConfig {
         config_path,
+        bind_addr,
         database,
         embedding,
         attachments,
@@ -257,7 +278,7 @@ fn resolve_runtime_config(
 fn load_file_config(
     cwd: &Path,
     selected_path: Option<&Path>,
-    generate_implicit_config: bool,
+    _generate_implicit_config: bool,
 ) -> anyhow::Result<(FileConfig, PathBuf)> {
     let explicit = selected_path.is_some();
     let path = resolve_path(
@@ -268,11 +289,7 @@ fn load_file_config(
     );
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
-        Err(error)
-            if !explicit
-                && generate_implicit_config
-                && error.kind() == std::io::ErrorKind::NotFound =>
-        {
+        Err(error) if !explicit && error.kind() == std::io::ErrorKind::NotFound => {
             generate_default_config(&path)?;
             std::fs::read_to_string(&path)
                 .with_context(|| format!("read generated config file {}", path.display()))?
@@ -283,6 +300,44 @@ fn load_file_config(
     };
     let config = parse_file_config(&contents, &path)?;
     Ok((config, path))
+}
+
+fn persist_missing_bind_addr(path: &Path, bind_addr: &str) -> anyhow::Result<()> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("read config file {}", path.display()))?;
+    let mut document = contents
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parse config file {} for update", path.display()))?;
+    if document
+        .get("server")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|server| server.get("bind_addr"))
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    if !document.contains_key("server") {
+        document["server"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    document["server"]["bind_addr"] = toml_edit::value(bind_addr);
+    let parent = path
+        .parent()
+        .context("config path has no parent directory")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary config file in {}", parent.display()))?;
+    temporary
+        .write_all(document.to_string().as_bytes())
+        .with_context(|| format!("write updated config file {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("sync updated config file {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("persist updated config file {}", path.display()))?;
+    Ok(())
 }
 
 fn parse_file_config(contents: &str, path: &Path) -> anyhow::Result<FileConfig> {
@@ -582,7 +637,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn debug_policy_creates_the_implicit_config_without_overwriting() {
+    fn debug_policy_creates_and_migrates_the_implicit_config() {
         let dir = tempfile::tempdir().unwrap();
 
         let config = resolve_runtime_config(dir.path(), EnvValues::default(), true).unwrap();
@@ -622,13 +677,120 @@ path = "winner-attachments"
 
         let winner = resolve_runtime_config(dir.path(), EnvValues::default(), true).unwrap();
 
-        assert_eq!(std::fs::read_to_string(path).unwrap(), replacement);
+        let migrated = std::fs::read_to_string(path).unwrap();
+        assert!(migrated.contains("path = \"winner.db\""));
+        assert!(migrated.contains("path = \"winner-attachments\""));
+        assert!(migrated.contains("[server]\nbind_addr = \"0.0.0.0:6222\""));
         assert_eq!(
             winner.database,
             DatabaseConfig::Embed {
                 path: dir.path().join("dev-data/winner.db"),
             }
         );
+    }
+
+    #[test]
+    fn server_bind_addr_uses_file_then_environment_then_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "file.toml",
+            "[server]\nbind_addr = \"127.0.0.1:7000\"\n",
+        );
+        write_config(dir.path(), "env.toml", "");
+        write_config(dir.path(), "default.toml", "");
+
+        let file = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some("file.toml".into()),
+                bind_addr: Some("127.0.0.1:7001".into()),
+                ..EnvValues::default()
+            },
+            false,
+        )
+        .unwrap();
+        let env = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some("env.toml".into()),
+                bind_addr: Some("127.0.0.1:7001".into()),
+                ..EnvValues::default()
+            },
+            false,
+        )
+        .unwrap();
+        let default = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some("default.toml".into()),
+                ..EnvValues::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(file.bind_addr, "127.0.0.1:7000");
+        assert_eq!(env.bind_addr, "127.0.0.1:7001");
+        assert_eq!(default.bind_addr, "0.0.0.0:6222");
+    }
+
+    #[test]
+    fn missing_implicit_config_is_generated_in_all_build_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let config = resolve_runtime_config(dir.path(), EnvValues::default(), false).unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("dev-data/config.toml")).unwrap();
+
+        assert_eq!(config.bind_addr, "0.0.0.0:6222");
+        assert!(contents.contains("[server]\nbind_addr = \"0.0.0.0:6222\""));
+    }
+
+    #[test]
+    fn missing_bind_addr_is_persisted_without_losing_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let existing = "# keep this comment\n[database]\npath = \"custom.db\"\n";
+        std::fs::write(&path, existing).unwrap();
+
+        let config = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some("config.toml".into()),
+                bind_addr: Some("0.0.0.0:7000".into()),
+                ..EnvValues::default()
+            },
+            false,
+        )
+        .unwrap();
+        let migrated = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(config.bind_addr, "0.0.0.0:7000");
+        assert!(migrated.contains("# keep this comment"));
+        assert!(migrated.contains("path = \"custom.db\""));
+        assert!(migrated.contains("[server]\nbind_addr = \"0.0.0.0:7000\""));
+    }
+
+    #[test]
+    fn existing_bind_addr_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let existing = "[server]\nbind_addr = \"127.0.0.1:9000\"\n";
+        std::fs::write(&path, existing).unwrap();
+
+        let config = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some("config.toml".into()),
+                bind_addr: Some("0.0.0.0:7000".into()),
+                ..EnvValues::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(config.bind_addr, "127.0.0.1:9000");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), existing);
     }
 
     #[test]
@@ -656,16 +818,6 @@ path = "winner-attachments"
         assert_eq!(std::fs::read_to_string(&*path).unwrap(), DEFAULT_DEV_CONFIG);
         let config = resolve_runtime_config(dir.path(), EnvValues::default(), false).unwrap();
         assert_eq!(config.config_path, *path);
-    }
-
-    #[test]
-    fn release_policy_rejects_a_missing_implicit_config() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let error = resolve_runtime_config(dir.path(), EnvValues::default(), false).unwrap_err();
-
-        assert!(error.to_string().contains("dev-data/config.toml"));
-        assert!(!dir.path().join("dev-data/config.toml").exists());
     }
 
     #[test]
@@ -1054,6 +1206,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
         const PASSWORD: &str = "known-debug-password";
         let config = RuntimeConfig {
             config_path: "/tmp/config.toml".into(),
+            bind_addr: DEFAULT_BIND_ADDR.into(),
             database: DatabaseConfig::Pg {
                 url: format!("postgresql://agent:{PASSWORD}@database/notes"),
                 max_connections: 10,
@@ -1076,6 +1229,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
         const API_KEY_ENV_SENTINEL: &str = "EMBEDDING_API_KEY_SENTINEL";
         let config = RuntimeConfig {
             config_path: "/tmp/config.toml".into(),
+            bind_addr: DEFAULT_BIND_ADDR.into(),
             database: DatabaseConfig::Embed {
                 path: "/tmp/notes.db".into(),
             },
@@ -1107,6 +1261,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
         const ENDPOINT_SENTINEL: &str = "s3-user:s3-password@minio.example:9000";
         let config = RuntimeConfig {
             config_path: "/tmp/config.toml".into(),
+            bind_addr: DEFAULT_BIND_ADDR.into(),
             database: DatabaseConfig::Embed {
                 path: "/tmp/notes.db".into(),
             },
