@@ -5,10 +5,11 @@ Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, Turso Data
 ## 1. Design Philosophy
 
 - **Pure core, effectful shell.** Validation, fusion scoring, and DTO assembly are pure transforms. All I/O (DB, inference) is pushed to explicit boundaries and threaded through one immutable context. Do not scatter DB calls or inference calls inside business logic — pipelines take pure data in, effects happen only at named boundary steps.
-- **Fully offline.** No external embedding APIs. The default `NOTE_EMBEDDING_MODE=process` starts
-  a supervised local worker subprocess and sends embedding requests over local IPC; that worker
-  runs BGE-M3 via ONNX Runtime when `NOTE_MODEL_PATH` is configured, or the deterministic stub
-  otherwise. The reserved `thread` and `remote` modes are not implemented.
+- **Offline by default.** The default local embedding engine starts a supervised worker subprocess
+  and sends requests over local IPC. That worker runs BGE-M3 via ONNX Runtime when
+  `embedding.model_path` (or its `NOTE_MODEL_PATH` fallback) is configured, or the deterministic
+  stub otherwise. A self-hosted OpenAI-compatible engine is configured by the same file but remains
+  reserved until its adapter plan is implemented.
 - **One core, two front doors.** REST/MCP-over-HTTP and MCP-over-stdio both call the same pipeline functions. No duplicated business logic per transport.
 
 ## 2. System Topology
@@ -25,14 +26,19 @@ Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, Turso Data
                           │
            ┌──────────────┴──────────────┐
            ▼                             ▼
-  BGE-M3 Inference (ORT)          Rust Turso Database Storage
-  1024-d dense output only,      title FTS/BM25 + exact dense
-  int8 quantized                 cosine + notes/labels
+  Embedding adapter                    Storage adapter
+  local BGE-M3 ORT today;              Rust Turso Database today;
+  OpenAI-compatible reserved           PostgreSQL reserved
+                          │
+                  Attachment adapter
+                  filesystem today; S3 reserved
 ```
 
 stdio is the same binary, selected by an entrypoint flag, and calls pipelines directly — never
 proxies through Axum. The composition root resolves configuration once, constructs one shared
-storage backend, and passes it explicitly to whichever transport is active.
+storage backend, embedding backend, and attachment store, and passes them explicitly to whichever
+transport is active. HTTP, stdio, import, and export all load the mandatory configuration file
+before opening an adapter.
 
 ## 3. Storage Contract
 
@@ -114,26 +120,67 @@ jobs. A worker claims a job in a short immediate transaction, performs inference
 database transaction, then atomically persists the dense body-chunk vector and marks the current
 chunk revision embedded.
 
-Runtime storage configuration is optional. The default `./config.toml` shape is:
+Runtime configuration is mandatory. `NOTE_CONFIG_PATH` selects the file, with relative selectors
+resolved from the process working directory; otherwise the implicit path is
+`./dev-data/config.toml`. A debug/dev build atomically creates that implicit file when missing and
+never overwrites an existing file. Explicit missing files always fail, and release builds fail when
+the implicit file is missing. The generated development shape is:
 
 ```toml
-attachments_dir = "dev-data/attachments"
-
 [database]
 engine = "embed"
-path = "dev-data/notes.db"
+path = "notes.db"
+
+[embedding]
+engine = "local"
+# model_path = "../models/bge-m3-int8.onnx/model_quantized.onnx"
+
+[attachments]
+engine = "filesystem"
+path = "attachments"
 ```
 
-Each field resolves independently in file-over-environment-over-default order. `NOTE_CONFIG_PATH`
-selects the file, `NOTE_DB_ENGINE` selects `embed` or the parsed-but-not-yet-supported future `pg`
-adapter, `NOTE_DB_PATH` selects the embedded database, and `NOTE_ATTACHMENTS_DIR` selects attachment
-storage. Relative TOML values are based on the selected file's directory; relative environment and
-default values are based on the process working directory.
+Every relative path is based on the selected configuration file's parent, including a path supplied
+by an environment fallback. Each field resolves independently in file-over-environment-over-default
+order:
+
+- `[database]`: `engine` (`NOTE_DB_ENGINE`, default `embed`). Embedded Turso uses `path`
+  (`NOTE_DB_PATH`, default `notes.db`). Reserved PostgreSQL uses `url` (`DATABASE_URL`) and
+  `max_connections` (`NOTE_DB_MAX_CONNECTIONS`, default `10`).
+- `[embedding]`: `engine` (`NOTE_EMBEDDING_ENGINE`, default `local`). Local inference accepts
+  optional `model_path` (`NOTE_MODEL_PATH`). Reserved OpenAI-compatible inference accepts
+  `base_url`, `model` (default `bge-m3`), optional `api_key_env`, `timeout_secs` (default `30`), and
+  `max_retries` (default `3`), with `NOTE_EMBEDDING_BASE_URL`, `NOTE_EMBEDDING_MODEL`,
+  `NOTE_EMBEDDING_API_KEY_ENV`, `NOTE_EMBEDDING_TIMEOUT_SECS`, and
+  `NOTE_EMBEDDING_MAX_RETRIES` fallbacks.
+- `[attachments]`: `engine` (`NOTE_ATTACHMENTS_ENGINE`, default `filesystem`). Filesystem uses
+  `path` (`NOTE_ATTACHMENTS_DIR`, default `attachments`). Reserved S3 uses `bucket`, `prefix`,
+  optional `region`, optional `endpoint`, and `force_path_style`, with `NOTE_S3_BUCKET`,
+  `NOTE_S3_PREFIX`, `AWS_REGION`, `NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE` fallbacks.
+
+The reserved OpenAI-compatible adapter will call `/v1/embeddings` with model `bge-m3`;
+`api_key_env` is optional and omission means no authentication. The reserved PostgreSQL adapter
+will use title FTS and exact cosine pgvector search over dense content vectors. The reserved S3
+adapter targets S3-compatible object storage. These values are parsed now. A mode that constructs a
+reserved adapter returns a precise not-implemented error rather than silently falling back; import
+and export use the stub embedder and therefore do not construct the reserved embedding adapter.
+
+The current filesystem attachment adapter stages a complete note set before the database
+transaction, publishes after commit, and aborts staging on database failure. Hydration and
+single-object reads go through the adapter; permanent deletion removes attachment data only after
+the database record is deleted. Per-note operations are coordinated within the process. The root
+must be exclusively owned by one agent-note process, with no external mutation or symlinks, and
+filesystem publication cannot be atomically committed with the database transaction.
 
 ## 4. Embedding Pipeline (BGE-M3)
 
 - **Quantization**: int8. Do not drop to 4-bit — CPU ONNX Runtime kernels for INT4 are not reliably faster than int8 on CPU EP, and quantization noise directly perturbs retrieval ordering (unlike LLM generation, where it's more forgiving). If corpus size later justifies revisiting this, it requires re-embedding the full corpus — quantization levels are not mixable in the same vector space.
 - **Output used**: the 1024-dimensional dense head. The worker persists one dense vector for each body chunk; no lexical or multi-vector embedding output is stored.
+- **Local model selection**: an optional `embedding.model_path` selects BGE-M3 ONNX; otherwise the
+  deterministic 1,024-component stub keeps development and tests self-contained.
+- **Reserved remote selection**: `embedding.engine = "openai"` describes a self-hosted
+  OpenAI-compatible `/v1/embeddings` endpoint using model `bge-m3`. Authentication is disabled when
+  `api_key_env` is omitted. The HTTP adapter is not active in this implementation slice.
 - **Threading**: inference runs via `spawn_blocking`, never inline on the async reactor.
 - **Backpressure**: the worker wraps its embedder in `BoundedEmbedder` with concurrency `1`, so
   inference calls are serialized behind a semaphore. The local IPC worker queue is also bounded
@@ -180,19 +227,24 @@ note are also auto-created by `save_note` with an empty description.
 **list_label_keys**: read-only → return the full label-key catalog (`key` + `description`), used by
 clients and the UI to populate suggestions and explain known keys.
 
-**save_note**: validate non-empty title/content and typed label values → atomically persist the note,
-auto-created missing label keys, attached labels, chunk records, and durable embedding jobs → commit
-prepared attachment files → return the persisted `Note`. The embedding worker later claims each job,
-performs one dense inference call outside the database transaction, and atomically persists the
-dense body-chunk vector for the current chunk revision.
+**save_note**: validate non-empty title/content and typed label values → prepare the attachment set
+outside the database transaction → atomically persist the note, auto-created missing label keys,
+attached labels, chunk records, and durable embedding jobs → commit the database transaction →
+publish prepared attachments → return the persisted `Note`. A database failure aborts the prepared
+set. The embedding worker later claims each job, performs one dense inference call outside the
+database transaction, and atomically persists the dense body-chunk vector for the current chunk
+revision.
 
 **search_notes**: embed the query once for exact dense content retrieval → request the title FTS
 ranking and dense note ranking → combine the two ranked ID lists with weighted RRF (pure function,
 no I/O) → apply label filtering and hydrate labels/metadata for top-k → return
 `Vec<(Note, f32)>` where the score is the fused weighted-RRF score, not raw BM25 or cosine.
 
-Context/environment: one struct holds a shared `StorageBackend` and embedder. The application
-composition root constructs it once and passes it explicitly — no global or implicit storage state.
+Context/environment: one struct holds a shared `StorageBackend`, embedder, and `AttachmentStore`.
+The application composition root constructs it once and passes it explicitly — no global or
+implicit storage state. System information stays backend-neutral: database engine, optional
+location and size, attachment engine, and optional attachment location. Credentials and embedding
+authentication are never part of that response.
 
 ## 7. Frontend (Yew + duskmoon-ui)
 

@@ -61,15 +61,15 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
      `/usr/local/opt/rustup/bin` (Apple Silicon: `/opt/homebrew/opt/rustup/bin`) ahead of the
      Homebrew `rust` formula on your `PATH`, otherwise `cargo` resolves to a single-target rust
      that can't build wasm and `trunk build` fails.
-2. (Optional, for real embeddings) Download the BGE-M3 int8-quantized ONNX model into the
-   expected local path:
+2. (Optional, for real local embeddings) Download the BGE-M3 int8-quantized ONNX model:
    ```
    hf download gpahal/bge-m3-onnx-int8 --local-dir ./models/bge-m3-int8.onnx
    ```
-   The whole app runs without it using a deterministic stub embedder. Set `NOTE_MODEL_PATH` to
-   `./models/bge-m3-int8.onnx/model_quantized.onnx` to use the real model. Embedding inference uses
-   all detected physical CPU cores by default; set `NOTE_EMBEDDING_THREADS` to a positive integer
-   to override it, or explicitly set it to `auto` to retain the default.
+   The whole app runs without it using a deterministic stub embedder. Set
+   `embedding.model_path = "../models/bge-m3-int8.onnx/model_quantized.onnx"` in the generated
+   `dev-data/config.toml`, or use the `NOTE_MODEL_PATH` fallback, to use the real model. Embedding
+   inference uses all detected physical CPU cores by default; set `NOTE_EMBEDDING_THREADS` to a
+   positive integer to override it, or explicitly set it to `auto` to retain the default.
 
 ## Build & test
 
@@ -89,40 +89,103 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
    cargo run
    ```
    Then open http://0.0.0.0:6221. Trunk proxies `/api` and `/mcp` to `note-server` on
-   `127.0.0.1:6222`. By default, the embedded Turso database is stored at
-   `./dev-data/notes.db` and attachments under `./dev-data/attachments`.
+   `127.0.0.1:6222`. A debug build atomically creates `./dev-data/config.toml` on first start,
+   without replacing an existing file. Its generated settings store the embedded Turso database
+   at `./dev-data/notes.db` and attachments under `./dev-data/attachments`.
    A note's unrendered Markdown is available at
    `GET /api/notes/{id}/raw` and `GET /notes/{id}/content`. During local development, use the
    backend URL `http://127.0.0.1:6222/notes/{id}/content` for the latter because Trunk owns the
    frontend `/notes/*` routes on port 6221. Add `?type=html` to the latter URL for a standalone,
    styled HTML document suitable for iframe embedding.
 
-## Storage configuration
+## Runtime configuration
 
-An optional `./config.toml` may configure storage:
+Every normal entrypoint—HTTP server, MCP over HTTP, MCP over stdio, `--import`, and `--export`—loads
+a configuration file before opening storage. `NOTE_CONFIG_PATH` selects it; a relative selector is
+resolved from the process working directory. Without that variable, the path is
+`./dev-data/config.toml`.
+
+A debug/dev build atomically creates the implicit `./dev-data/config.toml` when it is missing. It
+never overwrites an existing file. An explicitly selected missing file is always an error, even in
+a debug build, and a release build also rejects a missing implicit file. This is the generated
+development configuration:
 
 ```toml
-attachments_dir = "dev-data/attachments"
-
 [database]
 engine = "embed"
-path = "dev-data/notes.db"
+path = "notes.db"
+
+[embedding]
+engine = "local"
+# model_path = "../models/bge-m3-int8.onnx/model_quantized.onnx"
+
+[attachments]
+engine = "filesystem"
+path = "attachments"
 ```
 
-Each field resolves independently with precedence `config.toml` > environment > default. The
-supported variables are:
+All relative path values—including values supplied by environment fallbacks—are resolved from the
+configuration file's parent directory. Each field independently uses configuration file, then its
+supported environment variable, then its built-in default. The active schemas and their fallbacks
+are:
 
-- `NOTE_CONFIG_PATH`: selects a configuration file. A relative selector is resolved from the
-  process working directory. The default `./config.toml` is optional, but an explicitly selected
-  missing file is an error.
-- `NOTE_DB_ENGINE`: `embed` (the default embedded Rust Turso Database). `pg` is reserved for a
-  future PostgreSQL adapter and currently returns
-  `PostgreSQL storage is not supported in this release`.
-- `NOTE_DB_PATH`: embedded database path, default `dev-data/notes.db`.
-- `NOTE_ATTACHMENTS_DIR`: attachment directory, default `dev-data/attachments`.
+- `[database]`: `engine` (`NOTE_DB_ENGINE`, default `embed`); for `embed`, `path`
+  (`NOTE_DB_PATH`, default `notes.db`). The embedded adapter is Rust Turso Database.
+- `[embedding]`: `engine` (`NOTE_EMBEDDING_ENGINE`, default `local`); for `local`, optional
+  `model_path` (`NOTE_MODEL_PATH`). No model path selects the deterministic stub; a path selects
+  local BGE-M3 ONNX inference.
+- `[attachments]`: `engine` (`NOTE_ATTACHMENTS_ENGINE`, default `filesystem`); for `filesystem`,
+  `path` (`NOTE_ATTACHMENTS_DIR`, default `attachments`).
 
-Relative paths inside the TOML file are based on that file's directory. Relative environment and
-default paths are based on the process working directory.
+The filesystem attachment adapter stages a complete attachment set before the database
+transaction, publishes it after the database commit, and aborts staged data when the transaction
+fails. Reads load bytes through the same adapter, and permanent deletion removes the note's
+attachment directory after deleting its database record. Its configured root must be exclusively
+owned by this agent-note process: external mutation, symlinks, and multiple writers are unsupported.
+The database and filesystem do not share one transaction, so a publication or cleanup error is
+reported rather than hidden.
+
+The following values are parsed and validated now but remain reserved until their adapter plans are
+implemented. A mode that needs one returns a precise “not implemented yet” error rather than
+silently falling back. Import and export deliberately use the stub embedder, so those modes load
+and validate OpenAI-compatible settings without constructing that reserved embedding adapter.
+
+```toml
+[database]
+engine = "pg"
+url = "postgresql://agent-note@db.example.invalid/agent_note"
+max_connections = 10
+
+[embedding]
+engine = "openai"
+base_url = "http://embedding.example.invalid"
+model = "bge-m3"
+# api_key_env = "EMBEDDING_API_KEY"
+timeout_secs = 30
+max_retries = 3
+
+[attachments]
+engine = "s3"
+bucket = "agent-note-example"
+prefix = "notes"
+# region = "us-east-1"
+# endpoint = "http://object-store.example.invalid"
+force_path_style = false
+```
+
+The corresponding fallbacks are `DATABASE_URL` and `NOTE_DB_MAX_CONNECTIONS`;
+`NOTE_EMBEDDING_BASE_URL`, `NOTE_EMBEDDING_MODEL`, `NOTE_EMBEDDING_API_KEY_ENV`,
+`NOTE_EMBEDDING_TIMEOUT_SECS`, and `NOTE_EMBEDDING_MAX_RETRIES`; and `NOTE_S3_BUCKET`,
+`NOTE_S3_PREFIX`, `AWS_REGION`, `NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE`.
+`api_key_env` names the environment variable that a future adapter will read; omitting it means no
+authentication. The self-hosted OpenAI-compatible adapter is designed to call `/v1/embeddings` with
+model `bge-m3`. PostgreSQL is designed to use title FTS plus exact cosine search over 1,024-element
+pgvector content vectors. S3 configuration is intended for S3-compatible object storage; it does
+not create the bucket.
+
+The System API reports backend-neutral `database_engine`, optional `database_path` and
+`database_size_bytes`, plus `attachments_engine` and optional `attachments_location`. It does not
+expose database credentials or embedding authentication.
 
 ## Exact hybrid retrieval
 
@@ -141,12 +204,12 @@ the larger fixed title pool bounds physical FTS work and makes ties deterministi
 
 Exact dense scanning avoids an approximate-index lifecycle and gives deterministic results; the
 accepted trade-off is linear dense-search cost, which is appropriate for the current personal-notes
-corpus. A future `pg` backend can introduce a different physical retrieval strategy without
-changing pipeline or transport code.
+corpus. The planned PostgreSQL adapter keeps the same logical channels using title FTS and exact
+cosine pgvector retrieval without changing pipeline or transport code.
 
 The adapter intentionally makes a clean break from databases created by the retired storage
-implementation. Delete and recreate disposable test/development databases. For non-disposable
-data, export or back up the database before upgrading; there is no in-place legacy migration.
+implementation. Current databases contain disposable test/development data, so delete and recreate
+them; no in-place legacy-data migration is guaranteed.
 
 ## MCP
 
@@ -155,6 +218,8 @@ The same binary also speaks MCP over stdio (for MCP clients that spawn a subproc
 ```
 cargo run -p note-server -- --stdio
 ```
+
+This mode loads the same mandatory runtime configuration as HTTP, import, and export modes.
 
 It exposes `save_note`, `get_note`, `read_note_lines`, `edit_note`, `update_note`, `delete_note`,
 `list_notes`, and `semantic_search`. Label-key management is REST/UI-only. Attachments in
