@@ -5,6 +5,8 @@ use note_storage::{
 };
 use pgvector::Vector;
 
+const TITLE_SEARCH_SQL: &str = include_str!("title_search.sql");
+
 #[async_trait::async_trait]
 impl RetrievalRepository for PgSession {
     async fn insert_chunk_embedding(
@@ -66,23 +68,12 @@ impl RetrievalRepository for PgSession {
         let limit = checked_limit(limit, "title search")?;
 
         let mut connection = self.connection().await?;
-        sqlx::query_scalar(
-            "WITH query AS (
-                 SELECT to_tsquery('simple'::regconfig, $1) AS terms
-             )
-             SELECT notes.id
-             FROM notes
-             CROSS JOIN query
-             WHERE notes.deleted_at IS NULL
-               AND notes.title_fts @@ query.terms
-             ORDER BY ts_rank_cd(notes.title_fts, query.terms) DESC, notes.id ASC
-             LIMIT $2",
-        )
-        .bind(query)
-        .bind(limit)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| map_sqlx_error("query title search", error))
+        sqlx::query_scalar(TITLE_SEARCH_SQL)
+            .bind(query)
+            .bind(limit)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|error| map_sqlx_error("query title search", error))
     }
 }
 

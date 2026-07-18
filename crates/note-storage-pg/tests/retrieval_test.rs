@@ -6,9 +6,12 @@ use note_storage::{
     EMBEDDING_DIMENSION,
 };
 use note_storage_pg::{PgSession, PgStorage};
+use sqlx::AssertSqlSafe;
 use std::sync::OnceLock;
 use support::{configured_url_or_skip, TestDatabase};
 use tokio::sync::{Mutex, MutexGuard};
+
+const TITLE_SEARCH_SQL: &str = include_str!("../src/title_search.sql");
 
 async fn real_database_test_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -284,24 +287,13 @@ async fn title_fts_is_literal_title_only_active_and_uses_gin() {
         .execute(&mut *transaction)
         .await
         .unwrap();
-    let plan: Vec<String> = sqlx::query_scalar(
-        "EXPLAIN (COSTS OFF)
-         WITH query AS (
-             SELECT to_tsquery('simple'::regconfig, $1) AS terms
-         )
-         SELECT notes.id
-         FROM notes
-         CROSS JOIN query
-         WHERE notes.deleted_at IS NULL
-           AND notes.title_fts @@ query.terms
-         ORDER BY ts_rank_cd(notes.title_fts, query.terms) DESC, notes.id ASC
-         LIMIT $2",
-    )
-    .bind("'new'")
-    .bind(10_i64)
-    .fetch_all(&mut *transaction)
-    .await
-    .unwrap();
+    let explain_sql = format!("EXPLAIN (COSTS OFF)\n{TITLE_SEARCH_SQL}");
+    let plan: Vec<String> = sqlx::query_scalar(AssertSqlSafe(explain_sql))
+        .bind("'new'")
+        .bind(10_i64)
+        .fetch_all(&mut *transaction)
+        .await
+        .unwrap();
     let rendered = plan.join("\n");
     assert!(
         rendered.contains("Bitmap Index Scan on idx_notes_title_fts")
