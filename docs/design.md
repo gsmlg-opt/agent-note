@@ -1,4 +1,4 @@
-# Design Doc: Local-Inference Hybrid-Search Notes App
+# Design Doc: Hybrid-Search Notes App
 
 Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, Turso Database, PostgreSQL
 with pgvector), Yew/Wasm frontend, MCP server. This doc specifies contracts and decisions;
@@ -10,8 +10,8 @@ implementation details are left to the builder.
 - **Offline by default.** The default local embedding engine starts a supervised worker subprocess
   and sends requests over local IPC. That worker runs BGE-M3 via ONNX Runtime when
   `embedding.model_path` (or its `NOTE_MODEL_PATH` fallback) is configured, or the deterministic
-  stub otherwise. A self-hosted OpenAI-compatible engine is configured by the same file but remains
-  reserved until its adapter plan is implemented.
+  stub otherwise. The same file can select a self-hosted OpenAI-compatible BGE-M3 service when
+  remote inference is desired.
 - **One core, two front doors.** REST/MCP-over-HTTP and MCP-over-stdio both call the same pipeline functions. No duplicated business logic per transport.
 
 ## 2. System Topology
@@ -29,8 +29,8 @@ implementation details are left to the builder.
            ┌──────────────┴──────────────┐
            ▼                             ▼
   Embedding adapter                    Storage adapter
-  local BGE-M3 ORT today;              Rust Turso Database today;
-  OpenAI-compatible reserved           PostgreSQL external adapter
+  local BGE-M3 ORT or                  Rust Turso Database or
+  OpenAI-compatible HTTP               PostgreSQL external adapter
                           │
                   Attachment adapter
                   filesystem today; S3 reserved
@@ -149,8 +149,8 @@ order:
   (`NOTE_DB_PATH`, default `notes.db`). PostgreSQL uses `url` (`DATABASE_URL`) and
   `max_connections` (`NOTE_DB_MAX_CONNECTIONS`, default `10`).
 - `[embedding]`: `engine` (`NOTE_EMBEDDING_ENGINE`, default `local`). Local inference accepts
-  optional `model_path` (`NOTE_MODEL_PATH`). Reserved OpenAI-compatible inference accepts
-  `base_url`, `model` (default `bge-m3`), optional `api_key_env`, `timeout_secs` (default `30`), and
+  optional `model_path` (`NOTE_MODEL_PATH`). OpenAI-compatible inference accepts `base_url`,
+  `model` (default `bge-m3`), optional `api_key_env`, `timeout_secs` (default `30`), and
   `max_retries` (default `3`), with `NOTE_EMBEDDING_BASE_URL`, `NOTE_EMBEDDING_MODEL`,
   `NOTE_EMBEDDING_API_KEY_ENV`, `NOTE_EMBEDDING_TIMEOUT_SECS`, and
   `NOTE_EMBEDDING_MAX_RETRIES` fallbacks.
@@ -159,14 +159,18 @@ order:
   optional `region`, optional `endpoint`, and `force_path_style`, with `NOTE_S3_BUCKET`,
   `NOTE_S3_PREFIX`, `AWS_REGION`, `NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE` fallbacks.
 
-The reserved OpenAI-compatible adapter will call `/v1/embeddings` with model `bge-m3`;
-`api_key_env` is optional and omission means no authentication. The reserved S3 adapter targets
-S3-compatible object storage. Those reserved values are parsed into typed active variants and
-receive basic active-variant checks now; full URL, service, credential, connectivity, and
-operational validation is deferred until the corresponding adapter activates. A mode that
-constructs a reserved adapter returns a precise not-implemented error rather than silently falling
-back; import and export use the stub embedder and therefore do not construct the reserved embedding
-adapter.
+The OpenAI-compatible adapter posts batches to `/v1/embeddings` with `encoding_format = "float"`
+and no `dimensions` field. `api_key_env` is optional and names the environment variable containing
+the bearer token; omission means no authentication. Responses must contain exactly one uniquely
+indexed, finite 1,024-component vector per input. The adapter retries connection failures,
+timeouts, HTTP 429, and HTTP 5xx with bounded backoff. `max_retries` counts retries after the
+initial request and cannot exceed `10`. Successful response bodies are limited to 1 MiB;
+unauthenticated error bodies are limited to 4 KiB and authenticated error bodies are redacted.
+
+The reserved S3 adapter targets S3-compatible object storage. Its values are parsed into a typed
+active variant and receive basic active-variant checks now; full service, credential, connectivity,
+and operational validation is deferred until that adapter activates. A mode that constructs it
+returns a precise not-implemented error rather than silently falling back.
 
 `note-storage-pg` is the complete external database adapter. Before Agent Note starts, the operator
 must provision pgvector in the selected database:
@@ -205,18 +209,39 @@ non-disposable data before upgrading so recovery or deliberate import remains po
 
 ## 4. Embedding Pipeline (BGE-M3)
 
-- **Quantization**: int8. Do not drop to 4-bit — CPU ONNX Runtime kernels for INT4 are not reliably faster than int8 on CPU EP, and quantization noise directly perturbs retrieval ordering (unlike LLM generation, where it's more forgiving). If corpus size later justifies revisiting this, it requires re-embedding the full corpus — quantization levels are not mixable in the same vector space.
+- **Local quantization**: int8. Do not drop to 4-bit — CPU ONNX Runtime kernels for INT4 are not reliably faster than int8 on CPU EP, and quantization noise directly perturbs retrieval ordering (unlike LLM generation, where it's more forgiving). If corpus size later justifies revisiting this, it requires re-embedding the full corpus — quantization levels are not mixable in the same vector space.
 - **Output used**: the 1024-dimensional dense head. The worker persists one dense vector for each body chunk; no lexical or multi-vector embedding output is stored.
 - **Local model selection**: an optional `embedding.model_path` selects BGE-M3 ONNX; otherwise the
   deterministic 1,024-component stub keeps development and tests self-contained.
-- **Reserved remote selection**: `embedding.engine = "openai"` describes a self-hosted
-  OpenAI-compatible `/v1/embeddings` endpoint using model `bge-m3`. Authentication is disabled when
-  `api_key_env` is omitted. The HTTP adapter is not active in this implementation slice.
-- **Threading**: inference runs via `spawn_blocking`, never inline on the async reactor.
-- **Backpressure**: the worker wraps its embedder in `BoundedEmbedder` with concurrency `1`, so
-  inference calls are serialized behind a semaphore. The local IPC worker queue is also bounded
+- **Remote selection**: `embedding.engine = "openai"` selects a self-hosted OpenAI-compatible
+  `/v1/embeddings` endpoint. A runnable configuration is:
+
+  ```toml
+  [embedding]
+  engine = "openai"
+  base_url = "http://embedding.internal:8000"
+  model = "bge-m3"
+  api_key_env = "EMBEDDING_API_KEY"
+  timeout_secs = 30
+  max_retries = 3
+  ```
+
+  `api_key_env` is optional; omit it for no authentication.
+- **Fingerprint lifecycle**: local BGE-M3 and remote model `bge-m3` both identify their vector
+  space as `bge-m3:1024`. Startup preserves vectors when the fingerprint is unchanged. When it
+  changes, one storage transaction removes old vectors and jobs, queues one pending job for every
+  active chunk, and records the new fingerprint before the scheduler starts.
+- **Endpoint-free paths**: a blank retrieval query returns no results before embedding or storage
+  access. Normal note saves reject blank content; blank imported note content creates no chunks or
+  embedding jobs. Import and export use the deterministic stub and never contact the configured
+  embedding service; import queues missing chunks for later processing.
+- **Threading**: local ONNX inference runs via `spawn_blocking`, never inline on the async reactor;
+  remote inference uses asynchronous HTTP.
+- **Backpressure**: the local worker wraps its embedder in `BoundedEmbedder` with concurrency `1`,
+  so inference calls are serialized behind a semaphore. The local IPC worker queue is also bounded
   (default capacity `8`). `NOTE_EMBEDDING_THREADS` controls ONNX intra-op CPU threads separately;
-  it does not change request concurrency.
+  it does not change request concurrency. The scheduler processes one durable job at a time for
+  either backend.
 
 ## 5. Retrieval Design
 
@@ -282,7 +307,8 @@ Context/environment: one struct holds a shared `StorageBackend`, embedder, and `
 The application composition root constructs it once and passes it explicitly — no global or
 implicit storage state. System information stays backend-neutral: database engine, optional
 location and size, attachment engine, and optional attachment location. Credentials and embedding
-authentication are never part of that response.
+authentication are never part of that response. Embedding information is limited to engine, model,
+and fingerprint.
 
 ## 7. Frontend (Yew + duskmoon-ui)
 

@@ -1,13 +1,14 @@
 # agent-note
 
-Local-inference hybrid-search notes app. See `docs/design.md` for the full design.
+Hybrid-search notes app with local inference by default. See `docs/design.md` for the full design.
 
 A Rust workspace: `note-core` (pure types/validation/RRF fusion), `note-storage` (backend-neutral
 repository contracts), `note-storage-turso` (embedded Rust Turso Database adapter with title FTS
 and exact dense retrieval), `note-storage-pg` (external PostgreSQL adapter with title FTS and exact
-pgvector retrieval), `note-embedding` (BGE-M3 via ONNX, with a deterministic stub for offline
-dev), `note-pipelines` (save/search workflows), `note-mcp` (MCP over stdio + Streamable HTTP),
-`note-server` (Axum REST + `/mcp`), and `note-frontend` (Yew/Wasm UI built with the
+pgvector retrieval), `note-embedding` (BGE-M3 via local ONNX or a self-hosted OpenAI-compatible
+service, with a deterministic stub for offline dev), `note-pipelines` (save/search workflows),
+`note-mcp` (MCP over stdio + Streamable HTTP), `note-server` (Axum REST + `/mcp`), and
+`note-frontend` (Yew/Wasm UI built with the
 [`yew-duskmoon`](https://crates.io/crates/yew-duskmoon) component library).
 
 The frontend styling comes from the `@duskmoon-dev/core` design system, vendored as a prebuilt
@@ -30,7 +31,7 @@ note-core        pure: Note/Label/LabelKey types, input validation, RRF rank-fus
    ├── note-storage-turso
    │                    Rust Turso Database: notes + labels, title FTS/BM25 + exact dense cosine
    ├── note-storage-pg  PostgreSQL: notes + labels, title FTS/GIN + exact pgvector cosine
-   ├── note-embedding   Embedder trait → StubEmbedder (offline) | OrtEmbedder (BGE-M3); semaphore backpressure
+   ├── note-embedding   Embedder trait → StubEmbedder | local ONNX | OpenAI-compatible BGE-M3
    ▲
 note-pipelines   Context + workflows that compose core/storage/embedding:
                    • save_note   — validate → atomically persist note/chunks/jobs/labels → return Note
@@ -150,7 +151,10 @@ are:
   Database.
 - `[embedding]`: `engine` (`NOTE_EMBEDDING_ENGINE`, default `local`); for `local`, optional
   `model_path` (`NOTE_MODEL_PATH`). No model path selects the deterministic stub; a path selects
-  local BGE-M3 ONNX inference.
+  local BGE-M3 ONNX inference. For `openai`, `base_url` (`NOTE_EMBEDDING_BASE_URL`), `model`
+  (`NOTE_EMBEDDING_MODEL`, default `bge-m3`), optional `api_key_env`
+  (`NOTE_EMBEDDING_API_KEY_ENV`), `timeout_secs` (`NOTE_EMBEDDING_TIMEOUT_SECS`, default `30`), and
+  `max_retries` (`NOTE_EMBEDDING_MAX_RETRIES`, default `3`).
 - `[attachments]`: `engine` (`NOTE_ATTACHMENTS_ENGINE`, default `filesystem`); for `filesystem`,
   `path` (`NOTE_ATTACHMENTS_DIR`, default `attachments`).
 
@@ -187,6 +191,47 @@ PostgreSQL `simple` text-search configuration and indexes it with GIN. Dense ret
 exact cosine-distance scan using `<=>` over `vector(1024)` body-chunk embeddings; it creates no ANN
 index. System information reports the `pg` engine but never the PostgreSQL URL or credentials.
 
+### OpenAI-compatible BGE-M3
+
+Use a self-hosted OpenAI-compatible embeddings service with:
+
+```toml
+[embedding]
+engine = "openai"
+base_url = "http://embedding.internal:8000"
+model = "bge-m3"
+api_key_env = "EMBEDDING_API_KEY"
+timeout_secs = 30
+max_retries = 3
+```
+
+`api_key_env` names an environment variable that contains the bearer token; it never contains the
+secret itself. Set `EMBEDDING_API_KEY` in the server process environment for the example above.
+Omit `api_key_env` for a service that requires no authentication. When it is configured, a missing
+or blank named environment value is a startup error.
+
+The adapter posts input batches to `/v1/embeddings` with `encoding_format = "float"` and does not
+send `dimensions`. Each response must contain exactly one uniquely indexed, finite
+1,024-component vector per input. Connection failures, timeouts, HTTP 429, and HTTP 5xx responses
+are retried with bounded backoff; other transport errors and HTTP statuses fail immediately.
+`max_retries` is the number of retries after the initial request and must be at most `10`. A
+successful response body is limited to 1 MiB. Unauthenticated HTTP error bodies are limited to
+4 KiB, while authenticated response bodies are redacted.
+
+The default local engine and an OpenAI-compatible engine using model `bge-m3` share the fingerprint
+`bge-m3:1024`. On startup, an unchanged fingerprint preserves the existing vectors. A changed
+fingerprint atomically deletes old vectors, replaces existing embedding jobs, and queues one
+pending job for every active body chunk before the scheduler starts. Import and export still load
+the mandatory configuration and storage adapters, but use the deterministic stub internally and
+never contact the configured embedding service; import queues missing chunks for later processing
+by a normal server run.
+
+A blank retrieval query returns no results before embedding or storage access. Normal note saves
+reject blank content; if an import contains blank note content, it produces no chunks or embedding
+jobs. The System API exposes only `embedding_engine`, `embedding_model`, and
+`embedding_fingerprint` for the embedding backend—never the base URL, API-key
+environment-variable name, or secret.
+
 ### Filesystem attachments
 
 The filesystem attachment adapter stages a complete attachment set before the database
@@ -204,22 +249,12 @@ then manually repair or publish bytes or remove orphan data as appropriate. Erro
 logged, but there is no built-in retry or reconciliation command, worker, or durable outbox.
 Publication failure after database commit must not be treated as a database rollback.
 
-The following OpenAI-compatible embedding and S3 attachment values are parsed into typed active
-variants and receive basic active-variant checks now. Their full service, credential, connectivity,
-and operational validation is deferred until each adapter is activated by its implementation plan.
-A mode that needs one returns a precise “not implemented yet” error rather than silently falling
-back. Import and export deliberately use the stub embedder, so those modes parse OpenAI-compatible
-settings without constructing that reserved embedding adapter.
+The following S3 attachment values are parsed into a typed active variant and receive basic
+active-variant checks now. Full service, credential, connectivity, and operational validation is
+deferred until the S3 adapter is activated by its implementation plan. A mode that needs it returns
+a precise “not implemented yet” error rather than silently falling back.
 
 ```toml
-[embedding]
-engine = "openai"
-base_url = "http://embedding.example.invalid"
-model = "bge-m3"
-# api_key_env = "EMBEDDING_API_KEY"
-timeout_secs = 30
-max_retries = 3
-
 [attachments]
 engine = "s3"
 bucket = "agent-note-example"
@@ -229,18 +264,14 @@ prefix = "notes"
 force_path_style = false
 ```
 
-The corresponding fallbacks are `NOTE_EMBEDDING_BASE_URL`, `NOTE_EMBEDDING_MODEL`,
-`NOTE_EMBEDDING_API_KEY_ENV`,
-`NOTE_EMBEDDING_TIMEOUT_SECS`, and `NOTE_EMBEDDING_MAX_RETRIES`; and `NOTE_S3_BUCKET`,
-`NOTE_S3_PREFIX`, `AWS_REGION`, `NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE`.
-`api_key_env` names the environment variable that a future adapter will read; omitting it means no
-authentication. The self-hosted OpenAI-compatible adapter is designed to call `/v1/embeddings` with
-model `bge-m3`. S3 configuration is intended for S3-compatible object storage; it does not create
-the bucket.
+The corresponding fallbacks are `NOTE_S3_BUCKET`, `NOTE_S3_PREFIX`, `AWS_REGION`,
+`NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE`. S3 configuration is intended for S3-compatible
+object storage; it does not create the bucket.
 
 The System API reports backend-neutral `database_engine`, optional `database_path` and
-`database_size_bytes`, plus `attachments_engine` and optional `attachments_location`. It does not
-expose database credentials or embedding authentication.
+`database_size_bytes`, `attachments_engine` and optional `attachments_location`, plus the three
+safe embedding fields described above. It does not expose database credentials or embedding
+authentication.
 
 ## Exact hybrid retrieval
 
