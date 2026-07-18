@@ -1,6 +1,7 @@
 use note_storage_pg::PgStorage;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool};
+use std::io::Write;
 use url::Url;
 use uuid::Uuid;
 
@@ -10,7 +11,8 @@ pub fn configured_url_or_skip(test_name: &str) -> Option<String> {
     match std::env::var(TEST_DATABASE_URL_ENV) {
         Ok(url) => Some(url),
         Err(_) => {
-            eprintln!("skipping {test_name}: TEST_DATABASE_URL is not set");
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "skipping {test_name}: TEST_DATABASE_URL is not set");
             None
         }
     }
