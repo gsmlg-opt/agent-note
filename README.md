@@ -65,11 +65,16 @@ See `docs/design.md` for the full contracts and `docs/superpowers/` for the spec
    ```
    hf download gpahal/bge-m3-onnx-int8 --local-dir ./models/bge-m3-int8.onnx
    ```
-   The whole app runs without it using a deterministic stub embedder. Set
-   `embedding.model_path = "../models/bge-m3-int8.onnx/model_quantized.onnx"` in the generated
-   `dev-data/config.toml`, or use the `NOTE_MODEL_PATH` fallback, to use the real model. Embedding
-   inference uses all detected physical CPU cores by default; set `NOTE_EMBEDDING_THREADS` to a
-   positive integer to override it, or explicitly set it to `auto` to retain the default.
+   The whole app runs without it using a deterministic stub embedder. To use the real model, edit
+   the generated `dev-data/config.toml` so its embedding table is:
+   ```toml
+   [embedding]
+   engine = "local"
+   model_path = "../models/bge-m3-int8.onnx/model_quantized.onnx"
+   ```
+   `NOTE_MODEL_PATH` is the fallback when `model_path` is omitted. Embedding inference uses all
+   detected physical CPU cores by default; set `NOTE_EMBEDDING_THREADS` to a positive integer to
+   override it, or explicitly set it to `auto` to retain the default.
 
 ## Build & test
 
@@ -141,13 +146,20 @@ transaction, publishes it after the database commit, and aborts staged data when
 fails. Reads load bytes through the same adapter, and permanent deletion removes the note's
 attachment directory after deleting its database record. Its configured root must be exclusively
 owned by this agent-note process: external mutation, symlinks, and multiple writers are unsupported.
-The database and filesystem do not share one transaction, so a publication or cleanup error is
-reported rather than hidden.
+The database and attachment store do not share one transaction. Because the database commit
+precedes publication, a publication error can leave committed metadata referring to unavailable
+bytes or to the previous published bytes. A cleanup error after permanent database deletion can
+leave orphan attachment files or objects. These errors are returned or logged, but there is no
+automatic reconciliation worker or durable outbox; an operator must retry the failed action,
+repair publication, or remove orphan data as appropriate. Publication failure after database
+commit must not be treated as a database rollback.
 
-The following values are parsed and validated now but remain reserved until their adapter plans are
-implemented. A mode that needs one returns a precise “not implemented yet” error rather than
-silently falling back. Import and export deliberately use the stub embedder, so those modes load
-and validate OpenAI-compatible settings without constructing that reserved embedding adapter.
+The following reserved values are parsed into typed active variants and receive basic
+active-variant checks now. Full URL, service, credential, connectivity, and operational validation
+is deferred until each adapter is activated by its implementation plan. A mode that needs one
+returns a precise “not implemented yet” error rather than silently falling back. Import and export
+deliberately use the stub embedder, so those modes parse OpenAI-compatible settings without
+constructing that reserved embedding adapter.
 
 ```toml
 [database]
@@ -207,8 +219,9 @@ corpus. The planned PostgreSQL adapter keeps the same logical channels using tit
 cosine pgvector retrieval without changing pipeline or transport code.
 
 The adapter intentionally makes a clean break from databases created by the retired storage
-implementation. Current databases contain disposable test/development data, so delete and recreate
-them; no in-place legacy-data migration is guaranteed.
+implementation, and no in-place legacy-data migration is guaranteed. Delete and recreate only
+disposable test/development databases. Export or back up any non-disposable database before
+upgrading so its data can be recovered or imported deliberately.
 
 ## MCP
 

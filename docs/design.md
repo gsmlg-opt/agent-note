@@ -160,9 +160,12 @@ order:
 The reserved OpenAI-compatible adapter will call `/v1/embeddings` with model `bge-m3`;
 `api_key_env` is optional and omission means no authentication. The reserved PostgreSQL adapter
 will use title FTS and exact cosine pgvector search over dense content vectors. The reserved S3
-adapter targets S3-compatible object storage. These values are parsed now. A mode that constructs a
-reserved adapter returns a precise not-implemented error rather than silently falling back; import
-and export use the stub embedder and therefore do not construct the reserved embedding adapter.
+adapter targets S3-compatible object storage. Reserved values are parsed into typed active variants
+and receive basic active-variant checks now; full URL, service, credential, connectivity, and
+operational validation is deferred until the corresponding adapter activates. A mode that
+constructs a reserved adapter returns a precise not-implemented error rather than silently falling
+back; import and export use the stub embedder and therefore do not construct the reserved embedding
+adapter.
 
 The current filesystem attachment adapter stages a complete note set before the database
 transaction, publishes after commit, and aborts staging on database failure. Hydration and
@@ -170,6 +173,17 @@ single-object reads go through the adapter; permanent deletion removes attachmen
 the database record is deleted. Per-note operations are coordinated within the process. The root
 must be exclusively owned by one agent-note process, with no external mutation or symlinks, and
 filesystem publication cannot be atomically committed with the database transaction.
+
+The database commit precedes attachment publication. A publication error can therefore leave
+committed metadata referring to unavailable or previously published bytes; it cannot roll back the
+database commit. A cleanup error after permanent database deletion can leave orphan files or
+objects. Errors are returned or logged, but this design has no automatic reconciliation worker or
+durable outbox. Operators must retry the failed action, repair publication, or remove orphan data
+as appropriate.
+
+There is no guaranteed in-place migration from databases created by the retired storage
+implementation. Delete and recreate only disposable test/development databases. Export or back up
+non-disposable data before upgrading so recovery or deliberate import remains possible.
 
 ## 4. Embedding Pipeline (BGE-M3)
 
@@ -230,9 +244,10 @@ clients and the UI to populate suggestions and explain known keys.
 outside the database transaction → atomically persist the note, auto-created missing label keys,
 attached labels, chunk records, and durable embedding jobs → commit the database transaction →
 publish prepared attachments → return the persisted `Note`. A database failure aborts the prepared
-set. The embedding worker later claims each job, performs one dense inference call outside the
-database transaction, and atomically persists the dense body-chunk vector for the current chunk
-revision.
+set. A publication failure is returned after the database commit and may leave committed metadata
+referring to unavailable or previous bytes; it does not roll back that commit. The embedding worker
+later claims each job, performs one dense inference call outside the database transaction, and
+atomically persists the dense body-chunk vector for the current chunk revision.
 
 **search_notes**: embed the query once for exact dense content retrieval → request the title FTS
 ranking and dense note ranking → combine the two ranked ID lists with weighted RRF (pure function,
