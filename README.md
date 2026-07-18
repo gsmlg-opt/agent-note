@@ -4,9 +4,10 @@ Local-inference hybrid-search notes app. See `docs/design.md` for the full desig
 
 A Rust workspace: `note-core` (pure types/validation/RRF fusion), `note-storage` (backend-neutral
 repository contracts), `note-storage-turso` (embedded Rust Turso Database adapter with title FTS
-and exact dense retrieval), `note-embedding` (BGE-M3 via ONNX, with a deterministic stub for
-offline dev), `note-pipelines` (save/search workflows), `note-mcp` (MCP over stdio + Streamable
-HTTP), `note-server` (Axum REST + `/mcp`), and `note-frontend` (Yew/Wasm UI built with the
+and exact dense retrieval), `note-storage-pg` (external PostgreSQL adapter with title FTS and exact
+pgvector retrieval), `note-embedding` (BGE-M3 via ONNX, with a deterministic stub for offline
+dev), `note-pipelines` (save/search workflows), `note-mcp` (MCP over stdio + Streamable HTTP),
+`note-server` (Axum REST + `/mcp`), and `note-frontend` (Yew/Wasm UI built with the
 [`yew-duskmoon`](https://crates.io/crates/yew-duskmoon) component library).
 
 The frontend styling comes from the `@duskmoon-dev/core` design system, vendored as a prebuilt
@@ -28,6 +29,7 @@ note-core        pure: Note/Label/LabelKey types, input validation, RRF rank-fus
    ├── note-storage     backend-neutral repository/session/transaction contracts
    ├── note-storage-turso
    │                    Rust Turso Database: notes + labels, title FTS/BM25 + exact dense cosine
+   ├── note-storage-pg  PostgreSQL: notes + labels, title FTS/GIN + exact pgvector cosine
    ├── note-embedding   Embedder trait → StubEmbedder (offline) | OrtEmbedder (BGE-M3); semaphore backpressure
    ▲
 note-pipelines   Context + workflows that compose core/storage/embedding:
@@ -134,12 +136,49 @@ supported environment variable, then its built-in default. The active schemas an
 are:
 
 - `[database]`: `engine` (`NOTE_DB_ENGINE`, default `embed`); for `embed`, `path`
-  (`NOTE_DB_PATH`, default `notes.db`). The embedded adapter is Rust Turso Database.
+  (`NOTE_DB_PATH`, default `notes.db`); for `pg`, `url` (`DATABASE_URL`) and
+  `max_connections` (`NOTE_DB_MAX_CONNECTIONS`, default `10`). The embedded adapter is Rust Turso
+  Database.
 - `[embedding]`: `engine` (`NOTE_EMBEDDING_ENGINE`, default `local`); for `local`, optional
   `model_path` (`NOTE_MODEL_PATH`). No model path selects the deterministic stub; a path selects
   local BGE-M3 ONNX inference.
 - `[attachments]`: `engine` (`NOTE_ATTACHMENTS_ENGINE`, default `filesystem`); for `filesystem`,
   `path` (`NOTE_ATTACHMENTS_DIR`, default `attachments`).
+
+### PostgreSQL
+
+PostgreSQL is a complete external storage adapter. A mandatory configuration file selecting it can
+use:
+
+```toml
+[database]
+engine = "pg"
+url = "postgresql://user:password@db/agent_note"
+max_connections = 10
+
+[embedding]
+engine = "local"
+
+[attachments]
+engine = "filesystem"
+path = "attachments"
+```
+
+Before starting Agent Note, a PostgreSQL operator with extension-management privileges must install
+pgvector in the target database:
+
+```sql
+CREATE EXTENSION vector;
+```
+
+Agent Note verifies that `vector` is already installed and never runs `CREATE EXTENSION` itself.
+The configured application role needs the normal schema and migration privileges required to
+create and update Agent Note's tables and indexes. Title retrieval generates a `tsvector` with the
+PostgreSQL `simple` text-search configuration and indexes it with GIN. Dense retrieval performs an
+exact cosine-distance scan using `<=>` over `vector(1024)` body-chunk embeddings; it creates no ANN
+index. System information reports the `pg` engine but never the PostgreSQL URL or credentials.
+
+### Filesystem attachments
 
 The filesystem attachment adapter stages a complete attachment set before the database
 transaction, publishes it after the database commit, and aborts staged data when the transaction
@@ -156,19 +195,14 @@ then manually repair or publish bytes or remove orphan data as appropriate. Erro
 logged, but there is no built-in retry or reconciliation command, worker, or durable outbox.
 Publication failure after database commit must not be treated as a database rollback.
 
-The following reserved values are parsed into typed active variants and receive basic
-active-variant checks now. Full URL, service, credential, connectivity, and operational validation
-is deferred until each adapter is activated by its implementation plan. A mode that needs one
-returns a precise “not implemented yet” error rather than silently falling back. Import and export
-deliberately use the stub embedder, so those modes parse OpenAI-compatible settings without
-constructing that reserved embedding adapter.
+The following OpenAI-compatible embedding and S3 attachment values are parsed into typed active
+variants and receive basic active-variant checks now. Their full service, credential, connectivity,
+and operational validation is deferred until each adapter is activated by its implementation plan.
+A mode that needs one returns a precise “not implemented yet” error rather than silently falling
+back. Import and export deliberately use the stub embedder, so those modes parse OpenAI-compatible
+settings without constructing that reserved embedding adapter.
 
 ```toml
-[database]
-engine = "pg"
-url = "postgresql://agent-note@db.example.invalid/agent_note"
-max_connections = 10
-
 [embedding]
 engine = "openai"
 base_url = "http://embedding.example.invalid"
@@ -186,15 +220,14 @@ prefix = "notes"
 force_path_style = false
 ```
 
-The corresponding fallbacks are `DATABASE_URL` and `NOTE_DB_MAX_CONNECTIONS`;
-`NOTE_EMBEDDING_BASE_URL`, `NOTE_EMBEDDING_MODEL`, `NOTE_EMBEDDING_API_KEY_ENV`,
+The corresponding fallbacks are `NOTE_EMBEDDING_BASE_URL`, `NOTE_EMBEDDING_MODEL`,
+`NOTE_EMBEDDING_API_KEY_ENV`,
 `NOTE_EMBEDDING_TIMEOUT_SECS`, and `NOTE_EMBEDDING_MAX_RETRIES`; and `NOTE_S3_BUCKET`,
 `NOTE_S3_PREFIX`, `AWS_REGION`, `NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE`.
 `api_key_env` names the environment variable that a future adapter will read; omitting it means no
 authentication. The self-hosted OpenAI-compatible adapter is designed to call `/v1/embeddings` with
-model `bge-m3`. PostgreSQL is designed to use title FTS plus exact cosine search over 1,024-element
-pgvector content vectors. S3 configuration is intended for S3-compatible object storage; it does
-not create the bucket.
+model `bge-m3`. S3 configuration is intended for S3-compatible object storage; it does not create
+the bucket.
 
 The System API reports backend-neutral `database_engine`, optional `database_path` and
 `database_size_bytes`, plus `attachments_engine` and optional `attachments_location`. It does not
@@ -217,8 +250,8 @@ the larger fixed title pool bounds physical FTS work and makes ties deterministi
 
 Exact dense scanning avoids an approximate-index lifecycle and gives deterministic results; the
 accepted trade-off is linear dense-search cost, which is appropriate for the current personal-notes
-corpus. The planned PostgreSQL adapter keeps the same logical channels using title FTS and exact
-cosine pgvector retrieval without changing pipeline or transport code.
+corpus. The PostgreSQL adapter keeps the same logical channels using title FTS and exact cosine
+pgvector retrieval without changing pipeline or transport code.
 
 The adapter intentionally makes a clean break from databases created by the retired storage
 implementation, and no in-place legacy-data migration is guaranteed. Delete and recreate only

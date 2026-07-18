@@ -1,6 +1,8 @@
 # Design Doc: Local-Inference Hybrid-Search Notes App
 
-Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, Turso Database), Yew/Wasm frontend, MCP server. This doc specifies contracts and decisions; implementation details are left to the builder.
+Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, Turso Database, PostgreSQL
+with pgvector), Yew/Wasm frontend, MCP server. This doc specifies contracts and decisions;
+implementation details are left to the builder.
 
 ## 1. Design Philosophy
 
@@ -28,7 +30,7 @@ Handoff spec for implementation. Stack: Rust (Axum, ort/ONNX Runtime, Turso Data
            ▼                             ▼
   Embedding adapter                    Storage adapter
   local BGE-M3 ORT today;              Rust Turso Database today;
-  OpenAI-compatible reserved           PostgreSQL reserved
+  OpenAI-compatible reserved           PostgreSQL external adapter
                           │
                   Attachment adapter
                   filesystem today; S3 reserved
@@ -144,7 +146,7 @@ by an environment fallback. Each field resolves independently in file-over-envir
 order:
 
 - `[database]`: `engine` (`NOTE_DB_ENGINE`, default `embed`). Embedded Turso uses `path`
-  (`NOTE_DB_PATH`, default `notes.db`). Reserved PostgreSQL uses `url` (`DATABASE_URL`) and
+  (`NOTE_DB_PATH`, default `notes.db`). PostgreSQL uses `url` (`DATABASE_URL`) and
   `max_connections` (`NOTE_DB_MAX_CONNECTIONS`, default `10`).
 - `[embedding]`: `engine` (`NOTE_EMBEDDING_ENGINE`, default `local`). Local inference accepts
   optional `model_path` (`NOTE_MODEL_PATH`). Reserved OpenAI-compatible inference accepts
@@ -158,14 +160,28 @@ order:
   `NOTE_S3_PREFIX`, `AWS_REGION`, `NOTE_S3_ENDPOINT`, and `NOTE_S3_FORCE_PATH_STYLE` fallbacks.
 
 The reserved OpenAI-compatible adapter will call `/v1/embeddings` with model `bge-m3`;
-`api_key_env` is optional and omission means no authentication. The reserved PostgreSQL adapter
-will use title FTS and exact cosine pgvector search over dense content vectors. The reserved S3
-adapter targets S3-compatible object storage. Reserved values are parsed into typed active variants
-and receive basic active-variant checks now; full URL, service, credential, connectivity, and
+`api_key_env` is optional and omission means no authentication. The reserved S3 adapter targets
+S3-compatible object storage. Those reserved values are parsed into typed active variants and
+receive basic active-variant checks now; full URL, service, credential, connectivity, and
 operational validation is deferred until the corresponding adapter activates. A mode that
 constructs a reserved adapter returns a precise not-implemented error rather than silently falling
 back; import and export use the stub embedder and therefore do not construct the reserved embedding
 adapter.
+
+`note-storage-pg` is the complete external database adapter. Before Agent Note starts, the operator
+must provision pgvector in the selected database:
+
+```sql
+CREATE EXTENSION vector;
+```
+
+The application verifies the extension but never installs it. Its role needs normal privileges to
+run Agent Note's schema migrations and create or update its tables and indexes. The PostgreSQL
+schema stores title search data as
+`to_tsvector('simple'::regconfig, title)` and uses a GIN index. Body-chunk embeddings are
+`vector(1024)`, and dense retrieval orders exact cosine distance with `<=>`; there is no ANN index.
+Backend-neutral System information reports the `pg` engine without the database URL or
+credentials.
 
 The current filesystem attachment adapter stages a complete note set before the database
 transaction, publishes after commit, and aborts staging on database failure. Hydration and
@@ -205,10 +221,12 @@ non-disposable data before upgrading so recovery or deliberate import remains po
 ## 5. Retrieval Design
 
 Title FTS and dense content retrieval are independent queries, each producing a ranked note list.
-Rust Turso Database FTS ranks title matches with BM25. Dense retrieval performs an exact linear
+Rust Turso Database FTS ranks title matches with BM25. PostgreSQL title FTS uses its generated
+`simple`-configuration `tsvector` and GIN index. Both adapters perform an exact linear
 cosine-distance scan over body-chunk embeddings, grouping by note and using the closest chunk as
-that note's rank. The scores are not directly comparable, so fuse by weighted rank rather than raw
-score:
+that note's rank; PostgreSQL uses exact `<=>` over `vector(1024)` with no ANN index. The scores are
+not directly comparable, so the existing pipeline fuses the title and content-vector rankings by
+weighted rank rather than raw score:
 
 ```
 weighted_RRF(note) = Σ over retrievers r: weight_r / (60 + rank_r(note))
