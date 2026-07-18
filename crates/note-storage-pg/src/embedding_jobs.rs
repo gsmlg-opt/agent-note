@@ -9,46 +9,60 @@ use note_storage::{
 impl EmbeddingRepository for PgSession {
     async fn embedding_dashboard_status(&self) -> StorageResult<EmbeddingDashboardStatus> {
         let mut connection = self.connection().await?;
-        let embedded_note_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)
-             FROM notes n
-             WHERE n.deleted_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM note_chunks c
-                   WHERE c.note_id = n.id AND c.note_revision = n.note_revision
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM note_chunks c
-                   WHERE c.note_id = n.id
-                     AND (c.note_revision != n.note_revision OR c.status != 'embedded')
-               )",
+        let (embedded_note_count, processing_id, processing_title): (
+            i64,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "WITH embedded AS (
+                 SELECT COUNT(*) AS note_count
+                 FROM notes n
+                 WHERE n.deleted_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM note_chunks c
+                       WHERE c.note_id = n.id AND c.note_revision = n.note_revision
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM note_chunks c
+                       WHERE c.note_id = n.id
+                         AND (c.note_revision != n.note_revision OR c.status != 'embedded')
+                   )
+             ),
+             processing AS (
+                 SELECT n.id, n.title
+                 FROM embedding_jobs j
+                 JOIN notes n ON n.id = j.note_id
+                 WHERE j.status = 'processing' AND n.deleted_at IS NULL
+                 ORDER BY j.updated_at, j.id
+                 LIMIT 1
+             )
+             SELECT embedded.note_count, processing.id, processing.title
+             FROM embedded
+             LEFT JOIN processing ON TRUE",
         )
         .fetch_one(&mut *connection)
         .await
-        .map_err(|error| map_sqlx_error("query embedding dashboard count", error))?;
+        .map_err(|error| map_sqlx_error("query embedding dashboard status", error))?;
         let embedded_note_count = usize::try_from(embedded_note_count).map_err(|_| {
             StorageError::new(
                 StorageErrorKind::Operation,
                 "decode embedding dashboard count",
             )
         })?;
-
-        let processing_note: Option<(String, String)> = sqlx::query_as(
-            "SELECT n.id, n.title
-             FROM embedding_jobs j
-             JOIN notes n ON n.id = j.note_id
-             WHERE j.status = 'processing' AND n.deleted_at IS NULL
-             ORDER BY j.updated_at, j.id
-             LIMIT 1",
-        )
-        .fetch_optional(&mut *connection)
-        .await
-        .map_err(|error| map_sqlx_error("query processing embedding note", error))?;
+        let processing_note = match (processing_id, processing_title) {
+            (Some(id), Some(title)) => Some(ProcessingEmbeddingNote { id, title }),
+            (None, None) => None,
+            _ => {
+                return Err(StorageError::new(
+                    StorageErrorKind::Operation,
+                    "decode processing embedding note",
+                ));
+            }
+        };
 
         Ok(EmbeddingDashboardStatus {
             embedded_note_count,
-            processing_note: processing_note
-                .map(|(id, title)| ProcessingEmbeddingNote { id, title }),
+            processing_note,
         })
     }
 

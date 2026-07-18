@@ -1258,3 +1258,140 @@ async fn concurrent_embedding_claims_are_disjoint_and_complete() {
     second.commit().await.unwrap();
     database.cleanup(Some(&storage)).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dashboard_status_never_mixes_cross_session_snapshots() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+    use tokio::time::{timeout, Duration};
+
+    let Some(admin_url) =
+        configured_url_or_skip("dashboard_status_never_mixes_cross_session_snapshots")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    database.provision_vector().await;
+    let storage = PgStorage::connect(&database.url, 4)
+        .await
+        .expect("connect PostgreSQL storage");
+    let reader = storage.connect_session().await.unwrap();
+    reader
+        .insert_note(NewNote {
+            id: "dashboard-snapshot",
+            title: "Dashboard snapshot",
+            content: "content",
+            attachments: &[],
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    reader
+        .upsert_note_chunk(UpsertNoteChunk {
+            note_id: "dashboard-snapshot",
+            chunk_idx: 0,
+            content_hash: "snapshot",
+            content: "content",
+            note_revision: 1,
+            status: "embedded",
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    reader
+        .enqueue_embedding_job("dashboard-snapshot", 0, "snapshot", "content", 1, 1)
+        .await
+        .unwrap();
+
+    let writer_pool = database.inspect_pool().await;
+    sqlx::query("UPDATE embedding_jobs SET status = 'failed' WHERE note_id = $1")
+        .bind("dashboard-snapshot")
+        .execute(&writer_pool)
+        .await
+        .unwrap();
+    let initial = reader.embedding_dashboard_status().await.unwrap();
+    assert_eq!(
+        (initial.embedded_note_count, initial.processing_note),
+        (1, None)
+    );
+
+    let start = Arc::new(Barrier::new(2));
+    let stop = Arc::new(AtomicBool::new(false));
+    let transitions = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let start = start.clone();
+        let stop = stop.clone();
+        let transitions = transitions.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            let mut embedded = true;
+            while !stop.load(Ordering::Acquire) {
+                embedded = !embedded;
+                let mut transaction = writer_pool.begin().await.unwrap();
+                sqlx::query("UPDATE note_chunks SET status = $1 WHERE note_id = $2")
+                    .bind(if embedded { "embedded" } else { "pending" })
+                    .bind("dashboard-snapshot")
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "UPDATE embedding_jobs
+                     SET status = $1, updated_at = updated_at + 1
+                     WHERE note_id = $2",
+                )
+                .bind(if embedded { "failed" } else { "processing" })
+                .bind("dashboard-snapshot")
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+                transaction.commit().await.unwrap();
+                transitions.fetch_add(1, Ordering::Release);
+                tokio::task::yield_now().await;
+            }
+            writer_pool.close().await;
+        })
+    };
+
+    start.wait().await;
+    let transitions_before_reads = transitions.load(Ordering::Acquire);
+    let mut mixed_snapshot = None;
+    let mut saw_embedded = false;
+    let mut saw_processing = false;
+    for _ in 0..2_000 {
+        let status = reader.embedding_dashboard_status().await.unwrap();
+        let processing_id = status.processing_note.map(|processing| processing.id);
+        match (status.embedded_note_count, processing_id.as_deref()) {
+            (1, None) => saw_embedded = true,
+            (0, Some("dashboard-snapshot")) => saw_processing = true,
+            _ if mixed_snapshot.is_none() => {
+                mixed_snapshot = Some((status.embedded_note_count, processing_id));
+            }
+            _ => {}
+        }
+    }
+    let transitions_after_reads = transitions.load(Ordering::Acquire);
+    stop.store(true, Ordering::Release);
+    timeout(Duration::from_secs(10), writer)
+        .await
+        .expect("writer stops after reader completes")
+        .expect("writer task succeeds");
+    assert!(
+        transitions_after_reads > transitions_before_reads,
+        "writer must commit state transitions during dashboard reads"
+    );
+    assert!(
+        saw_embedded && saw_processing,
+        "reader must observe both coherent dashboard states"
+    );
+    assert_eq!(
+        mixed_snapshot, None,
+        "dashboard combined different database snapshots"
+    );
+
+    drop(reader);
+    database.cleanup(Some(&storage)).await.unwrap();
+}
