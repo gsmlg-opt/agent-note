@@ -249,6 +249,39 @@ async fn dense_search_deduplicates_chunks_to_note_ids() {
 }
 
 #[tokio::test]
+async fn dense_search_excludes_soft_deleted_notes_and_reuses_vectors_after_restore() {
+    let fixture = fixture().await;
+    insert_test_note(&fixture.session, "active").await;
+    insert_test_note(&fixture.session, "deleted").await;
+    fixture
+        .session
+        .insert_chunk_embedding("active", 0, &unit(1))
+        .await
+        .unwrap();
+    fixture
+        .session
+        .insert_chunk_embedding("deleted", 0, &unit(0))
+        .await
+        .unwrap();
+
+    fixture
+        .session
+        .soft_delete_note("deleted", 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.session.dense_search(&unit(0), 10).await.unwrap(),
+        vec!["active"]
+    );
+
+    fixture.session.restore_note("deleted", 2).await.unwrap();
+    assert_eq!(
+        fixture.session.dense_search(&unit(0), 10).await.unwrap(),
+        vec!["deleted", "active"]
+    );
+}
+
+#[tokio::test]
 async fn equal_dense_distances_use_note_id_order() {
     let fixture = fixture().await;
     insert_test_note(&fixture.session, "b").await;
