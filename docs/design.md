@@ -177,9 +177,11 @@ filesystem publication cannot be atomically committed with the database transact
 The database commit precedes attachment publication. A publication error can therefore leave
 committed metadata referring to unavailable or previously published bytes; it cannot roll back the
 database commit. A cleanup error after permanent database deletion can leave orphan files or
-objects. Errors are returned or logged, but this design has no automatic reconciliation worker or
-durable outbox. Operators must retry the failed action, repair publication, or remove orphan data
-as appropriate.
+objects. Callers must not blindly retry: create or update may already be committed, and retrying a
+create can duplicate it; a permanent-delete retry may return not found and cannot rerun attachment
+cleanup. Recovery requires inspecting committed database and object state, then manually repairing
+or publishing bytes or removing orphan data. Errors are returned or logged, but there is no
+built-in retry or reconciliation command, worker, or durable outbox.
 
 There is no guaranteed in-place migration from databases created by the retired storage
 implementation. Delete and recreate only disposable test/development databases. Export or back up

@@ -149,10 +149,12 @@ owned by this agent-note process: external mutation, symlinks, and multiple writ
 The database and attachment store do not share one transaction. Because the database commit
 precedes publication, a publication error can leave committed metadata referring to unavailable
 bytes or to the previous published bytes. A cleanup error after permanent database deletion can
-leave orphan attachment files or objects. These errors are returned or logged, but there is no
-automatic reconciliation worker or durable outbox; an operator must retry the failed action,
-repair publication, or remove orphan data as appropriate. Publication failure after database
-commit must not be treated as a database rollback.
+leave orphan attachment files or objects. Do not blindly retry: a create or update may already be
+committed, so retrying a create can duplicate it; retrying a permanent delete may return not found
+and cannot rerun attachment cleanup. Inspect the committed database and attachment-store state,
+then manually repair or publish bytes or remove orphan data as appropriate. Errors are returned or
+logged, but there is no built-in retry or reconciliation command, worker, or durable outbox.
+Publication failure after database commit must not be treated as a database rollback.
 
 The following reserved values are parsed into typed active variants and receive basic
 active-variant checks now. Full URL, service, credential, connectivity, and operational validation
