@@ -7,7 +7,7 @@ edition.workspace = true
 anyhow = "1.0.103"
 async-trait = "0.1.89"
 note-core = { version = "0.1.0", path = "../note-core" }
-tokio = { version = "1.52.3", features = ["fs", "sync"] }
+tokio = { version = "1.52.3", features = ["fs", "rt", "sync"] }
 uuid = { version = "1.23.4", features = ["v4"] }
 
 [dev-dependencies]

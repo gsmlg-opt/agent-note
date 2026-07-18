@@ -4,13 +4,14 @@ use crate::{
 };
 use note_core::NoteAttachment;
 use std::{
+    collections::HashMap,
     io::ErrorKind,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, Weak},
 };
 use tokio::{
     fs,
-    sync::{Mutex, OwnedMutexGuard},
+    sync::{Mutex as AsyncMutex, OwnedMutexGuard},
 };
 
 /// Filesystem-backed attachment storage.
@@ -22,7 +23,12 @@ use tokio::{
 #[derive(Clone)]
 pub struct FilesystemAttachmentStore {
     root: PathBuf,
-    coordination: Arc<Mutex<()>>,
+    coordination: Arc<NoteCoordination>,
+}
+
+#[derive(Default)]
+struct NoteCoordination {
+    locks: StdMutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>,
 }
 
 struct PreparedFilesystemSet {
@@ -39,6 +45,24 @@ struct DirectoryCleanupGuard {
 struct PublicationRollback {
     final_dir: PathBuf,
     backup_dir: Option<PathBuf>,
+    replacement_selected: bool,
+}
+
+impl NoteCoordination {
+    fn lock_for(&self, note_dir: &Path) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(note_dir).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(note_dir.to_path_buf(), Arc::downgrade(&lock));
+        lock
+    }
 }
 
 impl FilesystemAttachmentStore {
@@ -49,17 +73,16 @@ impl FilesystemAttachmentStore {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            coordination: Arc::new(Mutex::new(())),
+            coordination: Arc::new(NoteCoordination::default()),
         }
     }
 
-    async fn read_while_locked(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
-        let note_dir = note_directory(&self.root, note_id)?;
-        if !existing_safe_directory(&note_dir).await? {
+    async fn read_while_locked(&self, note_dir: &Path, path: &str) -> anyhow::Result<Vec<u8>> {
+        if !existing_safe_directory(note_dir).await? {
             anyhow::bail!("attachment note directory does not exist");
         }
-        let path_on_disk = canonical_attachment_path(&note_dir, path)?;
-        reject_symlink_components(&note_dir, path).await?;
+        let path_on_disk = canonical_attachment_path(note_dir, path)?;
+        reject_symlink_components(note_dir, path).await?;
         Ok(fs::read(path_on_disk).await?)
     }
 }
@@ -71,8 +94,8 @@ impl AttachmentStore for FilesystemAttachmentStore {
         note_id: &str,
         attachments: &[NoteAttachment],
     ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
-        let coordination_guard = self.coordination.clone().lock_owned().await;
         let final_dir = note_directory(&self.root, note_id)?;
+        let coordination_guard = self.coordination.lock_for(&final_dir).lock_owned().await;
         let metadata = attachments
             .iter()
             .map(|attachment| NoteAttachment {
@@ -126,8 +149,10 @@ impl AttachmentStore for FilesystemAttachmentStore {
     }
 
     async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
-        let _guard = self.coordination.lock().await;
-        self.read_while_locked(note_id, path).await
+        let note_dir = note_directory(&self.root, note_id)?;
+        let note_lock = self.coordination.lock_for(&note_dir);
+        let _guard = note_lock.lock().await;
+        self.read_while_locked(&note_dir, path).await
     }
 
     async fn hydrate(
@@ -135,16 +160,19 @@ impl AttachmentStore for FilesystemAttachmentStore {
         note_id: &str,
         attachments: &mut [NoteAttachment],
     ) -> anyhow::Result<()> {
-        let _guard = self.coordination.lock().await;
+        let note_dir = note_directory(&self.root, note_id)?;
+        let note_lock = self.coordination.lock_for(&note_dir);
+        let _guard = note_lock.lock().await;
         for attachment in attachments {
-            attachment.content = self.read_while_locked(note_id, &attachment.path).await?;
+            attachment.content = self.read_while_locked(&note_dir, &attachment.path).await?;
         }
         Ok(())
     }
 
     async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {
-        let _guard = self.coordination.lock().await;
         let note_dir = note_directory(&self.root, note_id)?;
+        let note_lock = self.coordination.lock_for(&note_dir);
+        let _guard = note_lock.lock().await;
         if existing_safe_directory(&note_dir).await? {
             remove_directory_if_present(&note_dir).await?;
         }
@@ -166,46 +194,10 @@ impl PreparedAttachmentSet for PreparedFilesystemSet {
     }
 
     async fn publish(self: Box<Self>) -> anyhow::Result<()> {
-        let Self {
-            final_dir,
-            mut staging,
-            metadata: _,
-            _coordination_guard,
-        } = *self;
-        let backup_dir = final_dir.with_file_name(format!(
-            ".{}-{}.backup",
-            final_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("attachments"),
-            uuid::Uuid::new_v4()
-        ));
-        let mut rollback = PublicationRollback::new(final_dir.clone());
-
-        if existing_safe_directory(&final_dir).await? {
-            fs::rename(&final_dir, &backup_dir).await?;
-            rollback.arm(backup_dir);
-        }
-
-        if let Some(staging) = staging.as_mut() {
-            if let Err(promotion_error) = fs::rename(staging.path(), &final_dir).await {
-                let cleanup_error = staging.cleanup().await.err();
-                let restore_error = rollback.restore().await.err();
-                return Err(publication_error(
-                    promotion_error,
-                    cleanup_error,
-                    restore_error,
-                ));
-            }
-            staging.disarm();
-        }
-
-        if let Some(backup_dir) = rollback.release() {
-            let mut obsolete_backup = DirectoryCleanupGuard::new(backup_dir);
-            obsolete_backup.cleanup().await?;
-        }
-        drop(_coordination_guard);
-        Ok(())
+        let prepared = *self;
+        tokio::task::spawn_blocking(move || publish_blocking(prepared))
+            .await
+            .map_err(|error| anyhow::anyhow!("attachment publication task failed: {error}"))?
     }
 
     async fn abort(self: Box<Self>) -> anyhow::Result<()> {
@@ -221,6 +213,56 @@ impl PreparedAttachmentSet for PreparedFilesystemSet {
         drop(_coordination_guard);
         Ok(())
     }
+}
+
+fn publish_blocking(prepared: PreparedFilesystemSet) -> anyhow::Result<()> {
+    let PreparedFilesystemSet {
+        final_dir,
+        mut staging,
+        metadata: _,
+        _coordination_guard,
+    } = prepared;
+    let backup_dir = final_dir.with_file_name(format!(
+        ".{}-{}.backup",
+        final_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachments"),
+        uuid::Uuid::new_v4()
+    ));
+    let mut rollback = PublicationRollback::new(final_dir.clone());
+
+    if existing_safe_directory_blocking(&final_dir)? {
+        std::fs::rename(&final_dir, &backup_dir)?;
+        rollback.arm(backup_dir);
+        #[cfg(test)]
+        pause_publication(&final_dir, PublicationPhase::AfterBackup);
+    }
+
+    if let Some(staging) = staging.as_mut() {
+        if let Err(promotion_error) = std::fs::rename(staging.path(), &final_dir) {
+            let cleanup_error = staging.cleanup_blocking().err();
+            let restore_error = rollback.restore_blocking().err();
+            return Err(publication_error(
+                promotion_error,
+                cleanup_error,
+                restore_error,
+            ));
+        }
+        staging.disarm();
+        rollback.mark_replacement_selected();
+        #[cfg(test)]
+        pause_publication(&final_dir, PublicationPhase::AfterPromotion);
+    } else {
+        rollback.mark_replacement_selected();
+    }
+
+    if let Some(backup_dir) = rollback.release() {
+        let mut obsolete_backup = DirectoryCleanupGuard::new(backup_dir);
+        obsolete_backup.cleanup_blocking()?;
+    }
+    drop(_coordination_guard);
+    Ok(())
 }
 
 impl DirectoryCleanupGuard {
@@ -243,6 +285,14 @@ impl DirectoryCleanupGuard {
         }
         Ok(())
     }
+
+    fn cleanup_blocking(&mut self) -> anyhow::Result<()> {
+        if let Some(path) = self.path.as_deref() {
+            remove_directory_if_present_blocking(path)?;
+            self.disarm();
+        }
+        Ok(())
+    }
 }
 
 impl Drop for DirectoryCleanupGuard {
@@ -258,6 +308,7 @@ impl PublicationRollback {
         Self {
             final_dir,
             backup_dir: None,
+            replacement_selected: false,
         }
     }
 
@@ -265,12 +316,16 @@ impl PublicationRollback {
         self.backup_dir = Some(backup_dir);
     }
 
-    async fn restore(&mut self) -> anyhow::Result<()> {
+    fn restore_blocking(&mut self) -> anyhow::Result<()> {
         if let Some(backup_dir) = self.backup_dir.as_deref() {
-            fs::rename(backup_dir, &self.final_dir).await?;
+            std::fs::rename(backup_dir, &self.final_dir)?;
             self.backup_dir = None;
         }
         Ok(())
+    }
+
+    fn mark_replacement_selected(&mut self) {
+        self.replacement_selected = true;
     }
 
     fn release(&mut self) -> Option<PathBuf> {
@@ -283,7 +338,9 @@ impl Drop for PublicationRollback {
         let Some(backup_dir) = self.backup_dir.take() else {
             return;
         };
-        if !self.final_dir.exists() {
+        if self.replacement_selected {
+            let _ = std::fs::remove_dir_all(backup_dir);
+        } else if !self.final_dir.exists() {
             let _ = std::fs::rename(backup_dir, &self.final_dir);
         }
     }
@@ -291,6 +348,20 @@ impl Drop for PublicationRollback {
 
 async fn existing_safe_directory(path: &Path) -> anyhow::Result<bool> {
     match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("attachment directory must not be a symlink")
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            anyhow::bail!("attachment directory must be a directory")
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn existing_safe_directory_blocking(path: &Path) -> anyhow::Result<bool> {
+    match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             anyhow::bail!("attachment directory must not be a symlink")
         }
@@ -333,6 +404,14 @@ async fn remove_directory_if_present(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+fn remove_directory_if_present_blocking(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn publication_error(
     promotion_error: std::io::Error,
     cleanup_error: Option<anyhow::Error>,
@@ -348,4 +427,185 @@ fn publication_error(
         ));
     }
     anyhow::anyhow!(message)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationPhase {
+    AfterBackup,
+    AfterPromotion,
+}
+
+#[cfg(test)]
+struct PublicationPause {
+    final_dir: PathBuf,
+    phase: PublicationPhase,
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+fn publication_pauses() -> &'static StdMutex<Vec<PublicationPause>> {
+    static PAUSES: std::sync::OnceLock<StdMutex<Vec<PublicationPause>>> =
+        std::sync::OnceLock::new();
+    PAUSES.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn install_publication_pause(
+    final_dir: PathBuf,
+    phase: PublicationPhase,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (reached_sender, reached_receiver) = tokio::sync::oneshot::channel();
+    let (resume_sender, resume_receiver) = std::sync::mpsc::channel();
+    publication_pauses()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(PublicationPause {
+            final_dir,
+            phase,
+            reached: reached_sender,
+            resume: resume_receiver,
+        });
+    (reached_receiver, resume_sender)
+}
+
+#[cfg(test)]
+fn pause_publication(final_dir: &Path, phase: PublicationPhase) {
+    let pause = {
+        let mut pauses = publication_pauses()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pauses
+            .iter()
+            .position(|pause| pause.final_dir == final_dir && pause.phase == phase)
+            .map(|index| pauses.swap_remove(index))
+    };
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        let _ = pause.resume.recv();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn attachment(content: &[u8]) -> NoteAttachment {
+        NoteAttachment {
+            id: "file".to_string(),
+            path: "./file.txt".to_string(),
+            mime: "text/plain".to_string(),
+            description: String::new(),
+            content: content.to_vec(),
+        }
+    }
+
+    fn staging_directory(root: &Path) -> PathBuf {
+        std::fs::read_dir(root)
+            .expect("read attachment root")
+            .map(|entry| entry.expect("read directory entry").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".tmp"))
+            })
+            .expect("staging directory")
+    }
+
+    fn assert_only_final_directory(root: &Path, final_dir: &Path) {
+        let entries = std::fs::read_dir(root)
+            .expect("read attachment root")
+            .map(|entry| entry.expect("read directory entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![final_dir]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_backup_finishes_rollback_on_failed_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("attachments");
+        let final_dir = root.join("note-1");
+        let store = FilesystemAttachmentStore::new(root.clone());
+        store
+            .prepare("note-1", &[attachment(b"old")])
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap();
+        let prepared = store
+            .prepare("note-1", &[attachment(b"new")])
+            .await
+            .unwrap();
+        let staging = staging_directory(&root);
+        let (reached, resume) =
+            install_publication_pause(final_dir.clone(), PublicationPhase::AfterBackup);
+        let publication = tokio::spawn(async move { prepared.publish().await });
+
+        tokio::time::timeout(Duration::from_secs(2), reached)
+            .await
+            .expect("publication must reach backup phase")
+            .expect("publication pause sender");
+        std::fs::remove_dir_all(staging).unwrap();
+        publication.abort();
+        let join_error = publication
+            .await
+            .expect_err("outer publication task must be cancelled");
+        assert!(join_error.is_cancelled());
+        resume.send(()).expect("resume publication");
+
+        let content =
+            tokio::time::timeout(Duration::from_secs(2), store.read("note-1", "./file.txt"))
+                .await
+                .expect("rollback must release note lock")
+                .unwrap();
+        assert_eq!(content, b"old");
+        assert_only_final_directory(&root, &final_dir);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_promotion_finishes_backup_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("attachments");
+        let final_dir = root.join("note-1");
+        let store = FilesystemAttachmentStore::new(root.clone());
+        store
+            .prepare("note-1", &[attachment(b"old")])
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap();
+        let prepared = store
+            .prepare("note-1", &[attachment(b"new")])
+            .await
+            .unwrap();
+        let (reached, resume) =
+            install_publication_pause(final_dir.clone(), PublicationPhase::AfterPromotion);
+        let publication = tokio::spawn(async move { prepared.publish().await });
+
+        tokio::time::timeout(Duration::from_secs(2), reached)
+            .await
+            .expect("publication must reach promotion phase")
+            .expect("publication pause sender");
+        publication.abort();
+        let join_error = publication
+            .await
+            .expect_err("outer publication task must be cancelled");
+        assert!(join_error.is_cancelled());
+        resume.send(()).expect("resume publication");
+
+        let content =
+            tokio::time::timeout(Duration::from_secs(2), store.read("note-1", "./file.txt"))
+                .await
+                .expect("cleanup must release note lock")
+                .unwrap();
+        assert_eq!(content, b"new");
+        assert_only_final_directory(&root, &final_dir);
+    }
 }

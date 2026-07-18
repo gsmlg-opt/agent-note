@@ -203,7 +203,7 @@ async fn empty_attachment_set_replaces_old_set_with_no_files() {
 }
 
 #[tokio::test]
-async fn concurrent_prepare_waits_until_the_first_set_is_resolved() {
+async fn concurrent_prepare_for_the_same_note_waits_until_the_first_set_is_resolved() {
     let dir = tempfile::tempdir().unwrap();
     let store = FilesystemAttachmentStore::new(dir.path().join("attachments"));
     let first = store
@@ -213,7 +213,7 @@ async fn concurrent_prepare_waits_until_the_first_set_is_resolved() {
     let second_store = store.clone();
     let mut second = tokio::spawn(async move {
         second_store
-            .prepare("note-2", &[attachment("./second.txt", b"second")])
+            .prepare("note-1", &[attachment("./second.txt", b"second")])
             .await
     });
 
@@ -223,6 +223,27 @@ async fn concurrent_prepare_waits_until_the_first_set_is_resolved() {
 
     first.abort().await.unwrap();
     second.await.unwrap().unwrap().abort().await.unwrap();
+}
+
+#[tokio::test]
+async fn prepared_sets_for_different_notes_can_coexist() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FilesystemAttachmentStore::new(dir.path().join("attachments"));
+    let first = store
+        .prepare("note-1", &[attachment("./first.txt", b"first")])
+        .await
+        .unwrap();
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(1),
+        store.prepare("note-2", &[attachment("./second.txt", b"second")]),
+    )
+    .await
+    .expect("different note preparation must not block")
+    .unwrap();
+
+    first.abort().await.unwrap();
+    second.abort().await.unwrap();
 }
 
 #[tokio::test]
