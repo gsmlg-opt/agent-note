@@ -794,6 +794,40 @@ path = "winner-attachments"
     }
 
     #[test]
+    fn config_example_is_valid_and_documents_every_file_option() {
+        let contents = include_str!("../../../config.example.toml");
+        parse_file_config(contents, Path::new("config.example.toml")).unwrap();
+
+        for option in [
+            "bind_addr",
+            "engine",
+            "path",
+            "url",
+            "max_connections",
+            "model_path",
+            "base_url",
+            "model",
+            "api_key_env",
+            "timeout_secs",
+            "max_retries",
+            "bucket",
+            "prefix",
+            "region",
+            "endpoint",
+            "force_path_style",
+        ] {
+            assert!(
+                contents.lines().any(|line| {
+                    line.trim_start_matches([' ', '#'])
+                        .trim_start()
+                        .starts_with(&format!("{option} ="))
+                }),
+                "config.example.toml does not document {option}"
+            );
+        }
+    }
+
+    #[test]
     fn concurrent_generation_accepts_one_atomic_winner() {
         const THREADS: usize = 16;
         let dir = tempfile::tempdir().unwrap();

@@ -144,6 +144,9 @@ engine = "filesystem"
 path = "attachments"
 ```
 
+See [`config.example.toml`](config.example.toml) for every supported option, environment fallback,
+default, and adapter-specific example.
+
 The HTTP bind address independently uses `server.bind_addr`, then `NOTE_BIND_ADDR`, then
 `0.0.0.0:6222`. The default exposes the REST API and `/mcp` on every network interface; run it only
 on a trusted network or protect it with an authenticating reverse proxy.

@@ -1,0 +1,83 @@
+# Agent Note runtime configuration example.
+#
+# Copy this file to dev-data/config.toml, or set NOTE_CONFIG_PATH to select a
+# different path. For each option, the TOML value wins over its environment
+# fallback. Relative paths are resolved from the config file's directory.
+
+[server]
+# HTTP address for the REST API, frontend assets, and Streamable HTTP MCP.
+# Environment fallback: NOTE_BIND_ADDR. Default: 0.0.0.0:6222.
+bind_addr = "0.0.0.0:6222"
+
+[database]
+# Storage engine: "embed" (embedded Turso) or "pg" (PostgreSQL).
+# Environment fallback: NOTE_DB_ENGINE. Default: "embed".
+engine = "embed"
+
+# Embedded Turso database path. Used only when engine = "embed".
+# Environment fallback: NOTE_DB_PATH. Default: "notes.db".
+path = "notes.db"
+
+# PostgreSQL options. To use them, comment the embedded engine/path above,
+# uncomment these lines, and set engine = "pg".
+# engine = "pg"
+# url = "postgresql://user:password@db/agent_note"
+# max_connections = 10
+#
+# url environment fallback: DATABASE_URL. Required for "pg".
+# max_connections environment fallback: NOTE_DB_MAX_CONNECTIONS.
+# max_connections default: 10; it must be greater than zero.
+
+[embedding]
+# Embedding engine: "local" or "openai".
+# Environment fallback: NOTE_EMBEDDING_ENGINE. Default: "local".
+engine = "local"
+
+# Optional BGE-M3 ONNX model path for the local engine.
+# Environment fallback: NOTE_MODEL_PATH.
+# Omit it to use the deterministic development stub.
+# model_path = "models/bge-m3.onnx"
+
+# OpenAI-compatible embedding options. To use them, comment engine = "local",
+# uncomment these lines, and set engine = "openai".
+# engine = "openai"
+# base_url = "http://embedding.internal:8000"
+# model = "bge-m3"
+# api_key_env = "EMBEDDING_API_KEY"
+# timeout_secs = 30
+# max_retries = 3
+#
+# base_url environment fallback: NOTE_EMBEDDING_BASE_URL. Required for "openai".
+# model environment fallback: NOTE_EMBEDDING_MODEL. Default: "bge-m3".
+# api_key_env environment fallback: NOTE_EMBEDDING_API_KEY_ENV. Optional; this
+# names the environment variable containing the token, never the token itself.
+# timeout_secs environment fallback: NOTE_EMBEDDING_TIMEOUT_SECS. Default: 30;
+# it must be greater than zero.
+# max_retries environment fallback: NOTE_EMBEDDING_MAX_RETRIES. Default: 3;
+# valid range: 0 through 10.
+
+[attachments]
+# Attachment engine: "filesystem" or "s3".
+# Environment fallback: NOTE_ATTACHMENTS_ENGINE. Default: "filesystem".
+engine = "filesystem"
+
+# Filesystem attachment root. Used only when engine = "filesystem".
+# Environment fallback: NOTE_ATTACHMENTS_DIR. Default: "attachments".
+path = "attachments"
+
+# S3 options. To use them, comment the filesystem engine/path above,
+# uncomment these lines, and set engine = "s3".
+# engine = "s3"
+# bucket = "agent-note"
+# prefix = "attachments"
+# region = "us-east-1"
+# endpoint = "http://127.0.0.1:9000"
+# force_path_style = true
+#
+# bucket environment fallback: NOTE_S3_BUCKET. Required for "s3".
+# prefix environment fallback: NOTE_S3_PREFIX. Default: empty.
+# region environment fallback: AWS_REGION. Optional.
+# endpoint environment fallback: NOTE_S3_ENDPOINT. Optional; omit for AWS S3.
+# force_path_style environment fallback: NOTE_S3_FORCE_PATH_STYLE.
+# Default: false. S3 credentials use the standard AWS credential provider
+# chain and must not be stored in this file.
