@@ -3,16 +3,16 @@ use text_splitter::MarkdownSplitter;
 pub const CHUNK_CAPACITY_CHARS: usize = 1000;
 
 pub fn chunk_content(content: &str) -> Vec<String> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+
     let chunks: Vec<String> = MarkdownSplitter::new(CHUNK_CAPACITY_CHARS)
         .chunks(content)
         .map(str::to_string)
         .collect();
 
-    if chunks.is_empty() {
-        vec![content.to_string()]
-    } else {
-        chunks
-    }
+    chunks
 }
 
 #[cfg(test)]
@@ -35,5 +35,11 @@ mod tests {
     #[test]
     fn short_markdown_yields_one_chunk() {
         assert_eq!(chunk_content("# Heading\n\nShort body.").len(), 1);
+    }
+
+    #[test]
+    fn blank_markdown_yields_no_chunks() {
+        assert!(chunk_content("").is_empty());
+        assert!(chunk_content(" \n\t\r\n").is_empty());
     }
 }

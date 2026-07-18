@@ -3,10 +3,12 @@ use note_core::Note;
 
 pub async fn get_note(ctx: &Context, id: &str) -> anyhow::Result<Option<Note>> {
     let session = ctx.storage().session().await?;
-    let Some(mut note) = session.get_note(id).await? else {
+    let note = session.get_note(id).await?;
+    drop(session);
+    let Some(mut note) = note else {
         return Ok(None);
     };
-    crate::attachment_files::hydrate_note_attachments(ctx, &mut note)?;
+    crate::hydrate_note_attachments(ctx, &mut note).await?;
     Ok(Some(note))
 }
 

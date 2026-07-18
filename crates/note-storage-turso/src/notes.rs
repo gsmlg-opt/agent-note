@@ -300,7 +300,7 @@ impl NotesRepository for TursoSession {
             .to_string();
         let mut params = Vec::<turso::Value>::new();
 
-        sql.push_str(" ORDER BY created_at DESC");
+        sql.push_str(" ORDER BY created_at DESC, id ASC");
         if selectors.is_empty() && (limit.is_some() || offset.is_some()) {
             sql.push_str(" LIMIT ? OFFSET ?");
             params.push(limit.unwrap_or(-1).into());
@@ -348,7 +348,7 @@ impl NotesRepository for TursoSession {
             .query(
                 "SELECT id, title, content, attachments, created_at, updated_at, deleted_at
                  FROM notes
-                 ORDER BY created_at DESC",
+                 ORDER BY created_at DESC, id ASC",
                 (),
             )
             .await
@@ -390,7 +390,7 @@ impl NotesRepository for TursoSession {
             .to_string();
         let mut params = Vec::<turso::Value>::new();
 
-        sql.push_str(" ORDER BY created_at DESC");
+        sql.push_str(" ORDER BY created_at DESC, id ASC");
         if selectors.is_empty() && (limit.is_some() || offset.is_some()) {
             sql.push_str(" LIMIT ? OFFSET ?");
             params.push(limit.unwrap_or(-1).into());

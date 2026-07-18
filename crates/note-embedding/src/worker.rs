@@ -35,15 +35,16 @@ impl WorkerConfig {
     pub fn new(ipc_name: String) -> anyhow::Result<Self> {
         Ok(Self {
             ipc_name,
-            model_path: std::env::var("NOTE_MODEL_PATH")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
+            model_path: model_path_from_env_value(std::env::var_os("NOTE_MODEL_PATH")),
             queue_capacity: env_usize("NOTE_EMBEDDING_WORKER_QUEUE", 8),
             embedding_threads: embedding_threads_from_env()?,
             limits: WorkerLimits::default(),
         })
     }
+}
+
+pub(crate) fn model_path_from_env_value(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 #[derive(Clone)]
@@ -466,5 +467,26 @@ mod tests {
             let error = resolve_embedding_threads(Some(value), 16, 32).unwrap_err();
             assert!(error.to_string().contains("NOTE_EMBEDDING_THREADS"));
         }
+    }
+
+    #[test]
+    fn empty_native_model_path_is_absent() {
+        assert_eq!(
+            model_path_from_env_value(Some(std::ffi::OsString::new())),
+            None
+        );
+        assert_eq!(model_path_from_env_value(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_model_path_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let native = std::ffi::OsString::from_vec(b"/models/bge-\xff.onnx".to_vec());
+
+        let decoded = model_path_from_env_value(Some(native)).unwrap();
+
+        assert_eq!(decoded.as_os_str().as_bytes(), b"/models/bge-\xff.onnx");
     }
 }

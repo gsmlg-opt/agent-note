@@ -1,8 +1,11 @@
 mod support;
 
-use note_storage::{EmbeddingRepository, NewNote, NotesRepository, UpsertNoteChunk};
+use note_storage::{
+    EmbeddingRepository, NewNote, NotesRepository, RetrievalRepository, SettingsRepository,
+    StorageBackend, TransactionMode, UpsertNoteChunk,
+};
 use note_storage_turso::TursoSession;
-use support::{fixture, insert_test_note};
+use support::{fixture, insert_test_note, unit};
 
 async fn insert_named_note(session: &TursoSession, id: &str, title: &str) {
     session
@@ -453,4 +456,202 @@ async fn concurrent_claims_only_return_a_pending_job_once() {
     let second = second.unwrap();
 
     assert_eq!(first.len() + second.len(), 1);
+}
+
+#[tokio::test]
+async fn reset_embeddings_clears_vectors_and_replaces_jobs_for_active_chunks_only() {
+    let fixture = fixture().await;
+    insert_test_note(&fixture.session, "active").await;
+    insert_test_note(&fixture.session, "deleted").await;
+    add_chunk(&fixture.session, "active", 0, "embedded").await;
+    add_chunk(&fixture.session, "deleted", 0, "embedded").await;
+    fixture
+        .session
+        .soft_delete_note("deleted", 1500)
+        .await
+        .unwrap();
+    fixture
+        .session
+        .insert_chunk_embedding("active", 0, &unit(0))
+        .await
+        .unwrap();
+    fixture
+        .session
+        .insert_chunk_embedding("deleted", 0, &unit(1))
+        .await
+        .unwrap();
+    for note_id in ["active", "deleted"] {
+        fixture
+            .session
+            .enqueue_embedding_job(
+                note_id,
+                0,
+                &format!("{note_id}-0"),
+                "stale content",
+                1,
+                1600,
+            )
+            .await
+            .unwrap();
+    }
+    let old_jobs = fixture
+        .session
+        .claim_pending_embedding_jobs(10, 1700)
+        .await
+        .unwrap();
+    assert_eq!(old_jobs.len(), 2);
+    assert!(old_jobs.iter().all(|job| job.attempts == 1));
+    let old_job_ids = old_jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+
+    let queued = fixture
+        .session
+        .reset_embeddings_for_regeneration(2000)
+        .await
+        .unwrap();
+
+    assert_eq!(queued, 1);
+    assert!(!fixture
+        .session
+        .chunk_embedding_exists("active", 0)
+        .await
+        .unwrap());
+    assert!(!fixture
+        .session
+        .chunk_embedding_exists("deleted", 0)
+        .await
+        .unwrap());
+    let active_chunk = fixture
+        .session
+        .get_note_chunk("active", 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_chunk.status, "pending");
+    assert_eq!(active_chunk.updated_at, 2000);
+    let deleted_chunk = fixture
+        .session
+        .get_note_chunk("deleted", 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted_chunk.status, "embedded");
+    assert_eq!(deleted_chunk.updated_at, 1000);
+
+    let jobs = fixture
+        .session
+        .claim_pending_embedding_jobs(10, 2001)
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].note_id, "active");
+    assert_eq!(jobs[0].attempts, 1);
+    assert!(!old_job_ids.contains(&jobs[0].id));
+    assert!(fixture
+        .session
+        .claim_pending_embedding_jobs(10, 2002)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn rolling_back_embedding_reset_preserves_fingerprint_vector_and_jobs() {
+    let fixture = fixture().await;
+    insert_test_note(&fixture.session, "active").await;
+    add_chunk(&fixture.session, "active", 0, "embedded").await;
+    fixture
+        .session
+        .insert_chunk_embedding("active", 0, &unit(0))
+        .await
+        .unwrap();
+    fixture
+        .session
+        .enqueue_embedding_job("active", 0, "active-0", "old content", 1, 1000)
+        .await
+        .unwrap();
+    let old_job = fixture
+        .session
+        .claim_pending_embedding_jobs(1, 1100)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(old_job.attempts, 1);
+    fixture
+        .session
+        .set_embedding_fingerprint("old:bge-m3:1024")
+        .await
+        .unwrap();
+
+    let transaction = fixture
+        .storage
+        .begin(TransactionMode::Immediate)
+        .await
+        .unwrap();
+    assert_eq!(
+        transaction
+            .reset_embeddings_for_regeneration(2000)
+            .await
+            .unwrap(),
+        1
+    );
+    transaction
+        .set_embedding_fingerprint("new:bge-m3:1024")
+        .await
+        .unwrap();
+    assert_eq!(
+        transaction
+            .get_embedding_fingerprint()
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("new:bge-m3:1024")
+    );
+    assert!(!transaction
+        .chunk_embedding_exists("active", 0)
+        .await
+        .unwrap());
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(
+        fixture
+            .session
+            .get_embedding_fingerprint()
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old:bge-m3:1024")
+    );
+    assert!(fixture
+        .session
+        .chunk_embedding_exists("active", 0)
+        .await
+        .unwrap());
+    assert_eq!(
+        fixture
+            .session
+            .get_note_chunk("active", 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "embedded"
+    );
+    assert_eq!(
+        fixture
+            .session
+            .requeue_processing_embedding_jobs(2100)
+            .await
+            .unwrap(),
+        1
+    );
+    let preserved_job = fixture
+        .session
+        .claim_pending_embedding_jobs(10, 2200)
+        .await
+        .unwrap();
+    assert_eq!(preserved_job.len(), 1);
+    assert_eq!(preserved_job[0].id, old_job.id);
+    assert_eq!(preserved_job[0].attempts, 2);
+    assert_eq!(preserved_job[0].content, "old content");
 }

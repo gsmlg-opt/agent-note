@@ -92,13 +92,57 @@ mod tests {
     use axum::{body::Body, http::Request};
     use flate2::read::GzDecoder;
     use http_body_util::BodyExt;
+    use note_attachments::{FilesystemAttachmentStore, S3AttachmentConfig, S3AttachmentStore};
     use note_core::NoteAttachment;
-    use note_embedding::StubEmbedder;
-    use note_pipelines::{save_note, SaveNoteInput};
-    use note_storage::StorageBackend;
+    use note_embedding::{
+        EmbeddingBackendInfo, OpenAiCompatibleConfig, OpenAiCompatibleEmbedder, StubEmbedder,
+    };
+    use note_pipelines::{save_note, EmbeddingJobNotifier, SaveNoteInput};
+    use note_storage::{
+        BackendInfo, StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
+        StorageTransaction, TransactionMode,
+    };
     use note_storage_turso::TursoStorage;
-    use std::io::Read;
+    use std::{io::Read, time::Duration};
     use tower::ServiceExt;
+
+    struct InfoBackend {
+        _connection_url: String,
+    }
+
+    struct NoopNotifier;
+
+    impl EmbeddingJobNotifier for NoopNotifier {
+        fn wake(&self) {}
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for InfoBackend {
+        async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "session not used by system info",
+            ))
+        }
+
+        async fn begin(
+            &self,
+            _mode: TransactionMode,
+        ) -> StorageResult<Box<dyn StorageTransaction>> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "transaction not used by system info",
+            ))
+        }
+
+        async fn info(&self) -> StorageResult<BackendInfo> {
+            Ok(BackendInfo {
+                engine: "pg".into(),
+                location: None,
+                size_bytes: None,
+            })
+        }
+    }
 
     async fn test_app() -> (Router, Arc<Context>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -110,7 +154,9 @@ mod tests {
         let ctx = Arc::new(Context::new(
             storage,
             Arc::new(StubEmbedder),
-            dir.path().join("attachments"),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("attachments"),
+            )),
         ));
         (system_router().with_state(ctx.clone()), ctx, dir)
     }
@@ -191,10 +237,100 @@ mod tests {
         assert_eq!(info["database_engine"], "embed");
         assert!(info["database_path"].as_str().unwrap().ends_with("test.db"));
         assert!(info["database_size_bytes"].as_u64().unwrap() > 0);
-        assert!(info["attachments_path"]
+        assert_eq!(info["attachments_engine"], "filesystem");
+        assert!(info["attachments_location"]
             .as_str()
             .unwrap()
             .ends_with("attachments"));
+    }
+
+    #[tokio::test]
+    async fn info_reports_safe_s3_location_without_endpoint_or_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            TursoStorage::open(dir.path().join("test.db"))
+                .await
+                .unwrap(),
+        );
+        let attachments: Arc<dyn note_attachments::AttachmentStore> = Arc::new(
+            S3AttachmentStore::new(S3AttachmentConfig {
+                bucket: "agent-note".into(),
+                prefix: "attachments".into(),
+                region: Some("us-east-1".into()),
+                endpoint: Some("http://minio.internal:9000".into()),
+                force_path_style: true,
+            })
+            .await
+            .unwrap(),
+        );
+        let ctx = Arc::new(Context::new(storage, Arc::new(StubEmbedder), attachments));
+        let response = system_router()
+            .with_state(ctx)
+            .oneshot(request("GET", "/api/system/info", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(info["attachments_engine"], "s3");
+        assert_eq!(info["attachments_location"], "s3://agent-note/attachments");
+        let rendered = serde_json::to_string(&info).unwrap();
+        assert!(!rendered.contains("minio.internal"));
+        assert!(!rendered.contains("AWS_ACCESS_KEY_ID"));
+        assert!(!rendered.contains("AWS_SECRET_ACCESS_KEY"));
+        assert!(!rendered.contains("minioadmin"));
+    }
+
+    #[tokio::test]
+    async fn info_reports_pg_and_openai_without_local_fields_or_credentials() {
+        const PASSWORD: &str = "do-not-render-this-secret";
+        const BASE_URL: &str = "https://embedding.example/private";
+        const TOKEN: &str = "secret-token";
+        const API_KEY_ENV: &str = "EMBEDDING_API_KEY";
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(InfoBackend {
+            _connection_url: format!("postgresql://agent:{PASSWORD}@database/notes"),
+        });
+        let embedder = OpenAiCompatibleEmbedder::new(OpenAiCompatibleConfig {
+            base_url: BASE_URL.into(),
+            model: "bge-m3".into(),
+            bearer_token: Some(TOKEN.into()),
+            timeout: Duration::from_secs(1),
+            max_retries: 0,
+        })
+        .unwrap();
+        let ctx = Arc::new(Context::with_embedding_job_notifier(
+            storage,
+            Arc::new(embedder),
+            EmbeddingBackendInfo::openai("bge-m3"),
+            Arc::new(NoopNotifier),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("attachments"),
+            )),
+        ));
+        let app = system_router().with_state(ctx);
+
+        let response = app
+            .oneshot(request("GET", "/api/system/info", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(info["database_engine"], "pg");
+        assert!(info["database_path"].is_null());
+        assert!(info["database_size_bytes"].is_null());
+        assert_eq!(info["embedding_engine"], "openai");
+        assert_eq!(info["embedding_model"], "bge-m3");
+        assert_eq!(info["embedding_fingerprint"], "bge-m3:1024");
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!body.contains(PASSWORD));
+        assert!(!body.contains(BASE_URL));
+        assert!(!body.contains(TOKEN));
+        assert!(!body.contains(API_KEY_ENV));
+        assert!(!body.contains("authorization"));
     }
 
     #[tokio::test]

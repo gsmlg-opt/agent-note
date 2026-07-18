@@ -1,11 +1,233 @@
 mod support;
 
+use note_attachments::{
+    AttachmentStore, AttachmentStoreInfo, FilesystemAttachmentStore, PreparedAttachmentSet,
+};
 use note_core::NoteAttachment;
+use note_embedding::StubEmbedder;
 use note_pipelines::{
     define_label_key, delete_note, export_data, get_note, import_data, import_json, list_all_notes,
-    list_deleted_note_summaries, list_label_keys, save_note, SaveNoteInput,
+    list_deleted_note_summaries, list_label_keys, save_note, Context, SaveNoteInput,
 };
-use support::test_context;
+use note_storage::StorageBackend;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use support::{event_log, test_context, ControlledAttachmentStore, EventStorageBackend};
+
+struct CountingAttachmentStore {
+    inner: FilesystemAttachmentStore,
+    prepares: Mutex<HashMap<String, usize>>,
+}
+
+#[async_trait::async_trait]
+impl AttachmentStore for CountingAttachmentStore {
+    async fn prepare(
+        &self,
+        note_id: &str,
+        attachments: &[NoteAttachment],
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
+        *self
+            .prepares
+            .lock()
+            .unwrap()
+            .entry(note_id.to_string())
+            .or_default() += 1;
+        self.inner.prepare(note_id, attachments).await
+    }
+
+    async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.read(note_id, path).await
+    }
+
+    async fn hydrate(
+        &self,
+        note_id: &str,
+        attachments: &mut [NoteAttachment],
+    ) -> anyhow::Result<()> {
+        self.inner.hydrate(note_id, attachments).await
+    }
+
+    async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {
+        self.inner.remove_note(note_id).await
+    }
+
+    fn info(&self) -> AttachmentStoreInfo {
+        self.inner.info()
+    }
+}
+
+#[tokio::test]
+async fn import_batch_prepares_distinct_notes_that_coexist_and_skips_duplicate_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let attachments = Arc::new(CountingAttachmentStore {
+        inner: FilesystemAttachmentStore::new(dir.path().join("attachments")),
+        prepares: Mutex::new(HashMap::new()),
+    });
+    let ctx = Context::new(backend, Arc::new(StubEmbedder), attachments.clone());
+    let input = r#"{
+        "version": 2,
+        "label_keys": [],
+        "notes": [
+            {"id":"note-a","title":"A","content":"first","attachments":[{"id":"a","path":"a.txt","mime":"text/plain","content":"a"}],"created_at":1,"updated_at":1,"labels":[]},
+            {"id":"note-b","title":"B","content":"second","attachments":[{"id":"b","path":"b.txt","mime":"text/plain","content":"b"}],"created_at":1,"updated_at":1,"labels":[]},
+            {"id":"note-a","title":"duplicate","content":"skip","attachments":[{"id":"duplicate","path":"duplicate.txt","mime":"text/plain","content":"duplicate"}],"created_at":1,"updated_at":1,"labels":[]}
+        ]
+    }"#;
+
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(2), import_json(&ctx, input))
+        .await
+        .expect("distinct prepared sets must coexist without a duplicate-ID lock")
+        .unwrap();
+
+    assert_eq!(stats.notes_added, 2);
+    assert_eq!(stats.notes_skipped, 1);
+    let prepares = attachments.prepares.lock().unwrap();
+    assert_eq!(prepares.get("note-a"), Some(&1));
+    assert_eq!(prepares.get("note-b"), Some(&1));
+}
+
+async fn controlled_import_context() -> (
+    Context,
+    Arc<ControlledAttachmentStore>,
+    support::EventLog,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let raw_backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let events = event_log();
+    let backend: Arc<dyn StorageBackend> =
+        Arc::new(EventStorageBackend::new(raw_backend, events.clone()));
+    let attachments = Arc::new(ControlledAttachmentStore::new(
+        backend.clone(),
+        events.clone(),
+    ));
+    let ctx = Context::new(backend, Arc::new(StubEmbedder), attachments.clone());
+    (ctx, attachments, events, dir)
+}
+
+#[tokio::test]
+async fn import_precommit_error_rolls_back_then_aborts_every_prepared_set() {
+    let (ctx, _attachments, events, _dir) = controlled_import_context().await;
+    let input = r#"{
+        "version": 2,
+        "label_keys": [{"key":"invalid","description":"","value_type":"not-a-type"}],
+        "notes": [
+            {"id":"note-a","title":"A","content":"first","attachments":[],"created_at":1,"updated_at":1,"labels":[]},
+            {"id":"note-b","title":"B","content":"second","attachments":[],"created_at":1,"updated_at":1,"labels":[]}
+        ]
+    }"#;
+
+    let error = import_json(&ctx, input).await.unwrap_err();
+
+    assert!(error.to_string().contains("invalid label value type"));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            String::from("prepare:note-a:missing"),
+            String::from("prepare:note-b:missing"),
+            String::from("begin"),
+            String::from("rollback"),
+            String::from("abort:note-a:marker=false"),
+            String::from("abort:note-b:marker=false"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn import_race_aborts_the_skipped_candidate_only_after_commit() {
+    let (ctx, attachments, events, _dir) = controlled_import_context().await;
+    attachments.race_note_on_prepare("race-note");
+    attachments.observe_committed_label_on_abort("committed-marker");
+    let input = r#"{
+        "version": 2,
+        "label_keys": [{"key":"committed-marker","description":"","value_type":"text"}],
+        "notes": [
+            {"id":"race-note","title":"Imported","content":"skip after recheck","attachments":[],"created_at":1,"updated_at":1,"labels":[]}
+        ]
+    }"#;
+
+    let stats = import_json(&ctx, input).await.unwrap();
+
+    assert_eq!(stats.notes_added, 0);
+    assert_eq!(stats.notes_skipped, 1);
+    assert_eq!(stats.label_keys_added, 1);
+    let events = events.lock().unwrap();
+    assert_eq!(events[0], "prepare:race-note:missing");
+    assert_eq!(events[1], "begin");
+    assert_eq!(events[2], "commit");
+    assert_eq!(events[3], "abort:race-note:marker=true");
+}
+
+#[tokio::test]
+async fn cancelling_import_during_finalization_does_not_cancel_the_remaining_batch() {
+    let (ctx, attachments, events, _dir) = controlled_import_context().await;
+    attachments.block_publish("note-a");
+    let mut import = Box::pin(import_json(
+        &ctx,
+        r#"{
+            "version": 2,
+            "label_keys": [],
+            "notes": [
+                {"id":"note-a","title":"A","content":"first","attachments":[],"created_at":1,"updated_at":1,"labels":[]},
+                {"id":"note-b","title":"B","content":"second","attachments":[],"created_at":1,"updated_at":1,"labels":[]},
+                {"id":"note-c","title":"C","content":"third","attachments":[],"created_at":1,"updated_at":1,"labels":[]}
+            ]
+        }"#,
+    ));
+
+    let blocked_publish = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        attachments.wait_for_blocked_publish(),
+    );
+    tokio::select! {
+        result = &mut import => panic!("import finished before blocked publication: {result:?}"),
+        result = blocked_publish => {
+            result.expect("first publication must start after the import transaction commits");
+        }
+    }
+    assert!(events.lock().unwrap().iter().any(|event| event == "commit"));
+    drop(import);
+    attachments.release_blocked_publish();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let published = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.starts_with("publish:"))
+                .count();
+            if published == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("detached finalization must publish every committed attachment set");
+
+    let events = events.lock().unwrap();
+    for note_id in ["note-a", "note-b", "note-c"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with(&format!("publish:{note_id}:")))
+                .count(),
+            1
+        );
+    }
+}
 
 #[tokio::test]
 async fn export_import_roundtrips_notes_and_label_keys() {
@@ -123,6 +345,38 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     assert_eq!(restored_plain.created_at, plain.created_at);
     assert_eq!(restored_plain.updated_at, plain.updated_at);
     assert!(restored_plain.labels.is_empty());
+}
+
+#[tokio::test]
+async fn blank_imported_content_creates_no_chunks_or_embedding_jobs() {
+    let (ctx, backend, _dir) = test_context().await;
+    let input = r#"{
+        "version": 2,
+        "label_keys": [],
+        "notes": [{
+            "id": "blank-legacy",
+            "title": "Title only",
+            "content": " \n\t",
+            "attachments": [],
+            "created_at": 1000,
+            "updated_at": 1000,
+            "labels": []
+        }]
+    }"#;
+
+    let stats = import_json(&ctx, input).await.unwrap();
+    assert_eq!(stats.embedding_jobs_queued, 0);
+    let session = backend.session().await.unwrap();
+    assert!(session
+        .list_note_chunks("blank-legacy")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(session
+        .claim_pending_embedding_jobs(10, chrono::Utc::now().timestamp())
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

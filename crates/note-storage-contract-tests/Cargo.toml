@@ -1,0 +1,10 @@
+[package]
+name = "note-storage-contract-tests"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+note-core = { path = "../note-core" }
+note-storage = { path = "../note-storage" }
+tokio = { version = "1.52.3", features = ["time"] }

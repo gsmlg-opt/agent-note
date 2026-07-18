@@ -3,7 +3,33 @@ mod support;
 use note_pipelines::{
     drain_embedding_jobs, save_note, search_notes, search_notes_filtered, SaveNoteInput,
 };
+use std::sync::Arc;
 use support::test_context;
+
+struct PanicEmbedder;
+
+#[async_trait::async_trait]
+impl note_embedding::Embedder for PanicEmbedder {
+    async fn embed(&self, _text: &str) -> anyhow::Result<note_embedding::DenseVector> {
+        panic!("blank retrieval must not call the embedder")
+    }
+}
+
+#[tokio::test]
+async fn blank_query_returns_no_results_without_embedding() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn note_storage::StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let attachments: Arc<dyn note_attachments::AttachmentStore> = Arc::new(
+        note_attachments::FilesystemAttachmentStore::new(dir.path().join("attachments")),
+    );
+    let ctx = note_pipelines::Context::new(storage, Arc::new(PanicEmbedder), attachments);
+
+    assert!(search_notes(&ctx, " \n\t", 10).await.unwrap().is_empty());
+}
 
 #[tokio::test]
 async fn search_returns_saved_notes_with_fused_scores() {

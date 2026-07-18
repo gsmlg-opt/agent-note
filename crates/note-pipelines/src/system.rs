@@ -1,14 +1,17 @@
 use crate::Context;
 use note_core::{validate_system_config, SystemConfig};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SystemInfo {
     pub database_engine: String,
     pub database_path: Option<String>,
     pub database_size_bytes: Option<u64>,
-    pub attachments_path: String,
+    pub attachments_engine: String,
+    pub attachments_location: Option<String>,
+    pub embedding_engine: String,
+    pub embedding_model: String,
+    pub embedding_fingerprint: String,
 }
 
 pub async fn get_system_config(ctx: &Context) -> anyhow::Result<SystemConfig> {
@@ -24,24 +27,18 @@ pub async fn update_system_config(ctx: &Context, config: &SystemConfig) -> anyho
 
 pub async fn get_system_info(ctx: &Context) -> anyhow::Result<SystemInfo> {
     let info = ctx.storage().info().await?;
+    let attachment_info = ctx.attachments().info();
+    let embedding_info = ctx.embedding_info();
     Ok(SystemInfo {
         database_engine: info.engine,
         database_path: info
             .location
             .map(|path| path.to_string_lossy().into_owned()),
         database_size_bytes: info.size_bytes,
-        attachments_path: absolute_path(ctx.attachments_dir())
-            .to_string_lossy()
-            .into_owned(),
+        attachments_engine: attachment_info.engine,
+        attachments_location: attachment_info.location,
+        embedding_engine: embedding_info.engine.clone(),
+        embedding_model: embedding_info.model.clone(),
+        embedding_fingerprint: embedding_info.fingerprint.clone(),
     })
-}
-
-fn absolute_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
 }

@@ -6,8 +6,17 @@ mod system_api;
 use axum::extract::DefaultBodyLimit;
 use axum::response::IntoResponse;
 use axum::Router;
-use note_embedding::{ProcessWorkerConfig, ProcessWorkerRuntime, StubEmbedder, WorkerConfig};
-use note_pipelines::{Context, EmbeddingJobNotifier, ProcessEmbeddingJobStatus};
+use note_attachments::{
+    AttachmentStore, FilesystemAttachmentStore, S3AttachmentConfig, S3AttachmentStore,
+};
+use note_embedding::{
+    EmbeddingBackendInfo, OpenAiCompatibleConfig, OpenAiCompatibleEmbedder, ProcessWorkerConfig,
+    ProcessWorkerRuntime, StubEmbedder, WorkerConfig,
+};
+use note_pipelines::{
+    Context, EmbeddingJobNotifier, FingerprintReconciliation, ProcessEmbeddingJobStatus,
+};
+use note_server::config::{AttachmentConfig, DatabaseConfig, EmbeddingConfig, RuntimeConfig};
 use note_storage::StorageBackend;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -25,27 +34,6 @@ const DEFAULT_EMBEDDING_POLL_MS: u64 = 1000;
 const TRASH_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const DEV_FRONTEND_URL: &str = "http://0.0.0.0:6221";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmbeddingExecutionMode {
-    Process,
-    Thread,
-    Remote,
-}
-
-impl EmbeddingExecutionMode {
-    fn from_env() -> anyhow::Result<Self> {
-        match std::env::var("NOTE_EMBEDDING_MODE")
-            .unwrap_or_else(|_| "process".to_string())
-            .as_str()
-        {
-            "process" => Ok(Self::Process),
-            "thread" => Ok(Self::Thread),
-            "remote" => Ok(Self::Remote),
-            other => anyhow::bail!("unknown NOTE_EMBEDDING_MODE={other}"),
-        }
-    }
-}
-
 struct NotifyEmbeddingJobs {
     notify: Arc<Notify>,
 }
@@ -56,30 +44,137 @@ impl EmbeddingJobNotifier for NotifyEmbeddingJobs {
     }
 }
 
+#[async_trait::async_trait]
+trait ProcessRuntimeHandle: Send {
+    async fn shutdown(self: Box<Self>);
+}
+
+#[async_trait::async_trait]
+impl ProcessRuntimeHandle for ProcessWorkerRuntime {
+    async fn shutdown(self: Box<Self>) {
+        (*self).shutdown().await;
+    }
+}
+
 struct RunningEmbedding {
     embedder: Arc<dyn note_embedding::Embedder>,
-    process_runtime: Option<ProcessWorkerRuntime>,
+    info: EmbeddingBackendInfo,
+    process_runtime: Option<Box<dyn ProcessRuntimeHandle>>,
     wake: Arc<Notify>,
 }
 
-async fn start_embedding_runtime() -> anyhow::Result<RunningEmbedding> {
-    match EmbeddingExecutionMode::from_env()? {
-        EmbeddingExecutionMode::Process => {
-            let process_runtime =
-                ProcessWorkerRuntime::start(ProcessWorkerConfig::from_env()?).await?;
+async fn start_embedding_runtime(config: &EmbeddingConfig) -> anyhow::Result<RunningEmbedding> {
+    match config {
+        EmbeddingConfig::Local { model_path } => {
+            let worker_config =
+                with_resolved_model_path(ProcessWorkerConfig::from_env()?, model_path);
+            let info = local_embedding_info(&worker_config);
+            let process_runtime = ProcessWorkerRuntime::start(worker_config).await?;
             Ok(RunningEmbedding {
                 embedder: process_runtime.embedder(),
-                process_runtime: Some(process_runtime),
+                info,
+                process_runtime: Some(Box::new(process_runtime)),
                 wake: Arc::new(Notify::new()),
             })
         }
-        EmbeddingExecutionMode::Thread => {
-            anyhow::bail!("NOTE_EMBEDDING_MODE=thread is reserved but not implemented yet")
-        }
-        EmbeddingExecutionMode::Remote => {
-            anyhow::bail!("NOTE_EMBEDDING_MODE=remote is reserved but not implemented yet")
+        EmbeddingConfig::OpenAi {
+            base_url,
+            model,
+            api_key_env,
+            timeout_secs,
+            max_retries,
+        } => {
+            let bearer_token =
+                resolve_bearer_token(api_key_env.as_deref(), |name| std::env::var(name).ok())?;
+            let info = EmbeddingBackendInfo::openai(model.clone());
+            let embedder = OpenAiCompatibleEmbedder::new(OpenAiCompatibleConfig {
+                base_url: base_url.clone(),
+                model: model.clone(),
+                bearer_token,
+                timeout: Duration::from_secs(*timeout_secs),
+                max_retries: *max_retries,
+            })?;
+            Ok(RunningEmbedding {
+                embedder: Arc::new(embedder),
+                info,
+                process_runtime: None,
+                wake: Arc::new(Notify::new()),
+            })
         }
     }
+}
+
+fn local_embedding_info(worker_config: &ProcessWorkerConfig) -> EmbeddingBackendInfo {
+    if worker_config.model_path.is_some() {
+        EmbeddingBackendInfo::local_bge_m3()
+    } else {
+        EmbeddingBackendInfo::local_stub()
+    }
+}
+
+fn resolve_bearer_token(
+    api_key_env: Option<&str>,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(variable) = api_key_env else {
+        return Ok(None);
+    };
+    let variable = variable.trim();
+    if variable.is_empty() {
+        anyhow::bail!("embedding API key environment variable name is blank");
+    }
+    match get_env(variable) {
+        Some(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_owned())),
+        _ => anyhow::bail!("embedding API key environment variable {variable} is missing or blank"),
+    }
+}
+
+async fn shutdown_embedding(embedding: &mut RunningEmbedding) {
+    if let Some(process_runtime) = embedding.process_runtime.take() {
+        process_runtime.shutdown().await;
+    }
+}
+
+async fn reconcile_started_embedding(
+    storage: &dyn StorageBackend,
+    embedding: &mut RunningEmbedding,
+) -> anyhow::Result<FingerprintReconciliation> {
+    let result = note_pipelines::reconcile_embedding_fingerprint(
+        storage,
+        &embedding.info.fingerprint,
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
+    match result {
+        Ok(reconciliation) => {
+            match reconciliation {
+                FingerprintReconciliation::Initialized => {
+                    eprintln!("initialized embedding fingerprint")
+                }
+                FingerprintReconciliation::Unchanged => {
+                    eprintln!("embedding fingerprint unchanged")
+                }
+                FingerprintReconciliation::Regenerated { queued_jobs } => {
+                    eprintln!(
+                        "embedding fingerprint changed; queued {queued_jobs} regeneration jobs"
+                    )
+                }
+            }
+            Ok(reconciliation)
+        }
+        Err(error) => {
+            shutdown_embedding(embedding).await;
+            Err(error)
+        }
+    }
+}
+
+fn with_resolved_model_path(
+    mut worker_config: ProcessWorkerConfig,
+    model_path: &Option<PathBuf>,
+) -> ProcessWorkerConfig {
+    worker_config.model_path = model_path.clone();
+    worker_config
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -95,15 +190,59 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn ensure_data_directories(db_path: &Path, attachments_dir: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = db_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)?;
+fn ensure_data_directories(config: &RuntimeConfig) -> anyhow::Result<()> {
+    if let DatabaseConfig::Embed { path } = &config.database {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
     }
-    std::fs::create_dir_all(attachments_dir)?;
+    if let AttachmentConfig::Filesystem { path } = &config.attachments {
+        std::fs::create_dir_all(path)?;
+    }
     Ok(())
+}
+
+async fn build_storage(config: &DatabaseConfig) -> anyhow::Result<Arc<dyn StorageBackend>> {
+    match config {
+        DatabaseConfig::Embed { path } => Ok(Arc::new(
+            note_storage_turso::TursoStorage::open(path).await?,
+        )),
+        DatabaseConfig::Pg {
+            url,
+            max_connections,
+        } => Ok(Arc::new(
+            note_storage_pg::PgStorage::connect(url, *max_connections).await?,
+        )),
+    }
+}
+
+async fn build_attachment_store(
+    config: &AttachmentConfig,
+) -> anyhow::Result<Arc<dyn AttachmentStore>> {
+    match config {
+        AttachmentConfig::Filesystem { path } => {
+            Ok(Arc::new(FilesystemAttachmentStore::new(path.clone())))
+        }
+        AttachmentConfig::S3 {
+            bucket,
+            prefix,
+            region,
+            endpoint,
+            force_path_style,
+        } => Ok(Arc::new(
+            S3AttachmentStore::new(S3AttachmentConfig {
+                bucket: bucket.clone(),
+                prefix: prefix.clone(),
+                region: region.clone(),
+                endpoint: endpoint.clone(),
+                force_path_style: *force_path_style,
+            })
+            .await?,
+        )),
+    }
 }
 
 fn should_start_dev_frontend(
@@ -255,29 +394,20 @@ async fn main() -> anyhow::Result<()> {
 
     let stdio_mode = args.iter().any(|a| a == "--stdio");
     let config = note_server::config::load_runtime_config()?;
-    config.validate_supported()?;
-    ensure_data_directories(&config.database_path, &config.attachments_dir)?;
-    let storage: Arc<dyn StorageBackend> =
-        Arc::new(note_storage_turso::TursoStorage::open(&config.database_path).await?);
+    ensure_data_directories(&config)?;
+    let storage = build_storage(&config.database).await?;
+    let attachments = build_attachment_store(&config.attachments).await?;
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
 
     if export_mode {
-        let ctx = Context::new(
-            storage.clone(),
-            Arc::new(StubEmbedder),
-            config.attachments_dir.clone(),
-        );
+        let ctx = Context::new(storage.clone(), Arc::new(StubEmbedder), attachments.clone());
         println!("{}", note_pipelines::export_json(&ctx).await?);
         return Ok(());
     }
 
     if import_mode {
-        let ctx = Context::new(
-            storage.clone(),
-            Arc::new(StubEmbedder),
-            config.attachments_dir.clone(),
-        );
+        let ctx = Context::new(storage.clone(), Arc::new(StubEmbedder), attachments.clone());
         let mut input = String::new();
         std::io::stdin().lock().read_to_string(&mut input)?;
         let stats = note_pipelines::import_json(&ctx, &input).await?;
@@ -292,15 +422,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if stdio_mode {
-        let embedding = start_embedding_runtime().await?;
+        let mut embedding = start_embedding_runtime(&config.embedding).await?;
+        reconcile_started_embedding(storage.as_ref(), &mut embedding).await?;
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
         let ctx = Arc::new(Context::with_embedding_job_notifier(
             storage.clone(),
             embedding.embedder.clone(),
+            embedding.info.clone(),
             notifier,
-            config.attachments_dir.clone(),
+            attachments.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
         let trash_retention = tokio::spawn(run_trash_retention(
@@ -312,23 +444,24 @@ async fn main() -> anyhow::Result<()> {
             embedding.wake.clone(),
             scheduler_shutdown_rx,
         ));
-        note_mcp::run_stdio(ctx).await?;
+        let run_result = note_mcp::run_stdio(ctx).await;
         let _ = scheduler_shutdown_tx.send(true);
         let _ = scheduler.await;
         let _ = trash_retention.await;
-        if let Some(process_runtime) = embedding.process_runtime {
-            process_runtime.shutdown().await;
-        }
+        shutdown_embedding(&mut embedding).await;
+        run_result?;
     } else {
-        let embedding = start_embedding_runtime().await?;
+        let mut embedding = start_embedding_runtime(&config.embedding).await?;
+        reconcile_started_embedding(storage.as_ref(), &mut embedding).await?;
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
         let ctx = Arc::new(Context::with_embedding_job_notifier(
             storage.clone(),
             embedding.embedder.clone(),
+            embedding.info.clone(),
             notifier,
-            config.attachments_dir.clone(),
+            attachments.clone(),
         ));
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
         let trash_retention = tokio::spawn(run_trash_retention(
@@ -447,9 +580,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = scheduler_shutdown_tx.send(true);
         let _ = scheduler.await;
         let _ = trash_retention.await;
-        if let Some(process_runtime) = embedding.process_runtime {
-            process_runtime.shutdown().await;
-        }
+        shutdown_embedding(&mut embedding).await;
         run_result?;
     }
     Ok(())
@@ -458,18 +589,380 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use note_storage::{
+        BackendInfo, StorageError, StorageErrorKind, StorageResult, StorageSession,
+        StorageTransaction, TransactionMode,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct TestEnvGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_attachment_config_constructs_a_safe_backend() {
+        let _env = TestEnvGuard::set("AWS_EC2_METADATA_DISABLED", "true");
+        let store = build_attachment_store(&AttachmentConfig::S3 {
+            bucket: "agent-note".into(),
+            prefix: "attachments".into(),
+            region: Some("us-east-1".into()),
+            endpoint: Some("http://minio.internal:9000".into()),
+            force_path_style: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.info(),
+            note_attachments::AttachmentStoreInfo {
+                engine: "s3".into(),
+                location: Some("s3://agent-note/attachments".into()),
+            }
+        );
+    }
 
     #[test]
-    fn data_directories_are_created_before_storage_opens() {
+    fn bearer_token_resolution_is_optional_and_rejects_missing_or_blank_values() {
+        assert_eq!(
+            resolve_bearer_token(None, |_| panic!("no environment read expected")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_bearer_token(Some("  EMBEDDING_API_KEY \n"), |name| {
+                (name == "EMBEDDING_API_KEY").then(|| " \tsecret-token\r\n".into())
+            })
+            .unwrap(),
+            Some("secret-token".into())
+        );
+
+        for value in [None, Some(" \t\n".into())] {
+            let error = resolve_bearer_token(Some("  EMBEDDING_API_KEY \n"), |_| value.clone())
+                .unwrap_err();
+            let rendered = error.to_string();
+            assert!(rendered.contains("EMBEDDING_API_KEY"), "{rendered}");
+            assert!(!rendered.contains("  EMBEDDING_API_KEY"), "{rendered}");
+            assert!(!rendered.contains('\n'), "{rendered}");
+            assert!(!rendered.contains('\t'), "{rendered}");
+            assert!(!rendered.contains("unrelated-secret"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn local_embedding_metadata_distinguishes_stub_from_bge_m3() {
+        let mut worker_config = ProcessWorkerConfig::from_env().unwrap();
+        worker_config.model_path = None;
+        assert_eq!(
+            local_embedding_info(&worker_config),
+            EmbeddingBackendInfo::local_stub()
+        );
+
+        worker_config.model_path = Some(PathBuf::from("/models/bge-m3.onnx"));
+        assert_eq!(
+            local_embedding_info(&worker_config),
+            EmbeddingBackendInfo::local_bge_m3()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_runtime_embeds_without_a_local_process() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(serde_json::json!({
+                "model": "bge-m3",
+                "input": ["remote request"],
+                "encoding_format": "float"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "index": 0,
+                    "embedding": vec![0.25_f32; note_embedding::DEFAULT_EMBEDDING_DIMENSION]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let running = start_embedding_runtime(&EmbeddingConfig::OpenAi {
+            base_url: server.uri(),
+            model: "bge-m3".into(),
+            api_key_env: None,
+            timeout_secs: 1,
+            max_retries: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(running.process_runtime.is_none());
+        assert_eq!(
+            running.info,
+            note_embedding::EmbeddingBackendInfo::openai("bge-m3")
+        );
+        assert_eq!(
+            running.embedder.embed("remote request").await.unwrap(),
+            vec![0.25_f32; note_embedding::DEFAULT_EMBEDDING_DIMENSION]
+        );
+    }
+
+    struct FakeRuntimeHandle {
+        shutdown: Arc<AtomicBool>,
+    }
+
+    struct FailingReconciliationBackend;
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FailingReconciliationBackend {
+        async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "session is not used",
+            ))
+        }
+
+        async fn begin(
+            &self,
+            _mode: TransactionMode,
+        ) -> StorageResult<Box<dyn StorageTransaction>> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "controlled reconciliation failure",
+            ))
+        }
+
+        async fn info(&self) -> StorageResult<BackendInfo> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "info is not used",
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRuntimeHandle for FakeRuntimeHandle {
+        async fn shutdown(self: Box<Self>) {
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_failure_shuts_down_a_started_local_runtime() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let storage: Arc<dyn StorageBackend> = Arc::new(FailingReconciliationBackend);
+        let mut embedding = RunningEmbedding {
+            embedder: Arc::new(StubEmbedder),
+            info: note_embedding::EmbeddingBackendInfo::local_bge_m3(),
+            process_runtime: Some(Box::new(FakeRuntimeHandle {
+                shutdown: shutdown.clone(),
+            })),
+            wake: Arc::new(Notify::new()),
+        };
+
+        let error = reconcile_started_embedding(storage.as_ref(), &mut embedding)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("controlled reconciliation failure"));
+        assert!(embedding.process_runtime.is_none());
+        assert!(shutdown.load(Ordering::SeqCst));
+    }
+
+    async fn reject_postgres_startup(listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        const SSL_REQUEST_CODE: u32 = 80_877_103;
+
+        let (mut stream, _) = listener.accept().await?;
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).await?;
+        let packet_len = u32::from_be_bytes(header) as usize;
+        if packet_len < 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid PostgreSQL startup packet length",
+            ));
+        }
+        let mut body = vec![0_u8; packet_len - 4];
+        stream.read_exact(&mut body).await?;
+
+        let request_code = u32::from_be_bytes(body[..4].try_into().unwrap());
+        if request_code == SSL_REQUEST_CODE {
+            stream.write_all(b"N").await?;
+            stream.read_exact(&mut header).await?;
+            let packet_len = u32::from_be_bytes(header) as usize;
+            if packet_len < 8 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid PostgreSQL startup packet length",
+                ));
+            }
+            body.resize(packet_len - 4, 0);
+            stream.read_exact(&mut body).await?;
+        }
+
+        let mut payload = b"SERROR\0C28P01\0Mcontrolled authentication rejection\0".to_vec();
+        payload.push(0);
+        let mut error_packet = Vec::with_capacity(payload.len() + 5);
+        error_packet.push(b'E');
+        error_packet.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+        error_packet.extend_from_slice(&payload);
+        stream.write_all(&error_packet).await?;
+        stream.shutdown().await
+    }
+
+    async fn await_postgres_peer(mut peer: tokio::task::JoinHandle<std::io::Result<()>>) {
+        match tokio::time::timeout(Duration::from_secs(2), &mut peer).await {
+            Ok(result) => result
+                .expect("controlled PostgreSQL peer task must not panic")
+                .expect("controlled PostgreSQL peer must complete its exchange"),
+            Err(_) => {
+                peer.abort();
+                let _ = peer.await;
+                panic!("controlled PostgreSQL peer did not finish");
+            }
+        }
+    }
+
+    #[test]
+    fn data_directories_are_created_only_for_local_adapters() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("dev-data/notes.db");
         let attachments_dir = temp.path().join("dev-data/attachments");
+        let local = RuntimeConfig {
+            config_path: temp.path().join("config.toml"),
+            database: DatabaseConfig::Embed {
+                path: db_path.clone(),
+            },
+            embedding: EmbeddingConfig::Local { model_path: None },
+            attachments: AttachmentConfig::Filesystem {
+                path: attachments_dir.clone(),
+            },
+        };
 
-        ensure_data_directories(&db_path, &attachments_dir).unwrap();
+        ensure_data_directories(&local).unwrap();
 
         assert!(db_path.parent().unwrap().is_dir());
         assert!(attachments_dir.is_dir());
         assert!(!db_path.exists());
+
+        let external_root = temp.path().join("external-only");
+        let external = RuntimeConfig {
+            config_path: temp.path().join("config.toml"),
+            database: DatabaseConfig::Pg {
+                url: "postgresql://localhost/notes".into(),
+                max_connections: 10,
+            },
+            embedding: EmbeddingConfig::OpenAi {
+                base_url: "http://localhost:8080".into(),
+                model: "bge-m3".into(),
+                api_key_env: None,
+                timeout_secs: 30,
+                max_retries: 3,
+            },
+            attachments: AttachmentConfig::S3 {
+                bucket: "notes".into(),
+                prefix: external_root.to_string_lossy().into_owned(),
+                region: None,
+                endpoint: None,
+                force_path_style: false,
+            },
+        };
+
+        ensure_data_directories(&external).unwrap();
+        assert!(!external_root.exists());
+    }
+
+    #[tokio::test]
+    async fn embed_storage_opens_only_the_configured_turso_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured_path = temp.path().join("configured/notes.db");
+        let default_path = temp.path().join("dev-data/notes.db");
+        let config = RuntimeConfig {
+            config_path: temp.path().join("config.toml"),
+            database: DatabaseConfig::Embed {
+                path: configured_path.clone(),
+            },
+            embedding: EmbeddingConfig::Local { model_path: None },
+            attachments: AttachmentConfig::Filesystem {
+                path: temp.path().join("attachments"),
+            },
+        };
+
+        ensure_data_directories(&config).unwrap();
+        let storage = build_storage(&config.database).await.unwrap();
+        storage.session().await.unwrap();
+
+        assert!(configured_path.exists());
+        assert!(!default_path.exists());
+    }
+
+    #[tokio::test]
+    async fn pg_connection_errors_are_bounded_and_do_not_render_credentials() {
+        const USERNAME: &str = "do-not-render-this-user";
+        const PASSWORD: &str = "do-not-render-this-secret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(reject_postgres_startup(listener));
+        let url = format!("postgresql://{USERNAME}:{PASSWORD}@{address}/notes");
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            build_storage(&DatabaseConfig::Pg {
+                url: url.clone(),
+                max_connections: 1,
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        await_postgres_peer(peer).await;
+        let error = result
+            .expect("controlled PostgreSQL rejection must finish within five seconds")
+            .err()
+            .expect("controlled PostgreSQL peer must reject the connection");
+        let rendered = format!("{error:#}");
+
+        assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
+        assert_eq!(rendered, "connect to PostgreSQL");
+        assert!(!rendered.contains(&url), "{rendered}");
+        assert!(!rendered.contains(USERNAME), "{rendered}");
+        assert!(!rendered.contains(PASSWORD), "{rendered}");
+    }
+
+    #[test]
+    fn resolved_local_model_path_overwrites_process_worker_environment_value() {
+        let mut worker_config = ProcessWorkerConfig::from_env().unwrap();
+        worker_config.model_path = Some("ambient-model.onnx".into());
+        let resolved = Some(PathBuf::from("/config/models/bge-m3.onnx"));
+
+        let worker_config = with_resolved_model_path(worker_config, &resolved);
+
+        assert_eq!(worker_config.model_path, resolved);
+
+        let mut worker_config = ProcessWorkerConfig::from_env().unwrap();
+        worker_config.model_path = Some("ambient-model.onnx".into());
+        let worker_config = with_resolved_model_path(worker_config, &None);
+        assert_eq!(worker_config.model_path, None);
     }
 
     #[test]

@@ -496,12 +496,16 @@ Await hydration in get/list/search/export. Await `remove_note` after permanent d
 Refactor import separately so it never holds a database transaction across
 filesystem or future S3 uploads:
 
-1. decode every imported attachment and prepare every attachment set;
-2. begin the database transaction only after all preparation succeeds;
-3. persist note metadata using `prepared.metadata()`;
-4. commit the database transaction;
-5. publish sets for inserted notes and abort sets for skipped notes;
-6. on preparation or database failure, abort every set prepared so far.
+1. preclassify duplicate note IDs within the import so only the first
+   occurrence is a preparation candidate and later occurrences count as
+   skipped without acquiring the same note's attachment guard;
+2. decode every candidate attachment and prepare each unique attachment set;
+3. begin the database transaction only after all preparation succeeds;
+4. recheck note existence in the transaction, persist inserted-note metadata
+   using `prepared.metadata()`, and mark raced/existing candidates skipped;
+5. commit the database transaction;
+6. publish sets for inserted notes and abort sets for skipped notes;
+7. on preparation or database failure, abort every set prepared so far.
 
 - [ ] **Step 5: Update test fixtures**
 

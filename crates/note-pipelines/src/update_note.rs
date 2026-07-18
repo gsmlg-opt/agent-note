@@ -74,14 +74,17 @@ pub async fn update_note(
     let note_revision = session.get_note_revision(id).await?.unwrap_or(1) + 1;
     drop(session);
     let chunks = crate::chunk::chunk_content(&input.content);
-    let prepared_attachments =
-        crate::attachment_files::prepare_note_attachments(ctx, id, &input.attachments)?;
+    let prepared_attachments = ctx.attachments().prepare(id, &input.attachments).await?;
+    let attachment_metadata = prepared_attachments.metadata().to_vec();
 
     let transaction = match ctx.storage().begin(TransactionMode::Deferred).await {
         Ok(transaction) => transaction,
         Err(error) => {
-            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
-            return Err(error.into());
+            return Err(crate::note_attachments::abort_with_primary(
+                prepared_attachments,
+                error.into(),
+            )
+            .await);
         }
     };
     let transaction_result = async {
@@ -90,7 +93,7 @@ pub async fn update_note(
                 id,
                 title: &input.title,
                 content: &input.content,
-                attachments: prepared_attachments.metadata(),
+                attachments: &attachment_metadata,
                 updated_at: now,
                 note_revision,
             })
@@ -116,9 +119,14 @@ pub async fn update_note(
     let transaction_result = match transaction_result {
         Ok(Some(result)) => Ok(result),
         Ok(None) => {
-            let rollback_result = transaction.rollback().await;
-            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
-            rollback_result?;
+            if let Err(error) = transaction.rollback().await {
+                return Err(crate::note_attachments::abort_with_primary(
+                    prepared_attachments,
+                    error.into(),
+                )
+                .await);
+            }
+            prepared_attachments.abort().await?;
             return Ok(None);
         }
         Err(error) => Err(error),
@@ -127,11 +135,12 @@ pub async fn update_note(
     let (queued, resolved_labels) = match finalized {
         Ok(result) => result,
         Err(error) => {
-            crate::attachment_files::cleanup_prepared_note_attachments(&prepared_attachments);
-            return Err(error);
+            return Err(
+                crate::note_attachments::abort_with_primary(prepared_attachments, error).await,
+            );
         }
     };
-    crate::attachment_files::commit_note_attachments(prepared_attachments)?;
+    prepared_attachments.publish().await?;
     if queued > 0 {
         ctx.wake_embedding_jobs();
     }
@@ -167,8 +176,9 @@ pub async fn delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
 pub async fn permanently_delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
     let session = ctx.storage().session().await?;
     let deleted = session.permanently_delete_note(id).await? > 0;
+    drop(session);
     if deleted {
-        crate::attachment_files::remove_note_attachments(ctx, id)?;
+        ctx.attachments().remove_note(id).await?;
     }
     Ok(deleted)
 }
@@ -243,7 +253,7 @@ pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Res
     .await;
     let ids = crate::save_note::finish_transaction(transaction, transaction_result).await?;
     for id in &ids {
-        crate::attachment_files::remove_note_attachments(ctx, id)?;
+        ctx.attachments().remove_note(id).await?;
     }
     Ok(ids.len())
 }

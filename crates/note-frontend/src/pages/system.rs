@@ -166,7 +166,7 @@ pub fn system_page() -> Html {
                     <div class="system-section-head">
                         <div>
                             <h3 id="storage-info-title">{ "Storage" }</h3>
-                            <p>{ "Active storage backend and local paths." }</p>
+                            <p>{ "Active storage backends and their locations." }</p>
                         </div>
                     </div>
                     <dl class="system-info">
@@ -187,8 +187,26 @@ pub fn system_page() -> Html {
                             </div>
                         }
                         <div>
-                            <dt>{ "Attachments path" }</dt>
-                            <dd>{ info.attachments_path.clone() }</dd>
+                            <dt>{ "Attachments engine" }</dt>
+                            <dd>{ info.attachments_engine.clone() }</dd>
+                        </div>
+                        if let Some(location) = &info.attachments_location {
+                            <div>
+                                <dt>{ "Attachments location" }</dt>
+                                <dd>{ location.clone() }</dd>
+                            </div>
+                        }
+                        <div>
+                            <dt>{ "Embedding engine" }</dt>
+                            <dd>{ info.embedding_engine.clone() }</dd>
+                        </div>
+                        <div>
+                            <dt>{ "Embedding model" }</dt>
+                            <dd>{ info.embedding_model.clone() }</dd>
+                        </div>
+                        <div>
+                            <dt>{ "Embedding fingerprint" }</dt>
+                            <dd>{ info.embedding_fingerprint.clone() }</dd>
                         </div>
                     </dl>
                 </section>

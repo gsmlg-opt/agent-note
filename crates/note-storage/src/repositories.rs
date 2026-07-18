@@ -133,6 +133,11 @@ pub trait EmbeddingRepository: Send + Sync {
         now: i64,
     ) -> StorageResult<u64>;
     async fn requeue_processing_embedding_jobs(&self, now: i64) -> StorageResult<u64>;
+    /// Removes every derived vector, marks active chunks pending, replaces all
+    /// embedding jobs with one pending job per active chunk, and returns the
+    /// number of queued jobs. Call this inside a storage transaction together
+    /// with `SettingsRepository::set_embedding_fingerprint`.
+    async fn reset_embeddings_for_regeneration(&self, now: i64) -> StorageResult<u64>;
 }
 
 #[async_trait::async_trait]
@@ -151,6 +156,8 @@ pub trait RetrievalRepository: Send + Sync {
 pub trait SettingsRepository: Send + Sync {
     async fn get_system_config(&self) -> StorageResult<note_core::SystemConfig>;
     async fn set_system_config(&self, config: &note_core::SystemConfig) -> StorageResult<()>;
+    async fn get_embedding_fingerprint(&self) -> StorageResult<Option<String>>;
+    async fn set_embedding_fingerprint(&self, fingerprint: &str) -> StorageResult<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

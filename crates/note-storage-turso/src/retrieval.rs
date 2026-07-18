@@ -38,10 +38,12 @@ impl RetrievalRepository for TursoSession {
         let mut rows = self
             .connection
             .query(
-                "SELECT note_id
-                 FROM note_chunk_embeddings
-                 GROUP BY note_id
-                 ORDER BY MIN(vector_distance_cos(embedding, vector(?1))) ASC, note_id ASC
+                "SELECT e.note_id
+                 FROM note_chunk_embeddings AS e
+                 JOIN notes AS n ON n.id = e.note_id
+                 WHERE n.deleted_at IS NULL
+                 GROUP BY e.note_id
+                 ORDER BY MIN(vector_distance_cos(e.embedding, vector(?1))) ASC, e.note_id ASC
                  LIMIT ?2",
                 turso::params![json, limit],
             )

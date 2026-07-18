@@ -20,6 +20,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["io-std", "rt", "macros"] }
 
 [dev-dependencies]
+note-attachments = { path = "../note-attachments" }
 note-embedding = { path = "../note-embedding" }
 note-storage = { path = "../note-storage" }
 note-storage-turso = { path = "../note-storage-turso" }

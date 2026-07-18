@@ -1,17 +1,575 @@
 mod support;
 
+use note_attachments::{AttachmentStore, AttachmentStoreInfo, PreparedAttachmentSet};
 use note_core::{LabelValueType, NoteAttachment};
+use note_embedding::StubEmbedder;
 use note_pipelines::{
     define_label_key, define_label_key_with_type, delete_note, drain_embedding_jobs, get_note,
-    list_deleted_note_summaries, list_label_keys, purge_expired_deleted_notes, restore_notes,
-    save_note, update_note, update_system_config, SaveNoteInput, TRASH_RETENTION_SECONDS,
+    get_note_attachment, import_json, list_deleted_note_summaries, list_label_keys,
+    purge_expired_deleted_notes, restore_notes, save_note, update_note, update_system_config,
+    Context, SaveNoteInput, TRASH_RETENTION_SECONDS,
 };
-use note_storage::TransactionMode;
-use support::test_context;
+use note_storage::{StorageBackend, TransactionMode};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+use support::{
+    event_log, test_context, ControlledAttachmentStore, EventLog, EventNotifier,
+    EventStorageBackend,
+};
 
 use note_core::{
     DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SystemConfig,
 };
+
+type AttachmentObjects = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
+
+#[derive(Default)]
+struct RecordingAttachmentStore {
+    objects: AttachmentObjects,
+    reads: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+struct RecordingPreparedSet {
+    note_id: String,
+    metadata: Vec<NoteAttachment>,
+    objects: AttachmentObjects,
+    content: Vec<(String, Vec<u8>)>,
+}
+
+#[async_trait::async_trait]
+impl PreparedAttachmentSet for RecordingPreparedSet {
+    fn metadata(&self) -> &[NoteAttachment] {
+        &self.metadata
+    }
+
+    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
+        let mut objects = self.objects.lock().unwrap();
+        objects.retain(|(note_id, _), _| note_id != &self.note_id);
+        for (path, content) in self.content {
+            objects.insert((self.note_id.clone(), path), content);
+        }
+        Ok(())
+    }
+
+    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AttachmentStore for RecordingAttachmentStore {
+    async fn prepare(
+        &self,
+        note_id: &str,
+        attachments: &[NoteAttachment],
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
+        Ok(Box::new(RecordingPreparedSet {
+            note_id: note_id.to_string(),
+            metadata: attachments
+                .iter()
+                .map(|attachment| NoteAttachment {
+                    id: attachment.id.clone(),
+                    path: attachment.path.clone(),
+                    mime: attachment.mime.clone(),
+                    description: attachment.description.clone(),
+                    content: Vec::new(),
+                })
+                .collect(),
+            objects: self.objects.clone(),
+            content: attachments
+                .iter()
+                .map(|attachment| (attachment.path.clone(), attachment.content.clone()))
+                .collect(),
+        }))
+    }
+
+    async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.reads
+            .lock()
+            .unwrap()
+            .push((note_id.to_string(), path.to_string()));
+        self.objects
+            .lock()
+            .unwrap()
+            .get(&(note_id.to_string(), path.to_string()))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing test attachment"))
+    }
+
+    async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {
+        self.objects
+            .lock()
+            .unwrap()
+            .retain(|(stored_note_id, _), _| stored_note_id != note_id);
+        Ok(())
+    }
+
+    fn info(&self) -> AttachmentStoreInfo {
+        AttachmentStoreInfo {
+            engine: "recording".into(),
+            location: None,
+        }
+    }
+}
+
+async fn recording_context() -> (
+    Context,
+    Arc<dyn StorageBackend>,
+    Arc<RecordingAttachmentStore>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let attachments = Arc::new(RecordingAttachmentStore::default());
+    let ctx = Context::new(backend.clone(), Arc::new(StubEmbedder), attachments.clone());
+    (ctx, backend, attachments, dir)
+}
+
+async fn controlled_context(
+    with_notifier: bool,
+) -> (
+    Context,
+    Arc<dyn StorageBackend>,
+    Arc<ControlledAttachmentStore>,
+    EventLog,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let raw_backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let events = event_log();
+    let backend: Arc<dyn StorageBackend> = Arc::new(EventStorageBackend::new(
+        raw_backend.clone(),
+        events.clone(),
+    ));
+    let attachments = Arc::new(ControlledAttachmentStore::new(
+        backend.clone(),
+        events.clone(),
+    ));
+    let ctx = if with_notifier {
+        Context::with_embedding_job_notifier(
+            backend,
+            Arc::new(StubEmbedder),
+            note_embedding::EmbeddingBackendInfo::local_bge_m3(),
+            Arc::new(EventNotifier::new(events.clone())),
+            attachments.clone(),
+        )
+    } else {
+        Context::new(backend, Arc::new(StubEmbedder), attachments.clone())
+    };
+    (ctx, raw_backend, attachments, events, dir)
+}
+
+fn one_attachment() -> Vec<NoteAttachment> {
+    vec![NoteAttachment {
+        id: "file".into(),
+        path: "./file.txt".into(),
+        mime: "text/plain".into(),
+        description: String::new(),
+        content: b"payload".to_vec(),
+    }]
+}
+
+#[tokio::test]
+async fn save_and_update_order_attachment_finalization_around_the_database_transaction() {
+    let (ctx, _backend, _attachments, events, _dir) = controlled_context(true).await;
+
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Before".into(),
+            content: "Initial content".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            format!("prepare:{}:missing", note.id),
+            "begin".into(),
+            "commit".into(),
+            format!("publish:{}:Before", note.id),
+            "wake".into(),
+        ]
+    );
+
+    events.lock().unwrap().clear();
+    update_note(
+        &ctx,
+        &note.id,
+        SaveNoteInput {
+            title: "After".into(),
+            content: "Updated content".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            format!("prepare:{}:Before", note.id),
+            "begin".into(),
+            "commit".into(),
+            format!("publish:{}:After", note.id),
+            "wake".into(),
+        ]
+    );
+}
+
+async fn enable_duplicate_series_rule(ctx: &Context) {
+    update_system_config(
+        ctx,
+        &SystemConfig {
+            duplicate_check: DuplicateCheckConfig {
+                enabled: true,
+                rules: vec![DuplicateCheckRule {
+                    terms: vec![DuplicateCheckTerm {
+                        key: "series".into(),
+                        value: Some("same".into()),
+                    }],
+                }],
+            },
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn save_existing_duplicate(ctx: &Context) {
+    save_note(
+        ctx,
+        SaveNoteInput {
+            title: "Existing".into(),
+            content: "Existing content".into(),
+            attachments: one_attachment(),
+            labels: vec![("series".into(), "same".into())],
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn save_transaction_failure_rolls_back_then_aborts_prepared_attachments() {
+    let (ctx, _backend, _attachments, events, _dir) = controlled_context(false).await;
+    enable_duplicate_series_rule(&ctx).await;
+    save_existing_duplicate(&ctx).await;
+    events.lock().unwrap().clear();
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Duplicate".into(),
+            content: "Duplicate content".into(),
+            attachments: one_attachment(),
+            labels: vec![("series".into(), "same".into())],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.downcast_ref::<DuplicateNoteError>().is_some());
+    let events = events.lock().unwrap().clone();
+    assert!(events[0].starts_with("prepare:"));
+    assert!(events[0].ends_with(":missing"));
+    assert_eq!(events[1], "begin");
+    assert_eq!(events[2], "rollback");
+    assert!(events[3].starts_with("abort:"));
+}
+
+#[tokio::test]
+async fn attachment_publish_failure_keeps_the_committed_note_but_does_not_wake_the_worker() {
+    let (ctx, backend, attachments, events, _dir) = controlled_context(true).await;
+    attachments.fail_publish();
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Committed".into(),
+            content: "Queue work only after publication".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "controlled publish failure");
+    let events = events.lock().unwrap().clone();
+    assert_eq!(events[1], "begin");
+    assert_eq!(events[2], "commit");
+    assert!(events[3].contains(":Committed"));
+    assert!(!events.iter().any(|event| event == "wake"));
+    assert_eq!(
+        backend
+            .session()
+            .await
+            .unwrap()
+            .list_all_notes()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn permanent_delete_and_purge_remove_attachments_only_after_database_deletion() {
+    let (ctx, backend, _attachments, events, _dir) = controlled_context(false).await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete".into(),
+            content: "Permanent deletion".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(delete_note(&ctx, &note.id).await.unwrap());
+    events.lock().unwrap().clear();
+
+    assert!(note_pipelines::permanently_delete_note(&ctx, &note.id)
+        .await
+        .unwrap());
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![format!("remove:{}:absent=true", note.id)]
+    );
+    events.lock().unwrap().clear();
+    assert!(!note_pipelines::permanently_delete_note(&ctx, "missing")
+        .await
+        .unwrap());
+    assert!(events.lock().unwrap().is_empty());
+
+    let expired = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Expired".into(),
+            content: "Purge deletion".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    backend
+        .session()
+        .await
+        .unwrap()
+        .soft_delete_note(&expired.id, now.saturating_sub(TRASH_RETENTION_SECONDS))
+        .await
+        .unwrap();
+    events.lock().unwrap().clear();
+
+    assert_eq!(purge_expired_deleted_notes(&ctx, now).await.unwrap(), 1);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "begin".into(),
+            "commit".into(),
+            format!("remove:{}:absent=true", expired.id),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn abort_failure_adds_context_without_hiding_the_primary_transaction_error() {
+    let (ctx, _backend, attachments, events, _dir) = controlled_context(false).await;
+    enable_duplicate_series_rule(&ctx).await;
+    save_existing_duplicate(&ctx).await;
+    events.lock().unwrap().clear();
+    attachments.fail_abort();
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Duplicate".into(),
+            content: "Duplicate content".into(),
+            attachments: one_attachment(),
+            labels: vec![("series".into(), "same".into())],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let chain = format!("{error:#}");
+    assert!(chain.contains("attachment abort also failed"));
+    assert!(chain.contains("controlled abort failure"));
+    assert!(error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DuplicateNoteError>().is_some()));
+    let events = events.lock().unwrap();
+    assert_eq!(events[1], "begin");
+    assert_eq!(events[2], "rollback");
+    assert!(events[3].starts_with("abort:"));
+}
+
+#[tokio::test]
+async fn get_note_hydrates_attachments_through_the_injected_store() {
+    let (ctx, _backend, attachments, _dir) = recording_context().await;
+    import_json(
+        &ctx,
+        r#"{
+            "version": 2,
+            "label_keys": [],
+            "notes": [{
+                "id": "note-1",
+                "title": "Recorded",
+                "content": "Attachment indirection",
+                "attachments": [{
+                    "id": "file",
+                    "path": "./file.txt",
+                    "mime": "text/plain",
+                    "content": "payload"
+                }],
+                "created_at": 1,
+                "updated_at": 1,
+                "labels": []
+            }]
+        }"#,
+    )
+    .await
+    .unwrap();
+    attachments.reads.lock().unwrap().clear();
+
+    let note = get_note(&ctx, "note-1").await.unwrap().unwrap();
+
+    assert_eq!(note.attachments[0].content, b"payload");
+    assert_eq!(
+        *attachments.reads.lock().unwrap(),
+        vec![("note-1".into(), "./file.txt".into())]
+    );
+}
+
+#[tokio::test]
+async fn get_note_attachment_reads_only_the_selected_object() {
+    let (ctx, _backend, attachments, _dir) = recording_context().await;
+    import_json(
+        &ctx,
+        r#"{
+            "version": 2,
+            "label_keys": [],
+            "notes": [{
+                "id": "note-1",
+                "title": "Recorded",
+                "content": "Attachment indirection",
+                "attachments": [
+                    {"id":"first","path":"./file.txt","mime":"text/plain","content":"payload"},
+                    {"id":"second","path":"./sibling.txt","mime":"text/plain","content":"sibling"}
+                ],
+                "created_at": 1,
+                "updated_at": 1,
+                "labels": []
+            }]
+        }"#,
+    )
+    .await
+    .unwrap();
+    attachments.reads.lock().unwrap().clear();
+
+    let attachment = get_note_attachment(&ctx, "note-1", "file.txt")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(attachment.path, "./file.txt");
+    assert_eq!(attachment.content, b"payload");
+    assert_eq!(
+        *attachments.reads.lock().unwrap(),
+        vec![("note-1".into(), "./file.txt".into())]
+    );
+    assert!(get_note_attachment(&ctx, "note-1", "missing.txt")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(get_note_attachment(&ctx, "missing-note", "file.txt")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(get_note_attachment(&ctx, "note-1", "../file.txt")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(get_note_attachment(&ctx, "note-1", "")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(attachments.reads.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn get_note_attachment_matches_forward_and_backslash_separators() {
+    let (ctx, _backend, attachments, _dir) = recording_context().await;
+    import_json(
+        &ctx,
+        r#"{
+            "version": 2,
+            "label_keys": [],
+            "notes": [
+                {
+                    "id":"forward-note",
+                    "title":"Forward",
+                    "content":"Forward storage path",
+                    "attachments":[{"id":"file","path":"./dir/file.txt","mime":"text/plain","content":"forward"}],
+                    "created_at":1,
+                    "updated_at":1,
+                    "labels":[]
+                },
+                {
+                    "id":"back-note",
+                    "title":"Back",
+                    "content":"Backslash storage path",
+                    "attachments":[{"id":"file","path":".\\dir\\file.txt","mime":"text/plain","content":"back"}],
+                    "created_at":1,
+                    "updated_at":1,
+                    "labels":[]
+                }
+            ]
+        }"#,
+    )
+    .await
+    .unwrap();
+    attachments.reads.lock().unwrap().clear();
+
+    let forward = get_note_attachment(&ctx, "forward-note", r"dir\file.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    let back = get_note_attachment(&ctx, "back-note", "dir/file.txt")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(forward.content, b"forward");
+    assert_eq!(back.content, b"back");
+    assert_eq!(
+        *attachments.reads.lock().unwrap(),
+        vec![
+            ("forward-note".into(), "./dir/file.txt".into()),
+            ("back-note".into(), r".\dir\file.txt".into()),
+        ]
+    );
+}
 
 #[tokio::test]
 async fn saves_and_returns_a_persisted_note() {

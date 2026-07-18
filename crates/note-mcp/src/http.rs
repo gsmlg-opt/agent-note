@@ -58,6 +58,7 @@ pub fn mcp_router(ctx: Arc<Context>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
     use note_storage::StorageBackend;
     use note_storage_turso::TursoStorage;
@@ -75,7 +76,9 @@ mod tests {
         let ctx = Context::new(
             backend.clone(),
             Arc::new(StubEmbedder),
-            dir.path().join("attachments"),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("attachments"),
+            )),
         );
         (ctx, backend, dir)
     }
