@@ -2780,6 +2780,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http 0.7.0",
+ "wiremock",
  "yew-duskmoon",
 ]
 

@@ -372,7 +372,9 @@ fn resolve_embedding(
                         .or_else(|| env.embedding_model.clone())
                         .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.into()),
                 ),
-            )?;
+            )?
+            .trim()
+            .to_owned();
             let timeout_secs = resolve_env_number(
                 file.timeout_secs,
                 env.embedding_timeout_secs.as_deref(),
@@ -385,6 +387,12 @@ fn resolve_embedding(
                 3,
                 "NOTE_EMBEDDING_MAX_RETRIES",
             )?;
+            if timeout_secs == 0 {
+                anyhow::bail!("embedding.timeout_secs must be greater than zero");
+            }
+            if max_retries > 10 {
+                anyhow::bail!("embedding.max_retries must be at most 10");
+            }
             Ok(EmbeddingConfig::OpenAi {
                 base_url,
                 model,
@@ -1031,6 +1039,93 @@ api_key_env = "SECRET_THAT_IS_NOT_READ"
                 max_retries: 3,
             }
         );
+    }
+
+    #[test]
+    fn openai_defaults_are_applied_and_model_is_normalized() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "config.toml",
+            r#"[embedding]
+engine = "openai"
+base_url = "http://127.0.0.1:8000"
+model = " bge-m3 "
+"#,
+        );
+
+        let config = resolve_explicit(dir.path(), "config.toml").unwrap();
+
+        assert_eq!(
+            config.embedding,
+            EmbeddingConfig::OpenAi {
+                base_url: "http://127.0.0.1:8000".into(),
+                model: "bge-m3".into(),
+                api_key_env: None,
+                timeout_secs: 30,
+                max_retries: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn openai_file_values_override_embedding_environment_values() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "config.toml",
+            r#"[embedding]
+engine = "openai"
+base_url = "http://127.0.0.1:8000"
+model = "file-model"
+timeout_secs = 12
+max_retries = 5
+"#,
+        );
+
+        let config = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some("config.toml".into()),
+                embedding_model: Some("environment-model".into()),
+                embedding_timeout_secs: Some("90".into()),
+                embedding_max_retries: Some("8".into()),
+                ..EnvValues::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.embedding,
+            EmbeddingConfig::OpenAi {
+                base_url: "http://127.0.0.1:8000".into(),
+                model: "file-model".into(),
+                api_key_env: None,
+                timeout_secs: 12,
+                max_retries: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn active_openai_rejects_invalid_timeout_and_retry_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, setting, expected) in [
+            ("timeout.toml", "timeout_secs = 0", "embedding.timeout_secs"),
+            ("retries.toml", "max_retries = 11", "embedding.max_retries"),
+        ] {
+            write_config(
+                dir.path(),
+                name,
+                &format!(
+                    "[embedding]\nengine = \"openai\"\nbase_url = \"http://127.0.0.1:8000\"\n{setting}\n"
+                ),
+            );
+
+            let error = resolve_explicit(dir.path(), name).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
     }
 
     #[test]

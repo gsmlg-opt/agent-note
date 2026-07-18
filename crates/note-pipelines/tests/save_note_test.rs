@@ -159,6 +159,7 @@ async fn controlled_context(
         Context::with_embedding_job_notifier(
             backend,
             Arc::new(StubEmbedder),
+            note_embedding::EmbeddingBackendInfo::local_bge_m3(),
             Arc::new(EventNotifier::new(events.clone())),
             attachments.clone(),
         )

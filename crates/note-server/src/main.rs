@@ -7,8 +7,13 @@ use axum::extract::DefaultBodyLimit;
 use axum::response::IntoResponse;
 use axum::Router;
 use note_attachments::{AttachmentStore, FilesystemAttachmentStore};
-use note_embedding::{ProcessWorkerConfig, ProcessWorkerRuntime, StubEmbedder, WorkerConfig};
-use note_pipelines::{Context, EmbeddingJobNotifier, ProcessEmbeddingJobStatus};
+use note_embedding::{
+    EmbeddingBackendInfo, OpenAiCompatibleConfig, OpenAiCompatibleEmbedder, ProcessWorkerConfig,
+    ProcessWorkerRuntime, StubEmbedder, WorkerConfig,
+};
+use note_pipelines::{
+    Context, EmbeddingJobNotifier, FingerprintReconciliation, ProcessEmbeddingJobStatus,
+};
 use note_server::config::{AttachmentConfig, DatabaseConfig, EmbeddingConfig, RuntimeConfig};
 use note_storage::StorageBackend;
 use std::io::Read;
@@ -27,27 +32,6 @@ const DEFAULT_EMBEDDING_POLL_MS: u64 = 1000;
 const TRASH_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const DEV_FRONTEND_URL: &str = "http://0.0.0.0:6221";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmbeddingExecutionMode {
-    Process,
-    Thread,
-    Remote,
-}
-
-impl EmbeddingExecutionMode {
-    fn from_env() -> anyhow::Result<Self> {
-        match std::env::var("NOTE_EMBEDDING_MODE")
-            .unwrap_or_else(|_| "process".to_string())
-            .as_str()
-        {
-            "process" => Ok(Self::Process),
-            "thread" => Ok(Self::Thread),
-            "remote" => Ok(Self::Remote),
-            other => anyhow::bail!("unknown NOTE_EMBEDDING_MODE={other}"),
-        }
-    }
-}
-
 struct NotifyEmbeddingJobs {
     notify: Arc<Notify>,
 }
@@ -58,33 +42,114 @@ impl EmbeddingJobNotifier for NotifyEmbeddingJobs {
     }
 }
 
+#[async_trait::async_trait]
+trait ProcessRuntimeHandle: Send {
+    async fn shutdown(self: Box<Self>);
+}
+
+#[async_trait::async_trait]
+impl ProcessRuntimeHandle for ProcessWorkerRuntime {
+    async fn shutdown(self: Box<Self>) {
+        (*self).shutdown().await;
+    }
+}
+
 struct RunningEmbedding {
     embedder: Arc<dyn note_embedding::Embedder>,
-    process_runtime: Option<ProcessWorkerRuntime>,
+    info: EmbeddingBackendInfo,
+    process_runtime: Option<Box<dyn ProcessRuntimeHandle>>,
     wake: Arc<Notify>,
 }
 
 async fn start_embedding_runtime(config: &EmbeddingConfig) -> anyhow::Result<RunningEmbedding> {
-    let EmbeddingConfig::Local { model_path } = config else {
-        anyhow::bail!("OpenAI-compatible embedding adapter is not implemented yet")
-    };
-
-    match EmbeddingExecutionMode::from_env()? {
-        EmbeddingExecutionMode::Process => {
+    match config {
+        EmbeddingConfig::Local { model_path } => {
             let worker_config =
                 with_resolved_model_path(ProcessWorkerConfig::from_env()?, model_path);
             let process_runtime = ProcessWorkerRuntime::start(worker_config).await?;
             Ok(RunningEmbedding {
                 embedder: process_runtime.embedder(),
-                process_runtime: Some(process_runtime),
+                info: EmbeddingBackendInfo::local_bge_m3(),
+                process_runtime: Some(Box::new(process_runtime)),
                 wake: Arc::new(Notify::new()),
             })
         }
-        EmbeddingExecutionMode::Thread => {
-            anyhow::bail!("NOTE_EMBEDDING_MODE=thread is reserved but not implemented yet")
+        EmbeddingConfig::OpenAi {
+            base_url,
+            model,
+            api_key_env,
+            timeout_secs,
+            max_retries,
+        } => {
+            let bearer_token =
+                resolve_bearer_token(api_key_env.as_deref(), |name| std::env::var(name).ok())?;
+            let info = EmbeddingBackendInfo::openai(model.clone());
+            let embedder = OpenAiCompatibleEmbedder::new(OpenAiCompatibleConfig {
+                base_url: base_url.clone(),
+                model: model.clone(),
+                bearer_token,
+                timeout: Duration::from_secs(*timeout_secs),
+                max_retries: *max_retries,
+            })?;
+            Ok(RunningEmbedding {
+                embedder: Arc::new(embedder),
+                info,
+                process_runtime: None,
+                wake: Arc::new(Notify::new()),
+            })
         }
-        EmbeddingExecutionMode::Remote => {
-            anyhow::bail!("NOTE_EMBEDDING_MODE=remote is reserved but not implemented yet")
+    }
+}
+
+fn resolve_bearer_token(
+    api_key_env: Option<&str>,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(variable) = api_key_env else {
+        return Ok(None);
+    };
+    match get_env(variable) {
+        Some(value) if !value.trim().is_empty() => Ok(Some(value)),
+        _ => anyhow::bail!("embedding API key environment variable {variable} is missing or blank"),
+    }
+}
+
+async fn shutdown_embedding(embedding: &mut RunningEmbedding) {
+    if let Some(process_runtime) = embedding.process_runtime.take() {
+        process_runtime.shutdown().await;
+    }
+}
+
+async fn reconcile_started_embedding(
+    storage: &dyn StorageBackend,
+    embedding: &mut RunningEmbedding,
+) -> anyhow::Result<FingerprintReconciliation> {
+    let result = note_pipelines::reconcile_embedding_fingerprint(
+        storage,
+        &embedding.info.fingerprint,
+        chrono::Utc::now().timestamp(),
+    )
+    .await;
+    match result {
+        Ok(reconciliation) => {
+            match reconciliation {
+                FingerprintReconciliation::Initialized => {
+                    eprintln!("initialized embedding fingerprint")
+                }
+                FingerprintReconciliation::Unchanged => {
+                    eprintln!("embedding fingerprint unchanged")
+                }
+                FingerprintReconciliation::Regenerated { queued_jobs } => {
+                    eprintln!(
+                        "embedding fingerprint changed; queued {queued_jobs} regeneration jobs"
+                    )
+                }
+            }
+            Ok(reconciliation)
+        }
+        Err(error) => {
+            shutdown_embedding(embedding).await;
+            Err(error)
         }
     }
 }
@@ -327,13 +392,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if stdio_mode {
-        let embedding = start_embedding_runtime(&config.embedding).await?;
+        let mut embedding = start_embedding_runtime(&config.embedding).await?;
+        reconcile_started_embedding(storage.as_ref(), &mut embedding).await?;
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
         let ctx = Arc::new(Context::with_embedding_job_notifier(
             storage.clone(),
             embedding.embedder.clone(),
+            embedding.info.clone(),
             notifier,
             attachments.clone(),
         ));
@@ -347,21 +414,22 @@ async fn main() -> anyhow::Result<()> {
             embedding.wake.clone(),
             scheduler_shutdown_rx,
         ));
-        note_mcp::run_stdio(ctx).await?;
+        let run_result = note_mcp::run_stdio(ctx).await;
         let _ = scheduler_shutdown_tx.send(true);
         let _ = scheduler.await;
         let _ = trash_retention.await;
-        if let Some(process_runtime) = embedding.process_runtime {
-            process_runtime.shutdown().await;
-        }
+        shutdown_embedding(&mut embedding).await;
+        run_result?;
     } else {
-        let embedding = start_embedding_runtime(&config.embedding).await?;
+        let mut embedding = start_embedding_runtime(&config.embedding).await?;
+        reconcile_started_embedding(storage.as_ref(), &mut embedding).await?;
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
         let ctx = Arc::new(Context::with_embedding_job_notifier(
             storage.clone(),
             embedding.embedder.clone(),
+            embedding.info.clone(),
             notifier,
             attachments.clone(),
         ));
@@ -482,9 +550,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = scheduler_shutdown_tx.send(true);
         let _ = scheduler.await;
         let _ = trash_retention.await;
-        if let Some(process_runtime) = embedding.process_runtime {
-            process_runtime.shutdown().await;
-        }
+        shutdown_embedding(&mut embedding).await;
         run_result?;
     }
     Ok(())
@@ -493,7 +559,142 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use note_storage::{
+        BackendInfo, StorageError, StorageErrorKind, StorageResult, StorageSession,
+        StorageTransaction, TransactionMode,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn bearer_token_resolution_is_optional_and_rejects_missing_or_blank_values() {
+        assert_eq!(
+            resolve_bearer_token(None, |_| panic!("no environment read expected")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_bearer_token(Some("EMBEDDING_API_KEY"), |name| {
+                (name == "EMBEDDING_API_KEY").then(|| "secret-token".into())
+            })
+            .unwrap(),
+            Some("secret-token".into())
+        );
+
+        for value in [None, Some(" \t\n".into())] {
+            let error =
+                resolve_bearer_token(Some("EMBEDDING_API_KEY"), |_| value.clone()).unwrap_err();
+            let rendered = error.to_string();
+            assert!(rendered.contains("EMBEDDING_API_KEY"), "{rendered}");
+            assert!(!rendered.contains("unrelated-secret"), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_runtime_embeds_without_a_local_process() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_json(serde_json::json!({
+                "model": "bge-m3",
+                "input": ["remote request"],
+                "encoding_format": "float"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "index": 0,
+                    "embedding": vec![0.25_f32; note_embedding::DEFAULT_EMBEDDING_DIMENSION]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let running = start_embedding_runtime(&EmbeddingConfig::OpenAi {
+            base_url: server.uri(),
+            model: "bge-m3".into(),
+            api_key_env: None,
+            timeout_secs: 1,
+            max_retries: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(running.process_runtime.is_none());
+        assert_eq!(
+            running.info,
+            note_embedding::EmbeddingBackendInfo::openai("bge-m3")
+        );
+        assert_eq!(
+            running.embedder.embed("remote request").await.unwrap(),
+            vec![0.25_f32; note_embedding::DEFAULT_EMBEDDING_DIMENSION]
+        );
+    }
+
+    struct FakeRuntimeHandle {
+        shutdown: Arc<AtomicBool>,
+    }
+
+    struct FailingReconciliationBackend;
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FailingReconciliationBackend {
+        async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "session is not used",
+            ))
+        }
+
+        async fn begin(
+            &self,
+            _mode: TransactionMode,
+        ) -> StorageResult<Box<dyn StorageTransaction>> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "controlled reconciliation failure",
+            ))
+        }
+
+        async fn info(&self) -> StorageResult<BackendInfo> {
+            Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "info is not used",
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRuntimeHandle for FakeRuntimeHandle {
+        async fn shutdown(self: Box<Self>) {
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_failure_shuts_down_a_started_local_runtime() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let storage: Arc<dyn StorageBackend> = Arc::new(FailingReconciliationBackend);
+        let mut embedding = RunningEmbedding {
+            embedder: Arc::new(StubEmbedder),
+            info: note_embedding::EmbeddingBackendInfo::local_bge_m3(),
+            process_runtime: Some(Box::new(FakeRuntimeHandle {
+                shutdown: shutdown.clone(),
+            })),
+            wake: Arc::new(Notify::new()),
+        };
+
+        let error = reconcile_started_embedding(storage.as_ref(), &mut embedding)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("controlled reconciliation failure"));
+        assert!(embedding.process_runtime.is_none());
+        assert!(shutdown.load(Ordering::SeqCst));
+    }
 
     async fn reject_postgres_startup(listener: tokio::net::TcpListener) -> std::io::Result<()> {
         const SSL_REQUEST_CODE: u32 = 80_877_103;
@@ -669,24 +870,6 @@ mod tests {
         assert_eq!(
             s3.to_string(),
             "S3 attachment adapter is not implemented yet"
-        );
-    }
-
-    #[tokio::test]
-    async fn reserved_external_embedding_returns_precise_error() {
-        let openai = start_embedding_runtime(&EmbeddingConfig::OpenAi {
-            base_url: "http://localhost:8080".into(),
-            model: "bge-m3".into(),
-            api_key_env: None,
-            timeout_secs: 30,
-            max_retries: 3,
-        })
-        .await
-        .err()
-        .expect("OpenAI embedding must remain reserved");
-        assert_eq!(
-            openai.to_string(),
-            "OpenAI-compatible embedding adapter is not implemented yet"
         );
     }
 
