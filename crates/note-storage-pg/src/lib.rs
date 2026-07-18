@@ -1,6 +1,8 @@
 mod connection;
+mod embedding_jobs;
 mod labels;
 mod notes;
+mod settings;
 
 pub use connection::PgSession;
 use connection::{map_connect_error, map_sqlx_error};

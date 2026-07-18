@@ -1,8 +1,14 @@
 #[allow(dead_code)]
 mod support;
 
-use note_core::{parse_label_selectors, LabelValueType, NoteAttachment};
-use note_storage::{LabelRepository, NewNote, NoteUpdate, NotesRepository, StorageErrorKind};
+use note_core::{
+    parse_label_selectors, DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm,
+    LabelValueType, NoteAttachment, SystemConfig,
+};
+use note_storage::{
+    EmbeddingRepository, LabelRepository, NewNote, NoteUpdate, NotesRepository, SettingsRepository,
+    StorageErrorKind, TransactionMode, UpsertNoteChunk,
+};
 use note_storage_pg::PgStorage;
 use serde_json::Value;
 use support::{configured_url_or_skip, TestDatabase};
@@ -718,5 +724,488 @@ async fn malformed_attachment_json_is_an_operation_error() {
 
     inspection_pool.close().await;
     drop(session);
+    database.cleanup(Some(&storage)).await.unwrap();
+}
+
+#[tokio::test]
+async fn embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantics() {
+    let Some(admin_url) = configured_url_or_skip(
+        "embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantics",
+    ) else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    database.provision_vector().await;
+    let storage = PgStorage::connect(&database.url, 4)
+        .await
+        .expect("connect PostgreSQL storage");
+    let session = storage.connect_session().await.unwrap();
+
+    for (id, title, revision, deleted_at) in [
+        ("complete", "Complete", 1, None),
+        ("partial", "Partial", 1, None),
+        ("stale", "Stale", 2, None),
+        ("deleted", "Deleted", 1, Some(99)),
+        ("processing", "Processing", 1, None),
+    ] {
+        session
+            .insert_note(NewNote {
+                id,
+                title,
+                content: "content",
+                attachments: &[],
+                created_at: 1,
+                updated_at: 1,
+                note_revision: revision,
+                deleted_at,
+            })
+            .await
+            .unwrap();
+    }
+
+    for (note_id, chunk_idx, revision, status) in [
+        ("complete", 1, 1, "embedded"),
+        ("complete", 0, 1, "embedded"),
+        ("partial", 0, 1, "embedded"),
+        ("partial", 1, 1, "pending"),
+        ("stale", 0, 1, "embedded"),
+        ("deleted", 0, 1, "embedded"),
+        ("processing", 0, 1, "pending"),
+    ] {
+        session
+            .upsert_note_chunk(UpsertNoteChunk {
+                note_id,
+                chunk_idx,
+                content_hash: &format!("{note_id}-{chunk_idx}"),
+                content: &format!("content-{chunk_idx}"),
+                note_revision: revision,
+                status,
+                updated_at: 10 + chunk_idx,
+            })
+            .await
+            .unwrap();
+    }
+
+    let chunks = session.list_note_chunks("complete").await.unwrap();
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.chunk_idx)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(chunks[0].content_hash, "complete-0");
+    let dashboard = session.embedding_dashboard_status().await.unwrap();
+    assert_eq!(dashboard.embedded_note_count, 1);
+    assert_eq!(dashboard.processing_note, None);
+    assert_eq!(
+        session
+            .mark_note_chunk_status("complete", 0, "wrong", 1, "pending", 20)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        session
+            .mark_note_chunk_status("complete", 0, "complete-0", 2, "pending", 20)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        session
+            .mark_note_chunk_status("complete", 0, "complete-0", 1, "pending", 20)
+            .await
+            .unwrap(),
+        1
+    );
+    let chunk = session
+        .get_note_chunk("complete", 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk.status, "pending");
+    assert_eq!(chunk.updated_at, 20);
+    assert_eq!(
+        session
+            .delete_note_chunks_from("complete", 1)
+            .await
+            .unwrap(),
+        1
+    );
+
+    let dashboard = session.embedding_dashboard_status().await.unwrap();
+    assert_eq!(dashboard.embedded_note_count, 0);
+    assert_eq!(dashboard.processing_note, None);
+
+    session
+        .enqueue_embedding_job("processing", 0, "processing-0", "original", 1, 30)
+        .await
+        .unwrap();
+    session
+        .enqueue_embedding_job("processing", 0, "processing-0", "replacement", 2, 31)
+        .await
+        .unwrap();
+    session
+        .enqueue_embedding_job("processing", 1, "processing-1", "second", 1, 29)
+        .await
+        .unwrap();
+    assert!(session
+        .claim_pending_embedding_jobs(0, 32)
+        .await
+        .unwrap()
+        .is_empty());
+    #[cfg(target_pointer_width = "64")]
+    {
+        let error = session
+            .claim_pending_embedding_jobs(usize::MAX, 32)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Operation);
+    }
+    let first = session
+        .claim_pending_embedding_jobs(1, 33)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(first.chunk_idx, 1);
+    assert_eq!(first.attempts, 1);
+    let second = session
+        .claim_pending_embedding_jobs(1, 34)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(second.chunk_idx, 0);
+    assert_eq!(second.content, "replacement");
+    assert_eq!(second.note_revision, 2);
+
+    session
+        .enqueue_embedding_job(
+            "processing",
+            0,
+            "processing-0",
+            "must not replace processing",
+            3,
+            35,
+        )
+        .await
+        .unwrap();
+    assert!(session
+        .claim_pending_embedding_jobs(1, 36)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        session
+            .fail_embedding_job(first.id, first.attempts, 2, "retry", 37)
+            .await
+            .unwrap(),
+        1
+    );
+    let retry = session
+        .claim_pending_embedding_jobs(1, 38)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(retry.id, first.id);
+    assert_eq!(retry.attempts, 2);
+    assert_eq!(
+        session
+            .fail_embedding_job(retry.id, retry.attempts, 2, "terminal", 39)
+            .await
+            .unwrap(),
+        1
+    );
+    session
+        .enqueue_embedding_job("partial", 2, "dashboard", "dashboard", 1, 40)
+        .await
+        .unwrap();
+    let oldest_processing = session
+        .claim_pending_embedding_jobs(1, 32)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let processing = session.embedding_dashboard_status().await.unwrap();
+    assert_eq!(processing.processing_note.unwrap().id, "partial");
+    assert_eq!(
+        session
+            .delete_embedding_job(oldest_processing.id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        session
+            .embedding_dashboard_status()
+            .await
+            .unwrap()
+            .processing_note
+            .unwrap()
+            .id,
+        "processing"
+    );
+    assert_eq!(
+        session
+            .delete_embedding_jobs_from_chunk("processing", 0)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        session
+            .embedding_dashboard_status()
+            .await
+            .unwrap()
+            .processing_note
+            .unwrap()
+            .id,
+        "processing"
+    );
+    assert_eq!(
+        session.requeue_processing_embedding_jobs(40).await.unwrap(),
+        1
+    );
+    let reclaimed = session
+        .claim_pending_embedding_jobs(1, 41)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(reclaimed.id, second.id);
+    assert_eq!(reclaimed.content, "replacement");
+    assert_eq!(session.delete_embedding_job(reclaimed.id).await.unwrap(), 1);
+    assert_eq!(session.delete_embedding_job(reclaimed.id).await.unwrap(), 0);
+
+    session
+        .enqueue_embedding_job("processing", 2, "old", "old", 1, 42)
+        .await
+        .unwrap();
+    session
+        .enqueue_embedding_job("processing", 2, "current", "current", 1, 43)
+        .await
+        .unwrap();
+    let old = session
+        .claim_pending_embedding_jobs(1, 44)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(old.content_hash, "old");
+    assert_eq!(
+        session
+            .delete_stale_embedding_jobs_for_chunk("processing", 2, "current")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        session.requeue_processing_embedding_jobs(45).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        session
+            .delete_stale_embedding_jobs_for_chunk("processing", 2, "current")
+            .await
+            .unwrap(),
+        1
+    );
+    let current = session
+        .claim_pending_embedding_jobs(1, 46)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(current.content_hash, "current");
+    assert_eq!(session.delete_embedding_job(current.id).await.unwrap(), 1);
+    assert_eq!(
+        session
+            .delete_embedding_jobs_from_chunk("processing", 0)
+            .await
+            .unwrap(),
+        0
+    );
+
+    for chunk_idx in 1..=2 {
+        session
+            .upsert_note_chunk(UpsertNoteChunk {
+                note_id: "processing",
+                chunk_idx,
+                content_hash: &format!("derived-{chunk_idx}"),
+                content: "derived content",
+                note_revision: 1,
+                status: "embedded",
+                updated_at: 50,
+            })
+            .await
+            .unwrap();
+    }
+    let inspection_pool = database.inspect_pool().await;
+    for chunk_idx in 0..=2 {
+        sqlx::query(
+            "INSERT INTO note_chunk_embeddings (note_id, chunk_idx, embedding)
+             VALUES ($1, $2, $3)",
+        )
+        .bind("processing")
+        .bind(chunk_idx)
+        .bind(pgvector::Vector::from(vec![
+            0.0;
+            note_storage::EMBEDDING_DIMENSION
+        ]))
+        .execute(&inspection_pool)
+        .await
+        .unwrap();
+        assert!(session
+            .chunk_embedding_exists("processing", chunk_idx)
+            .await
+            .unwrap());
+    }
+    session
+        .clear_note_chunk_derived("processing", 0)
+        .await
+        .unwrap();
+    session
+        .clear_note_chunks_from_derived("processing", 2)
+        .await
+        .unwrap();
+    assert!(!session
+        .chunk_embedding_exists("processing", 0)
+        .await
+        .unwrap());
+    assert!(session
+        .chunk_embedding_exists("processing", 1)
+        .await
+        .unwrap());
+    assert!(!session
+        .chunk_embedding_exists("processing", 2)
+        .await
+        .unwrap());
+    session
+        .enqueue_embedding_job("processing", 2, "clear", "clear", 1, 51)
+        .await
+        .unwrap();
+    session.clear_note_search_data("processing").await.unwrap();
+    assert!(session
+        .list_note_chunks("processing")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!session
+        .chunk_embedding_exists("processing", 1)
+        .await
+        .unwrap());
+    assert!(session
+        .claim_pending_embedding_jobs(10, 52)
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert_eq!(
+        session.get_system_config().await.unwrap(),
+        SystemConfig::default()
+    );
+    let config = SystemConfig {
+        duplicate_check: DuplicateCheckConfig {
+            enabled: true,
+            rules: vec![DuplicateCheckRule {
+                terms: vec![DuplicateCheckTerm {
+                    key: "kind".into(),
+                    value: Some("note".into()),
+                }],
+            }],
+        },
+    };
+    session.set_system_config(&config).await.unwrap();
+    assert_eq!(session.get_system_config().await.unwrap(), config);
+
+    sqlx::query(
+        "UPDATE app_settings
+         SET value = '{\"duplicate_check\":{\"enabled\":\"not-a-boolean\"}}'::jsonb
+         WHERE key = 'system_config'",
+    )
+    .execute(&inspection_pool)
+    .await
+    .unwrap();
+    let error = session.get_system_config().await.unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Operation);
+
+    inspection_pool.close().await;
+    drop(session);
+    database.cleanup(Some(&storage)).await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_embedding_claims_are_disjoint_and_complete() {
+    let Some(admin_url) =
+        configured_url_or_skip("concurrent_embedding_claims_are_disjoint_and_complete")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    database.provision_vector().await;
+    let storage = PgStorage::connect(&database.url, 4)
+        .await
+        .expect("connect PostgreSQL storage");
+    let session = storage.connect_session().await.unwrap();
+    session
+        .insert_note(NewNote {
+            id: "claim-concurrently",
+            title: "Concurrent claims",
+            content: "content",
+            attachments: &[],
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    for chunk_idx in 0..10 {
+        session
+            .enqueue_embedding_job(
+                "claim-concurrently",
+                chunk_idx,
+                &format!("hash-{chunk_idx}"),
+                &format!("content-{chunk_idx}"),
+                1,
+                10,
+            )
+            .await
+            .unwrap();
+    }
+    drop(session);
+
+    let first = storage
+        .begin_session(TransactionMode::Deferred)
+        .await
+        .unwrap();
+    let second = storage
+        .begin_session(TransactionMode::Deferred)
+        .await
+        .unwrap();
+    let (first_claim, second_claim) = tokio::join!(
+        first.claim_pending_embedding_jobs(5, 20),
+        second.claim_pending_embedding_jobs(5, 20)
+    );
+    let first_claim = first_claim.unwrap();
+    let second_claim = second_claim.unwrap();
+    assert_eq!(first_claim.len(), 5);
+    assert_eq!(second_claim.len(), 5);
+    let first_ids = first_claim
+        .iter()
+        .map(|job| job.id)
+        .collect::<std::collections::HashSet<_>>();
+    let second_ids = second_claim
+        .iter()
+        .map(|job| job.id)
+        .collect::<std::collections::HashSet<_>>();
+    assert!(first_ids.is_disjoint(&second_ids));
+    assert_eq!(first_ids.union(&second_ids).count(), 10);
+
+    first.commit().await.unwrap();
+    second.commit().await.unwrap();
     database.cleanup(Some(&storage)).await.unwrap();
 }
