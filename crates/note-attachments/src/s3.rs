@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn construction_does_not_require_credentials_or_wait_for_metadata() {
+    async fn construction_succeeds_without_environment_credentials_when_metadata_is_disabled() {
         let _lock = AWS_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -585,7 +585,7 @@ mod tests {
             }),
         )
         .await
-        .expect("constructor must not wait for metadata")
+        .expect("constructor must complete while instance metadata is disabled")
         .unwrap();
 
         let clone = store.clone();
