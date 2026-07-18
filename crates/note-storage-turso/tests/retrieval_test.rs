@@ -249,7 +249,7 @@ async fn dense_search_deduplicates_chunks_to_note_ids() {
 }
 
 #[tokio::test]
-async fn dense_search_excludes_soft_deleted_notes_and_reuses_vectors_after_restore() {
+async fn dense_search_excludes_soft_deleted_notes_and_restore_reuses_vectors() {
     let fixture = fixture().await;
     insert_test_note(&fixture.session, "active").await;
     insert_test_note(&fixture.session, "deleted").await;
