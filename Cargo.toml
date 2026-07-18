@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/note-attachments",
     "crates/note-core",
     "crates/note-storage",
     "crates/note-storage-turso",

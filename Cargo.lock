@@ -2258,6 +2258,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "note-attachments"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "note-core",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "note-core"
 version = "0.1.0"
 dependencies = [

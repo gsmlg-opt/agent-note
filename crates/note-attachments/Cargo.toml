@@ -1,0 +1,15 @@
+[package]
+name = "note-attachments"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow = "1.0.103"
+async-trait = "0.1.89"
+note-core = { version = "0.1.0", path = "../note-core" }
+tokio = { version = "1.52.3", features = ["fs"] }
+uuid = { version = "1.23.4", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
