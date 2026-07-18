@@ -69,6 +69,31 @@ async fn list_keys(fixture: &Fixture, prefix: &str) -> Vec<String> {
     }
 }
 
+async fn seed_final_objects(fixture: &Fixture, note_id: &str, count: usize) {
+    for chunk_start in (0..count).step_by(32) {
+        let chunk_end = (chunk_start + 32).min(count);
+        let mut set = tokio::task::JoinSet::new();
+        for index in chunk_start..chunk_end {
+            let client = fixture.client.clone();
+            let bucket = fixture.bucket.clone();
+            let key = format!("{}/{note_id}/item-{index:04}.bin", fixture.prefix);
+            set.spawn(async move {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+                    .send()
+                    .await
+                    .unwrap();
+            });
+        }
+        while let Some(result) = set.join_next().await {
+            result.unwrap();
+        }
+    }
+}
+
 async fn wait_for_no_keys(fixture: &Fixture) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -93,6 +118,134 @@ fn attachment(path: &str, content: &[u8]) -> NoteAttachment {
         description: "integration test".into(),
         content: content.to_vec(),
     }
+}
+
+#[tokio::test]
+async fn publish_uses_canonical_final_keys_and_removes_staging() {
+    let Some(fixture) = fixture().await else {
+        eprintln!("skipped: NOTE_TEST_MINIO_ENDPOINT is unset");
+        return;
+    };
+    let prepared = fixture
+        .store
+        .prepare("note-1", &[attachment("./nested/read me.txt", b"payload")])
+        .await
+        .unwrap();
+    prepared.publish().await.unwrap();
+
+    let keys = list_keys(&fixture, &format!("{}/", fixture.prefix)).await;
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].ends_with("/note-1/nested/read me.txt"));
+    assert!(!keys[0].contains("/.staging/"));
+    assert_eq!(
+        fixture
+            .store
+            .read("note-1", "./nested/read me.txt")
+            .await
+            .unwrap(),
+        b"payload"
+    );
+}
+
+#[tokio::test]
+async fn replacement_overwrites_retained_paths_and_removes_obsolete_paths() {
+    let Some(fixture) = fixture().await else {
+        eprintln!("skipped: NOTE_TEST_MINIO_ENDPOINT is unset");
+        return;
+    };
+    fixture
+        .store
+        .prepare(
+            "note-1",
+            &[
+                attachment("./retained.txt", b"old"),
+                attachment("./obsolete.txt", b"remove"),
+            ],
+        )
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+    fixture
+        .store
+        .prepare("note-1", &[attachment("./retained.txt", b"new")])
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .read("note-1", "./retained.txt")
+            .await
+            .unwrap(),
+        b"new"
+    );
+    assert!(fixture
+        .store
+        .read("note-1", "./obsolete.txt")
+        .await
+        .is_err());
+    assert_eq!(
+        list_keys(&fixture, &format!("{}/note-1/", fixture.prefix))
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn publishing_an_empty_set_removes_every_final_object() {
+    let Some(fixture) = fixture().await else {
+        eprintln!("skipped: NOTE_TEST_MINIO_ENDPOINT is unset");
+        return;
+    };
+    fixture
+        .store
+        .prepare("note-1", &[attachment("./old.txt", b"old")])
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+    fixture
+        .store
+        .prepare("note-1", &[])
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+
+    assert!(list_keys(&fixture, &format!("{}/note-1/", fixture.prefix))
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn remove_note_lists_every_page_and_deletes_in_at_most_one_thousand_key_batches() {
+    let Some(fixture) = fixture().await else {
+        eprintln!("skipped: NOTE_TEST_MINIO_ENDPOINT is unset");
+        return;
+    };
+    seed_final_objects(&fixture, "note-big", 1_005).await;
+    assert_eq!(
+        list_keys(&fixture, &format!("{}/note-big/", fixture.prefix))
+            .await
+            .len(),
+        1_005
+    );
+
+    fixture.store.remove_note("note-big").await.unwrap();
+
+    assert!(
+        list_keys(&fixture, &format!("{}/note-big/", fixture.prefix))
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]

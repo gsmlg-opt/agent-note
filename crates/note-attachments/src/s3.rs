@@ -232,55 +232,126 @@ impl S3AttachmentStore {
     }
 
     async fn delete_keys(&self, keys: &[String]) -> anyhow::Result<()> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        let objects = keys
-            .iter()
-            .map(|key| ObjectIdentifier::builder().key(key).build())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| anyhow::anyhow!("S3 delete objects failed (invalid key)"))?;
-        let delete = Delete::builder()
-            .set_objects(Some(objects))
-            .quiet(true)
-            .build()
-            .map_err(|_| anyhow::anyhow!("S3 delete objects failed (invalid request)"))?;
-        let output = self
-            .client
-            .delete_objects()
-            .bucket(&self.bucket)
-            .delete(delete)
-            .send()
-            .await
-            .map_err(|error| safe_sdk_error("delete objects", &error))?;
-        if !output.errors().is_empty() {
-            anyhow::bail!(
-                "S3 delete objects failed for {} object(s)",
-                output.errors().len()
-            );
+        for batch in keys.chunks(S3_DELETE_BATCH_SIZE) {
+            let mut pending = batch.to_vec();
+            for attempt in 0..S3_MAX_ATTEMPTS {
+                let expected = pending.iter().cloned().collect::<HashSet<_>>();
+                let objects = pending
+                    .iter()
+                    .map(|key| ObjectIdentifier::builder().key(key).build())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| anyhow::anyhow!("S3 delete objects failed (invalid key)"))?;
+                let delete = Delete::builder()
+                    .set_objects(Some(objects))
+                    .quiet(true)
+                    .build()
+                    .map_err(|_| anyhow::anyhow!("S3 delete objects failed (invalid request)"))?;
+                let no_sdk_retries = aws_sdk_s3::config::Builder::new()
+                    .retry_config(RetryConfig::standard().with_max_attempts(1));
+                let response = self
+                    .client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(delete)
+                    .customize()
+                    .config_override(no_sdk_retries)
+                    .send()
+                    .await;
+                let output = match response {
+                    Ok(output) => output,
+                    Err(error) if retryable_sdk_error(&error) && attempt + 1 < S3_MAX_ATTEMPTS => {
+                        sleep_before_delete_retry(attempt).await;
+                        continue;
+                    }
+                    Err(error) => return Err(safe_sdk_error("delete objects", &error)),
+                };
+                if output.errors().is_empty() {
+                    pending.clear();
+                    break;
+                }
+
+                let mut retry = Vec::new();
+                for error in output.errors() {
+                    let Some(key) = error.key().filter(|key| expected.contains(*key)) else {
+                        anyhow::bail!("S3 delete objects failed (malformed object error)");
+                    };
+                    if !transient_delete_code(error.code()) {
+                        anyhow::bail!("S3 delete objects failed (permanent object error)");
+                    }
+                    retry.push(key.to_owned());
+                }
+                retry.sort();
+                retry.dedup();
+                pending = retry;
+                if attempt + 1 == S3_MAX_ATTEMPTS {
+                    anyhow::bail!("S3 delete objects failed (transient retries exhausted)");
+                }
+                sleep_before_delete_retry(attempt).await;
+            }
+            if !pending.is_empty() {
+                anyhow::bail!("S3 delete objects failed (transient retries exhausted)");
+            }
         }
         Ok(())
     }
 
-    async fn list_keys_single_page(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
-        let output = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(prefix)
-            .max_keys(S3_PAGE_SIZE)
-            .send()
-            .await
-            .map_err(|error| safe_sdk_error("list objects", &error))?;
-        Ok(output
-            .contents()
-            .iter()
-            .filter_map(|object| object.key())
-            .map(ToOwned::to_owned)
-            .collect())
+    async fn list_keys(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut continuation: Option<String> = None;
+        let mut seen_tokens = HashSet::new();
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .max_keys(S3_PAGE_SIZE);
+            if let Some(token) = continuation.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let output = request
+                .send()
+                .await
+                .map_err(|error| safe_sdk_error("list objects", &error))?;
+            keys.extend(
+                output
+                    .contents()
+                    .iter()
+                    .filter_map(|object| object.key())
+                    .map(ToOwned::to_owned),
+            );
+            if output.is_truncated().unwrap_or(false) {
+                let token = output
+                    .next_continuation_token()
+                    .filter(|token| !token.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("S3 list objects failed (missing continuation token)")
+                    })?
+                    .to_string();
+                if !seen_tokens.insert(token.clone()) {
+                    anyhow::bail!("S3 list objects failed (repeated continuation token)");
+                }
+                continuation = Some(token);
+            } else {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<()> {
+        let keys = self.list_keys(prefix).await?;
+        self.delete_keys(&keys).await
     }
 
     async fn publish_set(&self, prepared: Box<PreparedS3Set>) -> anyhow::Result<()> {
+        let final_prefix = final_prefix(&self.prefix, &prepared.note_id)?;
+        let expected = prepared
+            .metadata
+            .iter()
+            .map(|attachment| final_key(&self.prefix, &prepared.note_id, &attachment.path))
+            .collect::<anyhow::Result<HashSet<_>>>()?;
+
         for attachment in &prepared.metadata {
             let relative = crate::path::canonical_relative_path(&attachment.path)?;
             let source_key = format!("{}{relative}", prepared.staging_prefix);
@@ -304,6 +375,33 @@ impl S3AttachmentStore {
                     "database committed; staged objects retained at {staging_location}"
                 )));
             }
+        }
+
+        let obsolete = match self.list_keys(&final_prefix).await {
+            Ok(keys) => keys
+                .into_iter()
+                .filter(|key| !expected.contains(key))
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                let staging_location = prepared.staging_location();
+                eprintln!(
+                    "S3 attachment replacement failed after database commit; \
+                     staged objects retained at {staging_location}"
+                );
+                return Err(error.context(format!(
+                    "database committed; staged objects retained at {staging_location}"
+                )));
+            }
+        };
+        if let Err(error) = self.delete_keys(&obsolete).await {
+            let staging_location = prepared.staging_location();
+            eprintln!(
+                "S3 attachment replacement failed after database commit; \
+                 staged objects retained at {staging_location}"
+            );
+            return Err(error.context(format!(
+                "database committed; staged objects retained at {staging_location}"
+            )));
         }
 
         if let Err(error) = self.delete_keys(&prepared.staged_keys).await {
@@ -472,10 +570,8 @@ impl crate::AttachmentStore for S3AttachmentStore {
         validate_note_id(note_id)?;
         let note_lock = self.coordination.lock_for(note_id);
         let _guard = note_lock.lock().await;
-        let keys = self
-            .list_keys_single_page(&final_prefix(&self.prefix, note_id)?)
-            .await?;
-        self.delete_keys(&keys).await
+        self.delete_prefix(&final_prefix(&self.prefix, note_id)?)
+            .await
     }
 
     fn info(&self) -> crate::AttachmentStoreInfo {
@@ -521,6 +617,27 @@ where
         _ => "unknown",
     };
     anyhow::anyhow!("S3 {operation} failed ({category})")
+}
+
+fn transient_delete_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("InternalError" | "SlowDown" | "ServiceUnavailable" | "RequestTimeout")
+    )
+}
+
+fn retryable_sdk_error<E>(error: &SdkError<E>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    matches!(
+        error,
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_)
+    ) || transient_delete_code(error.code())
+}
+
+async fn sleep_before_delete_retry(attempt: u32) {
+    tokio::time::sleep(std::time::Duration::from_millis(50_u64 << attempt.min(3))).await;
 }
 
 fn normalize_prefix(prefix: &str) -> anyhow::Result<String> {
@@ -595,6 +712,7 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
+    use crate::AttachmentStore;
     use std::{
         collections::HashMap,
         ffi::OsString,
@@ -960,6 +1078,15 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                "application/xml",
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/agent-note/"))
             .and(body_string_contains(".staging/note-1/"))
@@ -1259,13 +1386,22 @@ mod tests {
             .expect(1)
             .mount(&cleanup_server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&cleanup_server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/agent-note/"))
             .respond_with(ResponseTemplate::new(503).set_body_raw(
                 "<Error><Code>PrivateDeleteCode</Code><Message>private delete body</Message></Error>",
                 "application/xml",
             ))
-            .expect(4)
+            .expect(1)
             .mount(&cleanup_server)
             .await;
         let cleanup_store = test_store(cleanup_server.uri()).await;
@@ -1300,6 +1436,379 @@ mod tests {
                 "phase-secret",
                 &copy_server.uri(),
                 &cleanup_server.uri(),
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_failure_retains_staging_and_reports_only_safe_location() {
+        use wiremock::matchers::header_exists;
+
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("failure-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("failure-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/tests/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/tests/note-1/file.txt"))
+            .and(header_exists("x-amz-copy-source"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agent-note/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let store = S3AttachmentStore::new(S3AttachmentConfig {
+            bucket: "agent-note".into(),
+            prefix: "tests".into(),
+            region: Some("us-east-1".into()),
+            endpoint: Some(server.uri()),
+            force_path_style: true,
+        })
+        .await
+        .unwrap();
+        let error = store
+            .prepare(
+                "note-1",
+                &[NoteAttachment {
+                    id: "file".into(),
+                    path: "./file.txt".into(),
+                    mime: "text/plain".into(),
+                    description: String::new(),
+                    content: b"payload".to_vec(),
+                }],
+            )
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(
+            "database committed; staged objects retained at \
+             s3://agent-note/tests/.staging/note-1/"
+        ));
+        assert!(!error.contains("failure-access"));
+        assert!(!error.contains("failure-secret"));
+        assert!(!error.contains(&server.uri()));
+    }
+
+    #[tokio::test]
+    async fn truncated_list_with_an_empty_token_fails_safely() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("list-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("list-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                 <NextContinuationToken></NextContinuationToken></ListBucketResult>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = test_store(server.uri())
+            .await
+            .list_keys("note-1/")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "S3 list objects failed (missing continuation token)"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_list_token_fails_safely_instead_of_looping() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("list-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("list-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                 <NextContinuationToken>same-token</NextContinuationToken></ListBucketResult>",
+                "application/xml",
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let error = test_store(server.uri())
+            .await
+            .list_keys("note-1/")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "S3 list objects failed (repeated continuation token)"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_transient_delete_errors_retry_only_the_failed_key() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("delete-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("delete-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let responder_calls = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/agent-note/"))
+            .respond_with(move |request: &Request| {
+                let call = responder_calls.fetch_add(1, Ordering::SeqCst);
+                let body = String::from_utf8_lossy(&request.body);
+                if call == 0 {
+                    assert!(body.contains("<Key>first</Key>"));
+                    assert!(body.contains("<Key>second</Key>"));
+                    ResponseTemplate::new(200).set_body_raw(
+                        "<DeleteResult><Error><Key>second</Key><Code>InternalError</Code>\
+                         <Message>private</Message></Error></DeleteResult>",
+                        "application/xml",
+                    )
+                } else {
+                    assert!(!body.contains("<Key>first</Key>"));
+                    assert!(body.contains("<Key>second</Key>"));
+                    ResponseTemplate::new(200)
+                        .set_body_raw("<DeleteResult></DeleteResult>", "application/xml")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        test_store(server.uri())
+            .await
+            .delete_keys(&["first".into(), "second".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_delete_transport_failures_make_at_most_four_total_requests() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("delete-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("delete-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agent-note/"))
+            .respond_with(ResponseTemplate::new(503).set_body_raw(
+                "<Error><Code>ServiceUnavailable</Code><Message>private</Message></Error>",
+                "application/xml",
+            ))
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let rendered = test_store(server.uri())
+            .await
+            .delete_keys(&["requested".into()])
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(rendered, "S3 delete objects failed (service-unavailable)");
+        assert!(!rendered.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn replacement_copies_every_expected_object_before_any_list_or_delete() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("order-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("order-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/(first|second)\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/agent-note/note-1/(first|second)\.txt$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<ListBucketResult><IsTruncated>false</IsTruncated><Contents>\
+                 <Key>note-1/obsolete.txt</Key></Contents></ListBucketResult>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agent-note/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<DeleteResult></DeleteResult>", "application/xml"),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        store
+            .prepare(
+                "note-1",
+                &[
+                    NoteAttachment {
+                        id: "first".into(),
+                        path: "first.txt".into(),
+                        mime: "text/plain".into(),
+                        description: String::new(),
+                        content: b"first".to_vec(),
+                    },
+                    NoteAttachment {
+                        id: "second".into(),
+                        path: "second.txt".into(),
+                        mime: "text/plain".into(),
+                        description: String::new(),
+                        content: b"second".to_vec(),
+                    },
+                ],
+            )
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let publish_requests = requests
+            .iter()
+            .skip_while(|request| {
+                !(request.method.as_str() == "PUT"
+                    && request.url.path().starts_with("/agent-note/note-1/"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(publish_requests.len(), 5);
+        assert_eq!(publish_requests[0].method.as_str(), "PUT");
+        assert_eq!(publish_requests[1].method.as_str(), "PUT");
+        assert_eq!(publish_requests[2].method.as_str(), "GET");
+        assert_eq!(publish_requests[3].method.as_str(), "POST");
+        assert_eq!(publish_requests[4].method.as_str(), "POST");
+    }
+
+    #[tokio::test]
+    async fn malformed_or_permanent_delete_errors_never_echo_server_fields() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("delete-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("delete-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+
+        for (response, expected) in [
+            (
+                "<DeleteResult><Error><Key>unrequested-private-key</Key>\
+                 <Code>InternalError</Code><Message>private malformed message</Message>\
+                 </Error></DeleteResult>",
+                "S3 delete objects failed (malformed object error)",
+            ),
+            (
+                "<DeleteResult><Error><Key>requested</Key><Code>PrivatePermanentCode</Code>\
+                 <Message>private permanent message</Message></Error></DeleteResult>",
+                "S3 delete objects failed (permanent object error)",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/agent-note/"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(response, "application/xml"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let rendered = test_store(server.uri())
+                .await
+                .delete_keys(&["requested".into()])
+                .await
+                .unwrap_err()
+                .to_string();
+
+            assert_eq!(rendered, expected);
+            for secret in [
+                "unrequested-private-key",
+                "PrivatePermanentCode",
+                "private malformed message",
+                "private permanent message",
+                "delete-access",
+                "delete-secret",
             ] {
                 assert!(!rendered.contains(secret));
             }
