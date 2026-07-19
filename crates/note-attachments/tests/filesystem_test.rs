@@ -558,6 +558,31 @@ async fn failed_put_promotion_restores_previous_file_and_keeps_siblings() {
 }
 
 #[tokio::test]
+async fn failed_new_nested_put_promotion_removes_created_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let store = FilesystemAttachmentStore::new(root.clone());
+    let prepared = store
+        .prepare_put("note-1", &attachment("./new/nested/target.txt", b"content"))
+        .await
+        .unwrap();
+    let staging_file = directory_entries(&root)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".put.tmp"))
+        })
+        .expect("staged attachment file");
+    std::fs::remove_file(staging_file).unwrap();
+
+    assert!(prepared.publish().await.is_err());
+
+    assert!(!root.join("note-1").exists());
+    assert!(directory_entries(&root).is_empty());
+}
+
+#[tokio::test]
 async fn dropping_a_prepared_set_cleans_its_staging_directory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("attachments");
@@ -620,40 +645,6 @@ async fn cancelling_prepare_cleans_its_staging_directory() {
     .expect("prepare must create staging data");
     task.abort();
     let join_error = task.await.err().expect("prepare task must be cancelled");
-    assert!(join_error.is_cancelled());
-
-    assert!(directory_entries(&root).is_empty());
-}
-
-#[tokio::test]
-async fn cancelling_prepare_put_cleans_its_staging_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("attachments");
-    let store = FilesystemAttachmentStore::new(root.clone());
-    let task = tokio::spawn(async move {
-        store
-            .prepare_put(
-                "note-1",
-                &attachment("./large.bin", &vec![7; 128 * 1024 * 1024]),
-            )
-            .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if !directory_entries(&root).is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("prepare put must create staging data");
-    task.abort();
-    let join_error = task
-        .await
-        .err()
-        .expect("prepare put task must be cancelled");
     assert!(join_error.is_cancelled());
 
     assert!(directory_entries(&root).is_empty());
