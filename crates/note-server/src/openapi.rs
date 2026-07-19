@@ -24,6 +24,46 @@ impl PartialSchema for Binary {
 
 impl ToSchema for Binary {}
 
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct SystemConfigSchema {
+    pub duplicate_check: DuplicateCheckConfigSchema,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct DuplicateCheckConfigSchema {
+    pub enabled: bool,
+    pub rules: Vec<DuplicateCheckRuleSchema>,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct DuplicateCheckRuleSchema {
+    pub terms: Vec<DuplicateCheckTermSchema>,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct DuplicateCheckTermSchema {
+    pub key: String,
+    #[schema(required = false)]
+    pub value: Option<String>,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct SystemInfoSchema {
+    pub database_engine: String,
+    pub database_path: Option<String>,
+    pub database_size_bytes: Option<u64>,
+    pub attachments_engine: String,
+    pub attachments_location: Option<String>,
+    pub embedding_engine: String,
+    pub embedding_model: String,
+    pub embedding_fingerprint: String,
+}
+
 pub(crate) fn label_pairs_schema() -> Array {
     Array::new(
         ArrayBuilder::new()
@@ -101,8 +141,27 @@ mod tests {
         http::{Request, StatusCode},
     };
     use http_body_util::BodyExt;
+    use std::collections::BTreeSet;
     use tower::ServiceExt;
     use utoipa::openapi::OpenApi;
+
+    fn property_keys(value: &serde_json::Value) -> BTreeSet<String> {
+        value
+            .as_object()
+            .expect("serialized object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn schema_property_keys(document: &serde_json::Value, schema_name: &str) -> BTreeSet<String> {
+        document["components"]["schemas"][schema_name]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("missing properties for {schema_name}"))
+            .keys()
+            .cloned()
+            .collect()
+    }
 
     #[tokio::test]
     async fn serves_openapi_document() {
@@ -165,5 +224,60 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let javascript = String::from_utf8(body.to_vec()).unwrap();
         assert!(javascript.contains("/api/openapi.json"));
+    }
+
+    #[test]
+    fn system_schema_fields_match_runtime_serialization() {
+        let runtime_config = note_core::SystemConfig {
+            duplicate_check: note_core::DuplicateCheckConfig {
+                enabled: true,
+                rules: vec![note_core::DuplicateCheckRule {
+                    terms: vec![note_core::DuplicateCheckTerm {
+                        key: "kind".to_string(),
+                        value: Some("skill".to_string()),
+                    }],
+                }],
+            },
+        };
+        let runtime_config = serde_json::to_value(runtime_config).unwrap();
+        let runtime_duplicate_check = &runtime_config["duplicate_check"];
+        let runtime_rule = &runtime_duplicate_check["rules"][0];
+        let runtime_term = &runtime_rule["terms"][0];
+
+        let runtime_info = note_pipelines::SystemInfo {
+            database_engine: "embed".to_string(),
+            database_path: Some("/tmp/agent-note.db".to_string()),
+            database_size_bytes: Some(1024),
+            attachments_engine: "filesystem".to_string(),
+            attachments_location: Some("/tmp/attachments".to_string()),
+            embedding_engine: "stub".to_string(),
+            embedding_model: "stub".to_string(),
+            embedding_fingerprint: "stub:0".to_string(),
+        };
+        let runtime_info = serde_json::to_value(runtime_info).unwrap();
+
+        let (_, document) = rest_router();
+        let document = serde_json::to_value(document).unwrap();
+
+        assert_eq!(
+            property_keys(&runtime_config),
+            schema_property_keys(&document, "SystemConfigSchema")
+        );
+        assert_eq!(
+            property_keys(runtime_duplicate_check),
+            schema_property_keys(&document, "DuplicateCheckConfigSchema")
+        );
+        assert_eq!(
+            property_keys(runtime_rule),
+            schema_property_keys(&document, "DuplicateCheckRuleSchema")
+        );
+        assert_eq!(
+            property_keys(runtime_term),
+            schema_property_keys(&document, "DuplicateCheckTermSchema")
+        );
+        assert_eq!(
+            property_keys(&runtime_info),
+            schema_property_keys(&document, "SystemInfoSchema")
+        );
     }
 }
