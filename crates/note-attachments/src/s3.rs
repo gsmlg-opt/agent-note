@@ -50,9 +50,33 @@ struct PreparedS3Set {
     cleanup_armed: bool,
 }
 
+struct PreparedS3Mutation {
+    store: S3AttachmentStore,
+    operation: S3MutationOperation,
+    note_guard: Option<OwnedMutexGuard<()>>,
+    cleanup_armed: bool,
+}
+
+enum S3MutationOperation {
+    Put {
+        staging_key: String,
+        final_key: String,
+    },
+    Delete {
+        final_key: String,
+    },
+}
+
 struct S3CleanupWork {
     store: S3AttachmentStore,
     staged_keys: Vec<String>,
+    staging_location: String,
+    _note_guard: OwnedMutexGuard<()>,
+}
+
+struct S3SingleCleanupWork {
+    store: S3AttachmentStore,
+    staging_key: String,
     staging_location: String,
     _note_guard: OwnedMutexGuard<()>,
 }
@@ -151,6 +175,21 @@ impl S3AttachmentStore {
         Ok(())
     }
 
+    async fn delete_key(&self, key: &str) -> anyhow::Result<()> {
+        match self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => Ok(()),
+            Err(error) => Err(safe_sdk_error("delete object", &error)),
+        }
+    }
+
     #[cfg(test)]
     async fn put(&self, key: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.put_owned(key, bytes.to_vec()).await
@@ -212,6 +251,61 @@ impl S3AttachmentStore {
         }
 
         Ok(prepared)
+    }
+
+    async fn prepare_put_mutation(
+        &self,
+        note_id: String,
+        attachment: NoteAttachment,
+    ) -> anyhow::Result<PreparedS3Mutation> {
+        validate_note_id(&note_id)?;
+        let relative = crate::path::canonical_relative_path(&attachment.path)?;
+        let final_key = final_key(&self.prefix, &note_id, &relative)?;
+        let staging_prefix = staging_prefix(
+            &self.prefix,
+            &note_id,
+            &uuid::Uuid::new_v4().simple().to_string(),
+        )?;
+        let staging_key = format!("{staging_prefix}{relative}");
+        let note_guard = self.coordination.lock_for(&note_id).lock_owned().await;
+        let mut prepared = PreparedS3Mutation {
+            store: self.clone(),
+            operation: S3MutationOperation::Put {
+                staging_key: staging_key.clone(),
+                final_key,
+            },
+            note_guard: Some(note_guard),
+            cleanup_armed: true,
+        };
+
+        if let Err(error) = self.put_owned(&staging_key, attachment.content).await {
+            let error = error.context(format!("at {}", self.key_location(&staging_key)));
+            let cleanup = await_cleanup(prepared.schedule_cleanup()?).await;
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => {
+                    Err(error.context(format!("staging cleanup also failed: {cleanup_error}")))
+                }
+            };
+        }
+
+        Ok(prepared)
+    }
+
+    async fn prepare_delete_mutation(
+        &self,
+        note_id: String,
+        path: String,
+    ) -> anyhow::Result<PreparedS3Mutation> {
+        validate_note_id(&note_id)?;
+        let final_key = final_key(&self.prefix, &note_id, &path)?;
+        let note_guard = self.coordination.lock_for(&note_id).lock_owned().await;
+        Ok(PreparedS3Mutation {
+            store: self.clone(),
+            operation: S3MutationOperation::Delete { final_key },
+            note_guard: Some(note_guard),
+            cleanup_armed: false,
+        })
     }
 
     async fn read_key(&self, key: &str) -> anyhow::Result<Vec<u8>> {
@@ -418,6 +512,49 @@ impl S3AttachmentStore {
         Ok(())
     }
 
+    async fn publish_mutation(&self, prepared: Box<PreparedS3Mutation>) -> anyhow::Result<()> {
+        match &prepared.operation {
+            S3MutationOperation::Put {
+                staging_key,
+                final_key,
+            } => {
+                if let Err(error) = self
+                    .client
+                    .copy_object()
+                    .copy_source(copy_source(&self.bucket, staging_key))
+                    .bucket(&self.bucket)
+                    .key(final_key)
+                    .send()
+                    .await
+                    .map_err(|error| safe_sdk_error("copy object", &error))
+                {
+                    let staging_location = self.key_location(staging_key);
+                    let final_location = self.key_location(final_key);
+                    return Err(error.context(format!(
+                        "database committed; copy to {final_location} failed; \
+                         staged object retained at {staging_location}"
+                    )));
+                }
+                if let Err(error) = self.delete_key(staging_key).await {
+                    let staging_location = self.key_location(staging_key);
+                    return Err(error.context(format!(
+                        "database committed; final object copied; \
+                         staging cleanup uncertain at {staging_location}"
+                    )));
+                }
+            }
+            S3MutationOperation::Delete { final_key } => {
+                if let Err(error) = self.delete_key(final_key).await {
+                    return Err(error.context(format!(
+                        "database committed; delete failed at {}",
+                        self.key_location(final_key)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn safe_location(&self) -> String {
         let suffix = if self.prefix.is_empty() {
             String::new()
@@ -425,6 +562,10 @@ impl S3AttachmentStore {
             format!("/{}", self.prefix)
         };
         format!("s3://{}{suffix}", self.bucket)
+    }
+
+    fn key_location(&self, key: &str) -> String {
+        format!("s3://{}/{key}", self.bucket)
     }
 }
 
@@ -477,6 +618,19 @@ impl S3CleanupWork {
     }
 }
 
+impl S3SingleCleanupWork {
+    async fn run(self) -> anyhow::Result<()> {
+        let result = self.store.delete_key(&self.staging_key).await;
+        if let Err(error) = result.as_ref() {
+            eprintln!(
+                "S3 staged attachment cleanup failed at {}: {error}",
+                self.staging_location
+            );
+        }
+        result
+    }
+}
+
 async fn await_cleanup(cleanup: tokio::task::JoinHandle<anyhow::Result<()>>) -> anyhow::Result<()> {
     cleanup.await.map_err(safe_cleanup_join_error)?
 }
@@ -491,6 +645,60 @@ impl Drop for PreparedS3Set {
             return;
         }
         let staging_location = self.staging_location();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.cleanup_armed = false;
+            eprintln!("S3 staged attachment cleanup could not be scheduled at {staging_location}");
+            return;
+        };
+        if let Some(work) = self.take_cleanup_work() {
+            runtime.spawn(async move {
+                let _ = work.run().await;
+            });
+        }
+    }
+}
+
+impl PreparedS3Mutation {
+    fn take_cleanup_work(&mut self) -> Option<S3SingleCleanupWork> {
+        if !self.cleanup_armed {
+            return None;
+        }
+        self.cleanup_armed = false;
+        let note_guard = self.note_guard.take()?;
+        let S3MutationOperation::Put { staging_key, .. } = &self.operation else {
+            drop(note_guard);
+            return None;
+        };
+        Some(S3SingleCleanupWork {
+            store: self.store.clone(),
+            staging_key: staging_key.clone(),
+            staging_location: self.store.key_location(staging_key),
+            _note_guard: note_guard,
+        })
+    }
+
+    fn schedule_cleanup(&mut self) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow::anyhow!("S3 staging cleanup could not be scheduled"))?;
+        let work = self.take_cleanup_work();
+        Ok(runtime.spawn(async move {
+            let Some(work) = work else {
+                return Ok(());
+            };
+            work.run().await
+        }))
+    }
+}
+
+impl Drop for PreparedS3Mutation {
+    fn drop(&mut self) {
+        if !self.cleanup_armed {
+            return;
+        }
+        let staging_location = match &self.operation {
+            S3MutationOperation::Put { staging_key, .. } => self.store.key_location(staging_key),
+            S3MutationOperation::Delete { .. } => return,
+        };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             self.cleanup_armed = false;
             eprintln!("S3 staged attachment cleanup could not be scheduled at {staging_location}");
@@ -527,6 +735,21 @@ impl crate::PreparedAttachmentSet for PreparedS3Set {
 }
 
 #[async_trait::async_trait]
+impl crate::PreparedAttachmentMutation for PreparedS3Mutation {
+    async fn publish(mut self: Box<Self>) -> anyhow::Result<()> {
+        self.cleanup_armed = false;
+        let store = self.store.clone();
+        tokio::spawn(async move { store.publish_mutation(self).await })
+            .await
+            .map_err(|_| anyhow::anyhow!("S3 attachment mutation publication task failed"))?
+    }
+
+    async fn abort(mut self: Box<Self>) -> anyhow::Result<()> {
+        await_cleanup(self.schedule_cleanup()?).await
+    }
+}
+
+#[async_trait::async_trait]
 impl crate::AttachmentStore for S3AttachmentStore {
     async fn prepare(
         &self,
@@ -544,18 +767,32 @@ impl crate::AttachmentStore for S3AttachmentStore {
 
     async fn prepare_put(
         &self,
-        _note_id: &str,
-        _attachment: &NoteAttachment,
+        note_id: &str,
+        attachment: &NoteAttachment,
     ) -> anyhow::Result<Box<dyn crate::PreparedAttachmentMutation>> {
-        anyhow::bail!("S3 single-attachment put preparation is not implemented")
+        let store = self.clone();
+        let note_id = note_id.to_string();
+        let attachment = attachment.clone();
+        let prepared =
+            tokio::spawn(async move { store.prepare_put_mutation(note_id, attachment).await })
+                .await
+                .map_err(|_| anyhow::anyhow!("S3 attachment mutation preparation task failed"))??;
+        Ok(Box::new(prepared))
     }
 
     async fn prepare_delete(
         &self,
-        _note_id: &str,
-        _path: &str,
+        note_id: &str,
+        path: &str,
     ) -> anyhow::Result<Box<dyn crate::PreparedAttachmentMutation>> {
-        anyhow::bail!("S3 single-attachment delete preparation is not implemented")
+        let store = self.clone();
+        let note_id = note_id.to_string();
+        let path = path.to_string();
+        let prepared =
+            tokio::spawn(async move { store.prepare_delete_mutation(note_id, path).await })
+                .await
+                .map_err(|_| anyhow::anyhow!("S3 attachment mutation preparation task failed"))??;
+        Ok(Box::new(prepared))
     }
 
     async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
@@ -857,6 +1094,16 @@ mod tests {
         .unwrap()
     }
 
+    fn test_attachment(path: &str, content: &[u8]) -> NoteAttachment {
+        NoteAttachment {
+            id: path.into(),
+            path: path.into(),
+            mime: "application/octet-stream".into(),
+            description: String::new(),
+            content: content.to_vec(),
+        }
+    }
+
     #[test]
     fn operation_limits_match_s3_api_boundaries() {
         assert_eq!(S3_PAGE_SIZE, 1_000);
@@ -1061,6 +1308,501 @@ mod tests {
             &server.uri(),
         ] {
             assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn single_put_uploads_copies_and_cleans_only_its_staging_key() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("put-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("put-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/nested/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/note-1/nested/file.txt"))
+            .and(header_regex(
+                "x-amz-copy-source",
+                r"^agent-note/\.staging/note-1/[0-9a-f]{32}/nested/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/nested/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        test_store(server.uri())
+            .await
+            .prepare_put(
+                "note-1",
+                &test_attachment("./nested/file.txt", b"replacement"),
+            )
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "GET")
+                .count(),
+            0,
+            "single put must never list the final note prefix"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "POST")
+                .count(),
+            0,
+            "single put must never batch-delete sibling final objects"
+        );
+        assert!(requests
+            .iter()
+            .all(|request| !request.url.path().contains("sibling")));
+    }
+
+    #[tokio::test]
+    async fn single_put_abort_deletes_staging_without_changing_the_final_object() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("abort-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("abort-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/note-1/file.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"old".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        store
+            .prepare_put("note-1", &test_attachment("file.txt", b"new"))
+            .await
+            .unwrap()
+            .abort()
+            .await
+            .unwrap();
+
+        assert_eq!(store.read("note-1", "file.txt").await.unwrap(), b"old");
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| {
+                !(request.method.as_str() == "PUT"
+                    && request.url.path() == "/agent-note/note-1/file.txt")
+            }));
+    }
+
+    #[tokio::test]
+    async fn single_delete_targets_only_the_canonical_key_and_missing_is_success() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("delete-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("delete-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/agent-note/note-1/nested/file.txt"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/agent-note/note-1/missing.txt"))
+            .respond_with(ResponseTemplate::new(404).set_body_raw(
+                "<Error><Code>NoSuchKey</Code><Message>private</Message></Error>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        let prepared = store
+            .prepare_delete("note-1", "./nested/file.txt")
+            .await
+            .unwrap();
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "delete preparation must not mutate S3"
+        );
+        prepared.publish().await.unwrap();
+        store
+            .prepare_delete("note-1", "missing.txt")
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.method.as_str() == "DELETE"));
+    }
+
+    #[tokio::test]
+    async fn single_mutations_share_note_coordination_with_complete_sets() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("lock-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("lock-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let store = test_store(server.uri()).await;
+        let complete = store.prepare("note-1", &[]).await.unwrap();
+
+        let same_store = store.clone();
+        let mut same =
+            tokio::spawn(async move { same_store.prepare_delete("note-1", "same.txt").await });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut same)
+            .await
+            .is_err());
+        let different = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.prepare_delete("note-2", "different.txt"),
+        )
+        .await
+        .expect("different notes must remain concurrent")
+        .unwrap();
+        different.abort().await.unwrap();
+
+        complete.abort().await.unwrap();
+        let same = tokio::time::timeout(Duration::from_secs(2), same)
+            .await
+            .expect("same-note mutation must proceed after complete set")
+            .unwrap()
+            .unwrap();
+
+        let complete_store = store.clone();
+        let mut next_complete =
+            tokio::spawn(async move { complete_store.prepare("note-1", &[]).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut next_complete)
+                .await
+                .is_err()
+        );
+        same.abort().await.unwrap();
+        next_complete.await.unwrap().unwrap().abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_single_put_prepare_holds_lock_through_detached_cleanup() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("prepare-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("prepare-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let (put_response, put_reached, _) = block_first_response(ResponseTemplate::new(200));
+        let (delete_response, delete_reached, _) = block_first_response(ResponseTemplate::new(204));
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(put_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(delete_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        let preparing_store = store.clone();
+        let preparing = tokio::spawn(async move {
+            preparing_store
+                .prepare_put("note-1", &test_attachment("file.txt", b"payload"))
+                .await
+        });
+        put_reached.await.unwrap();
+        preparing.abort();
+        assert!(matches!(
+            preparing.await,
+            Err(error) if error.is_cancelled()
+        ));
+        delete_reached.await.unwrap();
+
+        let same_store = store.clone();
+        let mut same =
+            tokio::spawn(async move { same_store.prepare_delete("note-1", "next.txt").await });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut same)
+            .await
+            .is_err());
+        let prepared = tokio::time::timeout(Duration::from_secs(2), same)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        prepared.abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_single_put_publish_holds_lock_until_detached_publication_finishes() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("publish-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("publish-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let (copy_response, copy_reached, _) = block_first_response(ResponseTemplate::new(200));
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/note-1/file.txt"))
+            .respond_with(copy_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        let prepared = store
+            .prepare_put("note-1", &test_attachment("file.txt", b"payload"))
+            .await
+            .unwrap();
+        let publishing = tokio::spawn(async move { prepared.publish().await });
+        copy_reached.await.unwrap();
+        publishing.abort();
+        assert!(publishing.await.unwrap_err().is_cancelled());
+
+        let same_store = store.clone();
+        let mut same =
+            tokio::spawn(async move { same_store.prepare_delete("note-1", "next.txt").await });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut same)
+            .await
+            .is_err());
+        let prepared = tokio::time::timeout(Duration::from_secs(2), same)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        prepared.abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_single_put_abort_holds_lock_until_detached_cleanup_finishes() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("abort-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("abort-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let (delete_response, delete_reached, _) = block_first_response(ResponseTemplate::new(204));
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
+            ))
+            .respond_with(delete_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        let prepared = store
+            .prepare_put("note-1", &test_attachment("file.txt", b"payload"))
+            .await
+            .unwrap();
+        let aborting = tokio::spawn(async move { prepared.abort().await });
+        delete_reached.await.unwrap();
+        aborting.abort();
+        assert!(aborting.await.unwrap_err().is_cancelled());
+
+        let same_store = store.clone();
+        let mut same =
+            tokio::spawn(async move { same_store.prepare_delete("note-1", "next.txt").await });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut same)
+            .await
+            .is_err());
+        let prepared = tokio::time::timeout(Duration::from_secs(2), same)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        prepared.abort().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_mutation_errors_include_safe_object_locations_without_credentials() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("private-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("private-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let delete_server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/agent-note/note-1/private-name.txt"))
+            .respond_with(ResponseTemplate::new(403).set_body_raw(
+                "<Error><Code>AccessDenied</Code><Message>private-server-body</Message></Error>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&delete_server)
+            .await;
+
+        let delete_rendered = test_store(delete_server.uri())
+            .await
+            .prepare_delete("note-1", "./private-name.txt")
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(delete_rendered.contains("s3://agent-note/note-1/private-name.txt"));
+
+        let put_server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/private-name\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&put_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/note-1/private-name.txt"))
+            .respond_with(ResponseTemplate::new(403).set_body_raw(
+                "<Error><Code>AccessDenied</Code><Message>private-copy-body</Message></Error>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&put_server)
+            .await;
+        let put_rendered = test_store(put_server.uri())
+            .await
+            .prepare_put(
+                "note-1",
+                &test_attachment("./private-name.txt", b"private-content"),
+            )
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(put_rendered.contains("s3://agent-note/note-1/private-name.txt"));
+        assert!(put_rendered.contains("s3://agent-note/.staging/note-1/"));
+
+        for rendered in [&delete_rendered, &put_rendered] {
+            for secret in [
+                "private-access",
+                "private-secret",
+                "private-server-body",
+                "private-copy-body",
+                &delete_server.uri(),
+                &put_server.uri(),
+            ] {
+                assert!(!rendered.contains(secret));
+            }
         }
     }
 

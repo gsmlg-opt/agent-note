@@ -198,6 +198,66 @@ async fn replacement_overwrites_retained_paths_and_removes_obsolete_paths() {
 }
 
 #[tokio::test]
+async fn single_object_mutations_preserve_siblings_and_remove_staging() {
+    let Some(fixture) = fixture().await else {
+        eprintln!("skipped: NOTE_TEST_MINIO_ENDPOINT is unset");
+        return;
+    };
+    fixture
+        .store
+        .prepare(
+            "note-1",
+            &[
+                attachment("./target.txt", b"old target"),
+                attachment("./sibling.bin", b"\0sibling\xff"),
+            ],
+        )
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+
+    fixture
+        .store
+        .prepare_put("note-1", &attachment("./target.txt", b"new target"))
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.store.read("note-1", "target.txt").await.unwrap(),
+        b"new target"
+    );
+    assert_eq!(
+        fixture.store.read("note-1", "sibling.bin").await.unwrap(),
+        b"\0sibling\xff"
+    );
+
+    fixture
+        .store
+        .prepare_delete("note-1", "./target.txt")
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+    assert!(fixture.store.read("note-1", "target.txt").await.is_err());
+    assert_eq!(
+        fixture.store.read("note-1", "sibling.bin").await.unwrap(),
+        b"\0sibling\xff"
+    );
+
+    let keys = list_keys(&fixture, &format!("{}/", fixture.prefix)).await;
+    assert_eq!(keys, vec![format!("{}/note-1/sibling.bin", fixture.prefix)]);
+    assert!(keys.iter().all(|key| !key.contains("/.staging/")));
+
+    fixture.store.remove_note("note-1").await.unwrap();
+    wait_for_no_keys(&fixture).await;
+}
+
+#[tokio::test]
 async fn publishing_an_empty_set_removes_every_final_object() {
     let Some(fixture) = fixture().await else {
         eprintln!("skipped: NOTE_TEST_MINIO_ENDPOINT is unset");
