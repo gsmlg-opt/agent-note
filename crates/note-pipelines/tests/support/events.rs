@@ -246,6 +246,8 @@ pub struct ControlledAttachmentStore {
     fail_abort: AtomicBool,
     race_note_ids: Mutex<HashSet<String>>,
     delete_path_races: Mutex<HashMap<String, VecDeque<(String, String)>>>,
+    read_contents: Mutex<HashMap<(String, String), Vec<u8>>>,
+    read_path_races: Mutex<HashMap<(String, String), VecDeque<Vec<(String, String)>>>>,
     committed_marker: Mutex<Option<String>>,
     blocked_publish_note: Mutex<Option<String>>,
     publish_started: Arc<Notify>,
@@ -261,6 +263,8 @@ impl ControlledAttachmentStore {
             fail_abort: AtomicBool::new(false),
             race_note_ids: Mutex::new(HashSet::new()),
             delete_path_races: Mutex::new(HashMap::new()),
+            read_contents: Mutex::new(HashMap::new()),
+            read_path_races: Mutex::new(HashMap::new()),
             committed_marker: Mutex::new(None),
             blocked_publish_note: Mutex::new(None),
             publish_started: Arc::new(Notify::new()),
@@ -290,6 +294,32 @@ impl ControlledAttachmentStore {
             .entry(note_id.to_string())
             .or_default()
             .push_back((attachment_id.to_string(), path.to_string()));
+    }
+
+    pub fn set_read_content(&self, note_id: &str, path: &str, content: &[u8]) {
+        self.read_contents
+            .lock()
+            .unwrap()
+            .insert((note_id.to_string(), path.to_string()), content.to_vec());
+    }
+
+    pub fn race_attachment_paths_after_read(
+        &self,
+        note_id: &str,
+        path: &str,
+        replacements: &[(&str, &str)],
+    ) {
+        self.read_path_races
+            .lock()
+            .unwrap()
+            .entry((note_id.to_string(), path.to_string()))
+            .or_default()
+            .push_back(
+                replacements
+                    .iter()
+                    .map(|(attachment_id, path)| (attachment_id.to_string(), path.to_string()))
+                    .collect(),
+            );
     }
 
     pub fn observe_committed_label_on_abort(&self, key: &str) {
@@ -454,8 +484,51 @@ impl AttachmentStore for ControlledAttachmentStore {
         }))
     }
 
-    async fn read(&self, _note_id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
-        Ok(Vec::new())
+    async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("read:{note_id}:{path}"));
+        let key = (note_id.to_string(), path.to_string());
+        let content = self
+            .read_contents
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let race = self
+            .read_path_races
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front);
+        if let Some(replacements) = race {
+            let session = self.backend.session().await?;
+            if let Some(mut note) = session.get_note(note_id).await? {
+                for (attachment_id, replacement_path) in replacements {
+                    if let Some(attachment) = note
+                        .attachments
+                        .iter_mut()
+                        .find(|attachment| attachment.id == attachment_id)
+                    {
+                        attachment.path = replacement_path;
+                    }
+                }
+                session
+                    .update_note_attachments(AttachmentMetadataUpdate {
+                        id: note_id,
+                        attachments: &note.attachments,
+                        updated_at: note.updated_at.saturating_add(1),
+                    })
+                    .await?;
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("race_read_paths:{note_id}:{path}"));
+            }
+        }
+        Ok(content)
     }
 
     async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {

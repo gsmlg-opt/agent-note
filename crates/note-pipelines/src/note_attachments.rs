@@ -1,4 +1,5 @@
 use crate::Context;
+use anyhow::Context as _;
 use note_attachments::{PreparedAttachmentMutation, PreparedAttachmentSet};
 use note_core::{
     is_relative_attachment_path, normalize_attachment_path, validate_attachments, Note,
@@ -88,9 +89,10 @@ pub async fn get_note_attachment(
 pub async fn put_note_attachment(
     ctx: &Context,
     note_id: &str,
-    attachment: NoteAttachment,
+    mut attachment: NoteAttachment,
 ) -> anyhow::Result<PutNoteAttachmentResult> {
     validate_attachments(std::slice::from_ref(&attachment)).map_err(anyhow::Error::new)?;
+    attachment.id = canonical_attachment_id(&attachment.id).to_string();
     let prepared = ctx.attachments().prepare_put(note_id, &attachment).await?;
     let transaction = match ctx.storage().begin(TransactionMode::Immediate).await {
         Ok(transaction) => transaction,
@@ -104,11 +106,11 @@ pub async fn put_note_attachment(
                 note_id.to_string(),
             )));
         };
+        let updated_at = attachment_mutation_timestamp(note.updated_at);
         let normalized_path = normalize_attachment_path(&attachment.path);
-        let existing_index = note
-            .attachments
-            .iter()
-            .position(|existing| existing.id == attachment.id);
+        let existing_index = note.attachments.iter().position(|existing| {
+            canonical_attachment_id(&existing.id) == canonical_attachment_id(&attachment.id)
+        });
         let created = existing_index.is_none();
 
         if let Some(index) = existing_index {
@@ -121,7 +123,7 @@ pub async fn put_note_attachment(
             }
         }
         if note.attachments.iter().any(|existing| {
-            existing.id != attachment.id
+            canonical_attachment_id(&existing.id) != canonical_attachment_id(&attachment.id)
                 && normalize_attachment_path(&existing.path) == normalized_path
         }) {
             return Err(anyhow::Error::new(
@@ -135,14 +137,17 @@ pub async fn put_note_attachment(
         let mut stored_attachment = attachment.clone();
         stored_attachment.content.clear();
         match existing_index {
-            Some(index) => metadata[index] = stored_attachment.clone(),
+            Some(index) => {
+                stored_attachment.id = metadata[index].id.clone();
+                metadata[index] = stored_attachment.clone();
+            }
             None => metadata.push(stored_attachment.clone()),
         }
         let affected = transaction
             .update_note_attachments(AttachmentMetadataUpdate {
                 id: note_id,
                 attachments: &metadata,
-                updated_at: chrono::Utc::now().timestamp(),
+                updated_at,
             })
             .await?;
         if affected == 0 {
@@ -164,7 +169,12 @@ pub async fn put_note_attachment(
             return Err(abort_mutation_with_primary(prepared, error).await);
         }
     };
-    prepared.publish().await?;
+    prepared.publish().await.with_context(|| {
+        format!(
+            "attachment metadata is committed and active for note {note_id}, attachment {}; object publication failed",
+            result.attachment.id
+        )
+    })?;
     Ok(result)
 }
 
@@ -173,20 +183,28 @@ pub async fn get_note_attachment_by_id(
     note_id: &str,
     attachment_id: &str,
 ) -> anyhow::Result<Option<NoteAttachment>> {
-    let session = ctx.storage().session().await?;
-    let Some(note) = session.get_note(note_id).await? else {
-        return Ok(None);
-    };
-    let Some(attachment) = note
-        .attachments
-        .into_iter()
-        .find(|attachment| attachment.id == attachment_id)
-    else {
-        return Ok(None);
-    };
-    drop(session);
-
-    get_note_attachment(ctx, note_id, &attachment.path).await
+    let attachment_id = canonical_attachment_id(attachment_id);
+    for _ in 0..2 {
+        let Some(attachment) = resolve_attachment_metadata(ctx, note_id, attachment_id).await?
+        else {
+            return Ok(None);
+        };
+        let resolved_path = attachment.path;
+        let content = ctx.attachments().read(note_id, &resolved_path).await?;
+        let Some(mut confirmed) = resolve_attachment_metadata(ctx, note_id, attachment_id).await?
+        else {
+            continue;
+        };
+        if normalize_attachment_path(&confirmed.path) == normalize_attachment_path(&resolved_path) {
+            confirmed.content = content;
+            return Ok(Some(confirmed));
+        }
+    }
+    Err(anyhow::Error::new(
+        AttachmentMutationError::AttachmentPathChange {
+            attachment_id: attachment_id.to_string(),
+        },
+    ))
 }
 
 pub async fn delete_note_attachment(
@@ -194,6 +212,7 @@ pub async fn delete_note_attachment(
     note_id: &str,
     attachment_id: &str,
 ) -> anyhow::Result<bool> {
+    let attachment_id = canonical_attachment_id(attachment_id);
     let Some(mut captured_path) = resolve_attachment_path(ctx, note_id, attachment_id).await?
     else {
         return Ok(false);
@@ -223,7 +242,11 @@ pub async fn delete_note_attachment(
                 if let Err(error) = transaction.commit().await {
                     return Err(abort_mutation_with_primary(prepared, error.into()).await);
                 }
-                prepared.publish().await?;
+                prepared.publish().await.with_context(|| {
+                    format!(
+                        "attachment metadata deletion is committed for note {note_id}, attachment {attachment_id}; physical cleanup failed and an orphan object may remain"
+                    )
+                })?;
                 return Ok(true);
             }
             Ok(DeleteMetadataResult::Absent) => {
@@ -276,27 +299,24 @@ async fn delete_attachment_metadata(
     let Some(note) = transaction.get_note(note_id).await? else {
         return Ok(DeleteMetadataResult::Absent);
     };
-    let Some(existing) = note
-        .attachments
-        .iter()
-        .find(|attachment| attachment.id == attachment_id)
-    else {
+    let Some(existing_index) = note.attachments.iter().position(|attachment| {
+        canonical_attachment_id(&attachment.id) == canonical_attachment_id(attachment_id)
+    }) else {
         return Ok(DeleteMetadataResult::Absent);
     };
+    let existing = &note.attachments[existing_index];
     if normalize_attachment_path(&existing.path) != normalize_attachment_path(captured_path) {
         return Ok(DeleteMetadataResult::PathChanged);
     }
 
-    let metadata = note
-        .attachments
-        .into_iter()
-        .filter(|attachment| attachment.id != attachment_id)
-        .collect::<Vec<_>>();
+    let updated_at = attachment_mutation_timestamp(note.updated_at);
+    let mut metadata = note.attachments;
+    metadata.remove(existing_index);
     let affected = transaction
         .update_note_attachments(AttachmentMetadataUpdate {
             id: note_id,
             attachments: &metadata,
-            updated_at: chrono::Utc::now().timestamp(),
+            updated_at,
         })
         .await?;
     if affected == 0 {
@@ -310,15 +330,33 @@ async fn resolve_attachment_path(
     note_id: &str,
     attachment_id: &str,
 ) -> anyhow::Result<Option<String>> {
+    Ok(resolve_attachment_metadata(ctx, note_id, attachment_id)
+        .await?
+        .map(|attachment| attachment.path))
+}
+
+async fn resolve_attachment_metadata(
+    ctx: &Context,
+    note_id: &str,
+    attachment_id: &str,
+) -> anyhow::Result<Option<NoteAttachment>> {
     let session = ctx.storage().session().await?;
     let Some(note) = session.get_note(note_id).await? else {
         return Ok(None);
     };
-    Ok(note
-        .attachments
-        .into_iter()
-        .find(|attachment| attachment.id == attachment_id)
-        .map(|attachment| attachment.path))
+    Ok(note.attachments.into_iter().find(|attachment| {
+        canonical_attachment_id(&attachment.id) == canonical_attachment_id(attachment_id)
+    }))
+}
+
+fn canonical_attachment_id(attachment_id: &str) -> &str {
+    attachment_id.trim()
+}
+
+fn attachment_mutation_timestamp(stored_updated_at: i64) -> i64 {
+    chrono::Utc::now()
+        .timestamp()
+        .max(stored_updated_at.saturating_add(1))
 }
 
 async fn rollback_and_abort(

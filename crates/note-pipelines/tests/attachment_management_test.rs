@@ -38,6 +38,16 @@ async fn seed_note(
     note_id: &str,
     attachments: &[NoteAttachment],
 ) {
+    seed_note_at(ctx, backend, note_id, attachments, OLD_TIMESTAMP).await;
+}
+
+async fn seed_note_at(
+    ctx: &Context,
+    backend: &Arc<dyn StorageBackend>,
+    note_id: &str,
+    attachments: &[NoteAttachment],
+    timestamp: i64,
+) {
     let prepared = ctx
         .attachments()
         .prepare(note_id, attachments)
@@ -51,8 +61,8 @@ async fn seed_note(
             title: "Attachment note",
             content: NOTE_CONTENT,
             attachments: &metadata,
-            created_at: OLD_TIMESTAMP,
-            updated_at: OLD_TIMESTAMP,
+            created_at: timestamp,
+            updated_at: timestamp,
             note_revision: NOTE_REVISION,
             deleted_at: None,
         })
@@ -75,7 +85,7 @@ async fn seed_note(
             content: NOTE_CONTENT,
             note_revision: NOTE_REVISION,
             status: "pending",
-            updated_at: OLD_TIMESTAMP,
+            updated_at: timestamp,
         })
         .await
         .unwrap();
@@ -86,7 +96,7 @@ async fn seed_note(
             &content_hash,
             NOTE_CONTENT,
             NOTE_REVISION,
-            OLD_TIMESTAMP,
+            timestamp,
         )
         .await
         .unwrap();
@@ -215,6 +225,93 @@ async fn put_existing_id_at_same_normalized_path_replaces_bytes_and_metadata() {
 }
 
 #[tokio::test]
+async fn standalone_attachment_ids_use_one_trimmed_canonical_identity() {
+    let (ctx, backend, _dir) = test_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[attachment("foo", "foo.txt", "text/plain", "old", b"old")],
+    )
+    .await;
+
+    let replaced = put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        attachment(" foo ", "./foo.txt", "text/plain", "new", b"new"),
+    )
+    .await
+    .unwrap();
+
+    assert!(!replaced.created);
+    assert_eq!(replaced.attachment.id, "foo");
+    assert_eq!(stored_note(&backend, NOTE_ID).await.attachments.len(), 1);
+    assert_eq!(
+        get_note_attachment_by_id(&ctx, NOTE_ID, " foo ")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        b"new"
+    );
+    assert!(delete_note_attachment(&ctx, NOTE_ID, " foo ")
+        .await
+        .unwrap());
+
+    let (legacy_ctx, legacy_backend, _dir) = test_context().await;
+    seed_note(
+        &legacy_ctx,
+        &legacy_backend,
+        "legacy-id-note",
+        &[attachment(
+            " legacy ",
+            "legacy.txt",
+            "text/plain",
+            "old",
+            b"old",
+        )],
+    )
+    .await;
+    let legacy = put_note_attachment(
+        &legacy_ctx,
+        "legacy-id-note",
+        attachment("legacy", "./legacy.txt", "text/plain", "new", b"new"),
+    )
+    .await
+    .unwrap();
+    assert!(!legacy.created);
+    assert_eq!(legacy.attachment.id, " legacy ");
+    assert_eq!(
+        stored_note(&legacy_backend, "legacy-id-note")
+            .await
+            .attachments[0]
+            .id,
+        " legacy "
+    );
+}
+
+#[tokio::test]
+async fn a_new_standalone_attachment_stores_its_trimmed_canonical_id() {
+    let (ctx, backend, _dir) = test_context().await;
+    seed_note(&ctx, &backend, NOTE_ID, &[]).await;
+
+    let result = put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        attachment(" new ", "new.txt", "text/plain", "", b"new"),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.created);
+    assert_eq!(result.attachment.id, "new");
+    assert_eq!(
+        stored_note(&backend, NOTE_ID).await.attachments[0].id,
+        "new"
+    );
+}
+
+#[tokio::test]
 async fn put_rejects_path_changes_and_normalized_path_collisions_without_mutation() {
     let (ctx, backend, _dir) = test_context().await;
     seed_note(
@@ -301,6 +398,14 @@ async fn put_rejects_invalid_id_mime_and_paths_before_mutation() {
             ValidationError::EmptyAttachmentPath,
         ),
         (
+            attachment("file", ".", "text/plain", "", b"x"),
+            ValidationError::EmptyAttachmentPath,
+        ),
+        (
+            attachment("file", "./", "text/plain", "", b"x"),
+            ValidationError::EmptyAttachmentPath,
+        ),
+        (
             attachment("file", "/etc/passwd", "text/plain", "", b"x"),
             ValidationError::InvalidAttachmentPath("/etc/passwd".into()),
         ),
@@ -358,6 +463,94 @@ async fn get_by_id_reads_only_the_selected_object() {
             .await
             .unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn get_by_id_retries_when_the_old_path_is_reassigned_to_another_id() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[
+            attachment("target", "old.txt", "text/plain", "", b""),
+            attachment("other", "other.txt", "text/plain", "", b""),
+        ],
+    )
+    .await;
+    events.lock().unwrap().clear();
+    attachments.set_read_content(NOTE_ID, "old.txt", b"wrong bytes");
+    attachments.set_read_content(NOTE_ID, "new.txt", b"right bytes");
+    attachments.race_attachment_paths_after_read(
+        NOTE_ID,
+        "old.txt",
+        &[("target", "new.txt"), ("other", "old.txt")],
+    );
+
+    let loaded = get_note_attachment_by_id(&ctx, NOTE_ID, " target ")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(loaded.id, "target");
+    assert_eq!(loaded.path, "new.txt");
+    assert_eq!(loaded.content, b"right bytes");
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec![
+            "read:attachment-note:old.txt",
+            "race_read_paths:attachment-note:old.txt",
+            "read:attachment-note:new.txt",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn get_by_id_returns_a_typed_conflict_after_a_second_path_reassignment() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[
+            attachment("target", "first.txt", "text/plain", "", b""),
+            attachment("other", "other.txt", "text/plain", "", b""),
+        ],
+    )
+    .await;
+    events.lock().unwrap().clear();
+    attachments.set_read_content(NOTE_ID, "first.txt", b"first wrong bytes");
+    attachments.set_read_content(NOTE_ID, "second.txt", b"second wrong bytes");
+    attachments.race_attachment_paths_after_read(
+        NOTE_ID,
+        "first.txt",
+        &[("target", "second.txt"), ("other", "first.txt")],
+    );
+    attachments.race_attachment_paths_after_read(
+        NOTE_ID,
+        "second.txt",
+        &[("target", "third.txt"), ("other", "second.txt")],
+    );
+
+    let error = get_note_attachment_by_id(&ctx, NOTE_ID, "target")
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<AttachmentMutationError>(),
+        Some(&AttachmentMutationError::AttachmentPathChange {
+            attachment_id: "target".into()
+        })
+    );
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec![
+            "read:attachment-note:first.txt",
+            "race_read_paths:attachment-note:first.txt",
+            "read:attachment-note:second.txt",
+            "race_read_paths:attachment-note:second.txt",
+        ]
     );
 }
 
@@ -455,6 +648,23 @@ async fn put_preserves_revision_chunks_labels_and_embedding_queue() {
 }
 
 #[tokio::test]
+async fn put_advances_updated_at_when_the_stored_timestamp_is_the_current_second() {
+    let (ctx, backend, _dir) = test_context().await;
+    let current_second = chrono::Utc::now().timestamp();
+    seed_note_at(&ctx, &backend, NOTE_ID, &[], current_second).await;
+
+    put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        attachment("new", "new.txt", "text/plain", "", b"new"),
+    )
+    .await
+    .unwrap();
+
+    assert!(stored_note(&backend, NOTE_ID).await.updated_at > current_second);
+}
+
+#[tokio::test]
 async fn delete_preserves_revision_chunks_labels_and_embedding_queue() {
     let (ctx, backend, _dir) = test_context().await;
     seed_note(
@@ -484,6 +694,24 @@ async fn delete_preserves_revision_chunks_labels_and_embedding_queue() {
         labels_before
     );
     assert_eq!(drain_embedding_jobs(&ctx, 10).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn delete_advances_updated_at_when_the_stored_timestamp_is_the_current_second() {
+    let (ctx, backend, _dir) = test_context().await;
+    let current_second = chrono::Utc::now().timestamp();
+    seed_note_at(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[attachment("old", "old.txt", "text/plain", "", b"old")],
+        current_second,
+    )
+    .await;
+
+    assert!(delete_note_attachment(&ctx, NOTE_ID, "old").await.unwrap());
+
+    assert!(stored_note(&backend, NOTE_ID).await.updated_at > current_second);
 }
 
 #[tokio::test]
@@ -647,6 +875,72 @@ async fn put_and_delete_publish_only_after_metadata_commit() {
             "begin",
             "commit",
             "publish_put:attachment-note:new.txt",
+            "prepare_delete:attachment-note:old.txt",
+            "begin",
+            "commit",
+            "publish_delete:attachment-note:old.txt",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn put_publication_failure_reports_committed_active_metadata_without_aborting() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    seed_note(&ctx, &backend, NOTE_ID, &[]).await;
+    events.lock().unwrap().clear();
+    attachments.fail_publish();
+
+    let error = put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        attachment("new", "new.txt", "text/plain", "", b"new"),
+    )
+    .await
+    .unwrap_err();
+
+    let message = format!("{error:#}");
+    assert!(message.contains("attachment metadata is committed"));
+    assert!(message.contains("object publication failed"));
+    assert_eq!(
+        stored_note(&backend, NOTE_ID).await.attachments[0].id,
+        "new"
+    );
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec![
+            "prepare_put:attachment-note:new.txt",
+            "begin",
+            "commit",
+            "publish_put:attachment-note:new.txt",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn delete_publication_failure_reports_committed_deletion_and_possible_orphan() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[attachment("old", "old.txt", "text/plain", "", b"old")],
+    )
+    .await;
+    events.lock().unwrap().clear();
+    attachments.fail_publish();
+
+    let error = delete_note_attachment(&ctx, NOTE_ID, "old")
+        .await
+        .unwrap_err();
+
+    let message = format!("{error:#}");
+    assert!(message.contains("metadata deletion is committed"));
+    assert!(message.contains("physical cleanup failed"));
+    assert!(message.contains("orphan"));
+    assert!(stored_note(&backend, NOTE_ID).await.attachments.is_empty());
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec![
             "prepare_delete:attachment-note:old.txt",
             "begin",
             "commit",

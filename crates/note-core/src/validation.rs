@@ -123,6 +123,9 @@ pub fn validate_attachments(attachments: &[NoteAttachment]) -> Result<(), Valida
             return Err(ValidationError::InvalidAttachmentPath(path.to_string()));
         }
         let normalized_path = normalize_attachment_path(path);
+        if normalized_path.is_empty() {
+            return Err(ValidationError::EmptyAttachmentPath);
+        }
         if !paths.insert(normalized_path.clone()) {
             return Err(ValidationError::DuplicateAttachmentPath(normalized_path));
         }
@@ -277,5 +280,24 @@ mod tests {
                 "assets/meta.json".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn rejects_attachment_paths_that_normalize_to_empty() {
+        for path in [".", "./", ".//./"] {
+            let attachment = NoteAttachment {
+                id: "empty-path".to_string(),
+                path: path.to_string(),
+                mime: "text/plain".to_string(),
+                description: String::new(),
+                content: Vec::new(),
+            };
+
+            assert_eq!(
+                validate_attachments(&[attachment]),
+                Err(ValidationError::EmptyAttachmentPath),
+                "{path:?} must be rejected"
+            );
+        }
     }
 }
