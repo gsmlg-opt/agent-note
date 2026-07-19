@@ -447,6 +447,26 @@ a.dashboard-metric-detail:hover {
     justify-content: flex-end;
 }
 
+.note-id-copy {
+    display: flex;
+    align-items: flex-start;
+    max-width: 100%;
+    margin-bottom: 0.9rem;
+}
+
+.note-id-copy-chip {
+    max-width: 100%;
+    min-width: 0;
+    font-family: inherit;
+    text-align: left;
+    white-space: normal;
+}
+
+.note-id-copy-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
 .note-page-actions {
     display: flex;
     justify-content: flex-end;
