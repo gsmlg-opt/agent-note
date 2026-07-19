@@ -164,26 +164,32 @@ impl S3AttachmentStore {
     }
 
     async fn put_owned(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
-        self.client
+        let result = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .body(ByteStream::from(bytes))
             .send()
             .await
-            .map_err(|error| safe_sdk_error("put object", &error))?;
+            .map_err(|error| safe_sdk_error("put object", &error));
+        #[cfg(test)]
+        pause_s3_operation(S3OperationPhase::Put).await;
+        result?;
         Ok(())
     }
 
     async fn delete_key(&self, key: &str) -> anyhow::Result<()> {
-        match self
+        let result = self
             .client
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
-            .await
-        {
+            .await;
+        #[cfg(test)]
+        pause_s3_operation(S3OperationPhase::Delete).await;
+        match result {
             Ok(_) => Ok(()),
             Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound")) => Ok(()),
             Err(error) => Err(safe_sdk_error("delete object", &error)),
@@ -518,7 +524,7 @@ impl S3AttachmentStore {
                 staging_key,
                 final_key,
             } => {
-                if let Err(error) = self
+                let copy_result = self
                     .client
                     .copy_object()
                     .copy_source(copy_source(&self.bucket, staging_key))
@@ -526,8 +532,10 @@ impl S3AttachmentStore {
                     .key(final_key)
                     .send()
                     .await
-                    .map_err(|error| safe_sdk_error("copy object", &error))
-                {
+                    .map_err(|error| safe_sdk_error("copy object", &error));
+                #[cfg(test)]
+                pause_s3_operation(S3OperationPhase::Copy).await;
+                if let Err(error) = copy_result {
                     let staging_location = self.key_location(staging_key);
                     let final_location = self.key_location(final_key);
                     return Err(error.context(format!(
@@ -959,6 +967,65 @@ fn copy_source(bucket: &str, key: &str) -> String {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum S3OperationPhase {
+    Put,
+    Copy,
+    Delete,
+}
+
+#[cfg(test)]
+struct S3OperationPause {
+    phase: S3OperationPhase,
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+fn s3_operation_pauses() -> &'static StdMutex<Vec<S3OperationPause>> {
+    static PAUSES: std::sync::OnceLock<StdMutex<Vec<S3OperationPause>>> =
+        std::sync::OnceLock::new();
+    PAUSES.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn install_s3_operation_pause(
+    phase: S3OperationPhase,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (reached_sender, reached_receiver) = tokio::sync::oneshot::channel();
+    let (resume_sender, resume_receiver) = tokio::sync::oneshot::channel();
+    s3_operation_pauses()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(S3OperationPause {
+            phase,
+            reached: reached_sender,
+            resume: resume_receiver,
+        });
+    (reached_receiver, resume_sender)
+}
+
+#[cfg(test)]
+async fn pause_s3_operation(phase: S3OperationPhase) {
+    let pause = {
+        let mut pauses = s3_operation_pauses()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pauses
+            .iter()
+            .position(|pause| pause.phase == phase)
+            .map(|index| pauses.swap_remove(index))
+    };
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        let _ = pause.resume.await;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     // AWS configuration is process-global, so the standard mutex intentionally
     // remains held for each complete asynchronous test operation.
@@ -1365,6 +1432,23 @@ mod tests {
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 3);
+        let staging_path = requests[0].url.path();
+        assert_eq!(requests[0].method.as_str(), "PUT");
+        assert!(staging_path.starts_with("/agent-note/.staging/note-1/"));
+        assert!(staging_path.ends_with("/nested/file.txt"));
+        assert_eq!(requests[1].method.as_str(), "PUT");
+        assert_eq!(requests[1].url.path(), "/agent-note/note-1/nested/file.txt");
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("x-amz-copy-source")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            staging_path.trim_start_matches('/')
+        );
+        assert_eq!(requests[2].method.as_str(), "DELETE");
+        assert_eq!(requests[2].url.path(), staging_path);
         assert_eq!(
             requests
                 .iter()
@@ -1384,6 +1468,208 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| !request.url.path().contains("sibling")));
+    }
+
+    #[tokio::test]
+    async fn failed_single_put_upload_only_cleans_its_staging_key() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("failed-put-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("failed-put-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/target\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(503).set_body_raw(
+                "<Error><Code>ServiceUnavailable</Code><Message>private</Message></Error>",
+                "application/xml",
+            ))
+            .expect(4)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/target\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = test_store(server.uri())
+            .await
+            .prepare_put("note-1", &test_attachment("target.txt", b"payload"))
+            .await
+            .err()
+            .expect("ambiguous staging upload must fail");
+        assert!(format!("{error:#}").contains("S3 put object failed"));
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 5);
+        let staging_path = requests[0].url.path();
+        assert!(staging_path.starts_with("/agent-note/.staging/note-1/"));
+        assert!(staging_path.ends_with("/target.txt"));
+        for request in &requests[..4] {
+            assert_eq!(request.method.as_str(), "PUT");
+            assert_eq!(request.url.path(), staging_path);
+            assert!(request.headers.get("x-amz-copy-source").is_none());
+        }
+        assert_eq!(requests[4].method.as_str(), "DELETE");
+        assert_eq!(requests[4].url.path(), staging_path);
+        assert!(requests
+            .iter()
+            .all(|request| request.url.path() != "/agent-note/note-1/target.txt"));
+    }
+
+    #[tokio::test]
+    async fn failed_single_put_copy_retains_staging_without_cleanup_delete() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("failed-copy-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("failed-copy-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/target\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/note-1/target.txt"))
+            .and(header_regex(
+                "x-amz-copy-source",
+                r"^agent-note/\.staging/note-1/[0-9a-f]{32}/target\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(403).set_body_raw(
+                "<Error><Code>AccessDenied</Code><Message>private</Message></Error>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = test_store(server.uri())
+            .await
+            .prepare_put("note-1", &test_attachment("target.txt", b"payload"))
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("staged object retained at s3://agent-note/.staging/note-1/"));
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let staging_path = requests[0].url.path();
+        assert_eq!(requests[0].method.as_str(), "PUT");
+        assert!(staging_path.starts_with("/agent-note/.staging/note-1/"));
+        assert_eq!(requests[1].method.as_str(), "PUT");
+        assert_eq!(requests[1].url.path(), "/agent-note/note-1/target.txt");
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("x-amz-copy-source")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            staging_path.trim_start_matches('/')
+        );
+        assert!(requests
+            .iter()
+            .all(|request| request.method.as_str() != "DELETE"));
+    }
+
+    #[tokio::test]
+    async fn failed_single_put_staging_cleanup_happens_after_final_copy() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("failed-cleanup-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("failed-cleanup-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/target\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/note-1/target.txt"))
+            .and(header_regex(
+                "x-amz-copy-source",
+                r"^agent-note/\.staging/note-1/[0-9a-f]{32}/target\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/target\.txt$",
+            ))
+            .respond_with(ResponseTemplate::new(403).set_body_raw(
+                "<Error><Code>AccessDenied</Code><Message>private</Message></Error>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = test_store(server.uri())
+            .await
+            .prepare_put("note-1", &test_attachment("target.txt", b"payload"))
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(
+            "database committed; final object copied; staging cleanup uncertain at \
+             s3://agent-note/.staging/note-1/"
+        ));
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let staging_path = requests[0].url.path();
+        assert_eq!(requests[0].method.as_str(), "PUT");
+        assert!(staging_path.starts_with("/agent-note/.staging/note-1/"));
+        assert_eq!(requests[1].method.as_str(), "PUT");
+        assert_eq!(requests[1].url.path(), "/agent-note/note-1/target.txt");
+        assert_eq!(
+            requests[1]
+                .headers
+                .get("x-amz-copy-source")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            staging_path.trim_start_matches('/')
+        );
+        assert_eq!(requests[2].method.as_str(), "DELETE");
+        assert_eq!(requests[2].url.path(), staging_path);
     }
 
     #[tokio::test]
@@ -1560,13 +1846,13 @@ mod tests {
             ("AWS_ENDPOINT_URL_S3", None),
         ]);
         let server = MockServer::start().await;
-        let (put_response, put_reached, _) = block_first_response(ResponseTemplate::new(200));
-        let (delete_response, delete_reached, _) = block_first_response(ResponseTemplate::new(204));
+        let (put_reached, resume_put) = install_s3_operation_pause(S3OperationPhase::Put);
+        let (delete_reached, resume_delete) = install_s3_operation_pause(S3OperationPhase::Delete);
         Mock::given(method("PUT"))
             .and(path_regex(
                 r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
             ))
-            .respond_with(put_response)
+            .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
             .await;
@@ -1574,7 +1860,7 @@ mod tests {
             .and(path_regex(
                 r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
             ))
-            .respond_with(delete_response)
+            .respond_with(ResponseTemplate::new(204))
             .expect(1)
             .mount(&server)
             .await;
@@ -1592,20 +1878,26 @@ mod tests {
             preparing.await,
             Err(error) if error.is_cancelled()
         ));
-        delete_reached.await.unwrap();
-
         let same_store = store.clone();
-        let mut same =
+        let same =
             tokio::spawn(async move { same_store.prepare_delete("note-1", "next.txt").await });
-        assert!(tokio::time::timeout(Duration::from_millis(100), &mut same)
-            .await
-            .is_err());
+        tokio::task::yield_now().await;
+        assert!(!same.is_finished());
+        assert!(store.coordination.lock_for("note-1").try_lock().is_err());
+
+        resume_put.send(()).unwrap();
+        delete_reached.await.unwrap();
+        assert!(!same.is_finished());
+        assert!(store.coordination.lock_for("note-1").try_lock().is_err());
+
+        resume_delete.send(()).unwrap();
         let prepared = tokio::time::timeout(Duration::from_secs(2), same)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         prepared.abort().await.unwrap();
+        assert!(store.coordination.lock_for("note-1").try_lock().is_ok());
     }
 
     #[tokio::test]
@@ -1621,7 +1913,6 @@ mod tests {
             ("AWS_ENDPOINT_URL_S3", None),
         ]);
         let server = MockServer::start().await;
-        let (copy_response, copy_reached, _) = block_first_response(ResponseTemplate::new(200));
         Mock::given(method("PUT"))
             .and(path_regex(
                 r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
@@ -1632,7 +1923,7 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path("/agent-note/note-1/file.txt"))
-            .respond_with(copy_response)
+            .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
             .await;
@@ -1650,23 +1941,33 @@ mod tests {
             .prepare_put("note-1", &test_attachment("file.txt", b"payload"))
             .await
             .unwrap();
+        let (copy_reached, resume_copy) = install_s3_operation_pause(S3OperationPhase::Copy);
+        let (delete_reached, resume_delete) = install_s3_operation_pause(S3OperationPhase::Delete);
         let publishing = tokio::spawn(async move { prepared.publish().await });
         copy_reached.await.unwrap();
         publishing.abort();
         assert!(publishing.await.unwrap_err().is_cancelled());
 
         let same_store = store.clone();
-        let mut same =
+        let same =
             tokio::spawn(async move { same_store.prepare_delete("note-1", "next.txt").await });
-        assert!(tokio::time::timeout(Duration::from_millis(100), &mut same)
-            .await
-            .is_err());
+        tokio::task::yield_now().await;
+        assert!(!same.is_finished());
+        assert!(store.coordination.lock_for("note-1").try_lock().is_err());
+
+        resume_copy.send(()).unwrap();
+        delete_reached.await.unwrap();
+        assert!(!same.is_finished());
+        assert!(store.coordination.lock_for("note-1").try_lock().is_err());
+
+        resume_delete.send(()).unwrap();
         let prepared = tokio::time::timeout(Duration::from_secs(2), same)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         prepared.abort().await.unwrap();
+        assert!(store.coordination.lock_for("note-1").try_lock().is_ok());
     }
 
     #[tokio::test]
@@ -1682,7 +1983,6 @@ mod tests {
             ("AWS_ENDPOINT_URL_S3", None),
         ]);
         let server = MockServer::start().await;
-        let (delete_response, delete_reached, _) = block_first_response(ResponseTemplate::new(204));
         Mock::given(method("PUT"))
             .and(path_regex(
                 r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
@@ -1695,7 +1995,7 @@ mod tests {
             .and(path_regex(
                 r"^/agent-note/\.staging/note-1/[0-9a-f]{32}/file\.txt$",
             ))
-            .respond_with(delete_response)
+            .respond_with(ResponseTemplate::new(204))
             .expect(1)
             .mount(&server)
             .await;
@@ -1705,23 +2005,27 @@ mod tests {
             .prepare_put("note-1", &test_attachment("file.txt", b"payload"))
             .await
             .unwrap();
+        let (delete_reached, resume_delete) = install_s3_operation_pause(S3OperationPhase::Delete);
         let aborting = tokio::spawn(async move { prepared.abort().await });
         delete_reached.await.unwrap();
         aborting.abort();
         assert!(aborting.await.unwrap_err().is_cancelled());
 
         let same_store = store.clone();
-        let mut same =
+        let same =
             tokio::spawn(async move { same_store.prepare_delete("note-1", "next.txt").await });
-        assert!(tokio::time::timeout(Duration::from_millis(100), &mut same)
-            .await
-            .is_err());
+        tokio::task::yield_now().await;
+        assert!(!same.is_finished());
+        assert!(store.coordination.lock_for("note-1").try_lock().is_err());
+
+        resume_delete.send(()).unwrap();
         let prepared = tokio::time::timeout(Duration::from_secs(2), same)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         prepared.abort().await.unwrap();
+        assert!(store.coordination.lock_for("note-1").try_lock().is_ok());
     }
 
     #[tokio::test]
