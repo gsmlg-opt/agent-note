@@ -190,7 +190,22 @@ pub async fn get_note_attachment_by_id(
             return Ok(None);
         };
         let resolved_path = attachment.path;
-        let content = ctx.attachments().read(note_id, &resolved_path).await?;
+        let content = match ctx.attachments().read(note_id, &resolved_path).await {
+            Ok(content) => content,
+            Err(read_error) => {
+                let Some(confirmed) =
+                    resolve_attachment_metadata(ctx, note_id, attachment_id).await?
+                else {
+                    return Ok(None);
+                };
+                if normalize_attachment_path(&confirmed.path)
+                    == normalize_attachment_path(&resolved_path)
+                {
+                    return Err(read_error);
+                }
+                continue;
+            }
+        };
         let Some(mut confirmed) = resolve_attachment_metadata(ctx, note_id, attachment_id).await?
         else {
             continue;

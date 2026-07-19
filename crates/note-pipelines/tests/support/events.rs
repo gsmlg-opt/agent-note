@@ -247,6 +247,7 @@ pub struct ControlledAttachmentStore {
     race_note_ids: Mutex<HashSet<String>>,
     delete_path_races: Mutex<HashMap<String, VecDeque<(String, String)>>>,
     read_contents: Mutex<HashMap<(String, String), Vec<u8>>>,
+    read_failures: Mutex<HashMap<(String, String), VecDeque<String>>>,
     read_path_races: Mutex<HashMap<(String, String), VecDeque<Vec<(String, String)>>>>,
     committed_marker: Mutex<Option<String>>,
     blocked_publish_note: Mutex<Option<String>>,
@@ -264,6 +265,7 @@ impl ControlledAttachmentStore {
             race_note_ids: Mutex::new(HashSet::new()),
             delete_path_races: Mutex::new(HashMap::new()),
             read_contents: Mutex::new(HashMap::new()),
+            read_failures: Mutex::new(HashMap::new()),
             read_path_races: Mutex::new(HashMap::new()),
             committed_marker: Mutex::new(None),
             blocked_publish_note: Mutex::new(None),
@@ -301,6 +303,15 @@ impl ControlledAttachmentStore {
             .lock()
             .unwrap()
             .insert((note_id.to_string(), path.to_string()), content.to_vec());
+    }
+
+    pub fn fail_read_once(&self, note_id: &str, path: &str, message: &str) {
+        self.read_failures
+            .lock()
+            .unwrap()
+            .entry((note_id.to_string(), path.to_string()))
+            .or_default()
+            .push_back(message.to_string());
     }
 
     pub fn race_attachment_paths_after_read(
@@ -497,6 +508,12 @@ impl AttachmentStore for ControlledAttachmentStore {
             .get(&key)
             .cloned()
             .unwrap_or_default();
+        let failure = self
+            .read_failures
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front);
         let race = self
             .read_path_races
             .lock()
@@ -527,6 +544,9 @@ impl AttachmentStore for ControlledAttachmentStore {
                     .unwrap()
                     .push(format!("race_read_paths:{note_id}:{path}"));
             }
+        }
+        if let Some(message) = failure {
+            anyhow::bail!(message);
         }
         Ok(content)
     }

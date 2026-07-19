@@ -507,6 +507,69 @@ async fn get_by_id_retries_when_the_old_path_is_reassigned_to_another_id() {
 }
 
 #[tokio::test]
+async fn get_by_id_retries_a_missing_old_object_when_metadata_moved_to_a_new_path() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[
+            attachment("target", "old.txt", "text/plain", "", b""),
+            attachment("other", "other.txt", "text/plain", "", b""),
+        ],
+    )
+    .await;
+    events.lock().unwrap().clear();
+    attachments.fail_read_once(NOTE_ID, "old.txt", "controlled old object not found");
+    attachments.set_read_content(NOTE_ID, "new.txt", b"new bytes");
+    attachments.race_attachment_paths_after_read(
+        NOTE_ID,
+        "old.txt",
+        &[("target", "new.txt"), ("other", "old.txt")],
+    );
+
+    let loaded = get_note_attachment_by_id(&ctx, NOTE_ID, "target")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(loaded.path, "new.txt");
+    assert_eq!(loaded.content, b"new bytes");
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec![
+            "read:attachment-note:old.txt",
+            "race_read_paths:attachment-note:old.txt",
+            "read:attachment-note:new.txt",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn get_by_id_preserves_a_read_failure_when_metadata_still_maps_to_the_same_path() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[attachment("target", "same.txt", "text/plain", "", b"")],
+    )
+    .await;
+    events.lock().unwrap().clear();
+    attachments.fail_read_once(NOTE_ID, "same.txt", "sentinel unchanged-path read failure");
+
+    let error = get_note_attachment_by_id(&ctx, NOTE_ID, "target")
+        .await
+        .unwrap_err();
+
+    assert_eq!(format!("{error:#}"), "sentinel unchanged-path read failure");
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec!["read:attachment-note:same.txt"]
+    );
+}
+
+#[tokio::test]
 async fn get_by_id_returns_a_typed_conflict_after_a_second_path_reassignment() {
     let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
     seed_note(
