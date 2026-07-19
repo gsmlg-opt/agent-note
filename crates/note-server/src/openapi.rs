@@ -27,19 +27,26 @@ impl ToSchema for Binary {}
 #[derive(ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct SystemConfigSchema {
+    #[schema(
+        required = false,
+        default = json!({"enabled": false, "rules": []})
+    )]
     pub duplicate_check: DuplicateCheckConfigSchema,
 }
 
 #[derive(ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct DuplicateCheckConfigSchema {
+    #[schema(required = false, default = false)]
     pub enabled: bool,
+    #[schema(required = false, default = json!([]), max_items = 64)]
     pub rules: Vec<DuplicateCheckRuleSchema>,
 }
 
 #[derive(ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct DuplicateCheckRuleSchema {
+    #[schema(min_items = 1, max_items = 32)]
     pub terms: Vec<DuplicateCheckTermSchema>,
 }
 
@@ -55,9 +62,12 @@ pub(crate) struct DuplicateCheckTermSchema {
 #[allow(dead_code)]
 pub(crate) struct SystemInfoSchema {
     pub database_engine: String,
+    #[schema(required = true)]
     pub database_path: Option<String>,
+    #[schema(required = true)]
     pub database_size_bytes: Option<u64>,
     pub attachments_engine: String,
+    #[schema(required = true)]
     pub attachments_location: Option<String>,
     pub embedding_engine: String,
     pub embedding_model: String,
@@ -161,6 +171,34 @@ mod tests {
             .keys()
             .cloned()
             .collect()
+    }
+
+    fn schema_required_keys(document: &serde_json::Value, schema_name: &str) -> BTreeSet<String> {
+        document["components"]["schemas"][schema_name]["required"]
+            .as_array()
+            .map(|required| {
+                required
+                    .iter()
+                    .map(|key| key.as_str().expect("required property name").to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn assert_nullable_property(
+        document: &serde_json::Value,
+        schema_name: &str,
+        property_name: &str,
+    ) {
+        let schema_type =
+            &document["components"]["schemas"][schema_name]["properties"][property_name]["type"];
+        assert!(
+            schema_type
+                .as_array()
+                .expect("nullable OpenAPI 3.1 type array")
+                .contains(&serde_json::json!("null")),
+            "{schema_name}.{property_name} must accept null"
+        );
     }
 
     #[tokio::test]
@@ -278,6 +316,60 @@ mod tests {
         assert_eq!(
             property_keys(&runtime_info),
             schema_property_keys(&document, "SystemInfoSchema")
+        );
+
+        assert_eq!(
+            schema_required_keys(&document, "SystemConfigSchema"),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            schema_required_keys(&document, "DuplicateCheckConfigSchema"),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            schema_required_keys(&document, "DuplicateCheckRuleSchema"),
+            BTreeSet::from(["terms".to_string()])
+        );
+        assert_eq!(
+            schema_required_keys(&document, "DuplicateCheckTermSchema"),
+            BTreeSet::from(["key".to_string()])
+        );
+        assert_eq!(
+            schema_required_keys(&document, "SystemInfoSchema"),
+            property_keys(&runtime_info)
+        );
+        for property in [
+            "database_path",
+            "database_size_bytes",
+            "attachments_location",
+        ] {
+            assert_nullable_property(&document, "SystemInfoSchema", property);
+        }
+
+        let schemas = &document["components"]["schemas"];
+        assert_eq!(
+            schemas["SystemConfigSchema"]["properties"]["duplicate_check"]["default"],
+            serde_json::json!({"enabled": false, "rules": []})
+        );
+        assert_eq!(
+            schemas["DuplicateCheckConfigSchema"]["properties"]["enabled"]["default"],
+            false
+        );
+        assert_eq!(
+            schemas["DuplicateCheckConfigSchema"]["properties"]["rules"]["default"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            schemas["DuplicateCheckConfigSchema"]["properties"]["rules"]["maxItems"],
+            note_core::MAX_DUPLICATE_CHECK_RULES
+        );
+        assert_eq!(
+            schemas["DuplicateCheckRuleSchema"]["properties"]["terms"]["minItems"],
+            1
+        );
+        assert_eq!(
+            schemas["DuplicateCheckRuleSchema"]["properties"]["terms"]["maxItems"],
+            note_core::MAX_DUPLICATE_CHECK_TERMS
         );
     }
 }
