@@ -13,6 +13,36 @@ pub struct NoteShowProps {
     pub id: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CopyStatus {
+    #[default]
+    Ready,
+    Copied,
+    Failed,
+}
+
+impl CopyStatus {
+    fn action_label(self) -> &'static str {
+        match self {
+            Self::Ready => "Copy",
+            Self::Copied => "Copied",
+            Self::Failed => "Copy failed",
+        }
+    }
+}
+
+fn copy_chip_text(id: &str, status: CopyStatus) -> String {
+    format!("ID: {id} · {}", status.action_label())
+}
+
+fn copy_announcement(status: CopyStatus) -> &'static str {
+    match status {
+        CopyStatus::Ready => "",
+        CopyStatus::Copied => "Note ID copied to clipboard.",
+        CopyStatus::Failed => "Unable to copy note ID.",
+    }
+}
+
 /// Read-only view of a single note.
 #[function_component(NoteShowPage)]
 pub fn note_show_page(props: &NoteShowProps) -> Html {
@@ -245,10 +275,45 @@ fn markdown_options() -> Options {
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_attachment_urls;
+    use super::{
+        copy_announcement, copy_chip_text, rewrite_attachment_urls, CopyStatus,
+    };
     use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
     const BASE: &str = "/api/notes/note-1/attachments";
+
+    #[test]
+    fn copy_chip_initially_offers_to_copy_the_canonical_id() {
+        assert_eq!(
+            copy_chip_text("note-123", CopyStatus::Ready),
+            "ID: note-123 · Copy"
+        );
+        assert_eq!(copy_announcement(CopyStatus::Ready), "");
+    }
+
+    #[test]
+    fn copy_chip_reports_success() {
+        assert_eq!(
+            copy_chip_text("note-123", CopyStatus::Copied),
+            "ID: note-123 · Copied"
+        );
+        assert_eq!(
+            copy_announcement(CopyStatus::Copied),
+            "Note ID copied to clipboard."
+        );
+    }
+
+    #[test]
+    fn copy_chip_reports_failure() {
+        assert_eq!(
+            copy_chip_text("note-123", CopyStatus::Failed),
+            "ID: note-123 · Copy failed"
+        );
+        assert_eq!(
+            copy_announcement(CopyStatus::Failed),
+            "Unable to copy note ID."
+        );
+    }
 
     #[test]
     fn rewrites_relative_link_image_and_html_urls() {
