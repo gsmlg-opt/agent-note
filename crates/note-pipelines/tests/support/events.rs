@@ -7,10 +7,11 @@ use note_storage::{
     ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, EmbeddingDashboardStatus,
     EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteFieldsUpdate,
     NoteUpdate, NotesRepository, RetrievalRepository, SettingsRepository, StorageBackend,
-    StorageResult, StorageSession, StorageTransaction, TransactionMode, UpsertNoteChunk,
+    StorageError, StorageErrorKind, StorageResult, StorageSession, StorageTransaction,
+    TransactionMode, UpsertNoteChunk,
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -27,17 +28,27 @@ pub fn event_log() -> EventLog {
 pub struct EventStorageBackend {
     inner: Arc<dyn StorageBackend>,
     events: EventLog,
+    fail_commit: Arc<AtomicBool>,
 }
 
 impl EventStorageBackend {
     pub fn new(inner: Arc<dyn StorageBackend>, events: EventLog) -> Self {
-        Self { inner, events }
+        Self {
+            inner,
+            events,
+            fail_commit: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn fail_next_commit(&self) {
+        self.fail_commit.store(true, Ordering::SeqCst);
     }
 }
 
 struct EventTransaction {
     inner: Box<dyn StorageTransaction>,
     events: EventLog,
+    fail_commit: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -52,6 +63,7 @@ impl StorageBackend for EventStorageBackend {
         Ok(Box::new(EventTransaction {
             inner: transaction,
             events: self.events.clone(),
+            fail_commit: self.fail_commit.clone(),
         }))
     }
 
@@ -197,14 +209,30 @@ impl_forward_repository! {
 #[async_trait::async_trait]
 impl StorageTransaction for EventTransaction {
     async fn commit(self: Box<Self>) -> StorageResult<()> {
-        let Self { inner, events } = *self;
+        let Self {
+            inner,
+            events,
+            fail_commit,
+        } = *self;
+        if fail_commit.swap(false, Ordering::SeqCst) {
+            inner.rollback().await?;
+            events.lock().unwrap().push("commit_failed".into());
+            return Err(StorageError::new(
+                StorageErrorKind::Transaction,
+                "controlled commit failure",
+            ));
+        }
         inner.commit().await?;
         events.lock().unwrap().push("commit".into());
         Ok(())
     }
 
     async fn rollback(self: Box<Self>) -> StorageResult<()> {
-        let Self { inner, events } = *self;
+        let Self {
+            inner,
+            events,
+            fail_commit: _,
+        } = *self;
         inner.rollback().await?;
         events.lock().unwrap().push("rollback".into());
         Ok(())
@@ -217,6 +245,7 @@ pub struct ControlledAttachmentStore {
     fail_publish: AtomicBool,
     fail_abort: AtomicBool,
     race_note_ids: Mutex<HashSet<String>>,
+    delete_path_races: Mutex<HashMap<String, VecDeque<(String, String)>>>,
     committed_marker: Mutex<Option<String>>,
     blocked_publish_note: Mutex<Option<String>>,
     publish_started: Arc<Notify>,
@@ -231,6 +260,7 @@ impl ControlledAttachmentStore {
             fail_publish: AtomicBool::new(false),
             fail_abort: AtomicBool::new(false),
             race_note_ids: Mutex::new(HashSet::new()),
+            delete_path_races: Mutex::new(HashMap::new()),
             committed_marker: Mutex::new(None),
             blocked_publish_note: Mutex::new(None),
             publish_started: Arc::new(Notify::new()),
@@ -251,6 +281,15 @@ impl ControlledAttachmentStore {
             .lock()
             .unwrap()
             .insert(note_id.to_string());
+    }
+
+    pub fn race_attachment_path_on_delete(&self, note_id: &str, attachment_id: &str, path: &str) {
+        self.delete_path_races
+            .lock()
+            .unwrap()
+            .entry(note_id.to_string())
+            .or_default()
+            .push_back((attachment_id.to_string(), path.to_string()));
     }
 
     pub fn observe_committed_label_on_abort(&self, key: &str) {
@@ -377,6 +416,34 @@ impl AttachmentStore for ControlledAttachmentStore {
             .lock()
             .unwrap()
             .push(format!("prepare_delete:{note_id}:{path}"));
+        let race = self
+            .delete_path_races
+            .lock()
+            .unwrap()
+            .get_mut(note_id)
+            .and_then(VecDeque::pop_front);
+        if let Some((attachment_id, replacement_path)) = race {
+            let session = self.backend.session().await?;
+            if let Some(mut note) = session.get_note(note_id).await? {
+                if let Some(attachment) = note
+                    .attachments
+                    .iter_mut()
+                    .find(|attachment| attachment.id == attachment_id)
+                {
+                    attachment.path = replacement_path.clone();
+                    session
+                        .update_note_attachments(AttachmentMetadataUpdate {
+                            id: note_id,
+                            attachments: &note.attachments,
+                            updated_at: note.updated_at.saturating_add(1),
+                        })
+                        .await?;
+                    self.events.lock().unwrap().push(format!(
+                        "race_delete_path:{note_id}:{attachment_id}:{replacement_path}"
+                    ));
+                }
+            }
+        }
         Ok(Box::new(ControlledPreparedMutation {
             note_id: note_id.to_string(),
             path: path.to_string(),

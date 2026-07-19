@@ -104,7 +104,7 @@ pub fn validate_note_input(
     Ok(())
 }
 
-fn validate_attachments(attachments: &[NoteAttachment]) -> Result<(), ValidationError> {
+pub fn validate_attachments(attachments: &[NoteAttachment]) -> Result<(), ValidationError> {
     let mut ids = HashSet::new();
     let mut paths = HashSet::new();
     for attachment in attachments {
