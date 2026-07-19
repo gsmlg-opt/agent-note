@@ -14,6 +14,7 @@ use note_mcp::{
 use note_pipelines::{drain_embedding_jobs, update_system_config, Context, EditOp};
 use note_storage::StorageBackend;
 use note_storage_turso::TursoStorage;
+use serde_json::json;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -63,6 +64,53 @@ fn put_input(
         description: format!("{attachment_id} description"),
         content,
     }
+}
+
+#[test]
+fn non_byte_tool_inputs_keep_strict_deserialization() {
+    assert!(serde_json::from_value::<SaveNoteToolInput>(json!({
+        "title": "Title",
+        "content": "Body"
+    }))
+    .is_ok());
+    assert!(serde_json::from_value::<UpdateNoteToolInput>(json!({
+        "id": "note-1",
+        "title": "Title",
+        "content": "Body"
+    }))
+    .is_ok());
+    assert!(serde_json::from_value::<SemanticSearchToolInput>(json!({
+        "query": "body",
+        "limit": 5
+    }))
+    .is_ok());
+    assert!(serde_json::from_value::<SaveNoteToolInput>(json!({
+        "title": "Title",
+        "content": "Body",
+        "unknown": true
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<UpdateNoteToolInput>(json!({
+        "id": "note-1",
+        "title": "Title",
+        "content": "Body",
+        "unknown": true
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<SemanticSearchToolInput>(json!({
+        "query": "body",
+        "limit": 5,
+        "unknown": true
+    }))
+    .is_err());
+    assert!(
+        serde_json::from_value::<GetNoteAttachmentContentToolInput>(json!({
+            "note_id": "note-1",
+            "attachment_id": "blob",
+            "unknown": true
+        }))
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -432,9 +480,19 @@ async fn semantic_search_returns_summary_labels_and_timestamps() {
     )
     .await
     .unwrap();
+    save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Excluded".into(),
+            content: "unique searchable content".into(),
+            labels: vec![("topic".into(), "ops".into())],
+        },
+    )
+    .await
+    .unwrap();
     drain_embedding_jobs(&ctx, 10).await.unwrap();
 
-    let result = semantic_search_tool(
+    let results = semantic_search_tool(
         &ctx,
         SemanticSearchToolInput {
             query: "unique searchable content".into(),
@@ -443,10 +501,12 @@ async fn semantic_search_returns_summary_labels_and_timestamps() {
         },
     )
     .await
-    .unwrap()
-    .into_iter()
-    .find(|result| result.title == "Findable")
     .unwrap();
+    assert!(!results.iter().any(|result| result.title == "Excluded"));
+    let result = results
+        .into_iter()
+        .find(|result| result.title == "Findable")
+        .unwrap();
 
     assert_eq!(result.labels.len(), 1);
     assert_eq!(result.labels[0].key, "topic");

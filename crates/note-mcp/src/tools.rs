@@ -93,6 +93,7 @@ impl From<Note> for NoteDetailData {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SaveNoteToolInput {
     pub title: String,
     pub content: String,
@@ -182,6 +183,7 @@ pub async fn edit_note_tool(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateNoteToolInput {
     pub id: String,
     pub title: String,
@@ -232,6 +234,7 @@ pub async fn list_notes_tool(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticSearchToolInput {
     pub query: String,
     pub limit: usize,
@@ -267,7 +270,7 @@ pub async fn semantic_search_tool(
         .collect())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct PutNoteAttachmentToolInput {
     pub note_id: String,
     pub attachment_id: String,
@@ -306,12 +309,13 @@ pub async fn put_note_attachment_tool(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetNoteAttachmentContentToolInput {
     pub note_id: String,
     pub attachment_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct AttachmentContentData {
     pub attachment: AttachmentMetadataData,
     pub content: Vec<u8>,

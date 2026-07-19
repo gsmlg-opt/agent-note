@@ -3,7 +3,7 @@
 //! Transport-specific request/response marshalling lives here. The handlers
 //! delegate to transport-independent wrappers in [`crate::tools`].
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use note_pipelines::{AttachmentMutationError, Context};
 use rmcp::{
@@ -39,6 +39,7 @@ pub struct SaveNoteRequest {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SaveNoteResponse {
     /// Id of the newly saved note.
     pub id: String,
@@ -61,12 +62,14 @@ impl From<SaveNoteToolOutput> for SaveNoteResponse {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetNoteRequest {
     /// Note id.
     pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct LabelSchema {
     /// Label key.
     pub key: String,
@@ -90,6 +93,7 @@ impl From<LabelData> for LabelSchema {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct AttachmentMetadataSchema {
     /// Unique attachment id within the note.
     pub id: String,
@@ -113,6 +117,7 @@ impl From<AttachmentMetadataData> for AttachmentMetadataSchema {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct NoteSummaryResponse {
     /// Note id.
     pub id: String,
@@ -139,6 +144,7 @@ impl From<NoteSummaryData> for NoteSummaryResponse {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct NoteDetailResponse {
     /// Note id.
     pub id: String,
@@ -171,12 +177,14 @@ impl From<NoteDetailData> for NoteDetailResponse {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadNoteLinesRequest {
     /// Note id.
     pub id: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct NoteLineSchema {
     /// 1-indexed line number.
     pub n: usize,
@@ -185,6 +193,7 @@ pub struct NoteLineSchema {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct NoteLinesResponse {
     /// Note id.
     pub id: String,
@@ -214,6 +223,7 @@ impl From<NoteLinesData> for NoteLinesResponse {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EditOpSchema {
     /// Replace an original line range with zero or more lines.
@@ -248,6 +258,7 @@ impl From<EditOpSchema> for note_pipelines::EditOp {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EditNoteRequest {
     /// Note id.
     pub id: String,
@@ -283,18 +294,21 @@ impl From<UpdateNoteRequest> for UpdateNoteToolInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteNoteRequest {
     /// Note id.
     pub id: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct DeleteNoteResponse {
     /// Whether a note was deleted.
     pub deleted: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListNotesRequest {
     /// Max notes to return.
     #[serde(default)]
@@ -308,12 +322,14 @@ pub struct ListNotesRequest {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct NoteListResponse {
     /// Saved note summaries.
     pub notes: Vec<NoteSummaryResponse>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticSearchRequest {
     /// Natural-language query.
     pub query: String,
@@ -325,6 +341,7 @@ pub struct SemanticSearchRequest {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SemanticSearchHit {
     /// Id of the matching note.
     pub id: String,
@@ -341,6 +358,7 @@ pub struct SemanticSearchHit {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct SemanticSearchResponse {
     /// Matching notes, best first.
     pub results: Vec<SemanticSearchHit>,
@@ -370,6 +388,7 @@ impl From<SemanticSearchToolResult> for SemanticSearchHit {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(extend(
     "anyOf" = [
         {"required": ["content"]},
@@ -425,6 +444,7 @@ impl TryFrom<PutNoteAttachmentRequest> for PutNoteAttachmentToolInput {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct PutNoteAttachmentResponse {
     /// Whether a new attachment id was created.
     pub created: bool,
@@ -442,6 +462,7 @@ impl From<PutNoteAttachmentToolOutput> for PutNoteAttachmentResponse {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetNoteAttachmentContentRequest {
     /// Note id.
     pub note_id: String,
@@ -449,36 +470,75 @@ pub struct GetNoteAttachmentContentRequest {
     pub attachment_id: String,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize)]
 pub struct GetNoteAttachmentContentResponse {
     /// Attachment metadata.
     pub attachment: AttachmentMetadataSchema,
-    /// UTF-8 content, present only when the bytes are valid UTF-8.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    /// Canonical padded Base64, present only for non-UTF-8 bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_base64: Option<String>,
+    /// Exactly one UTF-8 or Base64 content representation.
+    #[serde(flatten)]
+    pub content: AttachmentContentRepresentation,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum AttachmentContentRepresentation {
+    /// UTF-8 attachment content.
+    Text { content: String },
+    /// Canonical padded Base64 for non-UTF-8 bytes.
+    Base64 { content_base64: String },
+}
+
+impl JsonSchema for GetNoteAttachmentContentResponse {
+    fn schema_name() -> Cow<'static, str> {
+        "GetNoteAttachmentContentResponse".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::GetNoteAttachmentContentResponse").into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let attachment = generator.subschema_for::<AttachmentMetadataSchema>();
+        schemars::json_schema!({
+            "type": "object",
+            "properties": {
+                "attachment": attachment,
+                "content": {"type": "string"},
+                "content_base64": {"type": "string"}
+            },
+            "required": ["attachment"],
+            "additionalProperties": false,
+            "oneOf": [
+                {
+                    "required": ["content"],
+                    "not": {"required": ["content_base64"]}
+                },
+                {
+                    "required": ["content_base64"],
+                    "not": {"required": ["content"]}
+                }
+            ]
+        })
+    }
 }
 
 impl From<AttachmentContentData> for GetNoteAttachmentContentResponse {
     fn from(data: AttachmentContentData) -> Self {
-        let (content, content_base64) = match String::from_utf8(data.content) {
-            Ok(content) => (Some(content), None),
-            Err(error) => (
-                None,
-                Some(note_core::encode_attachment_content(error.as_bytes())),
-            ),
+        let content = match String::from_utf8(data.content) {
+            Ok(content) => AttachmentContentRepresentation::Text { content },
+            Err(error) => AttachmentContentRepresentation::Base64 {
+                content_base64: note_core::encode_attachment_content(error.as_bytes()),
+            },
         };
         Self {
             attachment: data.attachment.into(),
             content,
-            content_base64,
         }
     }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteNoteAttachmentRequest {
     /// Note id.
     pub note_id: String,
@@ -487,6 +547,7 @@ pub struct DeleteNoteAttachmentRequest {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct DeleteNoteAttachmentResponse {
     /// Whether the attachment existed and was deleted.
     pub deleted: bool,
@@ -828,6 +889,47 @@ mod tests {
         names
     }
 
+    fn resolve_schema<'a>(
+        root: &'a serde_json::Value,
+        schema: &'a serde_json::Value,
+    ) -> &'a serde_json::Value {
+        match schema.get("$ref").and_then(serde_json::Value::as_str) {
+            Some(reference) => root
+                .pointer(reference.strip_prefix('#').expect("local schema reference"))
+                .unwrap_or_else(|| panic!("unresolved schema reference: {reference}")),
+            None => schema,
+        }
+    }
+
+    fn required_names(schema: &serde_json::Value) -> Vec<String> {
+        let mut names = schema["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|name| name.as_str().expect("required property name").to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn assert_exact_closed_object(
+        root: &serde_json::Value,
+        schema: &serde_json::Value,
+        expected_properties: &[&str],
+    ) {
+        let schema = resolve_schema(root, schema);
+        assert_eq!(schema["type"], "object", "{schema}");
+        assert_eq!(schema["additionalProperties"], false, "{schema}");
+        assert_eq!(
+            property_names(schema),
+            expected_properties
+                .iter()
+                .map(|property| (*property).to_owned())
+                .collect::<Vec<_>>(),
+            "{schema}"
+        );
+    }
+
     fn assert_attachment_content_requirement(schema: &serde_json::Value) {
         assert!(schema.pointer("/properties/content").is_some());
         assert!(schema.pointer("/properties/content_base64").is_some());
@@ -898,36 +1000,135 @@ mod tests {
         let (ctx, _backend, _dir) = test_context().await;
         let server = NoteMcpServer::new(Arc::new(ctx));
 
-        assert_eq!(
-            property_names(&tool_schema(&server, "save_note", false)),
-            vec!["content", "labels", "title"]
-        );
-        assert_eq!(
-            property_names(&tool_schema(&server, "update_note", false)),
-            vec!["content", "id", "labels", "title"]
+        for tool in server.tool_router.list_all() {
+            let schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+            assert_eq!(schema["type"], "object", "{}: {schema}", tool.name);
+            assert_eq!(
+                schema["additionalProperties"], false,
+                "{}: {schema}",
+                tool.name
+            );
+        }
+
+        let save_input = tool_schema(&server, "save_note", false);
+        assert_exact_closed_object(&save_input, &save_input, &["content", "labels", "title"]);
+        let update_input = tool_schema(&server, "update_note", false);
+        assert_exact_closed_object(
+            &update_input,
+            &update_input,
+            &["content", "id", "labels", "title"],
         );
 
         let put_schema = tool_schema(&server, "put_note_attachment", false);
+        assert_exact_closed_object(
+            &put_schema,
+            &put_schema,
+            &[
+                "attachment_id",
+                "content",
+                "content_base64",
+                "description",
+                "mime",
+                "note_id",
+                "path",
+            ],
+        );
         assert_attachment_content_requirement(&put_schema);
         let list_input = tool_schema(&server, "list_notes", false);
         assert!(schema_allows_null(&list_input["properties"]["label"]));
 
-        let list_output = tool_schema(&server, "list_notes", true).to_string();
-        assert!(!list_output.contains("\"content\""));
-        assert!(!list_output.contains("\"attachments\""));
-        let search_output = tool_schema(&server, "semantic_search", true).to_string();
-        for field in [
-            "\"id\"",
-            "\"title\"",
-            "\"score\"",
-            "\"labels\"",
-            "\"created_at\"",
-            "\"updated_at\"",
-        ] {
-            assert!(search_output.contains(field), "{field}: {search_output}");
-        }
-        assert!(!search_output.contains("\"content\""));
-        assert!(!search_output.contains("\"attachments\""));
+        let list_output = tool_schema(&server, "list_notes", true);
+        assert_exact_closed_object(&list_output, &list_output, &["notes"]);
+        let summary = resolve_schema(&list_output, &list_output["properties"]["notes"]["items"]);
+        assert_exact_closed_object(
+            &list_output,
+            summary,
+            &["created_at", "id", "labels", "title", "updated_at"],
+        );
+        let summary_label = resolve_schema(&list_output, &summary["properties"]["labels"]["items"]);
+        assert_exact_closed_object(
+            &list_output,
+            summary_label,
+            &["description", "key", "value", "value_type"],
+        );
+
+        let detail_output = tool_schema(&server, "get_note", true);
+        assert_exact_closed_object(
+            &detail_output,
+            &detail_output,
+            &[
+                "attachments",
+                "content",
+                "created_at",
+                "id",
+                "labels",
+                "title",
+                "updated_at",
+            ],
+        );
+        let attachment = resolve_schema(
+            &detail_output,
+            &detail_output["properties"]["attachments"]["items"],
+        );
+        assert_exact_closed_object(
+            &detail_output,
+            attachment,
+            &["description", "id", "mime", "path"],
+        );
+
+        let search_output = tool_schema(&server, "semantic_search", true);
+        assert_exact_closed_object(&search_output, &search_output, &["results"]);
+        let hit = resolve_schema(
+            &search_output,
+            &search_output["properties"]["results"]["items"],
+        );
+        assert_exact_closed_object(
+            &search_output,
+            hit,
+            &["created_at", "id", "labels", "score", "title", "updated_at"],
+        );
+
+        let attachment_output = tool_schema(&server, "get_note_attachment_content", true);
+        assert_exact_closed_object(
+            &attachment_output,
+            &attachment_output,
+            &["attachment", "content", "content_base64"],
+        );
+        let metadata = resolve_schema(
+            &attachment_output,
+            &attachment_output["properties"]["attachment"],
+        );
+        assert_exact_closed_object(
+            &attachment_output,
+            metadata,
+            &["description", "id", "mime", "path"],
+        );
+        assert_eq!(attachment_output["properties"]["content"]["type"], "string");
+        assert_eq!(
+            attachment_output["properties"]["content_base64"]["type"],
+            "string"
+        );
+        assert_eq!(required_names(&attachment_output), vec!["attachment"]);
+        let mut exclusive_variants = attachment_output["oneOf"]
+            .as_array()
+            .expect("exclusive attachment content variants")
+            .iter()
+            .map(|variant| (required_names(variant), required_names(&variant["not"])))
+            .collect::<Vec<_>>();
+        exclusive_variants.sort();
+        assert_eq!(
+            exclusive_variants,
+            vec![
+                (
+                    vec!["content".to_owned()],
+                    vec!["content_base64".to_owned()]
+                ),
+                (
+                    vec!["content_base64".to_owned()],
+                    vec!["content".to_owned()]
+                ),
+            ]
+        );
     }
 
     #[test]
