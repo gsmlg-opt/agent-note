@@ -1,6 +1,6 @@
 use crate::{
     path::{canonical_relative_path, note_directory},
-    AttachmentStore, AttachmentStoreInfo, PreparedAttachmentSet,
+    AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
 };
 use note_core::NoteAttachment;
 use std::{
@@ -38,7 +38,25 @@ struct PreparedFilesystemSet {
     _coordination_guard: OwnedMutexGuard<()>,
 }
 
+struct PreparedFilesystemPut {
+    note_dir: PathBuf,
+    relative_path: String,
+    staging: FileCleanupGuard,
+    _coordination_guard: OwnedMutexGuard<()>,
+}
+
+struct PreparedFilesystemDelete {
+    note_dir: PathBuf,
+    relative_path: String,
+    final_path: PathBuf,
+    _coordination_guard: OwnedMutexGuard<()>,
+}
+
 struct DirectoryCleanupGuard {
+    path: Option<PathBuf>,
+}
+
+struct FileCleanupGuard {
     path: Option<PathBuf>,
 }
 
@@ -150,6 +168,57 @@ impl AttachmentStore for FilesystemAttachmentStore {
         }))
     }
 
+    async fn prepare_put(
+        &self,
+        note_id: &str,
+        attachment: &NoteAttachment,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        let note_dir = note_directory(&self.root, note_id)?;
+        let coordination_guard = self.coordination.lock_for(&note_dir).lock_owned().await;
+        let relative_path = canonical_relative_path(&attachment.path)?;
+        if existing_safe_directory(&note_dir).await? {
+            reject_symlink_components(&note_dir, &relative_path).await?;
+        }
+
+        fs::create_dir_all(&self.root).await?;
+        let staging_path = self
+            .root
+            .join(format!(".{note_id}-{}.put.tmp", uuid::Uuid::new_v4()));
+        let mut staging = FileCleanupGuard::new(staging_path);
+        if let Err(error) = fs::write(staging.path(), &attachment.content).await {
+            let _ = staging.cleanup().await;
+            return Err(error.into());
+        }
+
+        Ok(Box::new(PreparedFilesystemPut {
+            note_dir,
+            relative_path,
+            staging,
+            _coordination_guard: coordination_guard,
+        }))
+    }
+
+    async fn prepare_delete(
+        &self,
+        note_id: &str,
+        path: &str,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        let note_dir = note_directory(&self.root, note_id)?;
+        let coordination_guard = self.coordination.lock_for(&note_dir).lock_owned().await;
+        let relative_path = canonical_relative_path(path)?;
+        if existing_safe_directory(&note_dir).await? {
+            reject_symlink_components(&note_dir, &relative_path).await?;
+        }
+        let final_path = attachment_path_on_disk(&note_dir, &relative_path);
+
+        Ok(Box::new(PreparedFilesystemDelete {
+            note_dir,
+            relative_path,
+            final_path,
+            _coordination_guard: coordination_guard,
+        }))
+    }
+
     async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
         let note_dir = note_directory(&self.root, note_id)?;
         let note_lock = self.coordination.lock_for(&note_dir);
@@ -186,6 +255,44 @@ impl AttachmentStore for FilesystemAttachmentStore {
             engine: "filesystem".to_string(),
             location: Some(self.root.to_string_lossy().into_owned()),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl PreparedAttachmentMutation for PreparedFilesystemPut {
+    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
+        let prepared = *self;
+        tokio::task::spawn_blocking(move || publish_put_blocking(prepared))
+            .await
+            .map_err(|error| anyhow::anyhow!("attachment put publication task failed: {error}"))?
+    }
+
+    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
+        let Self {
+            note_dir: _,
+            relative_path: _,
+            mut staging,
+            _coordination_guard,
+        } = *self;
+        staging.cleanup().await?;
+        drop(_coordination_guard);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PreparedAttachmentMutation for PreparedFilesystemDelete {
+    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
+        let prepared = *self;
+        tokio::task::spawn_blocking(move || publish_delete_blocking(prepared))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("attachment delete publication task failed: {error}")
+            })?
+    }
+
+    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -267,6 +374,74 @@ fn publish_blocking(prepared: PreparedFilesystemSet) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn publish_put_blocking(prepared: PreparedFilesystemPut) -> anyhow::Result<()> {
+    let PreparedFilesystemPut {
+        note_dir,
+        relative_path,
+        mut staging,
+        _coordination_guard,
+    } = prepared;
+    ensure_safe_parent_directories_blocking(&note_dir, &relative_path)?;
+    let final_path = attachment_path_on_disk(&note_dir, &relative_path);
+    let backup_path = final_path.with_file_name(format!(
+        ".{}-{}.backup",
+        final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment"),
+        uuid::Uuid::new_v4()
+    ));
+    let mut backup = None;
+
+    match std::fs::symlink_metadata(&final_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("attachment path must not contain a symlink")
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            anyhow::bail!("attachment target must be a file")
+        }
+        Ok(_) => {
+            std::fs::rename(&final_path, &backup_path)?;
+            backup = Some(backup_path);
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    if let Err(promotion_error) = std::fs::rename(staging.path(), &final_path) {
+        let restore_error = backup
+            .as_deref()
+            .map(|backup_path| std::fs::rename(backup_path, &final_path))
+            .transpose()
+            .err();
+        return Err(put_publication_error(promotion_error, restore_error));
+    }
+    staging.disarm();
+
+    if let Some(backup_path) = backup {
+        remove_file_if_present_blocking(&backup_path)?;
+    }
+    drop(_coordination_guard);
+    Ok(())
+}
+
+fn publish_delete_blocking(prepared: PreparedFilesystemDelete) -> anyhow::Result<()> {
+    let PreparedFilesystemDelete {
+        note_dir,
+        relative_path,
+        final_path,
+        _coordination_guard,
+    } = prepared;
+    if !existing_safe_directory_blocking(&note_dir)? {
+        return Ok(());
+    }
+    reject_symlink_components_blocking(&note_dir, &relative_path)?;
+    remove_file_if_present_blocking(&final_path)?;
+    prune_empty_attachment_directories_blocking(final_path.parent(), &note_dir)?;
+    drop(_coordination_guard);
+    Ok(())
+}
+
 impl DirectoryCleanupGuard {
     fn new(path: PathBuf) -> Self {
         Self { path: Some(path) }
@@ -294,6 +469,36 @@ impl DirectoryCleanupGuard {
             self.disarm();
         }
         Ok(())
+    }
+}
+
+impl FileCleanupGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("armed file cleanup guard")
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+
+    async fn cleanup(&mut self) -> anyhow::Result<()> {
+        if let Some(path) = self.path.as_deref() {
+            remove_file_if_present(path).await?;
+            self.disarm();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FileCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -400,6 +605,66 @@ async fn reject_symlink_components(note_dir: &Path, attachment_path: &str) -> an
     Ok(())
 }
 
+fn reject_symlink_components_blocking(
+    note_dir: &Path,
+    attachment_path: &str,
+) -> anyhow::Result<()> {
+    let mut path = note_dir.to_path_buf();
+    for segment in attachment_path.split('/') {
+        path.push(segment);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("attachment path must not contain a symlink")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_safe_parent_directories_blocking(
+    note_dir: &Path,
+    attachment_path: &str,
+) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(note_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("attachment directory must not be a symlink")
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            anyhow::bail!("attachment directory must be a directory")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => std::fs::create_dir(note_dir)?,
+        Err(error) => return Err(error.into()),
+    }
+
+    let final_path = attachment_path_on_disk(note_dir, attachment_path);
+    let Some(parent) = final_path.parent() else {
+        return Ok(());
+    };
+    let relative_parent = parent
+        .strip_prefix(note_dir)
+        .expect("attachment parent must remain below note directory");
+    let mut current = note_dir.to_path_buf();
+    for component in relative_parent.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("attachment path must not contain a symlink")
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                anyhow::bail!("attachment parent must be a directory")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => std::fs::create_dir(&current)?,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 async fn remove_directory_if_present(path: &Path) -> anyhow::Result<()> {
     match fs::remove_dir_all(path).await {
         Ok(()) => Ok(()),
@@ -408,12 +673,67 @@ async fn remove_directory_if_present(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+async fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_file_if_present_blocking(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn prune_empty_attachment_directories_blocking(
+    mut directory: Option<&Path>,
+    note_dir: &Path,
+) -> anyhow::Result<()> {
+    while let Some(path) = directory {
+        if !path.starts_with(note_dir) {
+            break;
+        }
+        match std::fs::remove_dir(path) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if path == note_dir {
+            break;
+        }
+        directory = path.parent();
+    }
+    Ok(())
+}
+
 fn remove_directory_if_present_blocking(path: &Path) -> anyhow::Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn put_publication_error(
+    promotion_error: std::io::Error,
+    restore_error: Option<std::io::Error>,
+) -> anyhow::Error {
+    let mut message = format!("failed to promote staged attachment: {promotion_error}");
+    if let Some(error) = restore_error {
+        message.push_str(&format!("; failed to restore previous attachment: {error}"));
+    }
+    anyhow::anyhow!(message)
 }
 
 fn publication_error(

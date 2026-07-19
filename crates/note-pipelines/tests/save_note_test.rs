@@ -1,6 +1,8 @@
 mod support;
 
-use note_attachments::{AttachmentStore, AttachmentStoreInfo, PreparedAttachmentSet};
+use note_attachments::{
+    AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
+};
 use note_core::{LabelValueType, NoteAttachment};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
@@ -38,6 +40,13 @@ struct RecordingPreparedSet {
     content: Vec<(String, Vec<u8>)>,
 }
 
+struct RecordingPreparedMutation {
+    note_id: String,
+    path: String,
+    content: Option<Vec<u8>>,
+    objects: AttachmentObjects,
+}
+
 #[async_trait::async_trait]
 impl PreparedAttachmentSet for RecordingPreparedSet {
     fn metadata(&self) -> &[NoteAttachment] {
@@ -49,6 +58,24 @@ impl PreparedAttachmentSet for RecordingPreparedSet {
         objects.retain(|(note_id, _), _| note_id != &self.note_id);
         for (path, content) in self.content {
             objects.insert((self.note_id.clone(), path), content);
+        }
+        Ok(())
+    }
+
+    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl PreparedAttachmentMutation for RecordingPreparedMutation {
+    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
+        let mut objects = self.objects.lock().unwrap();
+        let key = (self.note_id, self.path);
+        if let Some(content) = self.content {
+            objects.insert(key, content);
+        } else {
+            objects.remove(&key);
         }
         Ok(())
     }
@@ -82,6 +109,32 @@ impl AttachmentStore for RecordingAttachmentStore {
                 .iter()
                 .map(|attachment| (attachment.path.clone(), attachment.content.clone()))
                 .collect(),
+        }))
+    }
+
+    async fn prepare_put(
+        &self,
+        note_id: &str,
+        attachment: &NoteAttachment,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        Ok(Box::new(RecordingPreparedMutation {
+            note_id: note_id.to_string(),
+            path: attachment.path.clone(),
+            content: Some(attachment.content.clone()),
+            objects: self.objects.clone(),
+        }))
+    }
+
+    async fn prepare_delete(
+        &self,
+        note_id: &str,
+        path: &str,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        Ok(Box::new(RecordingPreparedMutation {
+            note_id: note_id.to_string(),
+            path: path.to_string(),
+            content: None,
+            objects: self.objects.clone(),
         }))
     }
 

@@ -22,12 +22,31 @@ pub trait PreparedAttachmentSet: Send {
 }
 
 #[async_trait::async_trait]
+pub trait PreparedAttachmentMutation: Send {
+    async fn publish(self: Box<Self>) -> anyhow::Result<()>;
+
+    async fn abort(self: Box<Self>) -> anyhow::Result<()>;
+}
+
+#[async_trait::async_trait]
 pub trait AttachmentStore: Send + Sync {
     async fn prepare(
         &self,
         note_id: &str,
         attachments: &[note_core::NoteAttachment],
     ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>>;
+
+    async fn prepare_put(
+        &self,
+        note_id: &str,
+        attachment: &note_core::NoteAttachment,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>>;
+
+    async fn prepare_delete(
+        &self,
+        note_id: &str,
+        path: &str,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>>;
 
     async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>>;
 

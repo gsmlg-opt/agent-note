@@ -1,7 +1,8 @@
 mod support;
 
 use note_attachments::{
-    AttachmentStore, AttachmentStoreInfo, FilesystemAttachmentStore, PreparedAttachmentSet,
+    AttachmentStore, AttachmentStoreInfo, FilesystemAttachmentStore, PreparedAttachmentMutation,
+    PreparedAttachmentSet,
 };
 use note_core::NoteAttachment;
 use note_embedding::StubEmbedder;
@@ -35,6 +36,22 @@ impl AttachmentStore for CountingAttachmentStore {
             .entry(note_id.to_string())
             .or_default() += 1;
         self.inner.prepare(note_id, attachments).await
+    }
+
+    async fn prepare_put(
+        &self,
+        note_id: &str,
+        attachment: &NoteAttachment,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        self.inner.prepare_put(note_id, attachment).await
+    }
+
+    async fn prepare_delete(
+        &self,
+        note_id: &str,
+        path: &str,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        self.inner.prepare_delete(note_id, path).await
     }
 
     async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {

@@ -1,4 +1,6 @@
-use note_attachments::{AttachmentStore, AttachmentStoreInfo, PreparedAttachmentSet};
+use note_attachments::{
+    AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
+};
 use note_core::{LabelSelector, NoteAttachment};
 use note_pipelines::EmbeddingJobNotifier;
 use note_storage::{
@@ -281,6 +283,15 @@ struct ControlledPreparedSet {
     publish_release: Arc<Notify>,
 }
 
+struct ControlledPreparedMutation {
+    note_id: String,
+    path: String,
+    operation: &'static str,
+    events: EventLog,
+    fail_publish: bool,
+    fail_abort: bool,
+}
+
 #[async_trait::async_trait]
 impl AttachmentStore for ControlledAttachmentStore {
     async fn prepare(
@@ -338,6 +349,44 @@ impl AttachmentStore for ControlledAttachmentStore {
         }))
     }
 
+    async fn prepare_put(
+        &self,
+        note_id: &str,
+        attachment: &NoteAttachment,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("prepare_put:{note_id}:{}", attachment.path));
+        Ok(Box::new(ControlledPreparedMutation {
+            note_id: note_id.to_string(),
+            path: attachment.path.clone(),
+            operation: "put",
+            events: self.events.clone(),
+            fail_publish: self.fail_publish.load(Ordering::SeqCst),
+            fail_abort: self.fail_abort.load(Ordering::SeqCst),
+        }))
+    }
+
+    async fn prepare_delete(
+        &self,
+        note_id: &str,
+        path: &str,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("prepare_delete:{note_id}:{path}"));
+        Ok(Box::new(ControlledPreparedMutation {
+            note_id: note_id.to_string(),
+            path: path.to_string(),
+            operation: "delete",
+            events: self.events.clone(),
+            fail_publish: self.fail_publish.load(Ordering::SeqCst),
+            fail_abort: self.fail_abort.load(Ordering::SeqCst),
+        }))
+    }
+
     async fn read(&self, _note_id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
         Ok(Vec::new())
     }
@@ -361,6 +410,31 @@ impl AttachmentStore for ControlledAttachmentStore {
             engine: "controlled".into(),
             location: None,
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl PreparedAttachmentMutation for ControlledPreparedMutation {
+    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
+        self.events.lock().unwrap().push(format!(
+            "publish_{}:{}:{}",
+            self.operation, self.note_id, self.path
+        ));
+        if self.fail_publish {
+            anyhow::bail!("controlled mutation publish failure");
+        }
+        Ok(())
+    }
+
+    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
+        self.events.lock().unwrap().push(format!(
+            "abort_{}:{}:{}",
+            self.operation, self.note_id, self.path
+        ));
+        if self.fail_abort {
+            anyhow::bail!("controlled mutation abort failure");
+        }
+        Ok(())
     }
 }
 

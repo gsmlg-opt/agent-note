@@ -85,6 +85,183 @@ async fn replacement_publication_removes_obsolete_files() {
 }
 
 #[tokio::test]
+async fn prepared_put_publishes_one_file_without_rewriting_siblings() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let store = FilesystemAttachmentStore::new(root.clone());
+    store
+        .prepare(
+            "note-1",
+            &[
+                attachment("./target.txt", b"old"),
+                attachment("./sibling.txt", b"sibling"),
+            ],
+        )
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+    let sibling_metadata = std::fs::metadata(root.join("note-1/sibling.txt")).unwrap();
+    #[cfg(unix)]
+    let sibling_inode = {
+        use std::os::unix::fs::MetadataExt;
+        sibling_metadata.ino()
+    };
+
+    let prepared = store
+        .prepare_put("note-1", &attachment("./target.txt", b"new"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(root.join("note-1/target.txt")).unwrap(),
+        b"old"
+    );
+    prepared.publish().await.unwrap();
+
+    assert_eq!(store.read("note-1", "./target.txt").await.unwrap(), b"new");
+    assert_eq!(
+        store.read("note-1", "./sibling.txt").await.unwrap(),
+        b"sibling"
+    );
+    let published_sibling_metadata = std::fs::metadata(root.join("note-1/sibling.txt")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(sibling_inode, published_sibling_metadata.ino());
+    }
+    assert_eq!(
+        sibling_metadata.modified().unwrap(),
+        published_sibling_metadata.modified().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn aborted_put_leaves_previous_file_and_siblings_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let store = FilesystemAttachmentStore::new(root.clone());
+    store
+        .prepare(
+            "note-1",
+            &[
+                attachment("./target.txt", b"old"),
+                attachment("./sibling.txt", b"sibling"),
+            ],
+        )
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+
+    store
+        .prepare_put("note-1", &attachment("./target.txt", b"new"))
+        .await
+        .unwrap()
+        .abort()
+        .await
+        .unwrap();
+
+    assert_eq!(store.read("note-1", "./target.txt").await.unwrap(), b"old");
+    assert_eq!(
+        store.read("note-1", "./sibling.txt").await.unwrap(),
+        b"sibling"
+    );
+    assert_eq!(directory_entries(&root), vec![root.join("note-1")]);
+}
+
+#[tokio::test]
+async fn prepared_delete_removes_only_selected_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let store = FilesystemAttachmentStore::new(root.clone());
+    store
+        .prepare(
+            "note-1",
+            &[
+                attachment("./nested/target.txt", b"target"),
+                attachment("./sibling.txt", b"sibling"),
+            ],
+        )
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+
+    let prepared = store
+        .prepare_delete("note-1", "./nested/target.txt")
+        .await
+        .unwrap();
+    assert!(root.join("note-1/nested/target.txt").exists());
+
+    prepared.publish().await.unwrap();
+
+    assert!(!root.join("note-1/nested/target.txt").exists());
+    assert!(!root.join("note-1/nested").exists());
+    assert_eq!(
+        store.read("note-1", "./sibling.txt").await.unwrap(),
+        b"sibling"
+    );
+}
+
+#[tokio::test]
+async fn aborted_delete_keeps_selected_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let store = FilesystemAttachmentStore::new(root.clone());
+    store
+        .prepare("note-1", &[attachment("./target.txt", b"target")])
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+
+    store
+        .prepare_delete("note-1", "./target.txt")
+        .await
+        .unwrap()
+        .abort()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.read("note-1", "./target.txt").await.unwrap(),
+        b"target"
+    );
+}
+
+#[tokio::test]
+async fn publishing_delete_for_a_missing_file_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let store = FilesystemAttachmentStore::new(root.clone());
+    store
+        .prepare("note-1", &[attachment("./sibling.txt", b"sibling")])
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+
+    store
+        .prepare_delete("note-1", "./missing.txt")
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.read("note-1", "./sibling.txt").await.unwrap(),
+        b"sibling"
+    );
+}
+
+#[tokio::test]
 async fn remove_note_removes_the_whole_note_directory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("attachments");
@@ -106,7 +283,7 @@ async fn remove_note_removes_the_whole_note_directory() {
 async fn traversal_and_absolute_attachment_paths_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("attachments");
-    let store = FilesystemAttachmentStore::new(root);
+    let store = FilesystemAttachmentStore::new(root.clone());
 
     for path in ["../secret.txt", "/tmp/secret.txt"] {
         let error = store
@@ -253,6 +430,60 @@ async fn prepared_sets_for_different_notes_can_coexist() {
 }
 
 #[tokio::test]
+async fn full_set_and_single_object_mutations_share_same_note_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FilesystemAttachmentStore::new(dir.path().join("attachments"));
+    let full_set = store
+        .prepare("note-1", &[attachment("./full.txt", b"full")])
+        .await
+        .unwrap();
+    let put_store = store.clone();
+    let mut put = tokio::spawn(async move {
+        put_store
+            .prepare_put("note-1", &attachment("./single.txt", b"single"))
+            .await
+    });
+
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut put)
+        .await
+        .is_err());
+
+    full_set.abort().await.unwrap();
+    let put = put.await.unwrap().unwrap();
+    let delete_store = store.clone();
+    let mut delete =
+        tokio::spawn(async move { delete_store.prepare_delete("note-1", "./single.txt").await });
+
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut delete)
+        .await
+        .is_err());
+
+    put.abort().await.unwrap();
+    delete.await.unwrap().unwrap().abort().await.unwrap();
+}
+
+#[tokio::test]
+async fn different_note_single_mutations_can_coexist() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FilesystemAttachmentStore::new(dir.path().join("attachments"));
+    let put = store
+        .prepare_put("note-1", &attachment("./file.txt", b"content"))
+        .await
+        .unwrap();
+
+    let delete = tokio::time::timeout(
+        Duration::from_secs(1),
+        store.prepare_delete("note-2", "./file.txt"),
+    )
+    .await
+    .expect("different-note single mutation must not block")
+    .unwrap();
+
+    put.abort().await.unwrap();
+    delete.abort().await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_promotion_restores_the_previous_attachment_set() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("attachments");
@@ -285,6 +516,48 @@ async fn failed_promotion_restores_the_previous_attachment_set() {
 }
 
 #[tokio::test]
+async fn failed_put_promotion_restores_previous_file_and_keeps_siblings() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let store = FilesystemAttachmentStore::new(root.clone());
+    store
+        .prepare(
+            "note-1",
+            &[
+                attachment("./target.txt", b"old"),
+                attachment("./sibling.txt", b"sibling"),
+            ],
+        )
+        .await
+        .unwrap()
+        .publish()
+        .await
+        .unwrap();
+    let prepared = store
+        .prepare_put("note-1", &attachment("./target.txt", b"new"))
+        .await
+        .unwrap();
+    let staging_file = directory_entries(&root)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".put.tmp"))
+        })
+        .expect("staged attachment file");
+    std::fs::remove_file(staging_file).unwrap();
+
+    assert!(prepared.publish().await.is_err());
+
+    assert_eq!(store.read("note-1", "./target.txt").await.unwrap(), b"old");
+    assert_eq!(
+        store.read("note-1", "./sibling.txt").await.unwrap(),
+        b"sibling"
+    );
+    assert_eq!(directory_entries(&root), vec![root.join("note-1")]);
+}
+
+#[tokio::test]
 async fn dropping_a_prepared_set_cleans_its_staging_directory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("attachments");
@@ -298,6 +571,30 @@ async fn dropping_a_prepared_set_cleans_its_staging_directory() {
     drop(prepared);
 
     assert!(directory_entries(&root).is_empty());
+}
+
+#[tokio::test]
+async fn dropping_a_prepared_put_cleans_its_staging_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let store = FilesystemAttachmentStore::new(root.clone());
+    let prepared = store
+        .prepare_put("note-1", &attachment("./file.txt", b"content"))
+        .await
+        .unwrap();
+    assert_eq!(directory_entries(&root).len(), 1);
+
+    drop(prepared);
+
+    assert!(directory_entries(&root).is_empty());
+    let replacement = tokio::time::timeout(
+        Duration::from_secs(1),
+        store.prepare_put("note-1", &attachment("./file.txt", b"replacement")),
+    )
+    .await
+    .expect("dropping prepared put must release note lock")
+    .unwrap();
+    replacement.abort().await.unwrap();
 }
 
 #[tokio::test]
@@ -323,6 +620,40 @@ async fn cancelling_prepare_cleans_its_staging_directory() {
     .expect("prepare must create staging data");
     task.abort();
     let join_error = task.await.err().expect("prepare task must be cancelled");
+    assert!(join_error.is_cancelled());
+
+    assert!(directory_entries(&root).is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_prepare_put_cleans_its_staging_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let store = FilesystemAttachmentStore::new(root.clone());
+    let task = tokio::spawn(async move {
+        store
+            .prepare_put(
+                "note-1",
+                &attachment("./large.bin", &vec![7; 128 * 1024 * 1024]),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !directory_entries(&root).is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("prepare put must create staging data");
+    task.abort();
+    let join_error = task
+        .await
+        .err()
+        .expect("prepare put task must be cancelled");
     assert!(join_error.is_cancelled());
 
     assert!(directory_entries(&root).is_empty());
@@ -401,4 +732,76 @@ async fn read_rejects_symlinked_note_directories_and_targets() {
     symlink(&outside, root.join("note-1")).unwrap();
     let directory_error = store.read("note-1", "./secret.txt").await.unwrap_err();
     assert!(directory_error.to_string().contains("symlink"));
+}
+
+#[tokio::test]
+async fn single_mutations_reject_unsafe_attachment_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FilesystemAttachmentStore::new(dir.path().join("attachments"));
+
+    for path in ["../secret.txt", "/tmp/secret.txt", r"C:\Windows\secret.txt"] {
+        let put_error = store
+            .prepare_put("note-1", &attachment(path, b"sensitive payload"))
+            .await
+            .err()
+            .expect("unsafe put path must fail");
+        assert!(put_error.to_string().contains("invalid attachment path"));
+        assert!(!put_error.to_string().contains("sensitive payload"));
+
+        let delete_error = store
+            .prepare_delete("note-1", path)
+            .await
+            .err()
+            .expect("unsafe delete path must fail");
+        assert!(delete_error.to_string().contains("invalid attachment path"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn single_mutations_reject_symlinked_paths() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+    std::fs::create_dir_all(root.join("note-1")).unwrap();
+    symlink(&outside, root.join("note-1/link")).unwrap();
+    let store = FilesystemAttachmentStore::new(root.clone());
+
+    let put_error = store
+        .prepare_put("note-1", &attachment("./link/secret.txt", b"replacement"))
+        .await
+        .err()
+        .expect("symlinked put path must fail");
+    assert!(put_error.to_string().contains("symlink"));
+
+    let delete_error = store
+        .prepare_delete("note-1", "./link/secret.txt")
+        .await
+        .err()
+        .expect("symlinked delete path must fail");
+    assert!(delete_error.to_string().contains("symlink"));
+    assert_eq!(
+        std::fs::read(outside.join("secret.txt")).unwrap(),
+        b"secret"
+    );
+
+    std::fs::remove_dir_all(root.join("note-1")).unwrap();
+    symlink(&outside, root.join("note-1")).unwrap();
+
+    let put_directory_error = store
+        .prepare_put("note-1", &attachment("./secret.txt", b"replacement"))
+        .await
+        .err()
+        .expect("symlinked note directory must reject put");
+    assert!(put_directory_error.to_string().contains("symlink"));
+    let delete_directory_error = store
+        .prepare_delete("note-1", "./secret.txt")
+        .await
+        .err()
+        .expect("symlinked note directory must reject delete");
+    assert!(delete_directory_error.to_string().contains("symlink"));
 }

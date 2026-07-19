@@ -542,6 +542,22 @@ impl crate::AttachmentStore for S3AttachmentStore {
         Ok(Box::new(prepared))
     }
 
+    async fn prepare_put(
+        &self,
+        _note_id: &str,
+        _attachment: &NoteAttachment,
+    ) -> anyhow::Result<Box<dyn crate::PreparedAttachmentMutation>> {
+        anyhow::bail!("S3 single-attachment put preparation is not implemented")
+    }
+
+    async fn prepare_delete(
+        &self,
+        _note_id: &str,
+        _path: &str,
+    ) -> anyhow::Result<Box<dyn crate::PreparedAttachmentMutation>> {
+        anyhow::bail!("S3 single-attachment delete preparation is not implemented")
+    }
+
     async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
         validate_note_id(note_id)?;
         let note_lock = self.coordination.lock_for(note_id);
