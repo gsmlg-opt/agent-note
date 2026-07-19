@@ -68,11 +68,23 @@ impl utoipa::PartialSchema for AttachmentRequestDocumentation {
             .item(
                 utoipa::openapi::schema::ObjectBuilder::new()
                     .schema_type(utoipa::openapi::schema::Type::Object)
+                    .property(
+                        "content",
+                        utoipa::openapi::schema::Object::with_type(
+                            utoipa::openapi::schema::Type::String,
+                        ),
+                    )
                     .required("content"),
             )
             .item(
                 utoipa::openapi::schema::ObjectBuilder::new()
                     .schema_type(utoipa::openapi::schema::Type::Object)
+                    .property(
+                        "content_base64",
+                        utoipa::openapi::schema::Object::with_type(
+                            utoipa::openapi::schema::Type::String,
+                        ),
+                    )
                     .required("content_base64"),
             );
 
@@ -1150,8 +1162,16 @@ mod tests {
         assert_eq!(
             request["allOf"][1]["anyOf"],
             serde_json::json!([
-                {"type": "object", "required": ["content"]},
-                {"type": "object", "required": ["content_base64"]}
+                {
+                    "type": "object",
+                    "required": ["content"],
+                    "properties": {"content": {"type": "string"}}
+                },
+                {
+                    "type": "object",
+                    "required": ["content_base64"],
+                    "properties": {"content_base64": {"type": "string"}}
+                }
             ])
         );
 
