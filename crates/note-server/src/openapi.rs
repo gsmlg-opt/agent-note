@@ -25,13 +25,33 @@ impl PartialSchema for Binary {
 impl ToSchema for Binary {}
 
 pub(crate) fn label_pairs_schema() -> Array {
-    Array::new(
+    ArrayBuilder::from(Array::new(
         ArrayBuilder::new()
             .items(Object::with_type(Type::String))
             .min_items(Some(2))
             .max_items(Some(2))
             .build(),
-    )
+    ))
+    .default(Some(serde_json::json!([])))
+    .build()
+}
+
+pub(crate) fn label_value_type_schema() -> Object {
+    ObjectBuilder::new()
+        .schema_type(Type::String)
+        .enum_values(Some([
+            "text", "number", "version", "date", "datetime", "time",
+        ]))
+        .description(Some("Label value type"))
+        .build()
+}
+
+pub(crate) fn note_content_type_schema() -> Object {
+    ObjectBuilder::new()
+        .schema_type(Type::String)
+        .enum_values(Some(["html"]))
+        .description(Some("Optional output format; omission returns Markdown."))
+        .build()
 }
 
 pub fn rest_router() -> (Router<Arc<Context>>, OpenApi) {

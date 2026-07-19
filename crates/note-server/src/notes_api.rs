@@ -32,6 +32,7 @@ pub struct SaveNoteRequest {
     pub title: String,
     pub content: String,
     #[serde(default)]
+    #[schema(default = json!([]))]
     pub attachments: Vec<AttachmentRequest>,
     #[serde(default)]
     #[schema(schema_with = crate::openapi::label_pairs_schema)]
@@ -39,15 +40,23 @@ pub struct SaveNoteRequest {
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
+#[schema(
+    description = "Each attachment request requires at least one of content or content_base64. If both are present, they must decode to identical bytes."
+)]
 pub struct AttachmentRequest {
     pub id: String,
     pub path: String,
     pub mime: String,
     #[serde(default)]
+    #[schema(default = "")]
     pub description: String,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
+    #[schema(
+        content_encoding = "base64",
+        content_media_type = "application/octet-stream"
+    )]
     pub content_base64: Option<String>,
 }
 
@@ -98,9 +107,14 @@ pub struct AttachmentResponse {
     pub id: String,
     pub path: String,
     pub mime: String,
+    #[schema(default = "")]
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[schema(
+        content_encoding = "base64",
+        content_media_type = "application/octet-stream"
+    )]
     pub content_base64: String,
 }
 
@@ -196,6 +210,7 @@ impl From<NoteListItem> for TrashNoteDto {
 pub struct DashboardLabelDto {
     pub key: String,
     pub description: String,
+    #[schema(schema_with = crate::openapi::label_value_type_schema)]
     pub value_type: String,
     pub count: usize,
 }
@@ -407,12 +422,25 @@ fn decode_attachment_requests(
 #[derive(Deserialize, Default, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListNotesQuery {
+    /// Maximum notes to return; omitted values are normalized to 10 and all values are clamped to 0..=1000.
     #[serde(default)]
+    #[param(default = 10, minimum = 0, maximum = 1000)]
     pub limit: Option<i64>,
+    /// Number of notes to skip; omitted and negative values are normalized to 0.
     #[serde(default)]
+    #[param(default = 0, minimum = 0)]
     pub offset: Option<i64>,
+    /// Optional label expression used to filter notes.
     #[serde(default)]
     pub label: Option<String>,
+}
+
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct CountNotesQuery {
+    /// Optional label expression used to filter notes.
+    #[serde(default)]
+    label: Option<String>,
 }
 
 fn normalized_limit(limit: Option<i64>) -> i64 {
@@ -459,7 +487,7 @@ pub struct CountNotesResponse {
     get,
     path = "/api/notes/count",
     tag = "notes",
-    params(ListNotesQuery),
+    params(CountNotesQuery),
     responses(
         (status = 200, description = "Note count", body = CountNotesResponse),
         (status = 500, description = "Server error", body = String, content_type = "text/plain")
@@ -467,7 +495,7 @@ pub struct CountNotesResponse {
 )]
 async fn count_notes_handler(
     State(ctx): State<Arc<Context>>,
-    Query(req): Query<ListNotesQuery>,
+    Query(req): Query<CountNotesQuery>,
 ) -> Result<Json<CountNotesResponse>, (axum::http::StatusCode, String)> {
     let total = count_notes(&ctx, req.label)
         .await
@@ -569,6 +597,10 @@ async fn get_note_raw_handler(
 #[into_params(parameter_in = Query)]
 struct NoteContentQuery {
     #[serde(rename = "type")]
+    #[param(
+        rename = "type",
+        schema_with = crate::openapi::note_content_type_schema
+    )]
     output_type: Option<String>,
 }
 
@@ -618,7 +650,7 @@ fn markdown_response(content: String) -> Result<Response, (axum::http::StatusCod
         ("path" = String, Path, description = "Attachment path")
     ),
     responses(
-        (status = 200, description = "Attachment bytes", body = inline(crate::openapi::Binary), content_type = "application/octet-stream"),
+        (status = 200, description = "Attachment bytes using the stored MIME type", body = inline(crate::openapi::Binary), content_type = "*/*"),
         (status = 404, description = "Attachment not found", body = String, content_type = "text/plain"),
         (status = 500, description = "Server error", body = String, content_type = "text/plain")
     )
@@ -739,6 +771,7 @@ async fn list_deleted_notes_handler(
 
 #[derive(Deserialize, utoipa::ToSchema)]
 struct RestoreNotesRequest {
+    #[schema(min_items = 1)]
     ids: Vec<String>,
 }
 
@@ -910,12 +943,26 @@ mod tests {
     use note_embedding::StubEmbedder;
     use note_storage::{StorageBackend, TransactionMode};
     use note_storage_turso::TursoStorage;
+    use serde_json::Value;
     use tower::ServiceExt;
+
+    fn note_openapi_document() -> Value {
+        let (_, openapi) = notes_router().split_for_parts();
+        serde_json::to_value(openapi).unwrap()
+    }
+
+    fn operation_parameter<'a>(operation: &'a Value, name: &str) -> &'a Value {
+        operation["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == name)
+            .unwrap_or_else(|| panic!("missing parameter {name}"))
+    }
 
     #[test]
     fn openapi_contains_all_note_operations() {
-        let (_, openapi) = notes_router().split_for_parts();
-        let document = serde_json::to_value(openapi).unwrap();
+        let document = note_openapi_document();
 
         for (path, methods) in [
             ("/api/notes", &["get", "post"][..]),
@@ -950,14 +997,8 @@ mod tests {
 
         let attachment_content = &document["paths"]["/api/notes/{id}/attachments/{path}"]["get"]
             ["responses"]["200"]["content"];
-        assert_eq!(
-            attachment_content["application/octet-stream"]["schema"]["type"],
-            "string"
-        );
-        assert_eq!(
-            attachment_content["application/octet-stream"]["schema"]["format"],
-            "binary"
-        );
+        assert_eq!(attachment_content["*/*"]["schema"]["type"], "string");
+        assert_eq!(attachment_content["*/*"]["schema"]["format"], "binary");
 
         let plain_error =
             &document["paths"]["/api/notes"]["post"]["responses"]["400"]["content"]["text/plain"];
@@ -967,6 +1008,107 @@ mod tests {
         assert!(
             empty_response.get("content").is_none(),
             "204 response must not publish a body"
+        );
+    }
+
+    #[test]
+    fn openapi_documents_list_and_count_queries() {
+        let document = note_openapi_document();
+        let list = &document["paths"]["/api/notes"]["get"];
+        let limit = operation_parameter(list, "limit");
+        assert_eq!(limit["required"], false);
+        assert_eq!(limit["schema"]["default"], 10);
+        assert_eq!(limit["schema"]["minimum"], 0);
+        assert_eq!(limit["schema"]["maximum"], 1000);
+        let limit_description = limit["description"].as_str().unwrap();
+        assert!(limit_description.contains("normalized"));
+        assert!(limit_description.contains("clamped"));
+
+        let offset = operation_parameter(list, "offset");
+        assert_eq!(offset["required"], false);
+        assert_eq!(offset["schema"]["default"], 0);
+        assert_eq!(offset["schema"]["minimum"], 0);
+        assert!(offset["description"]
+            .as_str()
+            .unwrap()
+            .contains("normalized"));
+
+        assert_eq!(operation_parameter(list, "label")["required"], false);
+
+        let count = &document["paths"]["/api/notes/count"]["get"];
+        let count_parameters = count["parameters"].as_array().unwrap();
+        assert_eq!(count_parameters.len(), 1);
+        assert_eq!(count_parameters[0]["name"], "label");
+        assert_eq!(count_parameters[0]["required"], false);
+    }
+
+    #[test]
+    fn openapi_documents_note_content_type_query() {
+        let document = note_openapi_document();
+        for path in ["/api/notes/{id}/raw", "/notes/{id}/content"] {
+            let operation = &document["paths"][path]["get"];
+            let content_type = operation_parameter(operation, "type");
+            assert_eq!(content_type["in"], "query");
+            assert_eq!(content_type["required"], false);
+            assert_eq!(content_type["schema"]["enum"], serde_json::json!(["html"]));
+            assert!(content_type["description"]
+                .as_str()
+                .or_else(|| content_type["schema"]["description"].as_str())
+                .unwrap()
+                .contains("omission returns Markdown"));
+        }
+    }
+
+    #[test]
+    fn openapi_requires_at_least_one_restore_id() {
+        let document = note_openapi_document();
+        assert_eq!(
+            document["components"]["schemas"]["RestoreNotesRequest"]["properties"]["ids"]
+                ["minItems"],
+            1
+        );
+    }
+
+    #[test]
+    fn openapi_documents_attachment_transport_contract() {
+        let document = note_openapi_document();
+        let schemas = &document["components"]["schemas"];
+        let request = &schemas["AttachmentRequest"];
+        let response = &schemas["AttachmentResponse"];
+        let save = &schemas["SaveNoteRequest"];
+
+        assert_eq!(request["properties"]["description"]["default"], "");
+        assert_eq!(response["properties"]["description"]["default"], "");
+        assert_eq!(
+            save["properties"]["attachments"]["default"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            save["properties"]["labels"]["default"],
+            serde_json::json!([])
+        );
+
+        for attachment in [request, response] {
+            let content_base64 = &attachment["properties"]["content_base64"];
+            assert_eq!(content_base64["contentEncoding"], "base64");
+            assert_eq!(
+                content_base64["contentMediaType"],
+                "application/octet-stream"
+            );
+        }
+
+        let request_description = request["description"].as_str().unwrap();
+        assert!(request_description.contains("at least one of content or content_base64"));
+        assert!(request_description.contains("identical bytes"));
+    }
+
+    #[test]
+    fn openapi_constrains_dashboard_label_value_types() {
+        let document = note_openapi_document();
+        assert_eq!(
+            document["components"]["schemas"]["DashboardLabelDto"]["properties"]["value_type"]
+                ["enum"],
+            serde_json::json!(["text", "number", "version", "date", "datetime", "time"])
         );
     }
 
