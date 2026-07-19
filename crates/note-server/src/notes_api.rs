@@ -2,8 +2,8 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     response::{Html, Response},
-    routing::{get as route_get, post},
-    Json, Router,
+    routing::get as route_get,
+    Json,
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
@@ -19,23 +19,26 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 const DEFAULT_LIST_LIMIT: i64 = 10;
 const MAX_LIST_LIMIT: i64 = 1000;
 const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(10);
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SaveNoteRequest {
     pub title: String,
     pub content: String,
     #[serde(default)]
     pub attachments: Vec<AttachmentRequest>,
     #[serde(default)]
+    #[schema(schema_with = crate::openapi::label_pairs_schema)]
     pub labels: Vec<(String, String)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct AttachmentRequest {
     pub id: String,
     pub path: String,
@@ -66,30 +69,31 @@ impl TryFrom<AttachmentRequest> for NoteAttachment {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct SaveNoteResponse {
     pub id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct RenderRequest {
     pub content: String,
     #[serde(default)]
     pub attachment_base: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct NoteDto {
     pub id: String,
     pub title: String,
     pub content: String,
     pub attachments: Vec<AttachmentResponse>,
+    #[schema(schema_with = crate::openapi::label_pairs_schema)]
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct AttachmentResponse {
     pub id: String,
     pub path: String,
@@ -132,10 +136,11 @@ impl From<Note> for NoteDto {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct NoteListDto {
     pub id: String,
     pub title: String,
+    #[schema(schema_with = crate::openapi::label_pairs_schema)]
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -157,10 +162,11 @@ impl From<NoteListItem> for NoteListDto {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct TrashNoteDto {
     pub id: String,
     pub title: String,
+    #[schema(schema_with = crate::openapi::label_pairs_schema)]
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -186,7 +192,7 @@ impl From<NoteListItem> for TrashNoteDto {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct DashboardLabelDto {
     pub key: String,
     pub description: String,
@@ -194,20 +200,20 @@ pub struct DashboardLabelDto {
     pub count: usize,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct DashboardNoteDto {
     pub id: String,
     pub title: String,
     pub updated_at: i64,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct DashboardEmbeddingNoteDto {
     pub id: String,
     pub title: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct DashboardDto {
     pub note_count: usize,
     pub embedded_note_count: usize,
@@ -304,6 +310,15 @@ async fn refresh_dashboard_embedding_status(
     Ok(())
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/dashboard",
+    tag = "dashboard",
+    responses(
+        (status = 200, description = "Dashboard summary", body = DashboardDto),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn dashboard_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Json<DashboardDto>, (axum::http::StatusCode, String)> {
@@ -328,6 +343,18 @@ async fn dashboard_handler(
     Ok(Json(value))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/notes",
+    tag = "notes",
+    request_body = SaveNoteRequest,
+    responses(
+        (status = 200, description = "Note saved", body = SaveNoteResponse),
+        (status = 400, description = "Invalid note", body = String, content_type = "text/plain"),
+        (status = 409, description = "Duplicate note", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn save_note_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<SaveNoteRequest>,
@@ -377,7 +404,8 @@ fn decode_attachment_requests(
         .collect()
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListNotesQuery {
     #[serde(default)]
     pub limit: Option<i64>,
@@ -395,6 +423,16 @@ fn normalized_offset(offset: Option<i64>) -> i64 {
     offset.unwrap_or(0).max(0)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes",
+    tag = "notes",
+    params(ListNotesQuery),
+    responses(
+        (status = 200, description = "Notes", body = Vec<NoteListDto>),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn list_notes_handler(
     State(ctx): State<Arc<Context>>,
     Query(req): Query<ListNotesQuery>,
@@ -412,11 +450,21 @@ async fn list_notes_handler(
     Ok(Json(notes.into_iter().map(Into::into).collect()))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct CountNotesResponse {
     pub total: usize,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes/count",
+    tag = "notes",
+    params(ListNotesQuery),
+    responses(
+        (status = 200, description = "Note count", body = CountNotesResponse),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn count_notes_handler(
     State(ctx): State<Arc<Context>>,
     Query(req): Query<ListNotesQuery>,
@@ -427,6 +475,17 @@ async fn count_notes_handler(
     Ok(Json(CountNotesResponse { total }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes/{id}",
+    tag = "notes",
+    params(("id" = String, Path, description = "Note ID")),
+    responses(
+        (status = 200, description = "Note", body = NoteDto),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn get_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -440,6 +499,24 @@ async fn get_note_handler(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes/{id}/raw",
+    tag = "notes",
+    params(
+        ("id" = String, Path, description = "Note ID"),
+        NoteContentQuery
+    ),
+    responses(
+        (status = 200, description = "Raw Markdown or rendered HTML", content(
+            (String = "text/markdown"),
+            (String = "text/html")
+        )),
+        (status = 400, description = "Unsupported content type", body = String, content_type = "text/plain"),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn get_note_raw_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -488,10 +565,37 @@ async fn get_note_raw_handler(
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct NoteContentQuery {
     #[serde(rename = "type")]
     output_type: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/notes/{id}/content",
+    tag = "notes",
+    params(
+        ("id" = String, Path, description = "Note ID"),
+        NoteContentQuery
+    ),
+    responses(
+        (status = 200, description = "Raw Markdown or rendered HTML", content(
+            (String = "text/markdown"),
+            (String = "text/html")
+        )),
+        (status = 400, description = "Unsupported content type", body = String, content_type = "text/plain"),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
+async fn get_note_content_handler(
+    state: State<Arc<Context>>,
+    path: Path<String>,
+    query: Query<NoteContentQuery>,
+) -> Result<Response, (axum::http::StatusCode, String)> {
+    get_note_raw_handler(state, path, query).await
 }
 
 fn markdown_response(content: String) -> Result<Response, (axum::http::StatusCode, String)> {
@@ -505,6 +609,20 @@ fn markdown_response(content: String) -> Result<Response, (axum::http::StatusCod
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes/{id}/attachments/{path}",
+    tag = "notes",
+    params(
+        ("id" = String, Path, description = "Note ID"),
+        ("path" = String, Path, description = "Attachment path")
+    ),
+    responses(
+        (status = 200, description = "Attachment bytes", body = inline(crate::openapi::Binary), content_type = "application/octet-stream"),
+        (status = 404, description = "Attachment not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn get_attachment_handler(
     State(ctx): State<Arc<Context>>,
     Path((id, path)): Path<(String, String)>,
@@ -526,6 +644,19 @@ async fn get_attachment_handler(
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/notes/{id}",
+    tag = "notes",
+    params(("id" = String, Path, description = "Note ID")),
+    request_body = SaveNoteRequest,
+    responses(
+        (status = 200, description = "Updated note", body = NoteDto),
+        (status = 400, description = "Invalid note", body = String, content_type = "text/plain"),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn update_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -561,6 +692,17 @@ async fn update_note_handler(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/notes/{id}",
+    tag = "notes",
+    params(("id" = String, Path, description = "Note ID")),
+    responses(
+        (status = 204, description = "Note moved to Trash"),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn delete_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -577,6 +719,15 @@ async fn delete_note_handler(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/trash",
+    tag = "trash",
+    responses(
+        (status = 200, description = "Trashed notes", body = Vec<TrashNoteDto>),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn list_deleted_notes_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Json<Vec<TrashNoteDto>>, (axum::http::StatusCode, String)> {
@@ -586,11 +737,23 @@ async fn list_deleted_notes_handler(
     Ok(Json(notes.into_iter().map(TrashNoteDto::from).collect()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct RestoreNotesRequest {
     ids: Vec<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/trash/restore",
+    tag = "trash",
+    request_body = RestoreNotesRequest,
+    responses(
+        (status = 204, description = "Notes restored"),
+        (status = 400, description = "Invalid restore request", body = String, content_type = "text/plain"),
+        (status = 404, description = "Trashed note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn restore_notes_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<RestoreNotesRequest>,
@@ -616,6 +779,17 @@ async fn restore_notes_handler(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/trash/{id}",
+    tag = "trash",
+    params(("id" = String, Path, description = "Note ID")),
+    responses(
+        (status = 204, description = "Note permanently deleted"),
+        (status = 404, description = "Trashed note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn permanently_delete_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -629,7 +803,7 @@ async fn permanently_delete_note_handler(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SearchQuery {
     pub query: String,
     pub limit: usize,
@@ -637,13 +811,23 @@ pub struct SearchQuery {
     pub label: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct SearchResultDto {
     pub id: String,
     pub title: String,
     pub score: f32, // fused RRF score — label as such in any client UI, not "similarity" (docs/design.md §7)
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/notes/search",
+    tag = "notes",
+    request_body = SearchQuery,
+    responses(
+        (status = 200, description = "Search results", body = Vec<SearchResultDto>),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn search_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<SearchQuery>,
@@ -663,6 +847,15 @@ async fn search_handler(
     ))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/render",
+    tag = "rendering",
+    request_body = RenderRequest,
+    responses(
+        (status = 200, description = "Rendered HTML", body = String, content_type = "text/html")
+    )
+)]
 async fn render_handler(Json(req): Json<RenderRequest>) -> Html<String> {
     let mut html = crate::render::render_markdown_html(&req.content);
     if let Some(base) = req.attachment_base {
@@ -678,27 +871,24 @@ fn rewrite_relative_attachment_urls(html: &str, base: &str) -> String {
 }
 
 pub fn notes_router() -> OpenApiRouter<Arc<Context>> {
-    Router::new()
-        .route(
-            "/api/notes",
-            post(save_note_handler).get(list_notes_handler),
-        )
-        .route("/api/notes/count", route_get(count_notes_handler))
-        .route("/api/trash", route_get(list_deleted_notes_handler))
-        .route("/api/trash/restore", post(restore_notes_handler))
-        .route(
-            "/api/trash/{id}",
-            axum::routing::delete(permanently_delete_note_handler),
-        )
-        .route("/api/dashboard", route_get(dashboard_handler))
-        .route(
-            "/api/notes/{id}",
-            route_get(get_note_handler)
-                .put(update_note_handler)
-                .delete(delete_note_handler),
-        )
-        .route("/api/notes/{id}/raw", route_get(get_note_raw_handler))
-        .route("/notes/{id}/content", route_get(get_note_raw_handler))
+    #[derive(OpenApi)]
+    #[openapi(paths(get_attachment_handler))]
+    struct AttachmentOpenApi;
+
+    OpenApiRouter::with_openapi(AttachmentOpenApi::openapi())
+        .routes(routes!(save_note_handler, list_notes_handler))
+        .routes(routes!(count_notes_handler))
+        .routes(routes!(list_deleted_notes_handler))
+        .routes(routes!(restore_notes_handler))
+        .routes(routes!(permanently_delete_note_handler))
+        .routes(routes!(dashboard_handler))
+        .routes(routes!(
+            get_note_handler,
+            update_note_handler,
+            delete_note_handler
+        ))
+        .routes(routes!(get_note_raw_handler))
+        .routes(routes!(get_note_content_handler))
         .route(
             "/api/notes/{id}/attachments/{*path}",
             route_get(get_attachment_handler),
@@ -706,22 +896,79 @@ pub fn notes_router() -> OpenApiRouter<Arc<Context>> {
         // POST (not GET) because search takes a JSON body: browsers' Fetch API forbids a body on
         // GET, so the Wasm frontend (gloo-net) can't call a GET-with-body search. POST-with-body is
         // the standard pattern for structured search params.
-        .route("/api/notes/search", post(search_handler))
-        .route("/api/render", post(render_handler))
-        .into()
+        .routes(routes!(search_handler))
+        .routes(routes!(render_handler))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::{body::Body, Router};
     use http_body_util::BodyExt;
     use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
     use note_storage::{StorageBackend, TransactionMode};
     use note_storage_turso::TursoStorage;
     use tower::ServiceExt;
+
+    #[test]
+    fn openapi_contains_all_note_operations() {
+        let (_, openapi) = notes_router().split_for_parts();
+        let document = serde_json::to_value(openapi).unwrap();
+
+        for (path, methods) in [
+            ("/api/notes", &["get", "post"][..]),
+            ("/api/notes/count", &["get"][..]),
+            ("/api/notes/{id}", &["get", "put", "delete"][..]),
+            ("/api/notes/{id}/raw", &["get"][..]),
+            ("/notes/{id}/content", &["get"][..]),
+            ("/api/notes/{id}/attachments/{path}", &["get"][..]),
+            ("/api/notes/search", &["post"][..]),
+            ("/api/render", &["post"][..]),
+            ("/api/trash", &["get"][..]),
+            ("/api/trash/restore", &["post"][..]),
+            ("/api/trash/{id}", &["delete"][..]),
+            ("/api/dashboard", &["get"][..]),
+        ] {
+            for method in methods {
+                assert!(
+                    document["paths"][path][method].is_object(),
+                    "missing {method} {path}"
+                );
+            }
+        }
+
+        let raw_content =
+            &document["paths"]["/api/notes/{id}/raw"]["get"]["responses"]["200"]["content"];
+        assert_eq!(raw_content["text/markdown"]["schema"]["type"], "string");
+        assert_eq!(raw_content["text/html"]["schema"]["type"], "string");
+
+        let render_content =
+            &document["paths"]["/api/render"]["post"]["responses"]["200"]["content"];
+        assert_eq!(render_content["text/html"]["schema"]["type"], "string");
+
+        let attachment_content = &document["paths"]["/api/notes/{id}/attachments/{path}"]["get"]
+            ["responses"]["200"]["content"];
+        assert_eq!(
+            attachment_content["application/octet-stream"]["schema"]["type"],
+            "string"
+        );
+        assert_eq!(
+            attachment_content["application/octet-stream"]["schema"]["format"],
+            "binary"
+        );
+
+        let plain_error =
+            &document["paths"]["/api/notes"]["post"]["responses"]["400"]["content"]["text/plain"];
+        assert_eq!(plain_error["schema"]["type"], "string");
+
+        let empty_response = &document["paths"]["/api/notes/{id}"]["delete"]["responses"]["204"];
+        assert!(
+            empty_response.get("content").is_none(),
+            "204 response must not publish a body"
+        );
+    }
 
     // Builds the real /api/notes router over a fresh temp DB + stub embedder so tests exercise the
     // actual HTTP surface (routing, JSON extractor, status codes, DTO serialization) via oneshot.

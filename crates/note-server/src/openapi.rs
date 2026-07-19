@@ -1,9 +1,38 @@
 use axum::Router;
 use note_pipelines::Context;
 use std::sync::Arc;
-use utoipa::openapi::{Info, OpenApi, OpenApiBuilder, Tag};
+use utoipa::{
+    openapi::{
+        schema::{Array, ArrayBuilder, Object, ObjectBuilder, Schema, Type},
+        Info, KnownFormat, OpenApi, OpenApiBuilder, RefOr, SchemaFormat, Tag,
+    },
+    PartialSchema, ToSchema,
+};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
+
+pub(crate) struct Binary;
+
+impl PartialSchema for Binary {
+    fn schema() -> RefOr<Schema> {
+        ObjectBuilder::new()
+            .schema_type(Type::String)
+            .format(Some(SchemaFormat::KnownFormat(KnownFormat::Binary)))
+            .into()
+    }
+}
+
+impl ToSchema for Binary {}
+
+pub(crate) fn label_pairs_schema() -> Array {
+    Array::new(
+        ArrayBuilder::new()
+            .items(Object::with_type(Type::String))
+            .min_items(Some(2))
+            .max_items(Some(2))
+            .build(),
+    )
+}
 
 pub fn rest_router() -> (Router<Arc<Context>>, OpenApi) {
     let openapi = OpenApiBuilder::new()
