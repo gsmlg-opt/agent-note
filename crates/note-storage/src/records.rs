@@ -70,6 +70,20 @@ pub struct NoteUpdate<'a> {
     pub note_revision: i64,
 }
 
+pub struct NoteFieldsUpdate<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub content: &'a str,
+    pub updated_at: i64,
+    pub note_revision: i64,
+}
+
+pub struct AttachmentMetadataUpdate<'a> {
+    pub id: &'a str,
+    pub attachments: &'a [note_core::NoteAttachment],
+    pub updated_at: i64,
+}
+
 pub struct UpsertNoteChunk<'a> {
     pub note_id: &'a str,
     pub chunk_idx: i64,

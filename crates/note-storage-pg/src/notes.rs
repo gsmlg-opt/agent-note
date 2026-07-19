@@ -3,8 +3,8 @@ use crate::PgSession;
 use futures_util::TryStreamExt;
 use note_core::{label_matches_selector, LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
-    ActiveNoteSource, NewNote, NoteUpdate, NotesRepository, StorageError, StorageErrorKind,
-    StorageResult,
+    ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate, NoteUpdate,
+    NotesRepository, StorageError, StorageErrorKind, StorageResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -112,6 +112,44 @@ impl NotesRepository for PgSession {
         .execute(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("update note", error))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn update_note_fields(&self, note: NoteFieldsUpdate<'_>) -> StorageResult<u64> {
+        let mut connection = self.connection().await?;
+        let result = sqlx::query(
+            "UPDATE notes
+             SET title = $2, content = $3, updated_at = $4, note_revision = $5
+             WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(note.id)
+        .bind(note.title)
+        .bind(note.content)
+        .bind(note.updated_at)
+        .bind(note.note_revision)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("update note fields", error))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn update_note_attachments(
+        &self,
+        note: AttachmentMetadataUpdate<'_>,
+    ) -> StorageResult<u64> {
+        let attachments = serialize_attachments(note.attachments)?;
+        let mut connection = self.connection().await?;
+        let result = sqlx::query(
+            "UPDATE notes
+             SET attachments = $2, updated_at = $3
+             WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(note.id)
+        .bind(attachments)
+        .bind(note.updated_at)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("update note attachments", error))?;
         Ok(result.rows_affected())
     }
 

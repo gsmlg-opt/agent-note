@@ -2,8 +2,8 @@ use crate::connection::map_turso_error;
 use crate::TursoSession;
 use note_core::{label_matches_selector, LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
-    ActiveNoteSource, LabelRepository, NewNote, NoteUpdate, NotesRepository, StorageError,
-    StorageErrorKind, StorageResult,
+    ActiveNoteSource, AttachmentMetadataUpdate, LabelRepository, NewNote, NoteFieldsUpdate,
+    NoteUpdate, NotesRepository, StorageError, StorageErrorKind, StorageResult,
 };
 
 #[async_trait::async_trait]
@@ -141,6 +141,40 @@ impl NotesRepository for TursoSession {
             )
             .await
             .map_err(|error| map_turso_error("update note", error))
+    }
+
+    async fn update_note_fields(&self, note: NoteFieldsUpdate<'_>) -> StorageResult<u64> {
+        self.connection
+            .execute(
+                "UPDATE notes
+                 SET title = ?2, content = ?3, updated_at = ?4, note_revision = ?5
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                turso::params![
+                    note.id,
+                    note.title,
+                    note.content,
+                    note.updated_at,
+                    note.note_revision
+                ],
+            )
+            .await
+            .map_err(|error| map_turso_error("update note fields", error))
+    }
+
+    async fn update_note_attachments(
+        &self,
+        note: AttachmentMetadataUpdate<'_>,
+    ) -> StorageResult<u64> {
+        let attachments = serialize_attachments(note.attachments)?;
+        self.connection
+            .execute(
+                "UPDATE notes
+                 SET attachments = ?2, updated_at = ?3
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                turso::params![note.id, attachments, note.updated_at],
+            )
+            .await
+            .map_err(|error| map_turso_error("update note attachments", error))
     }
 
     async fn soft_delete_note(&self, id: &str, deleted_at: i64) -> StorageResult<u64> {

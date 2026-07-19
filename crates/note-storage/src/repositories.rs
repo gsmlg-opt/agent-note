@@ -1,6 +1,6 @@
 use crate::{
-    ActiveNoteSource, BackendInfo, EmbeddingDashboardStatus, EmbeddingJob, NewNote, NoteChunk,
-    NoteUpdate, StorageResult, UpsertNoteChunk,
+    ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, EmbeddingDashboardStatus,
+    EmbeddingJob, NewNote, NoteChunk, NoteFieldsUpdate, NoteUpdate, StorageResult, UpsertNoteChunk,
 };
 
 #[async_trait::async_trait]
@@ -11,6 +11,11 @@ pub trait NotesRepository: Send + Sync {
     async fn get_note(&self, id: &str) -> StorageResult<Option<note_core::Note>>;
     async fn get_note_content(&self, id: &str) -> StorageResult<Option<String>>;
     async fn update_note(&self, note: NoteUpdate<'_>) -> StorageResult<u64>;
+    async fn update_note_fields(&self, note: NoteFieldsUpdate<'_>) -> StorageResult<u64>;
+    async fn update_note_attachments(
+        &self,
+        note: AttachmentMetadataUpdate<'_>,
+    ) -> StorageResult<u64>;
     async fn soft_delete_note(&self, id: &str, deleted_at: i64) -> StorageResult<u64>;
     async fn get_deleted_note_content_and_revision(
         &self,

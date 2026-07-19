@@ -1,5 +1,8 @@
 use note_core::{parse_label_selectors, LabelValueType, NoteAttachment};
-use note_storage::{ActiveNoteSource, NewNote, NoteUpdate, StorageBackend, StorageErrorKind};
+use note_storage::{
+    ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate, NoteUpdate,
+    StorageBackend, StorageErrorKind,
+};
 use std::sync::Arc;
 
 pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
@@ -92,6 +95,159 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .await
             .unwrap(),
         Some(2)
+    );
+
+    session
+        .insert_note(NewNote {
+            id: "contract-notes-partial",
+            title: "Partial title",
+            content: "Partial body",
+            attachments: std::slice::from_ref(&attachment),
+            created_at: 100,
+            updated_at: 100,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .update_note_fields(NoteFieldsUpdate {
+                id: "contract-notes-partial",
+                title: "Partial title updated",
+                content: "Partial body updated",
+                updated_at: 120,
+                note_revision: 2,
+            })
+            .await
+            .unwrap(),
+        1
+    );
+    let partial = session
+        .get_note("contract-notes-partial")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(partial.title, "Partial title updated");
+    assert_eq!(partial.content, "Partial body updated");
+    assert_eq!(partial.updated_at, 120);
+    assert_eq!(partial.attachments.len(), 1);
+    assert_eq!(partial.attachments[0].id, "meta");
+    assert_eq!(partial.attachments[0].path, "meta.json");
+    assert_eq!(partial.attachments[0].mime, "application/json");
+    assert_eq!(partial.attachments[0].description, "metadata");
+    assert!(partial.attachments[0].content.is_empty());
+    assert_eq!(
+        session
+            .get_note_revision("contract-notes-partial")
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        session
+            .update_note_fields(NoteFieldsUpdate {
+                id: "contract-notes-missing",
+                title: "Missing",
+                content: "Missing",
+                updated_at: 120,
+                note_revision: 2,
+            })
+            .await
+            .unwrap(),
+        0
+    );
+    session
+        .insert_note(NewNote {
+            id: "contract-notes-partial-deleted",
+            title: "Deleted title",
+            content: "Deleted body",
+            attachments: std::slice::from_ref(&attachment),
+            created_at: 100,
+            updated_at: 100,
+            note_revision: 1,
+            deleted_at: Some(10_000),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .update_note_fields(NoteFieldsUpdate {
+                id: "contract-notes-partial-deleted",
+                title: "Must not update",
+                content: "Must not update",
+                updated_at: 120,
+                note_revision: 2,
+            })
+            .await
+            .unwrap(),
+        0
+    );
+
+    let partial_attachment = NoteAttachment {
+        id: "partial-updated".into(),
+        path: "partial-updated.txt".into(),
+        mime: "text/plain".into(),
+        description: "partial updated metadata".into(),
+        content: b"must not be stored".to_vec(),
+    };
+    assert_eq!(
+        session
+            .update_note_attachments(AttachmentMetadataUpdate {
+                id: "contract-notes-partial",
+                attachments: std::slice::from_ref(&partial_attachment),
+                updated_at: 130,
+            })
+            .await
+            .unwrap(),
+        1
+    );
+    let partial = session
+        .get_note("contract-notes-partial")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(partial.title, "Partial title updated");
+    assert_eq!(partial.content, "Partial body updated");
+    assert_eq!(partial.created_at, 100);
+    assert_eq!(partial.updated_at, 130);
+    assert_eq!(partial.attachments.len(), 1);
+    assert_eq!(partial.attachments[0].id, "partial-updated");
+    assert_eq!(partial.attachments[0].path, "partial-updated.txt");
+    assert_eq!(partial.attachments[0].mime, "text/plain");
+    assert_eq!(
+        partial.attachments[0].description,
+        "partial updated metadata"
+    );
+    assert!(partial.attachments[0].content.is_empty());
+    assert_eq!(
+        session
+            .get_note_revision("contract-notes-partial")
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        session
+            .update_note_attachments(AttachmentMetadataUpdate {
+                id: "contract-notes-missing",
+                attachments: &[],
+                updated_at: 130,
+            })
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        session
+            .update_note_attachments(AttachmentMetadataUpdate {
+                id: "contract-notes-partial-deleted",
+                attachments: &[],
+                updated_at: 130,
+            })
+            .await
+            .unwrap(),
+        0
     );
 
     session
@@ -554,6 +710,11 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                 id: "contract-notes-numeric-ten".into(),
                 content: "contract-notes-numeric-ten".into(),
                 note_revision: 1,
+            },
+            ActiveNoteSource {
+                id: "contract-notes-partial".into(),
+                content: "Partial body updated".into(),
+                note_revision: 2,
             },
         ]
     );

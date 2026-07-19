@@ -2,10 +2,10 @@ use note_attachments::{AttachmentStore, AttachmentStoreInfo, PreparedAttachmentS
 use note_core::{LabelSelector, NoteAttachment};
 use note_pipelines::EmbeddingJobNotifier;
 use note_storage::{
-    ActiveNoteSource, BackendInfo, EmbeddingDashboardStatus, EmbeddingJob, EmbeddingRepository,
-    LabelRepository, NewNote, NoteChunk, NoteUpdate, NotesRepository, RetrievalRepository,
-    SettingsRepository, StorageBackend, StorageResult, StorageSession, StorageTransaction,
-    TransactionMode, UpsertNoteChunk,
+    ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, EmbeddingDashboardStatus,
+    EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteFieldsUpdate,
+    NoteUpdate, NotesRepository, RetrievalRepository, SettingsRepository, StorageBackend,
+    StorageResult, StorageSession, StorageTransaction, TransactionMode, UpsertNoteChunk,
 };
 use std::{
     collections::HashSet,
@@ -79,6 +79,8 @@ impl_forward_repository! {
         fn get_note(id: &str) -> Option<note_core::Note>;
         fn get_note_content(id: &str) -> Option<String>;
         fn update_note(note: NoteUpdate<'_>) -> u64;
+        fn update_note_fields(note: NoteFieldsUpdate<'_>) -> u64;
+        fn update_note_attachments(note: AttachmentMetadataUpdate<'_>) -> u64;
         fn soft_delete_note(id: &str, deleted_at: i64) -> u64;
         fn get_deleted_note_content_and_revision(id: &str) -> Option<(String, i64)>;
         fn restore_note(id: &str, note_revision: i64) -> u64;
