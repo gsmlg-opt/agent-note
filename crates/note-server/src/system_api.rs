@@ -12,6 +12,7 @@ use note_pipelines::{
     Context, SystemInfo,
 };
 use std::sync::Arc;
+use utoipa_axum::router::OpenApiRouter;
 
 async fn get_config_handler(
     State(ctx): State<Arc<Context>>,
@@ -76,7 +77,7 @@ async fn get_backup_handler(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
-pub fn system_router() -> Router<Arc<Context>> {
+pub fn system_router() -> OpenApiRouter<Arc<Context>> {
     Router::new()
         .route(
             "/api/system/config",
@@ -84,6 +85,7 @@ pub fn system_router() -> Router<Arc<Context>> {
         )
         .route("/api/system/info", get(get_info_handler))
         .route("/api/system/backup", get(get_backup_handler))
+        .into()
 }
 
 #[cfg(test)]
@@ -158,7 +160,7 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        (system_router().with_state(ctx.clone()), ctx, dir)
+        (system_router().with_state(ctx.clone()).into(), ctx, dir)
     }
 
     fn request(method: &str, uri: &str, body: &str) -> Request<Body> {
@@ -264,8 +266,8 @@ mod tests {
             .unwrap(),
         );
         let ctx = Arc::new(Context::new(storage, Arc::new(StubEmbedder), attachments));
-        let response = system_router()
-            .with_state(ctx)
+        let app: Router = system_router().with_state(ctx).into();
+        let response = app
             .oneshot(request("GET", "/api/system/info", ""))
             .await
             .unwrap();
@@ -309,7 +311,7 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        let app = system_router().with_state(ctx);
+        let app: Router = system_router().with_state(ctx).into();
 
         let response = app
             .oneshot(request("GET", "/api/system/info", ""))

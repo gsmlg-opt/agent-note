@@ -10,6 +10,7 @@ use note_pipelines::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa_axum::router::OpenApiRouter;
 
 #[derive(Deserialize)]
 pub struct DefineLabelKeyRequest {
@@ -128,7 +129,7 @@ fn default_label_value_type() -> String {
     "text".to_string()
 }
 
-pub fn labels_router() -> Router<Arc<Context>> {
+pub fn labels_router() -> OpenApiRouter<Arc<Context>> {
     // GET has no body (unlike /api/notes/search), so a browser GET is safe here.
     Router::new()
         .route(
@@ -139,6 +140,7 @@ pub fn labels_router() -> Router<Arc<Context>> {
             "/api/labels/{key}",
             put(update_label_key_handler).delete(delete_label_key_handler),
         )
+        .into()
 }
 
 #[cfg(test)]
@@ -164,7 +166,7 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        (labels_router().with_state(ctx), dir)
+        (labels_router().with_state(ctx).into(), dir)
     }
 
     fn post(uri: &str, body: &str) -> Request<Body> {

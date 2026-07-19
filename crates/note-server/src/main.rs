@@ -1,5 +1,6 @@
 mod labels_api;
 mod notes_api;
+mod openapi;
 mod render;
 mod system_api;
 
@@ -474,16 +475,12 @@ async fn main() -> anyhow::Result<()> {
             scheduler_shutdown_rx,
         ));
 
-        // notes_router()/labels_router() are Router<Arc<Context>> — applying .with_state converts them
-        // to Router<()>, which can then merge with mcp_router() (already Router<()>, self-stated).
-        let rest = Router::new()
-            .merge(notes_api::notes_router())
-            .merge(labels_api::labels_router())
-            .merge(system_api::system_router())
-            .with_state(ctx.clone());
+        let (rest, openapi) = openapi::rest_router();
+        let rest = rest.with_state(ctx.clone());
         let max_request_bytes = env_u64("NOTE_MAX_REQUEST_BYTES", 512 * 1024 * 1024);
         let mut app: Router = rest
             .merge(note_mcp::mcp_router(ctx))
+            .merge(openapi::swagger_router(openapi))
             .layer(DefaultBodyLimit::max(max_request_bytes as usize));
 
         // NOTE_STATIC_DIR is for packaged builds such as Docker. Local debug HTTP runs use the

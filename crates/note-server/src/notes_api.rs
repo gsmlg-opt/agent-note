@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+use utoipa_axum::router::OpenApiRouter;
 
 const DEFAULT_LIST_LIMIT: i64 = 10;
 const MAX_LIST_LIMIT: i64 = 1000;
@@ -676,7 +677,7 @@ fn rewrite_relative_attachment_urls(html: &str, base: &str) -> String {
         .replace("src=\"./", &format!("src=\"{base}/"))
 }
 
-pub fn notes_router() -> Router<Arc<Context>> {
+pub fn notes_router() -> OpenApiRouter<Arc<Context>> {
     Router::new()
         .route(
             "/api/notes",
@@ -707,6 +708,7 @@ pub fn notes_router() -> Router<Arc<Context>> {
         // the standard pattern for structured search params.
         .route("/api/notes/search", post(search_handler))
         .route("/api/render", post(render_handler))
+        .into()
 }
 
 #[cfg(test)]
@@ -739,7 +741,12 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        (notes_router().with_state(ctx.clone()), ctx, storage, dir)
+        (
+            notes_router().with_state(ctx.clone()).into(),
+            ctx,
+            storage,
+            dir,
+        )
     }
 
     async fn test_app() -> (Router, Arc<Context>, tempfile::TempDir) {
