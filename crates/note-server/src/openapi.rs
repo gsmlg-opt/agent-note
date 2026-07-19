@@ -25,15 +25,19 @@ impl PartialSchema for Binary {
 impl ToSchema for Binary {}
 
 pub(crate) fn label_pairs_schema() -> Array {
-    ArrayBuilder::from(Array::new(
+    Array::new(
         ArrayBuilder::new()
             .items(Object::with_type(Type::String))
             .min_items(Some(2))
             .max_items(Some(2))
             .build(),
-    ))
-    .default(Some(serde_json::json!([])))
-    .build()
+    )
+}
+
+pub(crate) fn label_pairs_with_empty_default_schema() -> Array {
+    ArrayBuilder::from(label_pairs_schema())
+        .default(Some(serde_json::json!([])))
+        .build()
 }
 
 pub(crate) fn label_value_type_schema() -> Object {

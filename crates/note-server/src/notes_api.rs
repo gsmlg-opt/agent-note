@@ -35,7 +35,7 @@ pub struct SaveNoteRequest {
     #[schema(default = json!([]))]
     pub attachments: Vec<AttachmentRequest>,
     #[serde(default)]
-    #[schema(schema_with = crate::openapi::label_pairs_schema)]
+    #[schema(schema_with = crate::openapi::label_pairs_with_empty_default_schema)]
     pub labels: Vec<(String, String)>,
 }
 
@@ -58,6 +58,50 @@ pub struct AttachmentRequest {
         content_media_type = "application/octet-stream"
     )]
     pub content_base64: Option<String>,
+}
+
+struct AttachmentRequestDocumentation;
+
+impl utoipa::PartialSchema for AttachmentRequestDocumentation {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        let content_requirement = utoipa::openapi::schema::AnyOfBuilder::new()
+            .item(
+                utoipa::openapi::schema::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::Object)
+                    .required("content"),
+            )
+            .item(
+                utoipa::openapi::schema::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::Object)
+                    .required("content_base64"),
+            );
+
+        utoipa::openapi::schema::AllOfBuilder::new()
+            .item(<AttachmentRequest as utoipa::PartialSchema>::schema())
+            .item(content_requirement)
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for AttachmentRequestDocumentation {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("AttachmentRequest")
+    }
+}
+
+#[derive(utoipa::ToSchema)]
+#[schema(as = SaveNoteRequest)]
+#[allow(dead_code)]
+struct SaveNoteRequestDocumentation {
+    title: String,
+    content: String,
+    #[schema(default = json!([]), required = false)]
+    attachments: Vec<AttachmentRequestDocumentation>,
+    #[schema(
+        schema_with = crate::openapi::label_pairs_with_empty_default_schema,
+        required = false
+    )]
+    labels: Vec<(String, String)>,
 }
 
 impl TryFrom<AttachmentRequest> for NoteAttachment {
@@ -362,7 +406,7 @@ async fn dashboard_handler(
     post,
     path = "/api/notes",
     tag = "notes",
-    request_body = SaveNoteRequest,
+    request_body = SaveNoteRequestDocumentation,
     responses(
         (status = 200, description = "Note saved", body = SaveNoteResponse),
         (status = 400, description = "Invalid note", body = String, content_type = "text/plain"),
@@ -437,6 +481,7 @@ pub struct ListNotesQuery {
 
 #[derive(Deserialize, Default, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+#[allow(dead_code)]
 struct CountNotesQuery {
     /// Optional label expression used to filter notes.
     #[serde(default)]
@@ -495,7 +540,7 @@ pub struct CountNotesResponse {
 )]
 async fn count_notes_handler(
     State(ctx): State<Arc<Context>>,
-    Query(req): Query<CountNotesQuery>,
+    Query(req): Query<ListNotesQuery>,
 ) -> Result<Json<CountNotesResponse>, (axum::http::StatusCode, String)> {
     let total = count_notes(&ctx, req.label)
         .await
@@ -681,7 +726,7 @@ async fn get_attachment_handler(
     path = "/api/notes/{id}",
     tag = "notes",
     params(("id" = String, Path, description = "Note ID")),
-    request_body = SaveNoteRequest,
+    request_body = SaveNoteRequestDocumentation,
     responses(
         (status = 200, description = "Updated note", body = NoteDto),
         (status = 400, description = "Invalid note", body = String, content_type = "text/plain"),
@@ -1074,10 +1119,15 @@ mod tests {
         let document = note_openapi_document();
         let schemas = &document["components"]["schemas"];
         let request = &schemas["AttachmentRequest"];
+        let request_properties = if request["properties"].is_object() {
+            &request["properties"]
+        } else {
+            &request["allOf"][0]["properties"]
+        };
         let response = &schemas["AttachmentResponse"];
         let save = &schemas["SaveNoteRequest"];
 
-        assert_eq!(request["properties"]["description"]["default"], "");
+        assert_eq!(request_properties["description"]["default"], "");
         assert_eq!(response["properties"]["description"]["default"], "");
         assert_eq!(
             save["properties"]["attachments"]["default"],
@@ -1088,8 +1138,8 @@ mod tests {
             serde_json::json!([])
         );
 
-        for attachment in [request, response] {
-            let content_base64 = &attachment["properties"]["content_base64"];
+        for properties in [request_properties, &response["properties"]] {
+            let content_base64 = &properties["content_base64"];
             assert_eq!(content_base64["contentEncoding"], "base64");
             assert_eq!(
                 content_base64["contentMediaType"],
@@ -1097,9 +1147,39 @@ mod tests {
             );
         }
 
-        let request_description = request["description"].as_str().unwrap();
+        assert_eq!(
+            request["allOf"][1]["anyOf"],
+            serde_json::json!([
+                {"type": "object", "required": ["content"]},
+                {"type": "object", "required": ["content_base64"]}
+            ])
+        );
+
+        let request_description = request["description"]
+            .as_str()
+            .or_else(|| request["allOf"][0]["description"].as_str())
+            .unwrap();
         assert!(request_description.contains("at least one of content or content_base64"));
         assert!(request_description.contains("identical bytes"));
+    }
+
+    #[test]
+    fn openapi_defaults_labels_only_on_save_requests() {
+        let document = note_openapi_document();
+        let schemas = &document["components"]["schemas"];
+
+        assert_eq!(
+            schemas["SaveNoteRequest"]["properties"]["labels"]["default"],
+            serde_json::json!([])
+        );
+        for response in ["NoteDto", "NoteListDto", "TrashNoteDto"] {
+            assert!(
+                schemas[response]["properties"]["labels"]
+                    .get("default")
+                    .is_none(),
+                "{response}.labels must not publish a default"
+            );
+        }
     }
 
     #[test]
@@ -1329,6 +1409,19 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json.get("total").and_then(|v| v.as_u64()), Some(12));
+    }
+
+    #[tokio::test]
+    async fn count_notes_rejects_invalid_pagination_query_values() {
+        let (app, _ctx, _dir) = test_app().await;
+
+        for uri in [
+            "/api/notes/count?limit=invalid",
+            "/api/notes/count?offset=invalid",
+        ] {
+            let response = app.clone().oneshot(get(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
     }
 
     #[test]
