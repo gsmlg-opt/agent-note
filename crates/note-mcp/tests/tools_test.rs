@@ -67,7 +67,7 @@ fn put_input(
 }
 
 #[test]
-fn non_byte_tool_inputs_keep_strict_deserialization() {
+fn tool_input_deserialization_preserves_intended_compatibility() {
     assert!(serde_json::from_value::<SaveNoteToolInput>(json!({
         "title": "Title",
         "content": "Body"
@@ -102,7 +102,7 @@ fn non_byte_tool_inputs_keep_strict_deserialization() {
         "limit": 5,
         "unknown": true
     }))
-    .is_err());
+    .is_ok());
     assert!(
         serde_json::from_value::<GetNoteAttachmentContentToolInput>(json!({
             "note_id": "note-1",

@@ -62,7 +62,6 @@ impl From<SaveNoteToolOutput> for SaveNoteResponse {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct GetNoteRequest {
     /// Note id.
     pub id: String,
@@ -177,7 +176,6 @@ impl From<NoteDetailData> for NoteDetailResponse {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ReadNoteLinesRequest {
     /// Note id.
     pub id: String,
@@ -223,7 +221,6 @@ impl From<NoteLinesData> for NoteLinesResponse {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EditOpSchema {
     /// Replace an original line range with zero or more lines.
@@ -258,7 +255,6 @@ impl From<EditOpSchema> for note_pipelines::EditOp {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct EditNoteRequest {
     /// Note id.
     pub id: String,
@@ -294,7 +290,6 @@ impl From<UpdateNoteRequest> for UpdateNoteToolInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct DeleteNoteRequest {
     /// Note id.
     pub id: String,
@@ -308,7 +303,6 @@ pub struct DeleteNoteResponse {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ListNotesRequest {
     /// Max notes to return.
     #[serde(default)]
@@ -329,7 +323,6 @@ pub struct NoteListResponse {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct SemanticSearchRequest {
     /// Natural-language query.
     pub query: String,
@@ -930,6 +923,19 @@ mod tests {
         );
     }
 
+    fn assert_exact_open_object(schema: &serde_json::Value, expected_properties: &[&str]) {
+        assert_eq!(schema["type"], "object", "{schema}");
+        assert!(schema.get("additionalProperties").is_none(), "{schema}");
+        assert_eq!(
+            property_names(schema),
+            expected_properties
+                .iter()
+                .map(|property| (*property).to_owned())
+                .collect::<Vec<_>>(),
+            "{schema}"
+        );
+    }
+
     fn assert_attachment_content_requirement(schema: &serde_json::Value) {
         assert!(schema.pointer("/properties/content").is_some());
         assert!(schema.pointer("/properties/content_base64").is_some());
@@ -1000,16 +1006,6 @@ mod tests {
         let (ctx, _backend, _dir) = test_context().await;
         let server = NoteMcpServer::new(Arc::new(ctx));
 
-        for tool in server.tool_router.list_all() {
-            let schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
-            assert_eq!(schema["type"], "object", "{}: {schema}", tool.name);
-            assert_eq!(
-                schema["additionalProperties"], false,
-                "{}: {schema}",
-                tool.name
-            );
-        }
-
         let save_input = tool_schema(&server, "save_note", false);
         assert_exact_closed_object(&save_input, &save_input, &["content", "labels", "title"]);
         let update_input = tool_schema(&server, "update_note", false);
@@ -1034,8 +1030,32 @@ mod tests {
             ],
         );
         assert_attachment_content_requirement(&put_schema);
+
+        let attachment_get_input = tool_schema(&server, "get_note_attachment_content", false);
+        assert_exact_closed_object(
+            &attachment_get_input,
+            &attachment_get_input,
+            &["attachment_id", "note_id"],
+        );
+        let attachment_delete_input = tool_schema(&server, "delete_note_attachment", false);
+        assert_exact_closed_object(
+            &attachment_delete_input,
+            &attachment_delete_input,
+            &["attachment_id", "note_id"],
+        );
+
         let list_input = tool_schema(&server, "list_notes", false);
+        assert_exact_open_object(&list_input, &["label", "limit", "offset"]);
         assert!(schema_allows_null(&list_input["properties"]["label"]));
+        assert!(required_names(&list_input).is_empty());
+        let search_input = tool_schema(&server, "semantic_search", false);
+        assert_exact_open_object(&search_input, &["label", "limit", "query"]);
+        assert!(schema_allows_null(&search_input["properties"]["label"]));
+        assert_eq!(
+            list_input["properties"]["label"]["type"],
+            search_input["properties"]["label"]["type"]
+        );
+        assert_eq!(required_names(&search_input), vec!["limit", "query"]);
 
         let list_output = tool_schema(&server, "list_notes", true);
         assert_exact_closed_object(&list_output, &list_output, &["notes"]);

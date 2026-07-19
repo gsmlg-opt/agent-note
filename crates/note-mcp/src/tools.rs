@@ -234,7 +234,6 @@ pub async fn list_notes_tool(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SemanticSearchToolInput {
     pub query: String,
     pub limit: usize,
