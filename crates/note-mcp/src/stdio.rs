@@ -1,16 +1,11 @@
-//! MCP server exposing the note tools over a stdio transport.
+//! MCP server exposing note tools over stdio and Streamable HTTP transports.
 //!
-//! JSON-RPC is spoken on stdin/stdout; rmcp keeps stdout clean for protocol
-//! traffic, so anything we want logged must go to stderr (docs/design.md §8).
-//! Both this transport and the Streamable HTTP transport (Task 20) delegate to
-//! the same plain-async wrappers in [`crate::tools`] — no MCP-specific logic
-//! lives here beyond request/response marshalling. The stdio tool surface
-//! includes whole-note tools plus `read_note_lines`/`edit_note` for tagged,
-//! line-anchored body editing.
+//! Transport-specific request/response marshalling lives here. The handlers
+//! delegate to transport-independent wrappers in [`crate::tools`].
 
 use std::sync::Arc;
 
-use note_pipelines::Context;
+use note_pipelines::{AttachmentMutationError, Context};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Json, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
@@ -22,72 +17,56 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::tools::{
-    delete_note_tool, edit_note_tool, get_note_tool, list_notes_tool, read_note_lines_tool,
-    save_note_tool, semantic_search_tool, update_note_tool, AttachmentData, LabelData, NoteData,
-    NoteLine, NoteLinesData, SaveNoteToolInput, SaveNoteToolOutput, SemanticSearchToolInput,
+    delete_note_attachment_tool, delete_note_tool, edit_note_tool,
+    get_note_attachment_content_tool, get_note_tool, list_notes_tool, put_note_attachment_tool,
+    read_note_lines_tool, save_note_tool, semantic_search_tool, update_note_tool,
+    AttachmentContentData, AttachmentMetadataData, GetNoteAttachmentContentToolInput, LabelData,
+    NoteDetailData, NoteLine, NoteLinesData, NoteSummaryData, PutNoteAttachmentToolInput,
+    PutNoteAttachmentToolOutput, SaveNoteToolInput, SaveNoteToolOutput, SemanticSearchToolInput,
     SemanticSearchToolResult, UpdateNoteToolInput,
 };
 
-/// MCP request schema for `save_note`. Mirrors [`SaveNoteToolInput`] but derives
-/// [`JsonSchema`] so rmcp can advertise the tool's input schema over the wire.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SaveNoteRequest {
     /// Note title.
     pub title: String,
     /// Note body, formatted as Markdown.
     pub content: String,
-    /// Attachments that belong to this note.
-    #[serde(default)]
-    pub attachments: Vec<AttachmentRequestSchema>,
-    /// Existing label keys to attach, as `(key, value)` pairs. Cannot create new
-    /// label keys — that is REST/UI-only (docs/design.md §8).
+    /// Existing label keys to attach, as `(key, value)` pairs.
     #[serde(default)]
     pub labels: Vec<(String, String)>,
 }
 
-/// MCP response schema for `save_note`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SaveNoteResponse {
     /// Id of the newly saved note.
     pub id: String,
 }
 
-// These `From` impls are the single place that names every field of the tool-layer twins, so
-// adding a field to a `crate::tools` type forces a compile-time decision here rather than silently
-// failing to expose it over MCP (the schema types intentionally stay separate to keep the
-// transport-agnostic wrapper layer free of the schemars/JsonSchema dependency).
-impl TryFrom<SaveNoteRequest> for SaveNoteToolInput {
-    type Error = ErrorData;
-
-    fn try_from(r: SaveNoteRequest) -> Result<Self, Self::Error> {
-        Ok(Self {
-            title: r.title,
-            content: r.content,
-            attachments: r
-                .attachments
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_, _>>()?,
-            labels: r.labels,
-        })
+impl From<SaveNoteRequest> for SaveNoteToolInput {
+    fn from(request: SaveNoteRequest) -> Self {
+        Self {
+            title: request.title,
+            content: request.content,
+            labels: request.labels,
+        }
     }
 }
 
 impl From<SaveNoteToolOutput> for SaveNoteResponse {
-    fn from(o: SaveNoteToolOutput) -> Self {
-        Self { id: o.id }
+    fn from(output: SaveNoteToolOutput) -> Self {
+        Self { id: output.id }
     }
 }
 
-/// MCP request schema for `get_note`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetNoteRequest {
     /// Note id.
     pub id: String,
 }
 
-/// MCP label schema embedded in note responses.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct LabelSchema {
     /// Label key.
     pub key: String,
@@ -99,61 +78,46 @@ pub struct LabelSchema {
     pub value_type: String,
 }
 
-/// MCP attachment schema embedded in note-creating and note-updating requests.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(extend(
-    "anyOf" = [
-        {"required": ["content"]},
-        {"required": ["content_base64"]}
-    ]
-))]
-pub struct AttachmentRequestSchema {
-    /// Unique attachment id within the note.
-    pub id: String,
-    /// Relative path that note Markdown can reference, for example `./meta.json`.
-    pub path: String,
-    /// MIME type of the attachment content.
-    pub mime: String,
-    /// Human-readable attachment description.
-    #[serde(default)]
-    pub description: String,
-    /// Legacy UTF-8 attachment content. Provide this or `content_base64`.
-    #[serde(default)]
-    pub content: Option<String>,
-    /// Base64-encoded attachment bytes. Provide this or `content`.
-    #[serde(default)]
-    pub content_base64: Option<String>,
+impl From<LabelData> for LabelSchema {
+    fn from(label: LabelData) -> Self {
+        Self {
+            key: label.key,
+            value: label.value,
+            description: label.description,
+            value_type: label.value_type,
+        }
+    }
 }
 
-/// MCP attachment schema embedded in note-returning responses.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct AttachmentResponseSchema {
+pub struct AttachmentMetadataSchema {
     /// Unique attachment id within the note.
     pub id: String,
-    /// Relative path that note Markdown can reference, for example `./meta.json`.
+    /// Relative path that note Markdown can reference.
     pub path: String,
     /// MIME type of the attachment content.
     pub mime: String,
     /// Human-readable attachment description.
     pub description: String,
-    /// UTF-8 attachment content, when the bytes are valid UTF-8.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    /// Canonical padded Base64 attachment content.
-    pub content_base64: String,
 }
 
-/// MCP response schema for note-returning tools.
+impl From<AttachmentMetadataData> for AttachmentMetadataSchema {
+    fn from(attachment: AttachmentMetadataData) -> Self {
+        Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
-pub struct NoteResponse {
+pub struct NoteSummaryResponse {
     /// Note id.
     pub id: String,
     /// Note title.
     pub title: String,
-    /// Note body, formatted as Markdown.
-    pub content: String,
-    /// Attachments that belong to this note.
-    pub attachments: Vec<AttachmentResponseSchema>,
     /// Labels attached to the note.
     pub labels: Vec<LabelSchema>,
     /// Unix timestamp when the note was created.
@@ -162,83 +126,56 @@ pub struct NoteResponse {
     pub updated_at: i64,
 }
 
-impl From<LabelData> for LabelSchema {
-    fn from(l: LabelData) -> Self {
+impl From<NoteSummaryData> for NoteSummaryResponse {
+    fn from(note: NoteSummaryData) -> Self {
         Self {
-            key: l.key,
-            value: l.value,
-            description: l.description,
-            value_type: l.value_type,
+            id: note.id,
+            title: note.title,
+            labels: note.labels.into_iter().map(Into::into).collect(),
+            created_at: note.created_at,
+            updated_at: note.updated_at,
         }
     }
 }
 
-impl From<AttachmentData> for AttachmentResponseSchema {
-    fn from(attachment: AttachmentData) -> Self {
-        let content = std::str::from_utf8(&attachment.content)
-            .ok()
-            .map(str::to_owned);
-        let content_base64 = note_core::encode_attachment_content(&attachment.content);
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct NoteDetailResponse {
+    /// Note id.
+    pub id: String,
+    /// Note title.
+    pub title: String,
+    /// Note body, formatted as Markdown.
+    pub content: String,
+    /// Attachment metadata. Content is fetched with `get_note_attachment_content`.
+    pub attachments: Vec<AttachmentMetadataSchema>,
+    /// Labels attached to the note.
+    pub labels: Vec<LabelSchema>,
+    /// Unix timestamp when the note was created.
+    pub created_at: i64,
+    /// Unix timestamp when the note was last updated.
+    pub updated_at: i64,
+}
+
+impl From<NoteDetailData> for NoteDetailResponse {
+    fn from(note: NoteDetailData) -> Self {
         Self {
-            id: attachment.id,
-            path: attachment.path,
-            mime: attachment.mime,
-            description: attachment.description,
-            content,
-            content_base64,
+            id: note.id,
+            title: note.title,
+            content: note.content,
+            attachments: note.attachments.into_iter().map(Into::into).collect(),
+            labels: note.labels.into_iter().map(Into::into).collect(),
+            created_at: note.created_at,
+            updated_at: note.updated_at,
         }
     }
 }
 
-impl TryFrom<AttachmentRequestSchema> for AttachmentData {
-    type Error = ErrorData;
-
-    fn try_from(attachment: AttachmentRequestSchema) -> Result<Self, Self::Error> {
-        let content = note_core::decode_attachment_content(
-            attachment.content.as_deref(),
-            attachment.content_base64.as_deref(),
-        )
-        .map_err(|error| {
-            ErrorData::invalid_params(
-                format!(
-                    "invalid attachment {} at {}: {error}",
-                    attachment.id, attachment.path
-                ),
-                None,
-            )
-        })?;
-        Ok(Self {
-            id: attachment.id,
-            path: attachment.path,
-            mime: attachment.mime,
-            description: attachment.description,
-            content,
-        })
-    }
-}
-
-impl From<NoteData> for NoteResponse {
-    fn from(n: NoteData) -> Self {
-        Self {
-            id: n.id,
-            title: n.title,
-            content: n.content,
-            attachments: n.attachments.into_iter().map(Into::into).collect(),
-            labels: n.labels.into_iter().map(Into::into).collect(),
-            created_at: n.created_at,
-            updated_at: n.updated_at,
-        }
-    }
-}
-
-/// MCP request schema for `read_note_lines`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadNoteLinesRequest {
     /// Note id.
     pub id: String,
 }
 
-/// One numbered line in a note body.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct NoteLineSchema {
     /// 1-indexed line number.
@@ -247,7 +184,6 @@ pub struct NoteLineSchema {
     pub text: String,
 }
 
-/// MCP response schema for line-editing reads and edits.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct NoteLinesResponse {
     /// Note id.
@@ -259,68 +195,43 @@ pub struct NoteLinesResponse {
 }
 
 impl From<NoteLine> for NoteLineSchema {
-    fn from(l: NoteLine) -> Self {
+    fn from(line: NoteLine) -> Self {
         Self {
-            n: l.n,
-            text: l.text,
+            n: line.n,
+            text: line.text,
         }
     }
 }
 
 impl From<NoteLinesData> for NoteLinesResponse {
-    fn from(n: NoteLinesData) -> Self {
+    fn from(note: NoteLinesData) -> Self {
         Self {
-            id: n.id,
-            tag: n.tag,
-            lines: n.lines.into_iter().map(Into::into).collect(),
+            id: note.id,
+            tag: note.tag,
+            lines: note.lines.into_iter().map(Into::into).collect(),
         }
     }
 }
 
-/// MCP edit operation schema for `edit_note`.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum EditOpSchema {
     /// Replace an original line range with zero or more lines.
     Swap {
-        /// First original line to replace, 1-indexed.
         from: usize,
-        /// Last original line to replace, inclusive.
         to: usize,
-        /// Replacement lines.
         lines: Vec<String>,
     },
     /// Delete an original line range.
-    Delete {
-        /// First original line to delete, 1-indexed.
-        from: usize,
-        /// Last original line to delete, inclusive.
-        to: usize,
-    },
+    Delete { from: usize, to: usize },
     /// Insert lines before an original line.
-    InsertBefore {
-        /// Original anchor line, 1-indexed.
-        line: usize,
-        /// Lines to insert.
-        lines: Vec<String>,
-    },
+    InsertBefore { line: usize, lines: Vec<String> },
     /// Insert lines after an original line.
-    InsertAfter {
-        /// Original anchor line, 1-indexed.
-        line: usize,
-        /// Lines to insert.
-        lines: Vec<String>,
-    },
+    InsertAfter { line: usize, lines: Vec<String> },
     /// Insert lines at the start of the note body.
-    InsertHead {
-        /// Lines to insert.
-        lines: Vec<String>,
-    },
+    InsertHead { lines: Vec<String> },
     /// Insert lines at the end of the note body.
-    InsertTail {
-        /// Lines to insert.
-        lines: Vec<String>,
-    },
+    InsertTail { lines: Vec<String> },
 }
 
 impl From<EditOpSchema> for note_pipelines::EditOp {
@@ -336,19 +247,18 @@ impl From<EditOpSchema> for note_pipelines::EditOp {
     }
 }
 
-/// MCP request schema for `edit_note`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EditNoteRequest {
     /// Note id.
     pub id: String,
     /// Tag from `read_note_lines`.
     pub tag: String,
-    /// Line edit operations, anchored to the ORIGINAL line numbers.
+    /// Operations anchored to the original line numbers.
     pub edits: Vec<EditOpSchema>,
 }
 
-/// MCP request schema for `update_note`.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateNoteRequest {
     /// Note id.
     pub id: String,
@@ -356,48 +266,34 @@ pub struct UpdateNoteRequest {
     pub title: String,
     /// New note body, formatted as Markdown.
     pub content: String,
-    /// Attachments that belong to this note.
-    #[serde(default)]
-    pub attachments: Vec<AttachmentRequestSchema>,
-    /// Existing label keys to attach, as `(key, value)` pairs. Cannot create new
-    /// label keys — that is REST/UI-only (docs/design.md §8).
+    /// Existing label keys to attach, as `(key, value)` pairs.
     #[serde(default)]
     pub labels: Vec<(String, String)>,
 }
 
-impl TryFrom<UpdateNoteRequest> for UpdateNoteToolInput {
-    type Error = ErrorData;
-
-    fn try_from(r: UpdateNoteRequest) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: r.id,
-            title: r.title,
-            content: r.content,
-            attachments: r
-                .attachments
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_, _>>()?,
-            labels: r.labels,
-        })
+impl From<UpdateNoteRequest> for UpdateNoteToolInput {
+    fn from(request: UpdateNoteRequest) -> Self {
+        Self {
+            id: request.id,
+            title: request.title,
+            content: request.content,
+            labels: request.labels,
+        }
     }
 }
 
-/// MCP request schema for `delete_note`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteNoteRequest {
     /// Note id.
     pub id: String,
 }
 
-/// MCP response schema for `delete_note`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DeleteNoteResponse {
     /// Whether a note was deleted.
     pub deleted: bool,
 }
 
-/// MCP request schema for `list_notes`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListNotesRequest {
     /// Max notes to return.
@@ -406,32 +302,28 @@ pub struct ListNotesRequest {
     /// Number of notes to skip.
     #[serde(default)]
     pub offset: Option<u32>,
-    /// Label selector, `&`-separated terms ANDed: `key=value`, `key>=value`, or bare `key` (any value). e.g. `env=prod&version>=1.2.0`.
+    /// Label selector, with `&`-separated terms ANDed.
     #[serde(default)]
     pub label: Option<String>,
 }
 
-/// MCP response schema for `list_notes`. Wraps the notes in an object so the
-/// tool's output schema has an `object` root, as the MCP spec requires.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct NoteListResponse {
-    /// Saved notes.
-    pub notes: Vec<NoteResponse>,
+    /// Saved note summaries.
+    pub notes: Vec<NoteSummaryResponse>,
 }
 
-/// MCP request schema for `semantic_search`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SemanticSearchRequest {
     /// Natural-language query.
     pub query: String,
     /// Maximum number of results to return.
     pub limit: usize,
-    /// Label selector, `&`-separated terms ANDed: `key=value`, `key>=value`, or bare `key` (any value). e.g. `env=prod&version>=1.2.0`.
+    /// Optional label selector.
     #[serde(default)]
     pub label: Option<String>,
 }
 
-/// A single `semantic_search` hit.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SemanticSearchHit {
     /// Id of the matching note.
@@ -440,10 +332,14 @@ pub struct SemanticSearchHit {
     pub title: String,
     /// Relevance score.
     pub score: f32,
+    /// Labels attached to the matching note.
+    pub labels: Vec<LabelSchema>,
+    /// Unix timestamp when the note was created.
+    pub created_at: i64,
+    /// Unix timestamp when the note was last updated.
+    pub updated_at: i64,
 }
 
-/// MCP response schema for `semantic_search`. Wraps the hits in an object so the
-/// tool's output schema has an `object` root, as the MCP spec requires.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct SemanticSearchResponse {
     /// Matching notes, best first.
@@ -451,27 +347,151 @@ pub struct SemanticSearchResponse {
 }
 
 impl From<SemanticSearchRequest> for SemanticSearchToolInput {
-    fn from(r: SemanticSearchRequest) -> Self {
+    fn from(request: SemanticSearchRequest) -> Self {
         Self {
-            query: r.query,
-            limit: r.limit,
-            label: r.label,
+            query: request.query,
+            limit: request.limit,
+            label: request.label,
         }
     }
 }
 
 impl From<SemanticSearchToolResult> for SemanticSearchHit {
-    fn from(r: SemanticSearchToolResult) -> Self {
+    fn from(result: SemanticSearchToolResult) -> Self {
         Self {
-            id: r.id,
-            title: r.title,
-            score: r.score,
+            id: result.id,
+            title: result.title,
+            score: result.score,
+            labels: result.labels.into_iter().map(Into::into).collect(),
+            created_at: result.created_at,
+            updated_at: result.updated_at,
         }
     }
 }
 
-/// MCP server holding the shared pipeline context. Cloned per request by rmcp's
-/// router, so state lives behind an `Arc`.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(extend(
+    "anyOf" = [
+        {"required": ["content"]},
+        {"required": ["content_base64"]}
+    ]
+))]
+pub struct PutNoteAttachmentRequest {
+    /// Note id.
+    pub note_id: String,
+    /// Attachment id unique within the note.
+    pub attachment_id: String,
+    /// Relative attachment path.
+    pub path: String,
+    /// MIME type.
+    pub mime: String,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: String,
+    /// UTF-8 attachment content. Provide this or `content_base64`.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Base64-encoded bytes. Provide this or `content`.
+    #[serde(default)]
+    pub content_base64: Option<String>,
+}
+
+impl TryFrom<PutNoteAttachmentRequest> for PutNoteAttachmentToolInput {
+    type Error = ErrorData;
+
+    fn try_from(request: PutNoteAttachmentRequest) -> Result<Self, Self::Error> {
+        let content = note_core::decode_attachment_content(
+            request.content.as_deref(),
+            request.content_base64.as_deref(),
+        )
+        .map_err(|error| {
+            ErrorData::invalid_params(
+                format!(
+                    "invalid attachment {} at {}: {error}",
+                    request.attachment_id, request.path
+                ),
+                None,
+            )
+        })?;
+        Ok(Self {
+            note_id: request.note_id,
+            attachment_id: request.attachment_id,
+            path: request.path,
+            mime: request.mime,
+            description: request.description,
+            content,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PutNoteAttachmentResponse {
+    /// Whether a new attachment id was created.
+    pub created: bool,
+    /// Stored attachment metadata.
+    pub attachment: AttachmentMetadataSchema,
+}
+
+impl From<PutNoteAttachmentToolOutput> for PutNoteAttachmentResponse {
+    fn from(output: PutNoteAttachmentToolOutput) -> Self {
+        Self {
+            created: output.created,
+            attachment: output.attachment.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetNoteAttachmentContentRequest {
+    /// Note id.
+    pub note_id: String,
+    /// Attachment id within the note.
+    pub attachment_id: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GetNoteAttachmentContentResponse {
+    /// Attachment metadata.
+    pub attachment: AttachmentMetadataSchema,
+    /// UTF-8 content, present only when the bytes are valid UTF-8.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Canonical padded Base64, present only for non-UTF-8 bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_base64: Option<String>,
+}
+
+impl From<AttachmentContentData> for GetNoteAttachmentContentResponse {
+    fn from(data: AttachmentContentData) -> Self {
+        let (content, content_base64) = match String::from_utf8(data.content) {
+            Ok(content) => (Some(content), None),
+            Err(error) => (
+                None,
+                Some(note_core::encode_attachment_content(error.as_bytes())),
+            ),
+        };
+        Self {
+            attachment: data.attachment.into(),
+            content,
+            content_base64,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteNoteAttachmentRequest {
+    /// Note id.
+    pub note_id: String,
+    /// Attachment id within the note.
+    pub attachment_id: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DeleteNoteAttachmentResponse {
+    /// Whether the attachment existed and was deleted.
+    pub deleted: bool,
+}
+
 #[derive(Clone)]
 pub struct NoteMcpServer {
     ctx: Arc<Context>,
@@ -479,7 +499,6 @@ pub struct NoteMcpServer {
 }
 
 impl NoteMcpServer {
-    /// Build a server around a shared [`Context`].
     pub fn new(ctx: Arc<Context>) -> Self {
         Self {
             ctx,
@@ -490,36 +509,36 @@ impl NoteMcpServer {
 
 #[tool_router(router = tool_router)]
 impl NoteMcpServer {
-    /// Save a note with a title, body, attachments, and optional existing label keys.
     #[tool(
         name = "save_note",
-        description = "Save a note with a title, Markdown content, optional attachments, and optional labels. Attachment content can use `content` for UTF-8 text or `content_base64` for binary bytes."
+        description = "Save a note with a title, Markdown content, and optional labels."
     )]
     pub async fn save_note(
         &self,
         params: Parameters<SaveNoteRequest>,
     ) -> Result<Json<SaveNoteResponse>, ErrorData> {
-        let input = params.0.try_into()?;
-        let output = save_note_tool(&self.ctx, input)
+        let output = save_note_tool(&self.ctx, params.0.into())
             .await
             .map_err(to_error_data)?;
         Ok(Json(output.into()))
     }
 
-    /// Fetch a single note by id.
-    #[tool(name = "get_note", description = "Fetch a single note by id.")]
+    #[tool(
+        name = "get_note",
+        description = "Fetch note content, labels, timestamps, and attachment metadata by note id."
+    )]
     pub async fn get_note(
         &self,
         params: Parameters<GetNoteRequest>,
-    ) -> Result<Json<NoteResponse>, ErrorData> {
+    ) -> Result<Json<NoteDetailResponse>, ErrorData> {
         let id = params.0.id;
-        let output = get_note_tool(&self.ctx, &id).await.map_err(to_error_data)?;
-        let note =
-            output.ok_or_else(|| to_error_data(anyhow::anyhow!("note not found: {}", id)))?;
+        let note = get_note_tool(&self.ctx, &id)
+            .await
+            .map_err(to_error_data)?
+            .ok_or_else(|| ErrorData::resource_not_found(format!("note not found: {id}"), None))?;
         Ok(Json(note.into()))
     }
 
-    /// Read a note's body as numbered lines with a content tag.
     #[tool(
         name = "read_note_lines",
         description = "Read a note's Markdown body as numbered lines with a content tag for editing."
@@ -529,54 +548,47 @@ impl NoteMcpServer {
         params: Parameters<ReadNoteLinesRequest>,
     ) -> Result<Json<NoteLinesResponse>, ErrorData> {
         let id = params.0.id;
-        let output = read_note_lines_tool(&self.ctx, &id)
+        let note = read_note_lines_tool(&self.ctx, &id)
             .await
-            .map_err(to_error_data)?;
-        let note =
-            output.ok_or_else(|| to_error_data(anyhow::anyhow!("note not found: {}", id)))?;
+            .map_err(to_error_data)?
+            .ok_or_else(|| ErrorData::resource_not_found(format!("note not found: {id}"), None))?;
         Ok(Json(note.into()))
     }
 
-    /// Edit a note's body with line-range operations guarded by a content tag.
     #[tool(
         name = "edit_note",
-        description = "Edit a note's Markdown body with line-range operations (swap/delete/insert) anchored by a content tag; rejects if the note changed since it was read."
+        description = "Edit a note's Markdown body with line-range operations anchored by a content tag."
     )]
     pub async fn edit_note(
         &self,
         params: Parameters<EditNoteRequest>,
     ) -> Result<Json<NoteLinesResponse>, ErrorData> {
-        let req = params.0;
-        let id = req.id;
-        let edits = req.edits.into_iter().map(Into::into).collect();
-        let output = edit_note_tool(&self.ctx, &id, &req.tag, edits)
+        let request = params.0;
+        let id = request.id;
+        let edits = request.edits.into_iter().map(Into::into).collect();
+        let note = edit_note_tool(&self.ctx, &id, &request.tag, edits)
             .await
-            .map_err(to_error_data)?;
-        let note =
-            output.ok_or_else(|| to_error_data(anyhow::anyhow!("note not found: {}", id)))?;
+            .map_err(to_error_data)?
+            .ok_or_else(|| ErrorData::resource_not_found(format!("note not found: {id}"), None))?;
         Ok(Json(note.into()))
     }
 
-    /// Update an existing note's title, body, attachments, and labels.
     #[tool(
         name = "update_note",
-        description = "Update an existing note's title, Markdown content, attachments, and labels by id. Attachment content can use `content` for UTF-8 text or `content_base64` for binary bytes."
+        description = "Update a note's title, Markdown content, and labels while preserving attachments."
     )]
     pub async fn update_note(
         &self,
         params: Parameters<UpdateNoteRequest>,
-    ) -> Result<Json<NoteResponse>, ErrorData> {
+    ) -> Result<Json<NoteDetailResponse>, ErrorData> {
         let id = params.0.id.clone();
-        let input = params.0.try_into()?;
-        let output = update_note_tool(&self.ctx, input)
+        let note = update_note_tool(&self.ctx, params.0.into())
             .await
-            .map_err(to_error_data)?;
-        let note =
-            output.ok_or_else(|| to_error_data(anyhow::anyhow!("note not found: {}", id)))?;
+            .map_err(to_error_data)?
+            .ok_or_else(|| ErrorData::resource_not_found(format!("note not found: {id}"), None))?;
         Ok(Json(note.into()))
     }
 
-    /// Delete a note by id.
     #[tool(name = "delete_note", description = "Delete a note by id.")]
     pub async fn delete_note(
         &self,
@@ -588,21 +600,20 @@ impl NoteMcpServer {
         Ok(Json(DeleteNoteResponse { deleted }))
     }
 
-    /// List saved notes.
     #[tool(
         name = "list_notes",
-        description = "List saved notes with optional limit, offset, and label selector filters."
+        description = "List note summaries with optional limit, offset, and label selector filters."
     )]
     pub async fn list_notes(
         &self,
         params: Parameters<ListNotesRequest>,
     ) -> Result<Json<NoteListResponse>, ErrorData> {
-        let req = params.0;
+        let request = params.0;
         let notes = list_notes_tool(
             &self.ctx,
-            req.limit.map(i64::from),
-            req.offset.map(i64::from),
-            req.label,
+            request.limit.map(i64::from),
+            request.offset.map(i64::from),
+            request.label,
         )
         .await
         .map_err(to_error_data)?;
@@ -611,10 +622,9 @@ impl NoteMcpServer {
         }))
     }
 
-    /// Weighted title-FTS and dense-content retrieval over saved notes.
     #[tool(
         name = "semantic_search",
-        description = "Search saved notes semantically with an optional label selector filter and return the top matches."
+        description = "Search note summaries semantically with an optional label selector."
     )]
     pub async fn semantic_search(
         &self,
@@ -623,8 +633,71 @@ impl NoteMcpServer {
         let results = semantic_search_tool(&self.ctx, params.0.into())
             .await
             .map_err(to_error_data)?;
-        let hits = results.into_iter().map(Into::into).collect();
-        Ok(Json(SemanticSearchResponse { results: hits }))
+        Ok(Json(SemanticSearchResponse {
+            results: results.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    #[tool(
+        name = "put_note_attachment",
+        description = "Add or replace one note attachment by attachment id."
+    )]
+    pub async fn put_note_attachment(
+        &self,
+        params: Parameters<PutNoteAttachmentRequest>,
+    ) -> Result<Json<PutNoteAttachmentResponse>, ErrorData> {
+        let input = params.0.try_into()?;
+        let output = put_note_attachment_tool(&self.ctx, input)
+            .await
+            .map_err(to_put_error_data)?;
+        Ok(Json(output.into()))
+    }
+
+    #[tool(
+        name = "get_note_attachment_content",
+        description = "Fetch one note attachment's content by attachment id."
+    )]
+    pub async fn get_note_attachment_content(
+        &self,
+        params: Parameters<GetNoteAttachmentContentRequest>,
+    ) -> Result<Json<GetNoteAttachmentContentResponse>, ErrorData> {
+        let request = params.0;
+        let note_id = request.note_id.clone();
+        let attachment_id = request.attachment_id.clone();
+        let output = get_note_attachment_content_tool(
+            &self.ctx,
+            GetNoteAttachmentContentToolInput {
+                note_id,
+                attachment_id,
+            },
+        )
+        .await
+        .map_err(to_error_data)?
+        .ok_or_else(|| {
+            ErrorData::resource_not_found(
+                format!(
+                    "note attachment not found: note {}, attachment {}",
+                    request.note_id, request.attachment_id
+                ),
+                None,
+            )
+        })?;
+        Ok(Json(output.into()))
+    }
+
+    #[tool(
+        name = "delete_note_attachment",
+        description = "Delete one note attachment by attachment id."
+    )]
+    pub async fn delete_note_attachment(
+        &self,
+        params: Parameters<DeleteNoteAttachmentRequest>,
+    ) -> Result<Json<DeleteNoteAttachmentResponse>, ErrorData> {
+        let deleted =
+            delete_note_attachment_tool(&self.ctx, &params.0.note_id, &params.0.attachment_id)
+                .await
+                .map_err(to_error_data)?;
+        Ok(Json(DeleteNoteAttachmentResponse { deleted }))
     }
 }
 
@@ -633,20 +706,45 @@ impl ServerHandler for NoteMcpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
         info.instructions = Some(
-            "Note server exposing save_note, get_note, read_note_lines, edit_note, update_note, delete_note, list_notes, and semantic_search over MCP."
+            "Note server exposing note CRUD, summary/list/search, tagged line editing, and standalone attachment put/get/delete tools over MCP."
                 .to_string(),
         );
         info
     }
 }
 
-/// Map a pipeline/anyhow error into an MCP JSON-RPC internal error.
-fn to_error_data(err: anyhow::Error) -> ErrorData {
-    ErrorData::internal_error(err.to_string(), None)
+fn to_error_data(error: anyhow::Error) -> ErrorData {
+    if error.downcast_ref::<note_core::ValidationError>().is_some() {
+        return ErrorData::invalid_params(error.to_string(), None);
+    }
+    if let Some(error_kind) = error.downcast_ref::<AttachmentMutationError>() {
+        return match error_kind {
+            AttachmentMutationError::NoteNotFound(_)
+            | AttachmentMutationError::AttachmentNotFound { .. } => {
+                ErrorData::resource_not_found(error.to_string(), None)
+            }
+            AttachmentMutationError::AttachmentPathChange { .. }
+            | AttachmentMutationError::AttachmentPathCollision { .. } => {
+                ErrorData::internal_error(error.to_string(), None)
+            }
+        };
+    }
+    ErrorData::internal_error(error.to_string(), None)
 }
 
-/// Serve the note tools as an MCP server over stdio until the client
-/// disconnects. JSON-RPC flows on stdin/stdout; keep logs on stderr.
+fn to_put_error_data(error: anyhow::Error) -> ErrorData {
+    if matches!(
+        error.downcast_ref::<AttachmentMutationError>(),
+        Some(
+            AttachmentMutationError::AttachmentPathChange { .. }
+                | AttachmentMutationError::AttachmentPathCollision { .. }
+        )
+    ) {
+        return ErrorData::invalid_params(error.to_string(), None);
+    }
+    to_error_data(error)
+}
+
 pub async fn run_stdio(ctx: Arc<Context>) -> anyhow::Result<()> {
     let server = NoteMcpServer::new(ctx);
     let running = server.serve(stdio()).await?;
@@ -665,8 +763,6 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    // Returns the TempDir guard alongside the Context so the caller keeps it
-    // alive: dropping it deletes the DB directory (mirrors note-pipelines tests).
     async fn test_context() -> (Context, Arc<dyn StorageBackend>, TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let backend: Arc<dyn StorageBackend> = Arc::new(
@@ -684,303 +780,58 @@ mod tests {
         (ctx, backend, dir)
     }
 
-    fn attachment_request(
+    fn put_request(
+        note_id: &str,
+        attachment_id: &str,
+        path: &str,
         content: Option<&str>,
         content_base64: Option<&str>,
-    ) -> AttachmentRequestSchema {
-        AttachmentRequestSchema {
-            id: "blob".into(),
-            path: "./blob.bin".into(),
+    ) -> PutNoteAttachmentRequest {
+        PutNoteAttachmentRequest {
+            note_id: note_id.into(),
+            attachment_id: attachment_id.into(),
+            path: path.into(),
             mime: "application/octet-stream".into(),
-            description: "raw".into(),
+            description: format!("{attachment_id} description"),
             content: content.map(str::to_owned),
             content_base64: content_base64.map(str::to_owned),
         }
     }
 
-    #[tokio::test]
-    async fn server_builds_and_lists_all_tools() {
-        let (ctx, _backend, _dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
-        let tools = server.tool_router.list_all();
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-        assert!(names.contains(&"save_note"), "save_note missing: {names:?}");
-        assert!(names.contains(&"get_note"), "get_note missing: {names:?}");
-        assert!(
-            names.contains(&"read_note_lines"),
-            "read_note_lines missing: {names:?}"
-        );
-        assert!(names.contains(&"edit_note"), "edit_note missing: {names:?}");
-        assert!(
-            names.contains(&"update_note"),
-            "update_note missing: {names:?}"
-        );
-        assert!(
-            names.contains(&"delete_note"),
-            "delete_note missing: {names:?}"
-        );
-        assert!(
-            names.contains(&"list_notes"),
-            "list_notes missing: {names:?}"
-        );
-        assert!(
-            names.contains(&"semantic_search"),
-            "semantic_search missing: {names:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_attachment_inputs_return_invalid_params_without_writes() {
-        let (ctx, backend, dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
-        for (attachment, expected) in [
-            (
-                attachment_request(None, Some("not base64 !!")),
-                "invalid attachment content_base64",
-            ),
-            (
-                attachment_request(None, None),
-                "attachment content or content_base64 is required",
-            ),
-            (
-                attachment_request(Some("abc"), Some("eHl6")),
-                "attachment content and content_base64 do not match",
-            ),
-        ] {
-            let result = server
-                .save_note(Parameters(SaveNoteRequest {
-                    title: "Rejected".into(),
-                    content: "Body".into(),
-                    attachments: vec![attachment],
-                    labels: vec![],
-                }))
-                .await;
-            let error = match result {
-                Ok(_) => panic!("invalid attachment input was accepted"),
-                Err(error) => error,
-            };
-            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-            assert!(error.message.contains("attachment blob at ./blob.bin"));
-            assert!(error.message.contains(expected), "{}", error.message);
-        }
-
-        let session = backend.session().await.unwrap();
-        let notes = session.list_notes(&[], None, None).await.unwrap();
-        assert!(notes.is_empty());
-        let attachments_dir = dir.path().join("attachments");
-        assert!(
-            !attachments_dir.exists()
-                || std::fs::read_dir(attachments_dir).unwrap().next().is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_text_and_matching_base64_roundtrip_through_update_and_list() {
-        let (ctx, _backend, _dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
-        let saved = server
-            .save_note(Parameters(SaveNoteRequest {
-                title: "Text".into(),
-                content: "Body".into(),
-                attachments: vec![AttachmentRequestSchema {
-                    id: "text".into(),
-                    path: "./text.txt".into(),
-                    mime: "text/plain".into(),
-                    description: String::new(),
-                    content: Some("plain text\n".into()),
-                    content_base64: None,
-                }],
-                labels: vec![],
-            }))
-            .await
-            .unwrap()
-            .0;
-
-        let fetched = server
-            .get_note(Parameters(GetNoteRequest {
-                id: saved.id.clone(),
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(
-            fetched.attachments[0].content.as_deref(),
-            Some("plain text\n")
-        );
-        assert_eq!(fetched.attachments[0].content_base64, "cGxhaW4gdGV4dAo=");
-
-        let updated = server
-            .update_note(Parameters(UpdateNoteRequest {
-                id: saved.id.clone(),
-                title: "Text updated".into(),
-                content: "Updated body".into(),
-                attachments: vec![AttachmentRequestSchema {
-                    id: "text".into(),
-                    path: "./text.txt".into(),
-                    mime: "text/plain".into(),
-                    description: String::new(),
-                    content: Some("plain text\n".into()),
-                    content_base64: Some("cGxhaW4gdGV4dAo=".into()),
-                }],
-                labels: vec![],
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(
-            updated.attachments[0].content.as_deref(),
-            Some("plain text\n")
-        );
-        assert_eq!(updated.attachments[0].content_base64, "cGxhaW4gdGV4dAo=");
-
-        let listed = server
-            .list_notes(Parameters(ListNotesRequest {
-                limit: None,
-                offset: None,
-                label: None,
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(listed.notes.len(), 1);
-        assert_eq!(listed.notes[0].title, "Text updated");
-        assert_eq!(
-            listed.notes[0].attachments[0].content.as_deref(),
-            Some("plain text\n")
-        );
-        assert_eq!(
-            listed.notes[0].attachments[0].content_base64,
-            "cGxhaW4gdGV4dAo="
-        );
-
-        let result = server
-            .update_note(Parameters(UpdateNoteRequest {
-                id: saved.id.clone(),
-                title: "Rejected update".into(),
-                content: "Rejected body".into(),
-                attachments: vec![attachment_request(None, None)],
-                labels: vec![],
-            }))
-            .await;
-        let error = match result {
-            Ok(_) => panic!("invalid attachment update was accepted"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-        let unchanged = server
-            .get_note(Parameters(GetNoteRequest { id: saved.id }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(unchanged.title, "Text updated");
-        assert_eq!(unchanged.content, "Updated body");
-    }
-
-    #[tokio::test]
-    async fn binary_note_response_uses_canonical_base64_and_omits_text() {
-        let (ctx, _backend, dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
-        let saved = server
-            .save_note(Parameters(SaveNoteRequest {
-                title: "Binary".into(),
-                content: "Body".into(),
-                attachments: vec![attachment_request(None, Some("AJ+Slv8="))],
-                labels: vec![],
-            }))
-            .await
-            .unwrap()
-            .0;
-        let response = server
-            .get_note(Parameters(GetNoteRequest {
-                id: saved.id.clone(),
-            }))
-            .await
-            .unwrap()
-            .0;
-        let json = serde_json::to_value(response).unwrap();
-
-        assert_eq!(
-            json["attachments"][0],
-            json!({
-                "id": "blob",
-                "path": "./blob.bin",
-                "mime": "application/octet-stream",
-                "description": "raw",
-                "content_base64": "AJ+Slv8="
-            })
-        );
-        assert_eq!(
-            json.as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec![
-                "attachments",
-                "content",
-                "created_at",
-                "id",
-                "labels",
-                "title",
-                "updated_at"
-            ]
-        );
-        assert_eq!(
-            std::fs::read(
-                dir.path()
-                    .join("attachments")
-                    .join(saved.id)
-                    .join("blob.bin")
+    fn tool_schema(server: &NoteMcpServer, name: &str, output: bool) -> serde_json::Value {
+        let tool = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("tool missing: {name}"));
+        if output {
+            serde_json::Value::Object(
+                tool.output_schema
+                    .unwrap_or_else(|| panic!("{name} output schema missing"))
+                    .as_ref()
+                    .clone(),
             )
-            .unwrap(),
-            vec![0x00, 0x9f, 0x92, 0x96, 0xff]
-        );
+        } else {
+            serde_json::Value::Object(tool.input_schema.as_ref().clone())
+        }
     }
 
-    #[tokio::test]
-    async fn attachment_request_and_response_schemas_advertise_distinct_content_shapes() {
-        let request = serde_json::to_value(schemars::schema_for!(AttachmentRequestSchema)).unwrap();
-        let response =
-            serde_json::to_value(schemars::schema_for!(AttachmentResponseSchema)).unwrap();
-        assert_attachment_content_requirement(&request);
-        let request_required = request["required"].as_array().unwrap();
-        assert!(!request_required.iter().any(|value| value == "content"));
-        assert!(!request_required
-            .iter()
-            .any(|value| value == "content_base64"));
-        assert!(response.pointer("/properties/content").is_some());
-        assert!(response.pointer("/properties/content_base64").is_some());
-        assert!(response["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value == "content_base64"));
-
-        let (ctx, _backend, _dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
-        for name in ["save_note", "update_note"] {
-            let tool = server
-                .tool_router
-                .list_all()
-                .into_iter()
-                .find(|tool| tool.name.as_ref() == name)
-                .unwrap();
-            assert!(tool
-                .description
-                .as_deref()
-                .is_some_and(|description| description.contains("content_base64")));
-            let schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
-            let attachment_schema = find_attachment_request_schema(&schema)
-                .unwrap_or_else(|| panic!("{name} attachment schema missing: {schema}"));
-            assert_attachment_content_requirement(attachment_schema);
-        }
+    fn property_names(schema: &serde_json::Value) -> Vec<String> {
+        let mut names = schema["properties"]
+            .as_object()
+            .expect("schema properties")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     fn assert_attachment_content_requirement(schema: &serde_json::Value) {
         assert!(schema.pointer("/properties/content").is_some());
         assert!(schema.pointer("/properties/content_base64").is_some());
         assert!(schema.get("oneOf").is_none());
-
         let mut required = schema["anyOf"]
             .as_array()
             .expect("attachment schema anyOf")
@@ -994,20 +845,474 @@ mod tests {
         );
     }
 
-    fn find_attachment_request_schema(schema: &serde_json::Value) -> Option<&serde_json::Value> {
-        if schema.pointer("/properties/content").is_some()
-            && schema.pointer("/properties/content_base64").is_some()
-        {
-            return Some(schema);
+    fn expect_error<T>(result: Result<T, ErrorData>) -> ErrorData {
+        match result {
+            Ok(_) => panic!("request unexpectedly succeeded"),
+            Err(error) => error,
         }
-        match schema {
-            serde_json::Value::Array(values) => {
-                values.iter().find_map(find_attachment_request_schema)
-            }
-            serde_json::Value::Object(values) => {
-                values.values().find_map(find_attachment_request_schema)
-            }
-            _ => None,
+    }
+
+    fn schema_allows_null(schema: &serde_json::Value) -> bool {
+        schema["type"] == "null"
+            || schema["type"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value == "null"))
+            || ["anyOf", "oneOf"].into_iter().any(|keyword| {
+                schema[keyword]
+                    .as_array()
+                    .is_some_and(|branches| branches.iter().any(schema_allows_null))
+            })
+    }
+
+    #[tokio::test]
+    async fn server_builds_and_lists_exactly_eleven_tools() {
+        let (ctx, _backend, _dir) = test_context().await;
+        let server = NoteMcpServer::new(Arc::new(ctx));
+        let mut names = server
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "delete_note",
+                "delete_note_attachment",
+                "edit_note",
+                "get_note",
+                "get_note_attachment_content",
+                "list_notes",
+                "put_note_attachment",
+                "read_note_lines",
+                "save_note",
+                "semantic_search",
+                "update_note",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn advertised_schemas_are_bounded_and_keep_nullable_filters() {
+        let (ctx, _backend, _dir) = test_context().await;
+        let server = NoteMcpServer::new(Arc::new(ctx));
+
+        assert_eq!(
+            property_names(&tool_schema(&server, "save_note", false)),
+            vec!["content", "labels", "title"]
+        );
+        assert_eq!(
+            property_names(&tool_schema(&server, "update_note", false)),
+            vec!["content", "id", "labels", "title"]
+        );
+
+        let put_schema = tool_schema(&server, "put_note_attachment", false);
+        assert_attachment_content_requirement(&put_schema);
+        let list_input = tool_schema(&server, "list_notes", false);
+        assert!(schema_allows_null(&list_input["properties"]["label"]));
+
+        let list_output = tool_schema(&server, "list_notes", true).to_string();
+        assert!(!list_output.contains("\"content\""));
+        assert!(!list_output.contains("\"attachments\""));
+        let search_output = tool_schema(&server, "semantic_search", true).to_string();
+        for field in [
+            "\"id\"",
+            "\"title\"",
+            "\"score\"",
+            "\"labels\"",
+            "\"created_at\"",
+            "\"updated_at\"",
+        ] {
+            assert!(search_output.contains(field), "{field}: {search_output}");
         }
+        assert!(!search_output.contains("\"content\""));
+        assert!(!search_output.contains("\"attachments\""));
+    }
+
+    #[test]
+    fn response_schema_types_have_exact_fields() {
+        assert_eq!(
+            property_names(
+                &serde_json::to_value(schemars::schema_for!(AttachmentMetadataSchema)).unwrap()
+            ),
+            vec!["description", "id", "mime", "path"]
+        );
+        assert_eq!(
+            property_names(
+                &serde_json::to_value(schemars::schema_for!(NoteSummaryResponse)).unwrap()
+            ),
+            vec!["created_at", "id", "labels", "title", "updated_at"]
+        );
+        assert_eq!(
+            property_names(
+                &serde_json::to_value(schemars::schema_for!(NoteDetailResponse)).unwrap()
+            ),
+            vec![
+                "attachments",
+                "content",
+                "created_at",
+                "id",
+                "labels",
+                "title",
+                "updated_at",
+            ]
+        );
+        assert_eq!(
+            property_names(
+                &serde_json::to_value(schemars::schema_for!(SemanticSearchHit)).unwrap()
+            ),
+            vec!["created_at", "id", "labels", "score", "title", "updated_at"]
+        );
+    }
+
+    #[test]
+    fn save_and_update_deserialization_rejects_inline_attachments() {
+        let save = serde_json::from_value::<SaveNoteRequest>(json!({
+            "title": "Legacy",
+            "content": "Body",
+            "attachments": []
+        }));
+        assert!(save.is_err());
+
+        let update = serde_json::from_value::<UpdateNoteRequest>(json!({
+            "id": "note-1",
+            "title": "Legacy",
+            "content": "Body",
+            "attachments": []
+        }));
+        assert!(update.is_err());
+    }
+
+    #[test]
+    fn only_put_maps_attachment_path_faults_to_invalid_params() {
+        let path_change = || {
+            anyhow::Error::new(AttachmentMutationError::AttachmentPathChange {
+                attachment_id: "blob".into(),
+            })
+        };
+        assert_eq!(
+            to_put_error_data(path_change()).code,
+            ErrorCode::INVALID_PARAMS
+        );
+        assert_eq!(to_error_data(path_change()).code, ErrorCode::INTERNAL_ERROR);
+
+        let collision = anyhow::Error::new(AttachmentMutationError::AttachmentPathCollision {
+            path: "blob.bin".into(),
+        });
+        assert_eq!(to_put_error_data(collision).code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn standalone_handlers_use_metadata_and_exclusive_content_shapes() {
+        let (ctx, _backend, dir) = test_context().await;
+        let server = NoteMcpServer::new(Arc::new(ctx));
+        let saved = server
+            .save_note(Parameters(SaveNoteRequest {
+                title: "Standalone".into(),
+                content: "searchable body".into(),
+                labels: vec![("topic".into(), "rust".into())],
+            }))
+            .await
+            .unwrap()
+            .0;
+        let text = server
+            .put_note_attachment(Parameters(put_request(
+                &saved.id,
+                "text",
+                "./text.txt",
+                Some("plain text\n"),
+                None,
+            )))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::to_value(text).unwrap(),
+            json!({
+                "created": true,
+                "attachment": {
+                    "id": "text",
+                    "path": "./text.txt",
+                    "mime": "application/octet-stream",
+                    "description": "text description"
+                }
+            })
+        );
+        server
+            .put_note_attachment(Parameters(put_request(
+                &saved.id,
+                "blob",
+                "./blob.bin",
+                None,
+                Some("AJ+Slv8="),
+            )))
+            .await
+            .unwrap();
+
+        let detail = server
+            .get_note(Parameters(GetNoteRequest {
+                id: saved.id.clone(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        let detail_json = serde_json::to_value(detail).unwrap();
+        assert_eq!(
+            detail_json
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "attachments",
+                "content",
+                "created_at",
+                "id",
+                "labels",
+                "title",
+                "updated_at"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
+        assert_eq!(
+            detail_json["attachments"][0],
+            json!({
+                "id": "text",
+                "path": "./text.txt",
+                "mime": "application/octet-stream",
+                "description": "text description"
+            })
+        );
+
+        let text_content = server
+            .get_note_attachment_content(Parameters(GetNoteAttachmentContentRequest {
+                note_id: saved.id.clone(),
+                attachment_id: "text".into(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::to_value(text_content).unwrap(),
+            json!({
+                "attachment": {
+                    "id": "text",
+                    "path": "./text.txt",
+                    "mime": "application/octet-stream",
+                    "description": "text description"
+                },
+                "content": "plain text\n"
+            })
+        );
+        let binary_content = server
+            .get_note_attachment_content(Parameters(GetNoteAttachmentContentRequest {
+                note_id: saved.id.clone(),
+                attachment_id: "blob".into(),
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::to_value(binary_content).unwrap(),
+            json!({
+                "attachment": {
+                    "id": "blob",
+                    "path": "./blob.bin",
+                    "mime": "application/octet-stream",
+                    "description": "blob description"
+                },
+                "content_base64": "AJ+Slv8="
+            })
+        );
+
+        std::fs::remove_file(
+            dir.path()
+                .join("attachments")
+                .join(&saved.id)
+                .join("blob.bin"),
+        )
+        .unwrap();
+        let updated = server
+            .update_note(Parameters(UpdateNoteRequest {
+                id: saved.id.clone(),
+                title: "Standalone updated".into(),
+                content: "updated searchable body".into(),
+                labels: vec![("topic".into(), "rust".into())],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(updated.attachments.len(), 2);
+
+        let listed = server
+            .list_notes(Parameters(ListNotesRequest {
+                limit: None,
+                offset: None,
+                label: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::to_value(&listed.notes[0])
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["created_at", "id", "labels", "title", "updated_at"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+
+        note_pipelines::drain_embedding_jobs(&server.ctx, 10)
+            .await
+            .unwrap();
+        let hit = server
+            .semantic_search(Parameters(SemanticSearchRequest {
+                query: "updated searchable body".into(),
+                limit: 5,
+                label: None,
+            }))
+            .await
+            .unwrap()
+            .0
+            .results
+            .into_iter()
+            .find(|hit| hit.id == saved.id)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(hit)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["created_at", "id", "labels", "score", "title", "updated_at"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+
+        for expected in [true, false] {
+            let deleted = server
+                .delete_note_attachment(Parameters(DeleteNoteAttachmentRequest {
+                    note_id: saved.id.clone(),
+                    attachment_id: "text".into(),
+                }))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(
+                serde_json::to_value(deleted).unwrap(),
+                json!({"deleted": expected})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_attachment_inputs_are_invalid_params_without_writes() {
+        let (ctx, _backend, dir) = test_context().await;
+        let server = NoteMcpServer::new(Arc::new(ctx));
+        let saved = server
+            .save_note(Parameters(SaveNoteRequest {
+                title: "Rejected".into(),
+                content: "Body".into(),
+                labels: vec![],
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        for (request, expected) in [
+            (
+                put_request(&saved.id, "blob", "./blob.bin", None, Some("not base64 !!")),
+                "invalid attachment content_base64",
+            ),
+            (
+                put_request(&saved.id, "blob", "./blob.bin", None, None),
+                "attachment content or content_base64 is required",
+            ),
+            (
+                put_request(&saved.id, "blob", "./blob.bin", Some("abc"), Some("eHl6")),
+                "attachment content and content_base64 do not match",
+            ),
+            (
+                put_request(&saved.id, "blob", "../blob.bin", Some("abc"), None),
+                "attachment path must be relative",
+            ),
+        ] {
+            let error = expect_error(server.put_note_attachment(Parameters(request)).await);
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
+
+        let note_dir = dir.path().join("attachments").join(saved.id);
+        assert!(!note_dir.exists() || std::fs::read_dir(note_dir).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn mutation_faults_and_missing_attachments_have_precise_errors() {
+        let (ctx, _backend, _dir) = test_context().await;
+        let server = NoteMcpServer::new(Arc::new(ctx));
+        let saved = server
+            .save_note(Parameters(SaveNoteRequest {
+                title: "Faults".into(),
+                content: "Body".into(),
+                labels: vec![],
+            }))
+            .await
+            .unwrap()
+            .0;
+        server
+            .put_note_attachment(Parameters(put_request(
+                &saved.id,
+                "first",
+                "./first.txt",
+                Some("first"),
+                None,
+            )))
+            .await
+            .unwrap();
+
+        for request in [
+            put_request(&saved.id, "first", "./moved.txt", Some("moved"), None),
+            put_request(&saved.id, "second", "./first.txt", Some("collision"), None),
+        ] {
+            let error = expect_error(server.put_note_attachment(Parameters(request)).await);
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        }
+
+        let missing_put = expect_error(
+            server
+                .put_note_attachment(Parameters(put_request(
+                    "missing-note",
+                    "blob",
+                    "./blob.bin",
+                    Some("bytes"),
+                    None,
+                )))
+                .await,
+        );
+        assert_eq!(missing_put.code, ErrorCode::RESOURCE_NOT_FOUND);
+        assert!(missing_put.message.contains("note not found: missing-note"));
+
+        let missing_get = expect_error(
+            server
+                .get_note_attachment_content(Parameters(GetNoteAttachmentContentRequest {
+                    note_id: saved.id,
+                    attachment_id: "missing".into(),
+                }))
+                .await,
+        );
+        assert_eq!(missing_get.code, ErrorCode::RESOURCE_NOT_FOUND);
+        assert!(missing_get.message.contains("note attachment not found"));
     }
 }

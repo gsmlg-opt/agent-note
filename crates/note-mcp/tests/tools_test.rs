@@ -4,8 +4,11 @@ use note_core::{
 };
 use note_embedding::StubEmbedder;
 use note_mcp::{
-    delete_note_tool, edit_note_tool, get_note_tool, list_notes_tool, read_note_lines_tool,
-    save_note_tool, semantic_search_tool, update_note_tool, AttachmentData, SaveNoteToolInput,
+    delete_note_attachment_tool, delete_note_tool, edit_note_tool,
+    get_note_attachment_content_tool, get_note_tool, list_notes_tool, put_note_attachment_tool,
+    read_note_lines_tool, save_note_tool, semantic_search_tool, update_note_tool,
+    AttachmentMetadataData, GetNoteAttachmentContentToolInput, NoteDetailData, NoteSummaryData,
+    PutNoteAttachmentToolInput, PutNoteAttachmentToolOutput, SaveNoteToolInput,
     SemanticSearchToolInput, UpdateNoteToolInput,
 };
 use note_pipelines::{drain_embedding_jobs, update_system_config, Context, EditOp};
@@ -31,108 +34,236 @@ async fn test_context() -> (Context, Arc<dyn StorageBackend>, TempDir) {
     (ctx, backend, dir)
 }
 
-#[tokio::test]
-async fn save_note_tool_returns_an_id() {
-    let (ctx, _backend, _dir) = test_context().await;
-    let result = save_note_tool(
-        &ctx,
+async fn save(ctx: &Context, title: &str, content: &str) -> String {
+    save_note_tool(
+        ctx,
         SaveNoteToolInput {
-            title: "Title".into(),
-            content: "Content".into(),
-            attachments: vec![],
-            labels: vec![],
-        },
-    )
-    .await
-    .unwrap();
-    assert!(!result.id.is_empty());
-}
-
-#[tokio::test]
-async fn binary_attachment_roundtrips_through_save_get_update_and_list() {
-    let (ctx, _backend, dir) = test_context().await;
-    let bytes = vec![0x00, 0x9f, 0x92, 0x96, 0xff];
-    let attachment = AttachmentData {
-        id: "blob".into(),
-        path: "./blob.bin".into(),
-        mime: "application/octet-stream".into(),
-        description: "raw bytes".into(),
-        content: bytes.clone(),
-    };
-    let saved = save_note_tool(
-        &ctx,
-        SaveNoteToolInput {
-            title: "Binary".into(),
-            content: "First line".into(),
-            attachments: vec![attachment.clone()],
-            labels: vec![],
-        },
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        std::fs::read(
-            dir.path()
-                .join("attachments")
-                .join(&saved.id)
-                .join("blob.bin")
-        )
-        .unwrap(),
-        bytes
-    );
-    let fetched = get_note_tool(&ctx, &saved.id).await.unwrap().unwrap();
-    assert_eq!(fetched.attachments, vec![attachment.clone()]);
-
-    let updated = update_note_tool(
-        &ctx,
-        UpdateNoteToolInput {
-            id: saved.id.clone(),
-            title: "Binary updated".into(),
-            content: "Updated body".into(),
-            attachments: vec![attachment.clone()],
+            title: title.into(),
+            content: content.into(),
             labels: vec![],
         },
     )
     .await
     .unwrap()
-    .unwrap();
-    assert_eq!(updated.attachments, vec![attachment.clone()]);
+    .id
+}
 
-    let listed = list_notes_tool(&ctx, None, None, None).await.unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].attachments, vec![attachment]);
+fn put_input(
+    note_id: &str,
+    attachment_id: &str,
+    path: &str,
+    mime: &str,
+    content: Vec<u8>,
+) -> PutNoteAttachmentToolInput {
+    PutNoteAttachmentToolInput {
+        note_id: note_id.into(),
+        attachment_id: attachment_id.into(),
+        path: path.into(),
+        mime: mime.into(),
+        description: format!("{attachment_id} description"),
+        content,
+    }
 }
 
 #[tokio::test]
-async fn line_edit_preserves_binary_attachment_bytes() {
+async fn save_then_put_text_and_binary_attachments() {
     let (ctx, _backend, dir) = test_context().await;
-    let bytes = vec![0x00, 0x9f, 0x92, 0x96, 0xff];
-    let saved = save_note_tool(
+    let note_id = save(&ctx, "Attachments", "Body").await;
+
+    let text = put_note_attachment_tool(
         &ctx,
-        SaveNoteToolInput {
-            title: "Binary edit".into(),
-            content: "First line".into(),
-            attachments: vec![AttachmentData {
-                id: "blob".into(),
-                path: "./blob.bin".into(),
-                mime: "application/octet-stream".into(),
-                description: String::new(),
-                content: bytes.clone(),
-            }],
-            labels: vec![],
-        },
+        put_input(
+            &note_id,
+            "text",
+            "./text.txt",
+            "text/plain",
+            b"plain text\n".to_vec(),
+        ),
     )
     .await
     .unwrap();
-    let read = read_note_lines_tool(&ctx, &saved.id)
-        .await
-        .unwrap()
-        .unwrap();
+    let binary_bytes = vec![0x00, 0x9f, 0x92, 0x96, 0xff];
+    let binary = put_note_attachment_tool(
+        &ctx,
+        put_input(
+            &note_id,
+            "blob",
+            "./blob.bin",
+            "application/octet-stream",
+            binary_bytes.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let PutNoteAttachmentToolOutput {
+        created,
+        attachment:
+            AttachmentMetadataData {
+                id,
+                path,
+                mime,
+                description,
+            },
+    } = text;
+    assert!(created);
+    assert_eq!(id, "text");
+    assert_eq!(path, "./text.txt");
+    assert_eq!(mime, "text/plain");
+    assert_eq!(description, "text description");
+    assert!(binary.created);
+    assert_eq!(binary.attachment.id, "blob");
+    assert_eq!(
+        std::fs::read(
+            dir.path()
+                .join("attachments")
+                .join(&note_id)
+                .join("blob.bin")
+        )
+        .unwrap(),
+        binary_bytes
+    );
+
+    let replacement_bytes = vec![3, 2, 1];
+    let replacement = put_note_attachment_tool(
+        &ctx,
+        put_input(
+            &note_id,
+            "blob",
+            "./blob.bin",
+            "application/new-binary",
+            replacement_bytes.clone(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(!replacement.created);
+    assert_eq!(replacement.attachment.id, "blob");
+    assert_eq!(replacement.attachment.mime, "application/new-binary");
+    let selected = get_note_attachment_content_tool(
+        &ctx,
+        GetNoteAttachmentContentToolInput {
+            note_id,
+            attachment_id: "blob".into(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(selected.content, replacement_bytes);
+}
+
+#[tokio::test]
+async fn get_update_list_and_line_read_do_not_require_attachment_content() {
+    let (ctx, _backend, dir) = test_context().await;
+    let note_id = save(&ctx, "Metadata", "First line").await;
+    put_note_attachment_tool(
+        &ctx,
+        put_input(
+            &note_id,
+            "missing",
+            "./missing.bin",
+            "application/octet-stream",
+            vec![1, 2, 3],
+        ),
+    )
+    .await
+    .unwrap();
+    std::fs::remove_file(
+        dir.path()
+            .join("attachments")
+            .join(&note_id)
+            .join("missing.bin"),
+    )
+    .unwrap();
+
+    let fetched = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
+    assert_eq!(fetched.content, "First line");
+    assert_eq!(fetched.attachments.len(), 1);
+    assert_eq!(fetched.attachments[0].id, "missing");
+
+    let updated = update_note_tool(
+        &ctx,
+        UpdateNoteToolInput {
+            id: note_id.clone(),
+            title: "Metadata updated".into(),
+            content: "Updated line".into(),
+            labels: vec![("topic".into(), "rust".into())],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(updated.title, "Metadata updated");
+    assert_eq!(updated.attachments, fetched.attachments);
+    let NoteDetailData {
+        id,
+        title,
+        content,
+        attachments,
+        labels,
+        created_at,
+        updated_at,
+    } = updated;
+    assert_eq!(id, note_id);
+    assert_eq!(title, "Metadata updated");
+    assert_eq!(content, "Updated line");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].key, "topic");
+    assert_eq!(labels[0].value, "rust");
+    assert!(created_at > 0);
+    assert!(updated_at >= created_at);
+
+    let lines = read_note_lines_tool(&ctx, &note_id).await.unwrap().unwrap();
+    assert_eq!(lines.lines.len(), 1);
+    assert_eq!(lines.lines[0].text, "Updated line");
+
+    let listed = list_notes_tool(&ctx, None, None, None).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let NoteSummaryData {
+        id,
+        title,
+        labels,
+        created_at,
+        updated_at,
+    } = listed.into_iter().next().unwrap();
+    assert_eq!(id, note_id);
+    assert_eq!(title, "Metadata updated");
+    assert_eq!(labels.len(), 1);
+    assert_eq!(labels[0].key, "topic");
+    assert_eq!(labels[0].value, "rust");
+    assert!(updated_at >= created_at);
+}
+
+#[tokio::test]
+async fn line_edit_preserves_attachment_metadata_without_reading_bytes() {
+    let (ctx, _backend, dir) = test_context().await;
+    let note_id = save(&ctx, "Line edit", "First line").await;
+    put_note_attachment_tool(
+        &ctx,
+        put_input(
+            &note_id,
+            "blob",
+            "./blob.bin",
+            "application/octet-stream",
+            vec![0, 1, 2],
+        ),
+    )
+    .await
+    .unwrap();
+    std::fs::remove_file(
+        dir.path()
+            .join("attachments")
+            .join(&note_id)
+            .join("blob.bin"),
+    )
+    .unwrap();
+    let read = read_note_lines_tool(&ctx, &note_id).await.unwrap().unwrap();
 
     let edited = edit_note_tool(
         &ctx,
-        &saved.id,
+        &note_id,
         &read.tag,
         vec![EditOp::InsertTail {
             lines: vec!["Second line".into()],
@@ -143,45 +274,110 @@ async fn line_edit_preserves_binary_attachment_bytes() {
     .unwrap();
 
     assert_eq!(edited.lines.len(), 2);
-    assert_eq!(edited.lines[1].text, "Second line");
-    let fetched = get_note_tool(&ctx, &saved.id).await.unwrap().unwrap();
+    let fetched = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
     assert_eq!(fetched.content, "First line\nSecond line");
-    assert_eq!(fetched.attachments[0].content, bytes);
-    assert_eq!(
-        std::fs::read(
-            dir.path()
-                .join("attachments")
-                .join(&saved.id)
-                .join("blob.bin")
-        )
-        .unwrap(),
-        fetched.attachments[0].content
-    );
+    assert_eq!(fetched.attachments[0].id, "blob");
+}
+
+#[tokio::test]
+async fn selected_attachment_content_read_does_not_read_siblings() {
+    let (ctx, _backend, dir) = test_context().await;
+    let note_id = save(&ctx, "Selected read", "Body").await;
+    put_note_attachment_tool(
+        &ctx,
+        put_input(
+            &note_id,
+            "selected",
+            "./selected.txt",
+            "text/plain",
+            b"selected bytes".to_vec(),
+        ),
+    )
+    .await
+    .unwrap();
+    put_note_attachment_tool(
+        &ctx,
+        put_input(
+            &note_id,
+            "missing-sibling",
+            "./missing.bin",
+            "application/octet-stream",
+            vec![9, 8, 7],
+        ),
+    )
+    .await
+    .unwrap();
+    std::fs::remove_file(
+        dir.path()
+            .join("attachments")
+            .join(&note_id)
+            .join("missing.bin"),
+    )
+    .unwrap();
+
+    let selected = get_note_attachment_content_tool(
+        &ctx,
+        GetNoteAttachmentContentToolInput {
+            note_id,
+            attachment_id: "selected".into(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(selected.attachment.id, "selected");
+    assert_eq!(selected.content, b"selected bytes");
+}
+
+#[tokio::test]
+async fn delete_attachment_is_idempotent_and_leaves_siblings_intact() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let note_id = save(&ctx, "Delete attachment", "Body").await;
+    for (id, path, content) in [
+        ("remove", "./remove.txt", b"remove".to_vec()),
+        ("keep", "./keep.txt", b"keep".to_vec()),
+    ] {
+        put_note_attachment_tool(&ctx, put_input(&note_id, id, path, "text/plain", content))
+            .await
+            .unwrap();
+    }
+
+    assert!(delete_note_attachment_tool(&ctx, &note_id, "remove")
+        .await
+        .unwrap());
+    assert!(!delete_note_attachment_tool(&ctx, &note_id, "remove")
+        .await
+        .unwrap());
+    let sibling = get_note_attachment_content_tool(
+        &ctx,
+        GetNoteAttachmentContentToolInput {
+            note_id: note_id.clone(),
+            attachment_id: "keep".into(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(sibling.content, b"keep");
+    let fetched = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
+    assert_eq!(fetched.attachments.len(), 1);
+    assert_eq!(fetched.attachments[0].id, "keep");
 }
 
 #[tokio::test]
 async fn delete_note_tool_soft_deletes_once_and_hides_the_note() {
     let (ctx, backend, _dir) = test_context().await;
-    let note = save_note_tool(
-        &ctx,
-        SaveNoteToolInput {
-            title: "Delete through MCP".into(),
-            content: "Content".into(),
-            attachments: vec![],
-            labels: vec![],
-        },
-    )
-    .await
-    .unwrap();
+    let note_id = save(&ctx, "Delete through MCP", "Content").await;
 
-    assert!(delete_note_tool(&ctx, &note.id).await.unwrap());
-    assert!(!delete_note_tool(&ctx, &note.id).await.unwrap());
+    assert!(delete_note_tool(&ctx, &note_id).await.unwrap());
+    assert!(!delete_note_tool(&ctx, &note_id).await.unwrap());
     assert!(list_notes_tool(&ctx, None, None, None)
         .await
         .unwrap()
         .is_empty());
     let session = backend.session().await.unwrap();
-    assert!(session.note_exists(&note.id).await.unwrap());
+    assert!(session.note_exists(&note_id).await.unwrap());
 }
 
 #[tokio::test]
@@ -212,7 +408,6 @@ async fn save_note_tool_honors_duplicate_check_config() {
     let input = || SaveNoteToolInput {
         title: "Skill".into(),
         content: "Content".into(),
-        attachments: vec![],
         labels: vec![
             ("skill-name".into(), "zddi-hooks".into()),
             ("version".into(), "1.0.0".into()),
@@ -225,73 +420,37 @@ async fn save_note_tool_honors_duplicate_check_config() {
 }
 
 #[tokio::test]
-async fn semantic_search_tool_finds_saved_note() {
+async fn semantic_search_returns_summary_labels_and_timestamps() {
     let (ctx, _backend, _dir) = test_context().await;
     save_note_tool(
         &ctx,
         SaveNoteToolInput {
             title: "Findable".into(),
             content: "unique searchable content".into(),
-            attachments: vec![],
-            labels: vec![],
-        },
-    )
-    .await
-    .unwrap();
-    drain_embedding_jobs(&ctx, 10).await.unwrap();
-
-    let results = semantic_search_tool(
-        &ctx,
-        SemanticSearchToolInput {
-            query: "unique searchable content".into(),
-            limit: 5,
-            label: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    assert!(results.iter().any(|r| r.title == "Findable"));
-}
-
-#[tokio::test]
-async fn semantic_search_tool_filters_by_label() {
-    let (ctx, _backend, _dir) = test_context().await;
-    save_note_tool(
-        &ctx,
-        SaveNoteToolInput {
-            title: "Rust".into(),
-            content: "shared searchable content".into(),
-            attachments: vec![],
             labels: vec![("topic".into(), "rust".into())],
         },
     )
     .await
     .unwrap();
-    save_note_tool(
-        &ctx,
-        SaveNoteToolInput {
-            title: "Ops".into(),
-            content: "shared searchable content".into(),
-            attachments: vec![],
-            labels: vec![("topic".into(), "ops".into())],
-        },
-    )
-    .await
-    .unwrap();
     drain_embedding_jobs(&ctx, 10).await.unwrap();
 
-    let results = semantic_search_tool(
+    let result = semantic_search_tool(
         &ctx,
         SemanticSearchToolInput {
-            query: "shared searchable content".into(),
+            query: "unique searchable content".into(),
             limit: 5,
             label: Some("topic=rust".into()),
         },
     )
     .await
+    .unwrap()
+    .into_iter()
+    .find(|result| result.title == "Findable")
     .unwrap();
 
-    assert!(results.iter().any(|r| r.title == "Rust"));
-    assert!(!results.iter().any(|r| r.title == "Ops"));
+    assert_eq!(result.labels.len(), 1);
+    assert_eq!(result.labels[0].key, "topic");
+    assert_eq!(result.labels[0].value, "rust");
+    assert!(result.created_at > 0);
+    assert!(result.updated_at >= result.created_at);
 }
