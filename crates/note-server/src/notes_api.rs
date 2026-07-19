@@ -498,6 +498,12 @@ struct CountNotesQuery {
     /// Optional label expression used to filter notes.
     #[serde(default)]
     label: Option<String>,
+    /// Accepted and validated for compatibility; values do not affect the count.
+    #[serde(default)]
+    limit: Option<i64>,
+    /// Accepted and validated for compatibility; values do not affect the count.
+    #[serde(default)]
+    offset: Option<i64>,
 }
 
 fn normalized_limit(limit: Option<i64>) -> i64 {
@@ -547,6 +553,7 @@ pub struct CountNotesResponse {
     params(CountNotesQuery),
     responses(
         (status = 200, description = "Note count", body = CountNotesResponse),
+        (status = 400, description = "Invalid compatibility query value", body = String, content_type = "text/plain"),
         (status = 500, description = "Server error", body = String, content_type = "text/plain")
     )
 )]
@@ -1094,9 +1101,18 @@ mod tests {
 
         let count = &document["paths"]["/api/notes/count"]["get"];
         let count_parameters = count["parameters"].as_array().unwrap();
-        assert_eq!(count_parameters.len(), 1);
-        assert_eq!(count_parameters[0]["name"], "label");
-        assert_eq!(count_parameters[0]["required"], false);
+        assert_eq!(count_parameters.len(), 3);
+        assert_eq!(operation_parameter(count, "label")["required"], false);
+        for name in ["limit", "offset"] {
+            let parameter = operation_parameter(count, name);
+            assert_eq!(parameter["required"], false);
+            let description = parameter["description"].as_str().unwrap();
+            assert!(description.contains("compatibility"));
+            assert!(description.contains("do not affect the count"));
+        }
+
+        let bad_query = &count["responses"]["400"]["content"]["text/plain"];
+        assert_eq!(bad_query["schema"]["type"], "string");
     }
 
     #[test]
@@ -1441,6 +1457,20 @@ mod tests {
         ] {
             let response = app.clone().oneshot(get(uri)).await.unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+                "{uri}"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(
+                body.contains("Failed to deserialize query string"),
+                "{uri}: {body}"
+            );
         }
     }
 
