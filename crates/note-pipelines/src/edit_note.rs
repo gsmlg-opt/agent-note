@@ -1,4 +1,4 @@
-use crate::{get_note, update_note, Context, SaveNoteInput};
+use crate::{get_note_metadata, update_note_fields, Context, UpdateNoteFieldsInput};
 use note_core::Note;
 
 pub use note_core::{compute_tag, EditOp};
@@ -9,7 +9,7 @@ pub async fn edit_note(
     expected_tag: &str,
     ops: &[EditOp],
 ) -> anyhow::Result<Option<Note>> {
-    let note = match get_note(ctx, id).await? {
+    let note = match get_note_metadata(ctx, id).await? {
         Some(note) => note,
         None => return Ok(None),
     };
@@ -29,13 +29,12 @@ pub async fn edit_note(
         .map(|label| (label.key.clone(), label.value.clone()))
         .collect();
 
-    update_note(
+    update_note_fields(
         ctx,
         id,
-        SaveNoteInput {
+        UpdateNoteFieldsInput {
             title: note.title.clone(),
             content: new_content,
-            attachments: note.attachments.clone(),
             labels,
         },
     )

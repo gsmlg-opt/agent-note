@@ -1,18 +1,52 @@
 use crate::{context::Context, SaveNoteInput};
+use note_attachments::PreparedAttachmentSet;
 use note_core::{
-    validate_label_value, validate_note_input, Label, LabelValueType, Note, NoteInput,
-    ValidationError,
+    validate_label_value, validate_note_input, Label, LabelValueType, Note, NoteAttachment,
+    NoteInput, ValidationError,
 };
-use note_storage::{NoteUpdate, TransactionMode};
+use note_storage::{NoteFieldsUpdate, NoteUpdate, TransactionMode};
 use std::collections::{HashMap, HashSet};
 
 pub const TRASH_RETENTION_DAYS: i64 = 90;
 pub const TRASH_RETENTION_SECONDS: i64 = TRASH_RETENTION_DAYS * 24 * 60 * 60;
 
+pub struct UpdateNoteFieldsInput {
+    pub title: String,
+    pub content: String,
+    pub labels: Vec<(String, String)>,
+}
+
 pub async fn update_note(
     ctx: &Context,
     id: &str,
     input: SaveNoteInput,
+) -> anyhow::Result<Option<Note>> {
+    update_note_inner(
+        ctx,
+        id,
+        UpdateNoteFieldsInput {
+            title: input.title,
+            content: input.content,
+            labels: input.labels,
+        },
+        Some(input.attachments),
+    )
+    .await
+}
+
+pub async fn update_note_fields(
+    ctx: &Context,
+    id: &str,
+    input: UpdateNoteFieldsInput,
+) -> anyhow::Result<Option<Note>> {
+    update_note_inner(ctx, id, input, None).await
+}
+
+async fn update_note_inner(
+    ctx: &Context,
+    id: &str,
+    input: UpdateNoteFieldsInput,
+    attachments: Option<Vec<NoteAttachment>>,
 ) -> anyhow::Result<Option<Note>> {
     let session = ctx.storage().session().await?;
 
@@ -39,7 +73,7 @@ pub async fn update_note(
         &NoteInput {
             title: input.title.clone(),
             content: input.content.clone(),
-            attachments: input.attachments.clone(),
+            attachments: attachments.clone().unwrap_or_default(),
             labels: input.labels.clone(),
         },
         &known_for_validation,
@@ -74,30 +108,46 @@ pub async fn update_note(
     let note_revision = session.get_note_revision(id).await?.unwrap_or(1) + 1;
     drop(session);
     let chunks = crate::chunk::chunk_content(&input.content);
-    let prepared_attachments = ctx.attachments().prepare(id, &input.attachments).await?;
-    let attachment_metadata = prepared_attachments.metadata().to_vec();
+    let mut prepared_attachments = match attachments.as_deref() {
+        Some(attachments) => Some(ctx.attachments().prepare(id, attachments).await?),
+        None => None,
+    };
+    let attachment_metadata = prepared_attachments
+        .as_ref()
+        .map(|prepared| prepared.metadata().to_vec());
 
     let transaction = match ctx.storage().begin(TransactionMode::Deferred).await {
         Ok(transaction) => transaction,
         Err(error) => {
-            return Err(crate::note_attachments::abort_with_primary(
-                prepared_attachments,
-                error.into(),
-            )
-            .await);
+            return Err(abort_optional(prepared_attachments.take(), error.into()).await);
         }
     };
     let transaction_result = async {
-        let affected = transaction
-            .update_note(NoteUpdate {
-                id,
-                title: &input.title,
-                content: &input.content,
-                attachments: &attachment_metadata,
-                updated_at: now,
-                note_revision,
-            })
-            .await?;
+        let affected = match attachment_metadata.as_deref() {
+            Some(attachments) => {
+                transaction
+                    .update_note(NoteUpdate {
+                        id,
+                        title: &input.title,
+                        content: &input.content,
+                        attachments,
+                        updated_at: now,
+                        note_revision,
+                    })
+                    .await?
+            }
+            None => {
+                transaction
+                    .update_note_fields(NoteFieldsUpdate {
+                        id,
+                        title: &input.title,
+                        content: &input.content,
+                        updated_at: now,
+                        note_revision,
+                    })
+                    .await?
+            }
+        };
         if affected == 0 {
             return anyhow::Ok(None);
         }
@@ -120,13 +170,11 @@ pub async fn update_note(
         Ok(Some(result)) => Ok(result),
         Ok(None) => {
             if let Err(error) = transaction.rollback().await {
-                return Err(crate::note_attachments::abort_with_primary(
-                    prepared_attachments,
-                    error.into(),
-                )
-                .await);
+                return Err(abort_optional(prepared_attachments.take(), error.into()).await);
             }
-            prepared_attachments.abort().await?;
+            if let Some(prepared) = prepared_attachments.take() {
+                prepared.abort().await?;
+            }
             return Ok(None);
         }
         Err(error) => Err(error),
@@ -135,26 +183,39 @@ pub async fn update_note(
     let (queued, resolved_labels) = match finalized {
         Ok(result) => result,
         Err(error) => {
-            return Err(
-                crate::note_attachments::abort_with_primary(prepared_attachments, error).await,
-            );
+            return Err(abort_optional(prepared_attachments.take(), error).await);
         }
     };
-    prepared_attachments.publish().await?;
+    if let Some(prepared) = prepared_attachments.take() {
+        prepared.publish().await?;
+    }
     if queued > 0 {
         ctx.wake_embedding_jobs();
     }
 
-    Ok(Some(Note {
-        id: id.to_string(),
-        title: input.title,
-        content: input.content,
-        attachments: input.attachments,
-        labels: resolved_labels,
-        created_at: existing.created_at,
-        updated_at: now,
-        deleted_at: None,
-    }))
+    match attachments {
+        Some(attachments) => Ok(Some(Note {
+            id: id.to_string(),
+            title: input.title,
+            content: input.content,
+            attachments,
+            labels: resolved_labels,
+            created_at: existing.created_at,
+            updated_at: now,
+            deleted_at: None,
+        })),
+        None => crate::get_note_metadata(ctx, id).await,
+    }
+}
+
+async fn abort_optional(
+    prepared: Option<Box<dyn PreparedAttachmentSet>>,
+    primary: anyhow::Error,
+) -> anyhow::Error {
+    match prepared {
+        Some(prepared) => crate::note_attachments::abort_with_primary(prepared, primary).await,
+        None => primary,
+    }
 }
 
 pub async fn delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {

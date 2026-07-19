@@ -6,10 +6,11 @@ use note_attachments::{
 use note_core::{LabelValueType, NoteAttachment};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    define_label_key, define_label_key_with_type, delete_note, drain_embedding_jobs, get_note,
-    get_note_attachment, import_json, list_deleted_note_summaries, list_label_keys,
-    purge_expired_deleted_notes, restore_notes, save_note, update_note, update_system_config,
-    Context, SaveNoteInput, TRASH_RETENTION_SECONDS,
+    compute_tag, define_label_key, define_label_key_with_type, delete_note, drain_embedding_jobs,
+    edit_note, get_note, get_note_attachment, get_note_metadata, import_json,
+    list_deleted_note_summaries, list_label_keys, purge_expired_deleted_notes, restore_notes,
+    save_note, update_note, update_note_fields, update_system_config, Context, EditOp,
+    SaveNoteInput, UpdateNoteFieldsInput, TRASH_RETENTION_SECONDS,
 };
 use note_storage::{StorageBackend, TransactionMode};
 use std::{
@@ -45,6 +46,58 @@ struct RecordingPreparedMutation {
     path: String,
     content: Option<Vec<u8>>,
     objects: AttachmentObjects,
+}
+
+struct PanicAttachmentStore;
+
+#[async_trait::async_trait]
+impl AttachmentStore for PanicAttachmentStore {
+    async fn prepare(
+        &self,
+        _note_id: &str,
+        _attachments: &[NoteAttachment],
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
+        panic!("metadata-only workflows must not prepare attachments")
+    }
+
+    async fn prepare_put(
+        &self,
+        _note_id: &str,
+        _attachment: &NoteAttachment,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        panic!("metadata-only workflows must not prepare an attachment put")
+    }
+
+    async fn prepare_delete(
+        &self,
+        _note_id: &str,
+        _path: &str,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        panic!("metadata-only workflows must not prepare an attachment delete")
+    }
+
+    async fn read(&self, _note_id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
+        panic!("metadata-only workflows must not read attachments")
+    }
+
+    async fn hydrate(
+        &self,
+        _note_id: &str,
+        _attachments: &mut [NoteAttachment],
+    ) -> anyhow::Result<()> {
+        panic!("metadata-only workflows must not hydrate attachments")
+    }
+
+    async fn remove_note(&self, _note_id: &str) -> anyhow::Result<()> {
+        panic!("metadata-only workflows must not remove attachments")
+    }
+
+    fn info(&self) -> AttachmentStoreInfo {
+        AttachmentStoreInfo {
+            engine: "panic".into(),
+            location: None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -512,6 +565,44 @@ async fn get_note_hydrates_attachments_through_the_injected_store() {
         *attachments.reads.lock().unwrap(),
         vec![("note-1".into(), "./file.txt".into())]
     );
+}
+
+#[tokio::test]
+async fn get_note_metadata_returns_content_and_unhydrated_attachment_metadata() {
+    let (write_ctx, backend, _dir) = test_context().await;
+    let saved = save_note(
+        &write_ctx,
+        SaveNoteInput {
+            title: "Metadata".into(),
+            content: "Metadata-only content".into(),
+            attachments: vec![NoteAttachment {
+                id: "proof".into(),
+                path: "./proof.txt".into(),
+                mime: "text/plain".into(),
+                description: "proof metadata".into(),
+                content: b"payload".to_vec(),
+            }],
+            labels: vec![("topic".into(), "metadata".into())],
+        },
+    )
+    .await
+    .unwrap();
+    let ctx = Context::new(
+        backend,
+        Arc::new(StubEmbedder),
+        Arc::new(PanicAttachmentStore),
+    );
+
+    let note = get_note_metadata(&ctx, &saved.id).await.unwrap().unwrap();
+
+    assert_eq!(note.content, "Metadata-only content");
+    assert_eq!(note.labels, saved.labels);
+    assert_eq!(note.attachments.len(), 1);
+    assert_eq!(note.attachments[0].id, "proof");
+    assert_eq!(note.attachments[0].path, "./proof.txt");
+    assert_eq!(note.attachments[0].mime, "text/plain");
+    assert_eq!(note.attachments[0].description, "proof metadata");
+    assert!(note.attachments[0].content.is_empty());
 }
 
 #[tokio::test]
@@ -1398,6 +1489,182 @@ async fn update_only_queues_embedding_when_content_hash_changes() {
         1
     );
     assert!(!session.chunk_embedding_exists(&note.id, 0).await.unwrap());
+}
+
+#[tokio::test]
+async fn field_only_update_preserves_attachments_and_synchronizes_content_embeddings() {
+    let (write_ctx, backend, _dir) = test_context().await;
+    let saved = save_note(
+        &write_ctx,
+        SaveNoteInput {
+            title: "Before".into(),
+            content: "Original content".into(),
+            attachments: vec![NoteAttachment {
+                id: "proof".into(),
+                path: "./proof.txt".into(),
+                mime: "text/plain".into(),
+                description: "preserved metadata".into(),
+                content: b"payload".to_vec(),
+            }],
+            labels: vec![("status".into(), "draft".into())],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&write_ctx, 10).await.unwrap();
+    let ctx = Context::new(
+        backend.clone(),
+        Arc::new(StubEmbedder),
+        Arc::new(PanicAttachmentStore),
+    );
+
+    let updated = update_note_fields(
+        &ctx,
+        &saved.id,
+        UpdateNoteFieldsInput {
+            title: "After".into(),
+            content: "Changed content".into(),
+            labels: vec![("status".into(), "published".into())],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(updated.title, "After");
+    assert_eq!(updated.content, "Changed content");
+    assert_eq!(updated.labels[0].value, "published");
+    assert_eq!(updated.attachments.len(), 1);
+    assert_eq!(updated.attachments[0].description, "preserved metadata");
+    assert!(updated.attachments[0].content.is_empty());
+    let session = backend.session().await.unwrap();
+    assert_eq!(session.get_note_revision(&saved.id).await.unwrap(), Some(2));
+    let chunks = session.list_note_chunks(&saved.id).await.unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].content, "Changed content");
+    assert_eq!(chunks[0].note_revision, 2);
+    let jobs = session
+        .claim_pending_embedding_jobs(10, chrono::Utc::now().timestamp())
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].content, "Changed content");
+    assert_eq!(jobs[0].note_revision, 2);
+}
+
+#[tokio::test]
+async fn edit_note_preserves_attachment_metadata_without_attachment_io() {
+    let (write_ctx, backend, _dir) = test_context().await;
+    let saved = save_note(
+        &write_ctx,
+        SaveNoteInput {
+            title: "Editable".into(),
+            content: "first\nsecond".into(),
+            attachments: vec![NoteAttachment {
+                id: "proof".into(),
+                path: "./proof.txt".into(),
+                mime: "text/plain".into(),
+                description: "preserved metadata".into(),
+                content: b"payload".to_vec(),
+            }],
+            labels: vec![("status".into(), "draft".into())],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&write_ctx, 10).await.unwrap();
+    let ctx = Context::new(
+        backend.clone(),
+        Arc::new(StubEmbedder),
+        Arc::new(PanicAttachmentStore),
+    );
+
+    let edited = edit_note(
+        &ctx,
+        &saved.id,
+        &compute_tag(&saved.content),
+        &[EditOp::InsertTail {
+            lines: vec!["third".into()],
+        }],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(edited.content, "first\nsecond\nthird");
+    assert_eq!(edited.title, saved.title);
+    assert_eq!(edited.labels, saved.labels);
+    assert_eq!(edited.attachments.len(), 1);
+    assert_eq!(edited.attachments[0].description, "preserved metadata");
+    assert!(edited.attachments[0].content.is_empty());
+    let session = backend.session().await.unwrap();
+    assert_eq!(session.get_note_revision(&saved.id).await.unwrap(), Some(2));
+    let jobs = session
+        .claim_pending_embedding_jobs(10, chrono::Utc::now().timestamp())
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].content, "first\nsecond\nthird");
+    assert_eq!(jobs[0].note_revision, 2);
+}
+
+#[tokio::test]
+async fn edit_note_keeps_the_stale_tag_error_without_attachment_io() {
+    let (write_ctx, backend, _dir) = test_context().await;
+    let saved = save_note(
+        &write_ctx,
+        SaveNoteInput {
+            title: "Editable".into(),
+            content: "current".into(),
+            attachments: vec![NoteAttachment {
+                id: "proof".into(),
+                path: "./proof.txt".into(),
+                mime: "text/plain".into(),
+                description: String::new(),
+                content: b"payload".to_vec(),
+            }],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let ctx = Context::new(
+        backend.clone(),
+        Arc::new(StubEmbedder),
+        Arc::new(PanicAttachmentStore),
+    );
+
+    let error = edit_note(
+        &ctx,
+        &saved.id,
+        &compute_tag("stale"),
+        &[EditOp::InsertTail {
+            lines: vec!["never written".into()],
+        }],
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("stale tag"));
+    let stored = backend
+        .session()
+        .await
+        .unwrap()
+        .get_note(&saved.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.content, "current");
+    assert_eq!(
+        backend
+            .session()
+            .await
+            .unwrap()
+            .get_note_revision(&saved.id)
+            .await
+            .unwrap(),
+        Some(1)
+    );
 }
 
 #[tokio::test]

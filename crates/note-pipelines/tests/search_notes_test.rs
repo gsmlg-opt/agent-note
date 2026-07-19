@@ -1,10 +1,67 @@
 mod support;
 
+use note_attachments::{
+    AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
+};
+use note_core::{NoteAttachment, NoteListItem};
+use note_embedding::StubEmbedder;
 use note_pipelines::{
     drain_embedding_jobs, save_note, search_notes, search_notes_filtered, SaveNoteInput,
 };
 use std::sync::Arc;
 use support::test_context;
+
+struct PanicAttachmentStore;
+
+#[async_trait::async_trait]
+impl AttachmentStore for PanicAttachmentStore {
+    async fn prepare(
+        &self,
+        _note_id: &str,
+        _attachments: &[NoteAttachment],
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
+        panic!("search must not prepare attachments")
+    }
+
+    async fn prepare_put(
+        &self,
+        _note_id: &str,
+        _attachment: &NoteAttachment,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        panic!("search must not prepare an attachment put")
+    }
+
+    async fn prepare_delete(
+        &self,
+        _note_id: &str,
+        _path: &str,
+    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+        panic!("search must not prepare an attachment delete")
+    }
+
+    async fn read(&self, _note_id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
+        panic!("search must not read attachments")
+    }
+
+    async fn hydrate(
+        &self,
+        _note_id: &str,
+        _attachments: &mut [NoteAttachment],
+    ) -> anyhow::Result<()> {
+        panic!("search must not hydrate attachments")
+    }
+
+    async fn remove_note(&self, _note_id: &str) -> anyhow::Result<()> {
+        panic!("search must not remove attachments")
+    }
+
+    fn info(&self) -> AttachmentStoreInfo {
+        AttachmentStoreInfo {
+            engine: "panic".into(),
+            location: None,
+        }
+    }
+}
 
 struct PanicEmbedder;
 
@@ -67,6 +124,47 @@ async fn search_returns_saved_notes_with_fused_scores() {
     for r in &results {
         assert!(r.score > 0.0);
     }
+}
+
+#[tokio::test]
+async fn search_returns_note_summaries_without_attachment_io() {
+    let (write_ctx, backend, _dir) = test_context().await;
+    let saved = save_note(
+        &write_ctx,
+        SaveNoteInput {
+            title: "Metadata search".into(),
+            content: "Find the metadata-only result".into(),
+            attachments: vec![NoteAttachment {
+                id: "proof".into(),
+                path: "./proof.txt".into(),
+                mime: "text/plain".into(),
+                description: "search proof".into(),
+                content: b"payload".to_vec(),
+            }],
+            labels: vec![("topic".into(), "metadata".into())],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&write_ctx, 10).await.unwrap();
+    let ctx = note_pipelines::Context::new(
+        backend,
+        Arc::new(StubEmbedder),
+        Arc::new(PanicAttachmentStore),
+    );
+
+    let results = search_notes(&ctx, "Metadata search", 10).await.unwrap();
+    let result = results
+        .iter()
+        .find(|result| result.note.id == saved.id)
+        .unwrap();
+
+    fn assert_summary_type(_: &NoteListItem) {}
+    assert_summary_type(&result.note);
+    assert_eq!(result.note.labels, saved.labels);
+    assert_eq!(result.note.created_at, saved.created_at);
+    assert_eq!(result.note.updated_at, saved.updated_at);
+    assert_eq!(result.note.deleted_at, saved.deleted_at);
 }
 
 #[tokio::test]

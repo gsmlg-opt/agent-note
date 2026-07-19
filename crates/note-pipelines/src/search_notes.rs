@@ -1,5 +1,5 @@
 use crate::context::Context;
-use note_core::{parse_label_selectors, weighted_rrf_fuse, SearchResult};
+use note_core::{parse_label_selectors, weighted_rrf_fuse, NoteListItem, SearchResult};
 use std::collections::HashSet;
 
 const RRF_K: f32 = 60.0;
@@ -29,8 +29,7 @@ pub async fn search_notes_filtered(
 
     let dense = ctx.embedder.embed(query).await?;
 
-    // Use one session for filtering, retrieval, and note metadata collection, then deliberately
-    // release it before attachment hydration performs external I/O.
+    // Use one session for filtering, retrieval, and note metadata collection.
     let session = ctx.storage().session().await?;
     let selectors = label
         .as_deref()
@@ -75,18 +74,21 @@ pub async fn search_notes_filtered(
         // A None here means a title/dense retrieval row outlived its note row; it would only occur
         // under index/note divergence (e.g. a future delete path with a bug).
         if let Some(note) = session.get_note(&note_id).await? {
-            notes.push((note, score));
+            notes.push(SearchResult {
+                note: NoteListItem {
+                    id: note.id,
+                    title: note.title,
+                    labels: note.labels,
+                    created_at: note.created_at,
+                    updated_at: note.updated_at,
+                    deleted_at: note.deleted_at,
+                },
+                score,
+            });
             if notes.len() >= limit {
                 break;
             }
         }
     }
-    drop(session);
-
-    let mut results = Vec::with_capacity(notes.len());
-    for (mut note, score) in notes {
-        crate::hydrate_note_attachments(ctx, &mut note).await?;
-        results.push(SearchResult { note, score });
-    }
-    Ok(results)
+    Ok(notes)
 }

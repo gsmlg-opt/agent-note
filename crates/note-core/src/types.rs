@@ -355,7 +355,7 @@ pub struct NoteListItem {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
-    pub note: Note,
+    pub note: NoteListItem,
     pub score: f32, // fused RRF score — NOT raw cosine similarity, label it as such in the UI (design.md §7)
 }
 
