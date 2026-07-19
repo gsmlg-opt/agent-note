@@ -115,6 +115,18 @@ accessing an external database.
    frontend `/notes/*` routes on port 6221. Add `?type=html` to the latter URL for a standalone,
    styled HTML document suitable for iframe embedding.
 
+### HTTP API documentation
+
+With the HTTP server running, open the interactive Swagger UI directly at
+`http://127.0.0.1:6222/api/docs` or fetch the generated OpenAPI document from
+`http://127.0.0.1:6222/api/openapi.json`. During frontend development, Trunk proxies the same
+paths on port `6221`, so `/api/docs` and `/api/openapi.json` are also available there.
+
+The OpenAPI document covers the REST API only. `/mcp` remains outside the document and retains its
+own MCP protocol discovery and schemas. Swagger UI has **Try it out** enabled, including for
+destructive operations, and the HTTP API is unauthenticated. Use it only on a trusted network or
+behind an authenticating reverse proxy.
+
 ## Runtime configuration
 
 Every normal entrypoint—HTTP server, MCP over HTTP, MCP over stdio, `--import`, and `--export`—loads

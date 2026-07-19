@@ -30,6 +30,7 @@ use tokio::process::Child;
 #[cfg(debug_assertions)]
 use tokio::process::Command;
 use tokio::sync::{watch, Notify};
+use utoipa::openapi::OpenApi;
 
 const DEFAULT_EMBEDDING_POLL_MS: u64 = 1000;
 const TRASH_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -252,6 +253,17 @@ fn should_start_dev_frontend(
     explicit_static_dir: bool,
 ) -> bool {
     debug_build && http_mode && !explicit_static_dir
+}
+
+fn compose_transport_router(
+    rest: Router,
+    mcp: Router,
+    openapi: OpenApi,
+    max_request_bytes: usize,
+) -> Router {
+    rest.merge(mcp)
+        .merge(openapi::swagger_router(openapi))
+        .layer(DefaultBodyLimit::max(max_request_bytes))
 }
 
 #[cfg(debug_assertions)]
@@ -478,10 +490,12 @@ async fn main() -> anyhow::Result<()> {
         let (rest, openapi) = openapi::rest_router();
         let rest = rest.with_state(ctx.clone());
         let max_request_bytes = env_u64("NOTE_MAX_REQUEST_BYTES", 512 * 1024 * 1024);
-        let mut app: Router = rest
-            .merge(note_mcp::mcp_router(ctx))
-            .merge(openapi::swagger_router(openapi))
-            .layer(DefaultBodyLimit::max(max_request_bytes as usize));
+        let mut app = compose_transport_router(
+            rest,
+            note_mcp::mcp_router(ctx),
+            openapi,
+            max_request_bytes as usize,
+        );
 
         // NOTE_STATIC_DIR is for packaged builds such as Docker. Local debug HTTP runs use the
         // Trunk development server instead, unless an explicit static directory is configured.
@@ -584,12 +598,19 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use http_body_util::BodyExt;
     use note_storage::{
         BackendInfo, StorageError, StorageErrorKind, StorageResult, StorageSession,
         StorageTransaction, TransactionMode,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -613,6 +634,100 @@ mod tests {
                 None => std::env::remove_var(self.name),
             }
         }
+    }
+
+    #[test]
+    fn generated_rest_openapi_is_complete_and_excludes_mcp() {
+        let (_, document) = openapi::rest_router();
+        let document = serde_json::to_value(document).unwrap();
+        let paths = document["paths"].as_object().expect("OpenAPI paths");
+        let operation_methods = [
+            "get", "put", "post", "delete", "options", "head", "patch", "trace",
+        ];
+        let operation_count = paths
+            .values()
+            .map(|path| {
+                let path = path.as_object().expect("OpenAPI path item");
+                operation_methods
+                    .iter()
+                    .filter(|method| path.contains_key(**method))
+                    .count()
+            })
+            .sum::<usize>();
+
+        assert_eq!(paths.len(), 17);
+        assert_eq!(operation_count, 23);
+        assert!(!paths.keys().any(|path| path.starts_with("/mcp")));
+        assert!(document["tags"]
+            .as_array()
+            .expect("OpenAPI tags")
+            .iter()
+            .all(|tag| tag["name"].as_str() != Some("mcp")));
+        assert!(document["components"]["schemas"]
+            .as_object()
+            .expect("OpenAPI schemas")
+            .keys()
+            .all(|schema| !schema.to_ascii_lowercase().contains("mcp")));
+        assert!(!serde_json::to_string(&document)
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("\"/mcp"));
+    }
+
+    #[tokio::test]
+    async fn composed_transport_router_serves_docs_and_preserves_mcp() {
+        let mcp = Router::new().route("/mcp", get(|| async { "mcp-preserved" }));
+        let app = compose_transport_router(Router::new(), mcp, OpenApi::default(), 1024 * 1024);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["openapi"], "3.1.0");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/docs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/docs/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("Swagger UI"));
+
+        let response = app
+            .oneshot(Request::builder().uri("/mcp").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"mcp-preserved");
     }
 
     #[tokio::test]

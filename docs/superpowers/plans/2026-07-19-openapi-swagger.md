@@ -586,7 +586,7 @@ async fn transport_router_serves_openapi_without_documenting_mcp() {
         .values()
         .map(|item| item.as_object().unwrap().len())
         .sum::<usize>();
-    assert_eq!(operation_count, 22);
+    assert_eq!(operation_count, 23);
 
     let rest = Router::new();
     let mcp = Router::new().route("/mcp", axum::routing::get(|| async { "mcp" }));
@@ -707,7 +707,7 @@ git commit -m "feat(server): serve Swagger API documentation"
 - [ ] **Step 1: Check specification coverage**
 
 Fetch the generated JSON in a test or from a locally started server and confirm
-the expected operation count is 22 across 17 path templates. Confirm:
+the expected operation count is 23 across 17 path templates. Confirm:
 
 ```text
 /mcp is absent
