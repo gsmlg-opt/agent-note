@@ -1,5 +1,7 @@
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
 use pulldown_cmark_to_cmark::cmark;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 use yew::prelude::*;
 use yew_duskmoon::{Alert, Card, Chip, DmMarkdown};
 use yew_router::prelude::*;
@@ -43,22 +45,40 @@ fn copy_announcement(status: CopyStatus) -> &'static str {
     }
 }
 
+fn browser_clipboard() -> Option<web_sys::Clipboard> {
+    let navigator = web_sys::window()?.navigator();
+    let clipboard = js_sys::Reflect::get(
+        navigator.as_ref(),
+        &wasm_bindgen::JsValue::from_str("clipboard"),
+    )
+    .ok()?;
+
+    if clipboard.is_null() || clipboard.is_undefined() {
+        None
+    } else {
+        Some(clipboard.unchecked_into())
+    }
+}
+
 /// Read-only view of a single note.
 #[function_component(NoteShowPage)]
 pub fn note_show_page(props: &NoteShowProps) -> Html {
     let note = use_state(|| None::<NoteSummary>);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
+    let copy_status = use_state(CopyStatus::default);
 
     {
         let note = note.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let copy_status = copy_status.clone();
         let id = props.id.clone();
         use_effect_with(props.id.clone(), move |_| {
             loading.set(true);
             note.set(None);
             error.set(None);
+            copy_status.set(CopyStatus::Ready);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::get_note(&id).await {
                     Ok(n) => note.set(Some(n)),
@@ -70,6 +90,30 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         });
     }
 
+    let copy_id = (*note)
+        .as_ref()
+        .map(|loaded_note| loaded_note.id.clone())
+        .unwrap_or_default();
+    let on_copy_id = {
+        let id = copy_id;
+        let copy_status = copy_status.clone();
+        Callback::from(move |_| {
+            let id = id.clone();
+            let copy_status = copy_status.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let copied = match browser_clipboard() {
+                    Some(clipboard) => JsFuture::from(clipboard.write_text(&id)).await.is_ok(),
+                    None => false,
+                };
+                copy_status.set(if copied {
+                    CopyStatus::Copied
+                } else {
+                    CopyStatus::Failed
+                });
+            });
+        })
+    };
+
     html! {
         <section class="stack">
             if let Some(err) = &*error {
@@ -79,6 +123,21 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                 <p class="loading">{ "Loading…" }</p>
             } else if let Some(n) = &*note {
                 <Card title={Some(html! { <span>{ n.title.clone() }</span> })}>
+                    <div class="note-id-copy">
+                        <button
+                            type="button"
+                            class="chip chip-clickable chip-primary note-id-copy-chip"
+                            aria-label={format!("Copy note ID {}", n.id)}
+                            onclick={on_copy_id}
+                        >
+                            <span class="note-id-copy-text">
+                                { copy_chip_text(&n.id, *copy_status) }
+                            </span>
+                        </button>
+                        <span class="sr-only" aria-live="polite" aria-atomic="true">
+                            { copy_announcement(*copy_status) }
+                        </span>
+                    </div>
                     <div class="note-page-actions">
                         <Link<Route> to={Route::Notes} classes={classes!("btn","btn-ghost")}>
                             { "Back" }
@@ -275,9 +334,7 @@ fn markdown_options() -> Options {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        copy_announcement, copy_chip_text, rewrite_attachment_urls, CopyStatus,
-    };
+    use super::{copy_announcement, copy_chip_text, rewrite_attachment_urls, CopyStatus};
     use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
     const BASE: &str = "/api/notes/note-1/attachments";
