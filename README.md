@@ -357,11 +357,21 @@ cargo run -p note-server -- --stdio
 This mode loads the same mandatory runtime configuration as HTTP, import, and export modes.
 
 It exposes `save_note`, `get_note`, `read_note_lines`, `edit_note`, `update_note`, `delete_note`,
-`list_notes`, and `semantic_search`. Label-key management is REST/UI-only. Attachments in
-`save_note` and `update_note` accept either UTF-8 `content` or padded Base64 `content_base64`;
-attachment responses always include `content_base64` and additionally include `content` when the
-bytes are valid UTF-8. The HTTP server additionally exposes the MCP Streamable HTTP transport at
-`/mcp`.
+`list_notes`, `semantic_search`, `put_note_attachment`, `get_note_attachment_content`, and
+`delete_note_attachment`. Label-key management is REST/UI-only. `list_notes` returns exactly `id`,
+`title`, `labels`, `created_at`, and `updated_at` for each result; `semantic_search` returns exactly
+those fields plus `score`. Neither response includes note content or attachments.
+
+`get_note` and `update_note` return note content plus attachment metadata (`id`, `path`, `mime`, and
+`description`) without attachment bytes. MCP `save_note` and `update_note` do not accept inline
+attachments. Create or replace one attachment with `put_note_attachment`, and remove one with
+`delete_note_attachment`; both address it by its stable `attachment_id`. An existing attachment id
+cannot change its normalized path, so rename an attachment with delete followed by put.
+`get_note_attachment_content` is the only MCP tool that reads attachment bytes. It returns exactly
+one content representation: direct `content` when the bytes are valid UTF-8, otherwise canonical
+Base64 in `content_base64`. These changes apply only to MCP; REST attachment behavior is unchanged.
+
+The HTTP server additionally exposes the MCP Streamable HTTP transport at `/mcp`.
 
 `note-server` binds its backend to `0.0.0.0:6222` by default, and the Debug Trunk server binds to
 `0.0.0.0:6221`, so the development UI, REST API, and MCP endpoint are reachable from the local
