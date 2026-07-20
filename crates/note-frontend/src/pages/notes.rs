@@ -16,6 +16,10 @@ const MAX_PAGE_SIZE: usize = 1000;
 const PAGE_SIZE_OPTIONS: [usize; 5] = [10, 30, 50, 100, 1000];
 const RETRIEVAL_PLACEHOLDER: &str = "Retrieve by title or content";
 const RETRIEVE_BUTTON_LABEL: &str = "Retrieve";
+const LABEL_FILTER_PARSER_OPERATORS: [&str; 9] =
+    [">=", "<=", "!=", "^=", "$=", "~=", "=", ">", "<"];
+const LABEL_FILTER_DISPLAY_OPERATORS: [&str; 9] =
+    ["=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="];
 
 #[derive(Clone, PartialEq)]
 struct NotesUrlState {
@@ -115,19 +119,25 @@ fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
             if term.is_empty() {
                 return None;
             }
-            for operator in [">=", "<=", "!=", "=", ">", "<"] {
-                if let Some(idx) = term.find(operator) {
-                    let key = term[..idx].trim();
-                    let value = term[idx + operator.len()..].trim();
-                    if key.is_empty() {
-                        return None;
-                    }
-                    return Some(LabelFilter {
-                        key: key.to_string(),
-                        operator: operator.to_string(),
-                        value: value.to_string(),
-                    });
+            let operator = LABEL_FILTER_PARSER_OPERATORS
+                .iter()
+                .filter_map(|operator| term.find(operator).map(|idx| (idx, *operator)))
+                .min_by(|(left_idx, left_operator), (right_idx, right_operator)| {
+                    left_idx
+                        .cmp(right_idx)
+                        .then_with(|| right_operator.len().cmp(&left_operator.len()))
+                });
+            if let Some((idx, operator)) = operator {
+                let key = term[..idx].trim();
+                let value = term[idx + operator.len()..].trim();
+                if key.is_empty() {
+                    return None;
                 }
+                return Some(LabelFilter {
+                    key: key.to_string(),
+                    operator: operator.to_string(),
+                    value: value.to_string(),
+                });
             }
             Some(LabelFilter {
                 key: term.to_string(),
@@ -523,7 +533,7 @@ fn label_filter_bar(
                     }) }
                 </datalist>
                 <select class="input label-filter-operator" onchange={on_operator_change} value={filter_operator.to_string()}>
-                    { for ["=", "!=", ">", ">=", "<", "<="].iter().map(|operator| {
+                    { for LABEL_FILTER_DISPLAY_OPERATORS.iter().map(|operator| {
                         let selected = *operator == filter_operator;
                         html! {
                             <option value={(*operator).to_string()} selected={selected}>{ *operator }</option>
@@ -532,7 +542,7 @@ fn label_filter_bar(
                 </select>
                 <input
                     class="input label-filter-value"
-                    type={label_value_input_type(value_type)}
+                    type={label_value_input_type(value_type, filter_operator)}
                     placeholder="value"
                     value={filter_value.to_string()}
                     oninput={on_value_input}
@@ -570,7 +580,11 @@ fn label_filter_label(filter: &LabelFilter) -> String {
     }
 }
 
-fn label_value_input_type(value_type: &str) -> &'static str {
+fn label_value_input_type(value_type: &str, operator: &str) -> &'static str {
+    if matches!(operator, "^=" | "$=" | "~=") {
+        return "text";
+    }
+
     match value_type {
         "number" => "number",
         "date" => "date",
@@ -869,5 +883,75 @@ mod tests {
             api::label_filter_selector(&filters),
             Some(selector.to_string())
         );
+    }
+
+    #[test]
+    fn parses_string_match_filters_with_operator_text_in_values() {
+        let filters = parse_label_filters("topic~=^ru!=st$&prefix^=a>=b&suffix$=a<=b");
+
+        assert_eq!(
+            filters,
+            vec![
+                LabelFilter {
+                    key: "topic".to_string(),
+                    operator: "~=".to_string(),
+                    value: "^ru!=st$".to_string(),
+                },
+                LabelFilter {
+                    key: "prefix".to_string(),
+                    operator: "^=".to_string(),
+                    value: "a>=b".to_string(),
+                },
+                LabelFilter {
+                    key: "suffix".to_string(),
+                    operator: "$=".to_string(),
+                    value: "a<=b".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_longest_operator_at_the_same_offset() {
+        assert_eq!(
+            parse_label_filters("priority>=10&date<=2026-07-20"),
+            vec![
+                LabelFilter {
+                    key: "priority".to_string(),
+                    operator: ">=".to_string(),
+                    value: "10".to_string(),
+                },
+                LabelFilter {
+                    key: "date".to_string(),
+                    operator: "<=".to_string(),
+                    value: "2026-07-20".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn label_filter_display_operators_have_expected_order() {
+        assert_eq!(
+            LABEL_FILTER_DISPLAY_OPERATORS,
+            ["=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="]
+        );
+    }
+
+    #[test]
+    fn string_match_operators_always_use_text_inputs() {
+        for value_type in ["number", "date", "datetime", "time"] {
+            for operator in ["^=", "$=", "~="] {
+                assert_eq!(label_value_input_type(value_type, operator), "text");
+            }
+        }
+    }
+
+    #[test]
+    fn comparison_operators_keep_typed_inputs() {
+        assert_eq!(label_value_input_type("number", "="), "number");
+        assert_eq!(label_value_input_type("date", ">="), "date");
+        assert_eq!(label_value_input_type("datetime", "<"), "datetime-local");
+        assert_eq!(label_value_input_type("time", "<="), "time");
     }
 }
