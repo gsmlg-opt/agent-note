@@ -468,6 +468,49 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         ]
     );
 
+    for selector in [
+        "contract-notes-status^=RE",
+        "contract-notes-status$=DY",
+        "contract-notes-status~=^R.*Y$",
+    ] {
+        let string_match_selectors = parse_label_selectors(selector);
+        assert_eq!(
+            session.count_notes(&string_match_selectors).await.unwrap(),
+            5
+        );
+        assert_eq!(
+            session
+                .list_notes(&string_match_selectors, Some(-1), Some(0))
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            session
+                .list_note_summaries(&string_match_selectors, Some(-1), Some(0))
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
+    }
+
+    let numeric_prefix_selectors = parse_label_selectors("contract-notes-priority^=1");
+    assert_eq!(
+        session
+            .count_notes(&numeric_prefix_selectors)
+            .await
+            .unwrap(),
+        2
+    );
+
+    let invalid_regex_selectors = parse_label_selectors("contract-notes-status~=[");
+    assert_eq!(
+        session.count_notes(&invalid_regex_selectors).await.unwrap(),
+        0
+    );
+
     for id in [
         "contract-notes-tie-c",
         "contract-notes-tie-a",

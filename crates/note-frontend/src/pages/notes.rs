@@ -840,4 +840,34 @@ mod tests {
         assert_eq!(RETRIEVAL_PLACEHOLDER, "Retrieve by title or content");
         assert_eq!(RETRIEVE_BUTTON_LABEL, "Retrieve");
     }
+
+    #[test]
+    fn parses_and_serializes_string_match_filters() {
+        let selector = "topic^=Rust&topic$=LANG&topic~=^ru.*t$";
+        let filters = parse_label_filters(selector);
+        assert_eq!(
+            filters,
+            vec![
+                LabelFilter {
+                    key: "topic".to_string(),
+                    operator: "^=".to_string(),
+                    value: "Rust".to_string(),
+                },
+                LabelFilter {
+                    key: "topic".to_string(),
+                    operator: "$=".to_string(),
+                    value: "LANG".to_string(),
+                },
+                LabelFilter {
+                    key: "topic".to_string(),
+                    operator: "~=".to_string(),
+                    value: "^ru.*t$".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            api::label_filter_selector(&filters),
+            Some(selector.to_string())
+        );
+    }
 }

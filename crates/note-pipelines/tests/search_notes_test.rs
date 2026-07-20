@@ -194,7 +194,7 @@ async fn search_filters_results_by_label() {
     .unwrap();
     drain_embedding_jobs(&ctx, 10).await.unwrap();
 
-    let results = search_notes_filtered(&ctx, "Shared", 10, Some("topic=rust".into()))
+    let results = search_notes_filtered(&ctx, "Shared", 10, Some("topic~=^RU.T$".into()))
         .await
         .unwrap();
 

@@ -1116,6 +1116,31 @@ mod tests {
     }
 
     #[test]
+    fn openapi_documents_label_filter_operators() {
+        let document = note_openapi_document();
+        let list_label = operation_parameter(&document["paths"]["/api/notes"]["get"], "label")
+            ["description"]
+            .as_str()
+            .unwrap_or_default();
+        let count_label =
+            operation_parameter(&document["paths"]["/api/notes/count"]["get"], "label")
+                ["description"]
+                .as_str()
+                .unwrap_or_default();
+        let search_label = document["components"]["schemas"]["SearchQuery"]["properties"]["label"]
+            ["description"]
+            .as_str()
+            .unwrap_or_default();
+
+        for description in [list_label, count_label, search_label] {
+            for operator in ["^=", "$=", "~="] {
+                assert!(description.contains(operator), "{description}");
+            }
+            assert!(description.contains("case-insensitive"), "{description}");
+        }
+    }
+
+    #[test]
     fn openapi_documents_note_content_type_query() {
         let document = note_openapi_document();
         for path in ["/api/notes/{id}/raw", "/notes/{id}/content"] {

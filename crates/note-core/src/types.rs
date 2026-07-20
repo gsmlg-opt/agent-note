@@ -474,6 +474,103 @@ mod tests {
     }
 
     #[test]
+    fn parses_string_match_selectors() {
+        assert_eq!(
+            parse_label_selectors("name^=Agent&name$=NOTE&name~=^agent-.+$"),
+            vec![
+                LabelSelector {
+                    key: "name".to_string(),
+                    value: Some("Agent".to_string()),
+                    operator: LabelOperator::StartsWith,
+                },
+                LabelSelector {
+                    key: "name".to_string(),
+                    value: Some("NOTE".to_string()),
+                    operator: LabelOperator::EndsWith,
+                },
+                LabelSelector {
+                    key: "name".to_string(),
+                    value: Some("^agent-.+$".to_string()),
+                    operator: LabelOperator::Regex,
+                },
+            ]
+        );
+        assert_eq!(LabelOperator::StartsWith.as_str(), "^=");
+        assert_eq!(LabelOperator::EndsWith.as_str(), "$=");
+        assert_eq!(LabelOperator::Regex.as_str(), "~=");
+    }
+
+    #[test]
+    fn string_match_operators_are_case_insensitive_for_all_value_types() {
+        let text_label = Label {
+            key: "name".to_string(),
+            value: "Agent-Note".to_string(),
+            description: String::new(),
+            value_type: LabelValueType::Text,
+        };
+        for (operator, value) in [
+            (LabelOperator::StartsWith, "agent"),
+            (LabelOperator::EndsWith, "NOTE"),
+            (LabelOperator::Regex, "^agent-.+"),
+        ] {
+            assert!(label_matches_selector(
+                &text_label,
+                &LabelSelector {
+                    key: "name".to_string(),
+                    value: Some(value.to_string()),
+                    operator,
+                }
+            ));
+        }
+        for (operator, value) in [
+            (LabelOperator::StartsWith, "gent"),
+            (LabelOperator::EndsWith, "not"),
+        ] {
+            assert!(!label_matches_selector(
+                &text_label,
+                &LabelSelector {
+                    key: "name".to_string(),
+                    value: Some(value.to_string()),
+                    operator,
+                }
+            ));
+        }
+
+        let number_label = Label {
+            key: "priority".to_string(),
+            value: "10".to_string(),
+            description: String::new(),
+            value_type: LabelValueType::Number,
+        };
+        assert!(label_matches_selector(
+            &number_label,
+            &LabelSelector {
+                key: "priority".to_string(),
+                value: Some("1".to_string()),
+                operator: LabelOperator::StartsWith,
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_label_regex_does_not_match() {
+        let label = Label {
+            key: "name".to_string(),
+            value: "Agent-Note".to_string(),
+            description: String::new(),
+            value_type: LabelValueType::Text,
+        };
+        assert!(!label_matches_selector(
+            &label,
+            &LabelSelector {
+                key: "name".to_string(),
+                value: Some("[".to_string()),
+                operator: LabelOperator::Regex,
+            }
+        ));
+    }
+
+    #[test]
     fn compares_typed_values() {
         assert!(compare_label_values(
             LabelValueType::Number,

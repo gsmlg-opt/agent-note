@@ -1055,6 +1055,16 @@ mod tests {
             list_input["properties"]["label"]["type"],
             search_input["properties"]["label"]["type"]
         );
+        for label in [
+            &list_input["properties"]["label"],
+            &search_input["properties"]["label"],
+        ] {
+            let description = label["description"].as_str().unwrap();
+            for operator in ["^=", "$=", "~="] {
+                assert!(description.contains(operator), "{description}");
+            }
+            assert!(description.contains("case-insensitive"), "{description}");
+        }
         assert_eq!(required_names(&search_input), vec!["limit", "query"]);
 
         let list_output = tool_schema(&server, "list_notes", true);
