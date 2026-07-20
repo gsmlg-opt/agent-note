@@ -3,8 +3,7 @@ use axum::{
     extract::State,
     http::{header, StatusCode},
     response::Response,
-    routing::get,
-    Json, Router,
+    Json,
 };
 use note_core::SystemConfig;
 use note_pipelines::{
@@ -12,7 +11,18 @@ use note_pipelines::{
     Context, SystemInfo,
 };
 use std::sync::Arc;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
+#[utoipa::path(
+    get,
+    path = "/api/system/config",
+    tag = "system",
+    responses(
+        (status = 200, description = "System configuration", body = crate::openapi::SystemConfigSchema),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn get_config_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Json<SystemConfig>, (StatusCode, String)> {
@@ -22,6 +32,17 @@ async fn get_config_handler(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/system/config",
+    tag = "system",
+    request_body = crate::openapi::SystemConfigSchema,
+    responses(
+        (status = 204, description = "System configuration updated"),
+        (status = 400, description = "Invalid system configuration", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn update_config_handler(
     State(ctx): State<Arc<Context>>,
     Json(config): Json<SystemConfig>,
@@ -42,6 +63,15 @@ async fn update_config_handler(
         })
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system/info",
+    tag = "system",
+    responses(
+        (status = 200, description = "System information", body = crate::openapi::SystemInfoSchema),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn get_info_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Json<SystemInfo>, (StatusCode, String)> {
@@ -51,6 +81,15 @@ async fn get_info_handler(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/system/backup",
+    tag = "system",
+    responses(
+        (status = 200, description = "System backup archive", body = inline(crate::openapi::Binary), content_type = "application/gzip"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn get_backup_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Response, (StatusCode, String)> {
@@ -76,20 +115,17 @@ async fn get_backup_handler(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
-pub fn system_router() -> Router<Arc<Context>> {
-    Router::new()
-        .route(
-            "/api/system/config",
-            get(get_config_handler).put(update_config_handler),
-        )
-        .route("/api/system/info", get(get_info_handler))
-        .route("/api/system/backup", get(get_backup_handler))
+pub fn system_router() -> OpenApiRouter<Arc<Context>> {
+    OpenApiRouter::new()
+        .routes(routes!(get_config_handler, update_config_handler))
+        .routes(routes!(get_info_handler))
+        .routes(routes!(get_backup_handler))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, http::Request, Router};
     use flate2::read::GzDecoder;
     use http_body_util::BodyExt;
     use note_attachments::{FilesystemAttachmentStore, S3AttachmentConfig, S3AttachmentStore};
@@ -105,6 +141,76 @@ mod tests {
     use note_storage_turso::TursoStorage;
     use std::{io::Read, time::Duration};
     use tower::ServiceExt;
+
+    fn system_openapi_document() -> serde_json::Value {
+        let (_, openapi) = system_router().split_for_parts();
+        serde_json::to_value(openapi).unwrap()
+    }
+
+    #[test]
+    fn openapi_contains_all_system_operations_and_contracts() {
+        let document = system_openapi_document();
+
+        for (path, method) in [
+            ("/api/system/config", "get"),
+            ("/api/system/config", "put"),
+            ("/api/system/info", "get"),
+            ("/api/system/backup", "get"),
+        ] {
+            assert!(
+                document["paths"][path][method].is_object(),
+                "missing {method} {path}"
+            );
+            assert_eq!(document["paths"][path][method]["tags"][0], "system");
+        }
+
+        let get_config = &document["paths"]["/api/system/config"]["get"];
+        assert_eq!(
+            get_config["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SystemConfigSchema"
+        );
+        assert_eq!(
+            get_config["responses"]["500"]["content"]["text/plain"]["schema"]["type"],
+            "string"
+        );
+
+        let put_config = &document["paths"]["/api/system/config"]["put"];
+        assert_eq!(
+            put_config["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SystemConfigSchema"
+        );
+        assert!(put_config["responses"]["204"].get("content").is_none());
+        for status in ["400", "500"] {
+            assert_eq!(
+                put_config["responses"][status]["content"]["text/plain"]["schema"]["type"],
+                "string"
+            );
+        }
+
+        let get_info = &document["paths"]["/api/system/info"]["get"];
+        assert_eq!(
+            get_info["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SystemInfoSchema"
+        );
+        assert_eq!(
+            get_info["responses"]["500"]["content"]["text/plain"]["schema"]["type"],
+            "string"
+        );
+
+        let get_backup = &document["paths"]["/api/system/backup"]["get"];
+        assert_eq!(
+            get_backup["responses"]["200"]["content"]["application/gzip"]["schema"]["type"],
+            "string"
+        );
+        assert_eq!(
+            get_backup["responses"]["200"]["content"]["application/gzip"]["schema"]["format"],
+            "binary"
+        );
+        assert_eq!(
+            get_backup["responses"]["500"]["content"]["text/plain"]["schema"]["type"],
+            "string"
+        );
+    }
 
     struct InfoBackend {
         _connection_url: String,
@@ -158,7 +264,7 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        (system_router().with_state(ctx.clone()), ctx, dir)
+        (system_router().with_state(ctx.clone()).into(), ctx, dir)
     }
 
     fn request(method: &str, uri: &str, body: &str) -> Request<Body> {
@@ -264,8 +370,8 @@ mod tests {
             .unwrap(),
         );
         let ctx = Arc::new(Context::new(storage, Arc::new(StubEmbedder), attachments));
-        let response = system_router()
-            .with_state(ctx)
+        let app: Router = system_router().with_state(ctx).into();
+        let response = app
             .oneshot(request("GET", "/api/system/info", ""))
             .await
             .unwrap();
@@ -309,7 +415,7 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        let app = system_router().with_state(ctx);
+        let app: Router = system_router().with_state(ctx).into();
 
         let response = app
             .oneshot(request("GET", "/api/system/info", ""))

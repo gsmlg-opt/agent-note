@@ -2,8 +2,8 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     response::{Html, Response},
-    routing::{get as route_get, post},
-    Json, Router,
+    routing::get as route_get,
+    Json,
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
@@ -19,32 +19,101 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 const DEFAULT_LIST_LIMIT: i64 = 10;
 const MAX_LIST_LIMIT: i64 = 1000;
 const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(10);
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SaveNoteRequest {
     pub title: String,
     pub content: String,
     #[serde(default)]
+    #[schema(default = json!([]))]
     pub attachments: Vec<AttachmentRequest>,
     #[serde(default)]
+    #[schema(schema_with = crate::openapi::label_pairs_with_empty_default_schema)]
     pub labels: Vec<(String, String)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
+#[schema(
+    description = "Each attachment request requires at least one of content or content_base64. If both are present, they must decode to identical bytes."
+)]
 pub struct AttachmentRequest {
     pub id: String,
     pub path: String,
     pub mime: String,
     #[serde(default)]
+    #[schema(default = "")]
     pub description: String,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
+    #[schema(
+        content_encoding = "base64",
+        content_media_type = "application/octet-stream"
+    )]
     pub content_base64: Option<String>,
+}
+
+struct AttachmentRequestDocumentation;
+
+impl utoipa::PartialSchema for AttachmentRequestDocumentation {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        let content_requirement = utoipa::openapi::schema::AnyOfBuilder::new()
+            .item(
+                utoipa::openapi::schema::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::Object)
+                    .property(
+                        "content",
+                        utoipa::openapi::schema::Object::with_type(
+                            utoipa::openapi::schema::Type::String,
+                        ),
+                    )
+                    .required("content"),
+            )
+            .item(
+                utoipa::openapi::schema::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::Object)
+                    .property(
+                        "content_base64",
+                        utoipa::openapi::schema::Object::with_type(
+                            utoipa::openapi::schema::Type::String,
+                        ),
+                    )
+                    .required("content_base64"),
+            );
+
+        utoipa::openapi::schema::AllOfBuilder::new()
+            .item(<AttachmentRequest as utoipa::PartialSchema>::schema())
+            .item(content_requirement)
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for AttachmentRequestDocumentation {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("AttachmentRequest")
+    }
+}
+
+#[derive(utoipa::ToSchema)]
+#[schema(as = SaveNoteRequest)]
+#[allow(dead_code)]
+struct SaveNoteRequestDocumentation {
+    title: String,
+    content: String,
+    #[schema(default = json!([]), required = false)]
+    attachments: Vec<AttachmentRequestDocumentation>,
+    #[schema(
+        schema_with = crate::openapi::label_pairs_with_empty_default_schema,
+        required = false
+    )]
+    labels: Vec<(String, String)>,
 }
 
 impl TryFrom<AttachmentRequest> for NoteAttachment {
@@ -65,37 +134,43 @@ impl TryFrom<AttachmentRequest> for NoteAttachment {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct SaveNoteResponse {
     pub id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct RenderRequest {
     pub content: String,
     #[serde(default)]
     pub attachment_base: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct NoteDto {
     pub id: String,
     pub title: String,
     pub content: String,
     pub attachments: Vec<AttachmentResponse>,
+    #[schema(schema_with = crate::openapi::label_pairs_schema)]
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct AttachmentResponse {
     pub id: String,
     pub path: String,
     pub mime: String,
+    #[schema(default = "")]
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[schema(
+        content_encoding = "base64",
+        content_media_type = "application/octet-stream"
+    )]
     pub content_base64: String,
 }
 
@@ -131,10 +206,11 @@ impl From<Note> for NoteDto {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct NoteListDto {
     pub id: String,
     pub title: String,
+    #[schema(schema_with = crate::openapi::label_pairs_schema)]
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -156,10 +232,11 @@ impl From<NoteListItem> for NoteListDto {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct TrashNoteDto {
     pub id: String,
     pub title: String,
+    #[schema(schema_with = crate::openapi::label_pairs_schema)]
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -185,28 +262,29 @@ impl From<NoteListItem> for TrashNoteDto {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct DashboardLabelDto {
     pub key: String,
     pub description: String,
+    #[schema(schema_with = crate::openapi::label_value_type_schema)]
     pub value_type: String,
     pub count: usize,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct DashboardNoteDto {
     pub id: String,
     pub title: String,
     pub updated_at: i64,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct DashboardEmbeddingNoteDto {
     pub id: String,
     pub title: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct DashboardDto {
     pub note_count: usize,
     pub embedded_note_count: usize,
@@ -303,6 +381,15 @@ async fn refresh_dashboard_embedding_status(
     Ok(())
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/dashboard",
+    tag = "dashboard",
+    responses(
+        (status = 200, description = "Dashboard summary", body = DashboardDto),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn dashboard_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Json<DashboardDto>, (axum::http::StatusCode, String)> {
@@ -327,6 +414,18 @@ async fn dashboard_handler(
     Ok(Json(value))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/notes",
+    tag = "notes",
+    request_body = SaveNoteRequestDocumentation,
+    responses(
+        (status = 200, description = "Note saved", body = SaveNoteResponse),
+        (status = 400, description = "Invalid note", body = String, content_type = "text/plain"),
+        (status = 409, description = "Duplicate note", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn save_note_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<SaveNoteRequest>,
@@ -376,14 +475,35 @@ fn decode_attachment_requests(
         .collect()
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListNotesQuery {
+    /// Maximum notes to return; omitted values are normalized to 10 and all values are clamped to 0..=1000.
     #[serde(default)]
+    #[param(default = 10, minimum = 0, maximum = 1000)]
     pub limit: Option<i64>,
+    /// Number of notes to skip; omitted and negative values are normalized to 0.
     #[serde(default)]
+    #[param(default = 0, minimum = 0)]
     pub offset: Option<i64>,
+    /// Optional label expression used to filter notes.
     #[serde(default)]
     pub label: Option<String>,
+}
+
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[allow(dead_code)]
+struct CountNotesQuery {
+    /// Optional label expression used to filter notes.
+    #[serde(default)]
+    label: Option<String>,
+    /// Accepted and validated for compatibility; values do not affect the count.
+    #[serde(default)]
+    limit: Option<i64>,
+    /// Accepted and validated for compatibility; values do not affect the count.
+    #[serde(default)]
+    offset: Option<i64>,
 }
 
 fn normalized_limit(limit: Option<i64>) -> i64 {
@@ -394,6 +514,16 @@ fn normalized_offset(offset: Option<i64>) -> i64 {
     offset.unwrap_or(0).max(0)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes",
+    tag = "notes",
+    params(ListNotesQuery),
+    responses(
+        (status = 200, description = "Notes", body = Vec<NoteListDto>),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn list_notes_handler(
     State(ctx): State<Arc<Context>>,
     Query(req): Query<ListNotesQuery>,
@@ -411,11 +541,22 @@ async fn list_notes_handler(
     Ok(Json(notes.into_iter().map(Into::into).collect()))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct CountNotesResponse {
     pub total: usize,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes/count",
+    tag = "notes",
+    params(CountNotesQuery),
+    responses(
+        (status = 200, description = "Note count", body = CountNotesResponse),
+        (status = 400, description = "Invalid compatibility query value", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn count_notes_handler(
     State(ctx): State<Arc<Context>>,
     Query(req): Query<ListNotesQuery>,
@@ -426,6 +567,17 @@ async fn count_notes_handler(
     Ok(Json(CountNotesResponse { total }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes/{id}",
+    tag = "notes",
+    params(("id" = String, Path, description = "Note ID")),
+    responses(
+        (status = 200, description = "Note", body = NoteDto),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn get_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -439,6 +591,24 @@ async fn get_note_handler(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes/{id}/raw",
+    tag = "notes",
+    params(
+        ("id" = String, Path, description = "Note ID"),
+        NoteContentQuery
+    ),
+    responses(
+        (status = 200, description = "Raw Markdown or rendered HTML", content(
+            (String = "text/markdown"),
+            (String = "text/html")
+        )),
+        (status = 400, description = "Unsupported content type", body = String, content_type = "text/plain"),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn get_note_raw_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -487,10 +657,41 @@ async fn get_note_raw_handler(
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct NoteContentQuery {
     #[serde(rename = "type")]
+    #[param(
+        rename = "type",
+        schema_with = crate::openapi::note_content_type_schema
+    )]
     output_type: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/notes/{id}/content",
+    tag = "notes",
+    params(
+        ("id" = String, Path, description = "Note ID"),
+        NoteContentQuery
+    ),
+    responses(
+        (status = 200, description = "Raw Markdown or rendered HTML", content(
+            (String = "text/markdown"),
+            (String = "text/html")
+        )),
+        (status = 400, description = "Unsupported content type", body = String, content_type = "text/plain"),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
+async fn get_note_content_handler(
+    state: State<Arc<Context>>,
+    path: Path<String>,
+    query: Query<NoteContentQuery>,
+) -> Result<Response, (axum::http::StatusCode, String)> {
+    get_note_raw_handler(state, path, query).await
 }
 
 fn markdown_response(content: String) -> Result<Response, (axum::http::StatusCode, String)> {
@@ -504,6 +705,20 @@ fn markdown_response(content: String) -> Result<Response, (axum::http::StatusCod
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/notes/{id}/attachments/{path}",
+    tag = "notes",
+    params(
+        ("id" = String, Path, description = "Note ID"),
+        ("path" = String, Path, description = "Attachment path")
+    ),
+    responses(
+        (status = 200, description = "Attachment bytes using the stored MIME type", body = inline(crate::openapi::Binary), content_type = "*/*"),
+        (status = 404, description = "Attachment not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn get_attachment_handler(
     State(ctx): State<Arc<Context>>,
     Path((id, path)): Path<(String, String)>,
@@ -525,6 +740,19 @@ async fn get_attachment_handler(
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/notes/{id}",
+    tag = "notes",
+    params(("id" = String, Path, description = "Note ID")),
+    request_body = SaveNoteRequestDocumentation,
+    responses(
+        (status = 200, description = "Updated note", body = NoteDto),
+        (status = 400, description = "Invalid note", body = String, content_type = "text/plain"),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn update_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -560,6 +788,17 @@ async fn update_note_handler(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/notes/{id}",
+    tag = "notes",
+    params(("id" = String, Path, description = "Note ID")),
+    responses(
+        (status = 204, description = "Note moved to Trash"),
+        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn delete_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -576,6 +815,15 @@ async fn delete_note_handler(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/trash",
+    tag = "trash",
+    responses(
+        (status = 200, description = "Trashed notes", body = Vec<TrashNoteDto>),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn list_deleted_notes_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Json<Vec<TrashNoteDto>>, (axum::http::StatusCode, String)> {
@@ -585,11 +833,24 @@ async fn list_deleted_notes_handler(
     Ok(Json(notes.into_iter().map(TrashNoteDto::from).collect()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 struct RestoreNotesRequest {
+    #[schema(min_items = 1)]
     ids: Vec<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/trash/restore",
+    tag = "trash",
+    request_body = RestoreNotesRequest,
+    responses(
+        (status = 204, description = "Notes restored"),
+        (status = 400, description = "Invalid restore request", body = String, content_type = "text/plain"),
+        (status = 404, description = "Trashed note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn restore_notes_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<RestoreNotesRequest>,
@@ -615,6 +876,17 @@ async fn restore_notes_handler(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/trash/{id}",
+    tag = "trash",
+    params(("id" = String, Path, description = "Note ID")),
+    responses(
+        (status = 204, description = "Note permanently deleted"),
+        (status = 404, description = "Trashed note not found", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn permanently_delete_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
@@ -628,7 +900,7 @@ async fn permanently_delete_note_handler(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct SearchQuery {
     pub query: String,
     pub limit: usize,
@@ -636,13 +908,23 @@ pub struct SearchQuery {
     pub label: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct SearchResultDto {
     pub id: String,
     pub title: String,
     pub score: f32, // fused RRF score — label as such in any client UI, not "similarity" (docs/design.md §7)
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/notes/search",
+    tag = "notes",
+    request_body = SearchQuery,
+    responses(
+        (status = 200, description = "Search results", body = Vec<SearchResultDto>),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn search_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<SearchQuery>,
@@ -662,6 +944,15 @@ async fn search_handler(
     ))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/render",
+    tag = "rendering",
+    request_body = RenderRequest,
+    responses(
+        (status = 200, description = "Rendered HTML", body = String, content_type = "text/html")
+    )
+)]
 async fn render_handler(Json(req): Json<RenderRequest>) -> Html<String> {
     let mut html = crate::render::render_markdown_html(&req.content);
     if let Some(base) = req.attachment_base {
@@ -676,28 +967,25 @@ fn rewrite_relative_attachment_urls(html: &str, base: &str) -> String {
         .replace("src=\"./", &format!("src=\"{base}/"))
 }
 
-pub fn notes_router() -> Router<Arc<Context>> {
-    Router::new()
-        .route(
-            "/api/notes",
-            post(save_note_handler).get(list_notes_handler),
-        )
-        .route("/api/notes/count", route_get(count_notes_handler))
-        .route("/api/trash", route_get(list_deleted_notes_handler))
-        .route("/api/trash/restore", post(restore_notes_handler))
-        .route(
-            "/api/trash/{id}",
-            axum::routing::delete(permanently_delete_note_handler),
-        )
-        .route("/api/dashboard", route_get(dashboard_handler))
-        .route(
-            "/api/notes/{id}",
-            route_get(get_note_handler)
-                .put(update_note_handler)
-                .delete(delete_note_handler),
-        )
-        .route("/api/notes/{id}/raw", route_get(get_note_raw_handler))
-        .route("/notes/{id}/content", route_get(get_note_raw_handler))
+pub fn notes_router() -> OpenApiRouter<Arc<Context>> {
+    #[derive(OpenApi)]
+    #[openapi(paths(get_attachment_handler))]
+    struct AttachmentOpenApi;
+
+    OpenApiRouter::with_openapi(AttachmentOpenApi::openapi())
+        .routes(routes!(save_note_handler, list_notes_handler))
+        .routes(routes!(count_notes_handler))
+        .routes(routes!(list_deleted_notes_handler))
+        .routes(routes!(restore_notes_handler))
+        .routes(routes!(permanently_delete_note_handler))
+        .routes(routes!(dashboard_handler))
+        .routes(routes!(
+            get_note_handler,
+            update_note_handler,
+            delete_note_handler
+        ))
+        .routes(routes!(get_note_raw_handler))
+        .routes(routes!(get_note_content_handler))
         .route(
             "/api/notes/{id}/attachments/{*path}",
             route_get(get_attachment_handler),
@@ -705,21 +993,240 @@ pub fn notes_router() -> Router<Arc<Context>> {
         // POST (not GET) because search takes a JSON body: browsers' Fetch API forbids a body on
         // GET, so the Wasm frontend (gloo-net) can't call a GET-with-body search. POST-with-body is
         // the standard pattern for structured search params.
-        .route("/api/notes/search", post(search_handler))
-        .route("/api/render", post(render_handler))
+        .routes(routes!(search_handler))
+        .routes(routes!(render_handler))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::{body::Body, Router};
     use http_body_util::BodyExt;
     use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
     use note_storage::{StorageBackend, TransactionMode};
     use note_storage_turso::TursoStorage;
+    use serde_json::Value;
     use tower::ServiceExt;
+
+    fn note_openapi_document() -> Value {
+        let (_, openapi) = notes_router().split_for_parts();
+        serde_json::to_value(openapi).unwrap()
+    }
+
+    fn operation_parameter<'a>(operation: &'a Value, name: &str) -> &'a Value {
+        operation["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == name)
+            .unwrap_or_else(|| panic!("missing parameter {name}"))
+    }
+
+    #[test]
+    fn openapi_contains_all_note_operations() {
+        let document = note_openapi_document();
+
+        for (path, methods) in [
+            ("/api/notes", &["get", "post"][..]),
+            ("/api/notes/count", &["get"][..]),
+            ("/api/notes/{id}", &["get", "put", "delete"][..]),
+            ("/api/notes/{id}/raw", &["get"][..]),
+            ("/notes/{id}/content", &["get"][..]),
+            ("/api/notes/{id}/attachments/{path}", &["get"][..]),
+            ("/api/notes/search", &["post"][..]),
+            ("/api/render", &["post"][..]),
+            ("/api/trash", &["get"][..]),
+            ("/api/trash/restore", &["post"][..]),
+            ("/api/trash/{id}", &["delete"][..]),
+            ("/api/dashboard", &["get"][..]),
+        ] {
+            for method in methods {
+                assert!(
+                    document["paths"][path][method].is_object(),
+                    "missing {method} {path}"
+                );
+            }
+        }
+
+        let raw_content =
+            &document["paths"]["/api/notes/{id}/raw"]["get"]["responses"]["200"]["content"];
+        assert_eq!(raw_content["text/markdown"]["schema"]["type"], "string");
+        assert_eq!(raw_content["text/html"]["schema"]["type"], "string");
+
+        let render_content =
+            &document["paths"]["/api/render"]["post"]["responses"]["200"]["content"];
+        assert_eq!(render_content["text/html"]["schema"]["type"], "string");
+
+        let attachment_content = &document["paths"]["/api/notes/{id}/attachments/{path}"]["get"]
+            ["responses"]["200"]["content"];
+        assert_eq!(attachment_content["*/*"]["schema"]["type"], "string");
+        assert_eq!(attachment_content["*/*"]["schema"]["format"], "binary");
+
+        let plain_error =
+            &document["paths"]["/api/notes"]["post"]["responses"]["400"]["content"]["text/plain"];
+        assert_eq!(plain_error["schema"]["type"], "string");
+
+        let empty_response = &document["paths"]["/api/notes/{id}"]["delete"]["responses"]["204"];
+        assert!(
+            empty_response.get("content").is_none(),
+            "204 response must not publish a body"
+        );
+    }
+
+    #[test]
+    fn openapi_documents_list_and_count_queries() {
+        let document = note_openapi_document();
+        let list = &document["paths"]["/api/notes"]["get"];
+        let limit = operation_parameter(list, "limit");
+        assert_eq!(limit["required"], false);
+        assert_eq!(limit["schema"]["default"], 10);
+        assert_eq!(limit["schema"]["minimum"], 0);
+        assert_eq!(limit["schema"]["maximum"], 1000);
+        let limit_description = limit["description"].as_str().unwrap();
+        assert!(limit_description.contains("normalized"));
+        assert!(limit_description.contains("clamped"));
+
+        let offset = operation_parameter(list, "offset");
+        assert_eq!(offset["required"], false);
+        assert_eq!(offset["schema"]["default"], 0);
+        assert_eq!(offset["schema"]["minimum"], 0);
+        assert!(offset["description"]
+            .as_str()
+            .unwrap()
+            .contains("normalized"));
+
+        assert_eq!(operation_parameter(list, "label")["required"], false);
+
+        let count = &document["paths"]["/api/notes/count"]["get"];
+        let count_parameters = count["parameters"].as_array().unwrap();
+        assert_eq!(count_parameters.len(), 3);
+        assert_eq!(operation_parameter(count, "label")["required"], false);
+        for name in ["limit", "offset"] {
+            let parameter = operation_parameter(count, name);
+            assert_eq!(parameter["required"], false);
+            let description = parameter["description"].as_str().unwrap();
+            assert!(description.contains("compatibility"));
+            assert!(description.contains("do not affect the count"));
+        }
+
+        let bad_query = &count["responses"]["400"]["content"]["text/plain"];
+        assert_eq!(bad_query["schema"]["type"], "string");
+    }
+
+    #[test]
+    fn openapi_documents_note_content_type_query() {
+        let document = note_openapi_document();
+        for path in ["/api/notes/{id}/raw", "/notes/{id}/content"] {
+            let operation = &document["paths"][path]["get"];
+            let content_type = operation_parameter(operation, "type");
+            assert_eq!(content_type["in"], "query");
+            assert_eq!(content_type["required"], false);
+            assert_eq!(content_type["schema"]["enum"], serde_json::json!(["html"]));
+            assert!(content_type["description"]
+                .as_str()
+                .or_else(|| content_type["schema"]["description"].as_str())
+                .unwrap()
+                .contains("omission returns Markdown"));
+        }
+    }
+
+    #[test]
+    fn openapi_requires_at_least_one_restore_id() {
+        let document = note_openapi_document();
+        assert_eq!(
+            document["components"]["schemas"]["RestoreNotesRequest"]["properties"]["ids"]
+                ["minItems"],
+            1
+        );
+    }
+
+    #[test]
+    fn openapi_documents_attachment_transport_contract() {
+        let document = note_openapi_document();
+        let schemas = &document["components"]["schemas"];
+        let request = &schemas["AttachmentRequest"];
+        let request_properties = if request["properties"].is_object() {
+            &request["properties"]
+        } else {
+            &request["allOf"][0]["properties"]
+        };
+        let response = &schemas["AttachmentResponse"];
+        let save = &schemas["SaveNoteRequest"];
+
+        assert_eq!(request_properties["description"]["default"], "");
+        assert_eq!(response["properties"]["description"]["default"], "");
+        assert_eq!(
+            save["properties"]["attachments"]["default"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            save["properties"]["labels"]["default"],
+            serde_json::json!([])
+        );
+
+        for properties in [request_properties, &response["properties"]] {
+            let content_base64 = &properties["content_base64"];
+            assert_eq!(content_base64["contentEncoding"], "base64");
+            assert_eq!(
+                content_base64["contentMediaType"],
+                "application/octet-stream"
+            );
+        }
+
+        assert_eq!(
+            request["allOf"][1]["anyOf"],
+            serde_json::json!([
+                {
+                    "type": "object",
+                    "required": ["content"],
+                    "properties": {"content": {"type": "string"}}
+                },
+                {
+                    "type": "object",
+                    "required": ["content_base64"],
+                    "properties": {"content_base64": {"type": "string"}}
+                }
+            ])
+        );
+
+        let request_description = request["description"]
+            .as_str()
+            .or_else(|| request["allOf"][0]["description"].as_str())
+            .unwrap();
+        assert!(request_description.contains("at least one of content or content_base64"));
+        assert!(request_description.contains("identical bytes"));
+    }
+
+    #[test]
+    fn openapi_defaults_labels_only_on_save_requests() {
+        let document = note_openapi_document();
+        let schemas = &document["components"]["schemas"];
+
+        assert_eq!(
+            schemas["SaveNoteRequest"]["properties"]["labels"]["default"],
+            serde_json::json!([])
+        );
+        for response in ["NoteDto", "NoteListDto", "TrashNoteDto"] {
+            assert!(
+                schemas[response]["properties"]["labels"]
+                    .get("default")
+                    .is_none(),
+                "{response}.labels must not publish a default"
+            );
+        }
+    }
+
+    #[test]
+    fn openapi_constrains_dashboard_label_value_types() {
+        let document = note_openapi_document();
+        assert_eq!(
+            document["components"]["schemas"]["DashboardLabelDto"]["properties"]["value_type"]
+                ["enum"],
+            serde_json::json!(["text", "number", "version", "date", "datetime", "time"])
+        );
+    }
 
     // Builds the real /api/notes router over a fresh temp DB + stub embedder so tests exercise the
     // actual HTTP surface (routing, JSON extractor, status codes, DTO serialization) via oneshot.
@@ -739,7 +1246,12 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        (notes_router().with_state(ctx.clone()), ctx, storage, dir)
+        (
+            notes_router().with_state(ctx.clone()).into(),
+            ctx,
+            storage,
+            dir,
+        )
     }
 
     async fn test_app() -> (Router, Arc<Context>, tempfile::TempDir) {
@@ -933,6 +1445,33 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json.get("total").and_then(|v| v.as_u64()), Some(12));
+    }
+
+    #[tokio::test]
+    async fn count_notes_rejects_invalid_pagination_query_values() {
+        let (app, _ctx, _dir) = test_app().await;
+
+        for uri in [
+            "/api/notes/count?limit=invalid",
+            "/api/notes/count?offset=invalid",
+        ] {
+            let response = app.clone().oneshot(get(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/plain; charset=utf-8"),
+                "{uri}"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(
+                body.contains("Failed to deserialize query string"),
+                "{uri}: {body}"
+            );
+        }
     }
 
     #[test]

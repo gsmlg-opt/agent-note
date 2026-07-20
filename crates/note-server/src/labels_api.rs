@@ -1,7 +1,6 @@
 use axum::{
     extract::{Path, State},
-    routing::{post, put},
-    Json, Router,
+    Json,
 };
 use note_core::LabelKey;
 use note_pipelines::{
@@ -10,26 +9,37 @@ use note_pipelines::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct DefineLabelKeyRequest {
     pub key: String,
     pub description: String,
     #[serde(default = "default_label_value_type")]
+    #[schema(
+        schema_with = label_value_type_with_text_default_schema,
+        required = false
+    )]
     pub value_type: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdateLabelKeyRequest {
     pub description: String,
     #[serde(default)]
+    #[schema(
+        schema_with = crate::openapi::label_value_type_schema,
+        required = false
+    )]
     pub value_type: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct LabelKeyDto {
     pub key: String,
     pub description: String,
+    #[schema(schema_with = crate::openapi::label_value_type_schema)]
     pub value_type: String,
 }
 
@@ -43,6 +53,17 @@ impl From<LabelKey> for LabelKeyDto {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/labels",
+    tag = "labels",
+    request_body = DefineLabelKeyRequest,
+    responses(
+        (status = 200, description = "Label key defined"),
+        (status = 400, description = "Invalid label key", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn define_label_key_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<DefineLabelKeyRequest>,
@@ -79,6 +100,15 @@ async fn define_label_key_handler(
     Ok(())
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/labels",
+    tag = "labels",
+    responses(
+        (status = 200, description = "Label keys", body = Vec<LabelKeyDto>),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn list_label_keys_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Json<Vec<LabelKeyDto>>, (axum::http::StatusCode, String)> {
@@ -88,6 +118,17 @@ async fn list_label_keys_handler(
     Ok(Json(keys.into_iter().map(Into::into).collect()))
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/labels/{key}",
+    tag = "labels",
+    params(("key" = String, Path, description = "Label key")),
+    request_body = UpdateLabelKeyRequest,
+    responses(
+        (status = 200, description = "Label key updated"),
+        (status = 400, description = "Invalid label key update", body = String, content_type = "text/plain")
+    )
+)]
 async fn update_label_key_handler(
     State(ctx): State<Arc<Context>>,
     Path(key): Path<String>,
@@ -113,6 +154,16 @@ async fn update_label_key_handler(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/labels/{key}",
+    tag = "labels",
+    params(("key" = String, Path, description = "Label key")),
+    responses(
+        (status = 200, description = "Label key deleted"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
 async fn delete_label_key_handler(
     State(ctx): State<Arc<Context>>,
     Path(key): Path<String>,
@@ -128,17 +179,17 @@ fn default_label_value_type() -> String {
     "text".to_string()
 }
 
-pub fn labels_router() -> Router<Arc<Context>> {
+fn label_value_type_with_text_default_schema() -> utoipa::openapi::schema::Object {
+    utoipa::openapi::schema::ObjectBuilder::from(crate::openapi::label_value_type_schema())
+        .default(Some(serde_json::json!("text")))
+        .build()
+}
+
+pub fn labels_router() -> OpenApiRouter<Arc<Context>> {
     // GET has no body (unlike /api/notes/search), so a browser GET is safe here.
-    Router::new()
-        .route(
-            "/api/labels",
-            post(define_label_key_handler).get(list_label_keys_handler),
-        )
-        .route(
-            "/api/labels/{key}",
-            put(update_label_key_handler).delete(delete_label_key_handler),
-        )
+    OpenApiRouter::new()
+        .routes(routes!(define_label_key_handler, list_label_keys_handler))
+        .routes(routes!(update_label_key_handler, delete_label_key_handler))
 }
 
 #[cfg(test)]
@@ -146,12 +197,112 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use axum::Router;
     use http_body_util::BodyExt;
     use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
     use note_storage::StorageBackend;
     use note_storage_turso::TursoStorage;
+    use serde_json::Value;
     use tower::ServiceExt;
+
+    fn label_openapi_document() -> Value {
+        let (_, openapi) = labels_router().split_for_parts();
+        serde_json::to_value(openapi).unwrap()
+    }
+
+    #[test]
+    fn openapi_contains_all_label_operations_and_contracts() {
+        let document = label_openapi_document();
+
+        for (path, methods) in [
+            ("/api/labels", &["get", "post"][..]),
+            ("/api/labels/{key}", &["put", "delete"][..]),
+        ] {
+            for method in methods {
+                assert!(
+                    document["paths"][path][method].is_object(),
+                    "missing {method} {path}"
+                );
+                assert_eq!(document["paths"][path][method]["tags"][0], "labels");
+            }
+        }
+
+        let post = &document["paths"]["/api/labels"]["post"];
+        assert_eq!(
+            post["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/DefineLabelKeyRequest"
+        );
+        for status in ["400", "500"] {
+            assert_eq!(
+                post["responses"][status]["content"]["text/plain"]["schema"]["type"],
+                "string"
+            );
+        }
+        assert!(post["responses"]["200"].get("content").is_none());
+
+        let get = &document["paths"]["/api/labels"]["get"];
+        assert_eq!(
+            get["responses"]["200"]["content"]["application/json"]["schema"]["type"],
+            "array"
+        );
+        assert_eq!(
+            get["responses"]["200"]["content"]["application/json"]["schema"]["items"]["$ref"],
+            "#/components/schemas/LabelKeyDto"
+        );
+        assert_eq!(
+            get["responses"]["500"]["content"]["text/plain"]["schema"]["type"],
+            "string"
+        );
+
+        for (method, error_status) in [("put", "400"), ("delete", "500")] {
+            let operation = &document["paths"]["/api/labels/{key}"][method];
+            let key = operation["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|parameter| parameter["name"] == "key")
+                .expect("key path parameter");
+            assert_eq!(key["in"], "path");
+            assert_eq!(key["required"], true);
+            assert_eq!(key["schema"]["type"], "string");
+            assert!(operation["responses"]["200"].get("content").is_none());
+            assert_eq!(
+                operation["responses"][error_status]["content"]["text/plain"]["schema"]["type"],
+                "string"
+            );
+        }
+
+        assert_eq!(
+            document["paths"]["/api/labels/{key}"]["put"]["requestBody"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/UpdateLabelKeyRequest"
+        );
+
+        let schemas = &document["components"]["schemas"];
+        assert_eq!(
+            schemas["DefineLabelKeyRequest"]["properties"]["value_type"]["default"],
+            "text"
+        );
+        assert!(!schemas["DefineLabelKeyRequest"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("value_type")));
+        assert!(!schemas["UpdateLabelKeyRequest"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("value_type")));
+        for schema in [
+            "DefineLabelKeyRequest",
+            "UpdateLabelKeyRequest",
+            "LabelKeyDto",
+        ] {
+            assert_eq!(
+                schemas[schema]["properties"]["value_type"]["enum"],
+                serde_json::json!(["text", "number", "version", "date", "datetime", "time"])
+            );
+        }
+    }
 
     async fn test_app() -> (Router, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -164,7 +315,7 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        (labels_router().with_state(ctx), dir)
+        (labels_router().with_state(ctx).into(), dir)
     }
 
     fn post(uri: &str, body: &str) -> Request<Body> {
