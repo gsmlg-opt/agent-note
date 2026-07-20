@@ -659,6 +659,22 @@ mod tests {
     }
 
     #[test]
+    fn empty_string_match_operands_match_existing_values() {
+        for operator in [
+            LabelOperator::StartsWith,
+            LabelOperator::EndsWith,
+            LabelOperator::Regex,
+        ] {
+            assert!(compare_label_values(
+                LabelValueType::Text,
+                "Agent-Note",
+                operator,
+                ""
+            ));
+        }
+    }
+
+    #[test]
     fn compares_typed_values() {
         assert!(compare_label_values(
             LabelValueType::Number,

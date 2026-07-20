@@ -3,7 +3,7 @@ mod support;
 use note_attachments::{
     AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
 };
-use note_core::{LabelValueType, NoteAttachment};
+use note_core::{LabelKeyValidationError, LabelValueType, NoteAttachment};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
     compute_tag, define_label_key, define_label_key_with_type, delete_note, drain_embedding_jobs,
@@ -764,6 +764,90 @@ async fn unknown_label_key_is_auto_created() {
     // The previously-unknown key now exists in the catalog (auto-created, empty description).
     let keys = list_label_keys(&ctx).await.unwrap();
     assert!(keys.iter().any(|k| k.key == "project"));
+}
+
+#[tokio::test]
+async fn selector_reserved_label_key_is_not_auto_created_on_save() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "My note".into(),
+            content: "Some content".into(),
+            attachments: vec![],
+            labels: vec![("project$name".into(), "alpha".into())],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<LabelKeyValidationError>(),
+        Some(&LabelKeyValidationError::ReservedCharacter('$'))
+    );
+    assert!(list_label_keys(&ctx).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn selector_reserved_label_key_is_not_auto_created_on_update() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "My note".into(),
+            content: "Some content".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let error = update_note(
+        &ctx,
+        &note.id,
+        SaveNoteInput {
+            title: "Updated note".into(),
+            content: "Updated content".into(),
+            attachments: vec![],
+            labels: vec![("project$name".into(), "alpha".into())],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<LabelKeyValidationError>(),
+        Some(&LabelKeyValidationError::ReservedCharacter('$'))
+    );
+    assert!(list_label_keys(&ctx).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn existing_cataloged_reserved_label_key_remains_attachable() {
+    let (ctx, backend, _dir) = test_context().await;
+    backend
+        .session()
+        .await
+        .unwrap()
+        .insert_label_key_with_type("project$name", "", LabelValueType::Text)
+        .await
+        .unwrap();
+
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Legacy label".into(),
+            content: "Some content".into(),
+            attachments: vec![],
+            labels: vec![("project$name".into(), "alpha".into())],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(note.labels[0].key, "project$name");
+    assert_eq!(note.labels[0].value, "alpha");
 }
 
 #[tokio::test]

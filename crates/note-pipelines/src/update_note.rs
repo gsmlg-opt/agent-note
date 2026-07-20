@@ -1,8 +1,8 @@
 use crate::{context::Context, SaveNoteInput};
 use note_attachments::PreparedAttachmentSet;
 use note_core::{
-    validate_label_value, validate_note_input, Label, LabelValueType, Note, NoteAttachment,
-    NoteInput, ValidationError,
+    validate_label_key, validate_label_value, validate_note_input, Label, LabelValueType, Note,
+    NoteAttachment, NoteInput, ValidationError,
 };
 use note_storage::{NoteFieldsUpdate, NoteUpdate, TransactionMode};
 use std::collections::{HashMap, HashSet};
@@ -96,10 +96,8 @@ async fn update_note_inner(
 
     let mut missing_keys: Vec<String> = Vec::new();
     for (key, _) in &input.labels {
-        if !key.is_empty()
-            && !existing_keys.iter().any(|k| k == key)
-            && !missing_keys.iter().any(|k| k == key)
-        {
+        if !existing_keys.iter().any(|k| k == key) && !missing_keys.iter().any(|k| k == key) {
+            validate_label_key(key).map_err(anyhow::Error::new)?;
             missing_keys.push(key.clone());
         }
     }

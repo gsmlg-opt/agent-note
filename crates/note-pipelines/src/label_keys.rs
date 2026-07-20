@@ -1,5 +1,5 @@
 use crate::context::Context;
-use note_core::{LabelKey, LabelKeyValidationError, LabelValueType};
+use note_core::{validate_label_key, LabelKey, LabelKeyValidationError, LabelValueType};
 use std::str::FromStr;
 
 pub async fn define_label_key(ctx: &Context, key: &str, description: &str) -> anyhow::Result<()> {
@@ -14,9 +14,7 @@ pub async fn define_label_key_with_type(
 ) -> anyhow::Result<()> {
     // Preserve the typed error in the anyhow chain (rather than a bail! string) so the REST handler
     // can downcast to distinguish these caller-fault cases (400) from storage failures (500).
-    if key.trim().is_empty() {
-        return Err(anyhow::Error::new(LabelKeyValidationError::EmptyKey));
-    }
+    validate_label_key(key).map_err(anyhow::Error::new)?;
     let session = ctx.storage().session().await?;
     Ok(session
         .insert_label_key_with_type(key, description, value_type)

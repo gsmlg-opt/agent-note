@@ -33,7 +33,8 @@ pub struct SaveNoteRequest {
     pub title: String,
     /// Note body, formatted as Markdown.
     pub content: String,
-    /// Existing label keys to attach, as `(key, value)` pairs.
+    /// Label `(key, value)` pairs to attach. Missing keys are auto-created, but keys cannot contain
+    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`.
     #[serde(default)]
     pub labels: Vec<(String, String)>,
 }
@@ -273,7 +274,8 @@ pub struct UpdateNoteRequest {
     pub title: String,
     /// New note body, formatted as Markdown.
     pub content: String,
-    /// Existing label keys to attach, as `(key, value)` pairs.
+    /// Label `(key, value)` pairs to attach. Missing keys are auto-created, but keys cannot contain
+    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`.
     #[serde(default)]
     pub labels: Vec<(String, String)>,
 }
@@ -312,7 +314,9 @@ pub struct ListNotesRequest {
     pub offset: Option<u32>,
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
+    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
+    /// the `&` separator is also reserved in operands.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -332,7 +336,9 @@ pub struct SemanticSearchRequest {
     pub limit: usize,
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
+    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
+    /// the `&` separator is also reserved in operands.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -772,7 +778,11 @@ impl ServerHandler for NoteMcpServer {
 }
 
 fn to_error_data(error: anyhow::Error) -> ErrorData {
-    if error.downcast_ref::<note_core::ValidationError>().is_some() {
+    if error.downcast_ref::<note_core::ValidationError>().is_some()
+        || error
+            .downcast_ref::<note_core::LabelKeyValidationError>()
+            .is_some()
+    {
         return ErrorData::invalid_params(error.to_string(), None);
     }
     if let Some(error_kind) = error.downcast_ref::<AttachmentMutationError>() {
@@ -1236,6 +1246,12 @@ mod tests {
             path: "blob.bin".into(),
         });
         assert_eq!(to_put_error_data(collision).code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn label_key_validation_faults_are_invalid_params() {
+        let error = anyhow::Error::new(note_core::LabelKeyValidationError::ReservedCharacter('$'));
+        assert_eq!(to_error_data(error).code, ErrorCode::INVALID_PARAMS);
     }
 
     #[tokio::test]

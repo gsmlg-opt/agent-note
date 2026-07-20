@@ -447,7 +447,10 @@ async fn save_note_handler(
         // in the anyhow chain, so we downcast to tell them apart.
         let status = if e.downcast_ref::<note_core::DuplicateNoteError>().is_some() {
             axum::http::StatusCode::CONFLICT
-        } else if e.downcast_ref::<note_core::ValidationError>().is_some() {
+        } else if e.downcast_ref::<note_core::ValidationError>().is_some()
+            || e.downcast_ref::<note_core::LabelKeyValidationError>()
+                .is_some()
+        {
             axum::http::StatusCode::BAD_REQUEST
         } else {
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -488,7 +491,9 @@ pub struct ListNotesQuery {
     pub offset: Option<i64>,
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
+    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
+    /// the `&` separator is also reserved in operands.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -499,7 +504,9 @@ pub struct ListNotesQuery {
 struct CountNotesQuery {
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
+    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
+    /// the `&` separator is also reserved in operands.
     #[serde(default)]
     label: Option<String>,
     /// Accepted and validated for compatibility; values do not affect the count.
@@ -775,7 +782,10 @@ async fn update_note_handler(
     )
     .await
     .map_err(|e| {
-        let status = if e.downcast_ref::<note_core::ValidationError>().is_some() {
+        let status = if e.downcast_ref::<note_core::ValidationError>().is_some()
+            || e.downcast_ref::<note_core::LabelKeyValidationError>()
+                .is_some()
+        {
             axum::http::StatusCode::BAD_REQUEST
         } else {
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -910,7 +920,9 @@ pub struct SearchQuery {
     pub limit: usize,
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
+    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
+    /// the `&` separator is also reserved in operands.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -1418,6 +1430,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn selector_reserved_label_key_returns_400() {
+        let (app, _ctx, _dir) = test_app().await;
+        let resp = app
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"T","content":"C","labels":[["project$name","v"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

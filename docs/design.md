@@ -320,9 +320,13 @@ retrieval quality.
 
 ## 6. Pipeline Contracts
 
-**define_label_key**: validate that `key` is non-empty, then insert the key, description, and value
+**define_label_key**: validate that `key` is non-empty and contains none of the selector-reserved
+characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`, then insert the key, description, and value
 type into `label_keys`. Descriptions may be empty and filled in later. Missing keys referenced by a
-note are also auto-created by `save_note` with an empty description.
+note are also auto-created by `save_note` with an empty description after the same key validation.
+Catalogs created before this grammar was enforced can still contain reserved characters; those keys
+remain attachable but must be renamed with a storage migration before selector filtering can address
+them unambiguously.
 
 **list_label_keys**: read-only → return the full label-key catalog (`key` + `description`), used by
 clients and the UI to populate suggestions and explain known keys.

@@ -14,6 +14,8 @@ use utoipa_axum::routes;
 
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct DefineLabelKeyRequest {
+    /// Label key. Selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, and `~`
+    /// are not allowed.
     pub key: String,
     pub description: String,
     #[serde(default = "default_label_value_type")]
@@ -82,10 +84,10 @@ async fn define_label_key_handler(
     define_label_key_with_type(&ctx, &req.key, &req.description, value_type)
         .await
         .map_err(|e| {
-            // Empty keys are the caller's fault (400); anything else (storage failure, or a
-            // duplicate-key UNIQUE violation) falls through to 500. A duplicate arguably wants 409,
-            // but mapping the backend-neutral StorageErrorKind::Constraint category is not currently
-            // part of this handler's error handling.
+            // Invalid keys are the caller's fault (400); anything else (storage failure, or a
+            // duplicate-key UNIQUE violation) falls through to 500. A duplicate arguably wants
+            // 409, but mapping the backend-neutral StorageErrorKind::Constraint category is not
+            // currently part of this handler's error handling.
             let status = if e
                 .downcast_ref::<note_core::LabelKeyValidationError>()
                 .is_some()
@@ -429,6 +431,19 @@ mod tests {
             .uri("/api/labels")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"key":"","description":"d"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn selector_reserved_key_returns_400() {
+        let (app, _dir) = test_app().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/labels")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"key":"project$name","description":"d"}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);

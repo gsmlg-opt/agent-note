@@ -9,7 +9,8 @@ Extend note label filters with three string-match operators:
 - `key~=pattern`: case-insensitive regular-expression match.
 
 All three operators apply to the stored string representation of every label value type. Existing
-equality, inequality, ordering, bare-key presence, and multi-selector AND behavior remain unchanged.
+equality, inequality, ordering, bare-key presence, and multi-selector AND behavior remain unchanged
+for valid selector keys.
 
 ## Core Design
 
@@ -23,6 +24,12 @@ storage adapters:
 - Starts-with and ends-with matching lowercase both operands before comparison.
 - Regex matching compiles the caller-supplied pattern with case-insensitive matching enabled.
 - An invalid regex returns `false` for that selector instead of failing the search request.
+
+To keep operator parsing unambiguous, newly defined or auto-created label keys cannot contain the
+selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`. Existing cataloged keys are
+still accepted when saving notes, but a pre-existing key containing one of these characters must be
+renamed with a storage migration before selectors can address it unambiguously. The `&` term
+separator is also reserved in operands; this selector grammar does not define escaping.
 
 Empty prefix, suffix, and regex operands follow normal string/regex behavior and match any existing
 value. The web UI continues converting an empty filter value into a bare-key presence selector.

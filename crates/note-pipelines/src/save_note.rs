@@ -1,7 +1,7 @@
 use crate::context::Context;
 use note_core::{
-    resolve_duplicate_rule, validate_label_value, validate_note_input, DuplicateNoteError, Label,
-    LabelValueType, Note, NoteAttachment, NoteInput, ValidationError,
+    resolve_duplicate_rule, validate_label_key, validate_label_value, validate_note_input,
+    DuplicateNoteError, Label, LabelValueType, Note, NoteAttachment, NoteInput, ValidationError,
 };
 use note_storage::{NewNote, StorageTransaction, TransactionMode};
 use std::collections::HashMap;
@@ -81,10 +81,8 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     // Distinct referenced keys not yet in the catalog — these get auto-created in the transaction.
     let mut missing_keys: Vec<String> = Vec::new();
     for (key, _) in &input.labels {
-        if !key.is_empty()
-            && !existing_keys.iter().any(|k| k == key)
-            && !missing_keys.iter().any(|k| k == key)
-        {
+        if !existing_keys.iter().any(|k| k == key) && !missing_keys.iter().any(|k| k == key) {
+            validate_label_key(key).map_err(anyhow::Error::new)?;
             missing_keys.push(key.clone());
         }
     }

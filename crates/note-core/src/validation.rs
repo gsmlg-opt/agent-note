@@ -55,13 +55,14 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
-/// Validation failures for the label-key catalog (define_label_key). Kept separate from
-/// `ValidationError` (which is about note input) so each handler downcasts to the precise type it
-/// cares about. Like `ValidationError`, this is carried through the anyhow chain so the REST layer
-/// can map these caller-fault cases to 400 while genuine storage failures stay 500.
+/// Validation failures for label-key creation. Kept separate from `ValidationError` (which is
+/// about note input) so each handler downcasts to the precise type it cares about. Like
+/// `ValidationError`, this is carried through the anyhow chain so transports can map these
+/// caller-fault cases precisely while genuine storage failures stay internal errors.
 #[derive(Debug, PartialEq)]
 pub enum LabelKeyValidationError {
     EmptyKey,
+    ReservedCharacter(char),
     InvalidValueType(String),
 }
 
@@ -69,6 +70,10 @@ impl std::fmt::Display for LabelKeyValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LabelKeyValidationError::EmptyKey => write!(f, "label key must not be empty"),
+            LabelKeyValidationError::ReservedCharacter(character) => write!(
+                f,
+                "label key must not contain selector-reserved character: {character}"
+            ),
             LabelKeyValidationError::InvalidValueType(value_type) => {
                 write!(f, "invalid label value type: {value_type}")
             }
@@ -77,6 +82,19 @@ impl std::fmt::Display for LabelKeyValidationError {
 }
 
 impl std::error::Error for LabelKeyValidationError {}
+
+pub fn validate_label_key(key: &str) -> Result<(), LabelKeyValidationError> {
+    if key.trim().is_empty() {
+        return Err(LabelKeyValidationError::EmptyKey);
+    }
+    if let Some(character) = key
+        .chars()
+        .find(|character| matches!(character, '&' | '=' | '!' | '<' | '>' | '^' | '$' | '~'))
+    {
+        return Err(LabelKeyValidationError::ReservedCharacter(character));
+    }
+    Ok(())
+}
 
 pub struct NoteInput {
     pub title: String,
@@ -210,6 +228,27 @@ mod tests {
     fn accepts_valid_input_with_no_labels() {
         let result = validate_note_input(&input("title", "content", &[]), &[]);
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn label_keys_reject_selector_reserved_characters() {
+        for character in ['&', '=', '!', '<', '>', '^', '$', '~'] {
+            let key = format!("project{character}name");
+            assert_eq!(
+                validate_label_key(&key),
+                Err(LabelKeyValidationError::ReservedCharacter(character)),
+                "{character:?} must be reserved for label selectors"
+            );
+        }
+    }
+
+    #[test]
+    fn label_keys_preserve_existing_nonempty_grammar_otherwise() {
+        assert_eq!(validate_label_key("project/name with spaces"), Ok(()));
+        assert_eq!(
+            validate_label_key(" \t "),
+            Err(LabelKeyValidationError::EmptyKey)
+        );
     }
 
     #[test]
