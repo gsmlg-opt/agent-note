@@ -310,7 +310,9 @@ pub struct ListNotesRequest {
     /// Number of notes to skip.
     #[serde(default)]
     pub offset: Option<u32>,
-    /// Label selector, with `&`-separated terms ANDed.
+    /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
+    /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -328,7 +330,9 @@ pub struct SemanticSearchRequest {
     pub query: String,
     /// Maximum number of results to return.
     pub limit: usize,
-    /// Optional label selector.
+    /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
+    /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
     #[serde(default)]
     pub label: Option<String>,
 }

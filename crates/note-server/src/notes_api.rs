@@ -486,7 +486,9 @@ pub struct ListNotesQuery {
     #[serde(default)]
     #[param(default = 0, minimum = 0)]
     pub offset: Option<i64>,
-    /// Optional label expression used to filter notes.
+    /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
+    /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -495,7 +497,9 @@ pub struct ListNotesQuery {
 #[into_params(parameter_in = Query)]
 #[allow(dead_code)]
 struct CountNotesQuery {
-    /// Optional label expression used to filter notes.
+    /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
+    /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
     #[serde(default)]
     label: Option<String>,
     /// Accepted and validated for compatibility; values do not affect the count.
@@ -904,6 +908,9 @@ async fn permanently_delete_note_handler(
 pub struct SearchQuery {
     pub query: String,
     pub limit: usize,
+    /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
+    /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex).
     #[serde(default)]
     pub label: Option<String>,
 }
