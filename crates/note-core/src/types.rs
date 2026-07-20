@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
 pub type NoteId = String;
@@ -72,6 +73,9 @@ pub enum LabelOperator {
     Gte,
     Lt,
     Lte,
+    StartsWith,
+    EndsWith,
+    Regex,
 }
 
 impl LabelOperator {
@@ -83,6 +87,9 @@ impl LabelOperator {
             LabelOperator::Gte => ">=",
             LabelOperator::Lt => "<",
             LabelOperator::Lte => "<=",
+            LabelOperator::StartsWith => "^=",
+            LabelOperator::EndsWith => "$=",
+            LabelOperator::Regex => "~=",
         }
     }
 }
@@ -141,6 +148,22 @@ pub fn compare_label_values(
     operator: LabelOperator,
     right: &str,
 ) -> bool {
+    match operator {
+        LabelOperator::StartsWith => {
+            return left.to_lowercase().starts_with(&right.to_lowercase());
+        }
+        LabelOperator::EndsWith => {
+            return left.to_lowercase().ends_with(&right.to_lowercase());
+        }
+        LabelOperator::Regex => {
+            return RegexBuilder::new(right)
+                .case_insensitive(true)
+                .build()
+                .is_ok_and(|regex| regex.is_match(left));
+        }
+        _ => {}
+    }
+
     match (
         comparable_value(value_type, left),
         comparable_value(value_type, right),
@@ -151,24 +174,27 @@ pub fn compare_label_values(
 }
 
 fn split_selector_term(term: &str) -> Option<(&str, LabelOperator, &str)> {
-    for (token, operator) in [
+    let (idx, token, operator) = [
         (">=", LabelOperator::Gte),
         ("<=", LabelOperator::Lte),
         ("!=", LabelOperator::NotEq),
+        ("^=", LabelOperator::StartsWith),
+        ("$=", LabelOperator::EndsWith),
+        ("~=", LabelOperator::Regex),
         ("=", LabelOperator::Eq),
         (">", LabelOperator::Gt),
         ("<", LabelOperator::Lt),
-    ] {
-        if let Some(idx) = term.find(token) {
-            let key = &term[..idx];
-            let value = &term[idx + token.len()..];
-            if key.trim().is_empty() {
-                return None;
-            }
-            return Some((key, operator, value));
-        }
+    ]
+    .into_iter()
+    .filter_map(|(token, operator)| term.find(token).map(|idx| (idx, token, operator)))
+    .min_by_key(|(idx, token, _)| (*idx, std::cmp::Reverse(token.len())))?;
+
+    let key = &term[..idx];
+    let value = &term[idx + token.len()..];
+    if key.trim().is_empty() {
+        return None;
     }
-    None
+    Some((key, operator, value))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -261,6 +287,7 @@ fn compare_ordering(ordering: std::cmp::Ordering, operator: LabelOperator) -> bo
         LabelOperator::Gte => ordering.is_ge(),
         LabelOperator::Lt => ordering.is_lt(),
         LabelOperator::Lte => ordering.is_le(),
+        LabelOperator::StartsWith | LabelOperator::EndsWith | LabelOperator::Regex => false,
     }
 }
 
@@ -501,7 +528,26 @@ mod tests {
     }
 
     #[test]
-    fn string_match_operators_are_case_insensitive_for_all_value_types() {
+    fn parses_first_operator_when_values_contain_operator_tokens() {
+        for (input, operator, value) in [
+            ("name~=^a!=b$", LabelOperator::Regex, "^a!=b$"),
+            ("name^=a>=b", LabelOperator::StartsWith, "a>=b"),
+            ("name$=a<=b", LabelOperator::EndsWith, "a<=b"),
+            ("name~=a^=b$=c", LabelOperator::Regex, "a^=b$=c"),
+        ] {
+            assert_eq!(
+                parse_label_selectors(input),
+                vec![LabelSelector {
+                    key: "name".to_string(),
+                    value: Some(value.to_string()),
+                    operator,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn string_match_operators_use_case_insensitive_raw_stored_values() {
         let text_label = Label {
             key: "name".to_string(),
             value: "Agent-Note".to_string(),
@@ -549,6 +595,48 @@ mod tests {
                 value: Some("1".to_string()),
                 operator: LabelOperator::StartsWith,
             }
+        ));
+
+        for (value_type, left, operator, right) in [
+            (
+                LabelValueType::Version,
+                "v1.2.3",
+                LabelOperator::Regex,
+                r"^V1\.",
+            ),
+            (
+                LabelValueType::Date,
+                "2026-07-21",
+                LabelOperator::StartsWith,
+                "2026-",
+            ),
+            (
+                LabelValueType::DateTime,
+                "2026-07-21T12:30",
+                LabelOperator::Regex,
+                r"T12:\d+$",
+            ),
+            (
+                LabelValueType::Time,
+                "09:30",
+                LabelOperator::EndsWith,
+                ":30",
+            ),
+        ] {
+            assert!(compare_label_values(value_type, left, operator, right));
+        }
+
+        assert!(compare_label_values(
+            LabelValueType::Text,
+            "ÄGENT-NÖTE",
+            LabelOperator::StartsWith,
+            "äge"
+        ));
+        assert!(compare_label_values(
+            LabelValueType::Text,
+            "ÄGENT-NÖTE",
+            LabelOperator::EndsWith,
+            "nöte"
         ));
     }
 
