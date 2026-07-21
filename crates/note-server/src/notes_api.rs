@@ -1022,12 +1022,74 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::{body::Body, Router};
     use http_body_util::BodyExt;
-    use note_attachments::FilesystemAttachmentStore;
+    use note_attachments::{
+        AttachmentStore, AttachmentStoreInfo, FilesystemAttachmentStore,
+        PreparedAttachmentMutation, PreparedAttachmentSet,
+    };
     use note_embedding::StubEmbedder;
     use note_storage::{StorageBackend, TransactionMode};
     use note_storage_turso::TursoStorage;
     use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    struct RecordingReadAttachmentStore {
+        inner: FilesystemAttachmentStore,
+        read_calls: AtomicUsize,
+    }
+
+    impl RecordingReadAttachmentStore {
+        fn new(root: impl Into<std::path::PathBuf>) -> Self {
+            Self {
+                inner: FilesystemAttachmentStore::new(root.into()),
+                read_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn read_calls(&self) -> usize {
+            self.read_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AttachmentStore for RecordingReadAttachmentStore {
+        async fn prepare(
+            &self,
+            note_id: &str,
+            attachments: &[NoteAttachment],
+        ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
+            self.inner.prepare(note_id, attachments).await
+        }
+
+        async fn prepare_put(
+            &self,
+            note_id: &str,
+            attachment: &NoteAttachment,
+        ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+            self.inner.prepare_put(note_id, attachment).await
+        }
+
+        async fn prepare_delete(
+            &self,
+            note_id: &str,
+            path: &str,
+        ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
+            self.inner.prepare_delete(note_id, path).await
+        }
+
+        async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.read(note_id, path).await
+        }
+
+        async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {
+            self.inner.remove_note(note_id).await
+        }
+
+        fn info(&self) -> AttachmentStoreInfo {
+            self.inner.info()
+        }
+    }
 
     fn note_openapi_document() -> Value {
         let (_, openapi) = notes_router().split_for_parts();
@@ -1197,13 +1259,14 @@ mod tests {
             &request["allOf"][0]["properties"]
         };
         let response = &schemas["AttachmentMetadataResponse"];
+        let response_properties = response["properties"]
+            .as_object()
+            .expect("attachment metadata response properties");
         let save = &schemas["SaveNoteRequest"];
 
         assert_eq!(request_properties["description"]["default"], "");
-        assert_eq!(response["properties"]["description"]["default"], "");
-        let mut response_property_keys = response["properties"]
-            .as_object()
-            .expect("attachment metadata response properties")
+        assert_eq!(response_properties["description"]["default"], "");
+        let mut response_property_keys = response_properties
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>();
@@ -1211,6 +1274,15 @@ mod tests {
         assert_eq!(
             response_property_keys,
             vec!["description", "id", "mime", "path"]
+        );
+        assert_eq!(
+            schemas["NoteDto"]["properties"]["attachments"]["items"]["$ref"],
+            "#/components/schemas/AttachmentMetadataResponse"
+        );
+        assert_eq!(
+            document["paths"]["/api/notes/{id}"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/NoteDto"
         );
         assert_eq!(
             save["properties"]["attachments"]["default"],
@@ -1916,7 +1988,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binary_attachments_roundtrip_as_base64_and_download_as_raw_bytes() {
+    async fn get_note_does_not_read_attachment_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
+        let attachments = Arc::new(RecordingReadAttachmentStore::new(
+            dir.path().join("attachments"),
+        ));
+        let ctx = Arc::new(Context::new(
+            storage,
+            Arc::new(StubEmbedder),
+            attachments.clone(),
+        ));
+        let app: Router = notes_router().with_state(ctx).into();
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Proof","content":"See [proof](./proof.txt)","attachments":[{"id":"proof","path":"./proof.txt","mime":"text/plain","description":"proof","content":"evidence"}],"labels":[]}"#,
+        )
+        .await;
+        assert_eq!(
+            attachments.read_calls(),
+            0,
+            "saving must not read attachments"
+        );
+
+        let response = app.oneshot(get(&format!("/api/notes/{id}"))).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            attachments.read_calls(),
+            0,
+            "GET /api/notes/{{id}} must not read attachment content"
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_attachments_accept_base64_requests_and_download_as_raw_bytes() {
         let (app, _ctx, dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
@@ -1931,18 +2038,36 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let attachment = &json["attachments"][0];
-        assert_eq!(attachment["content_base64"], "AJ+Slv8=");
+        assert_eq!(
+            attachment,
+            &serde_json::json!({
+                "id": "blob",
+                "path": "./blob.bin",
+                "mime": "application/octet-stream",
+                "description": "raw bytes"
+            })
+        );
+        assert!(attachment.get("content_base64").is_none());
         assert!(attachment.get("content").is_none());
 
-        json["title"] = serde_json::Value::String("Binary updated".into());
+        let update_body = serde_json::json!({
+            "title": "Binary updated",
+            "content": "![blob](./blob.bin)",
+            "attachments": [{
+                "id": "blob",
+                "path": "./blob.bin",
+                "mime": "application/octet-stream",
+                "description": "raw bytes",
+                "content_base64": "AJ+Slv8="
+            }],
+            "labels": []
+        })
+        .to_string();
         let resp = app
             .clone()
-            .oneshot(put(
-                &format!("/api/notes/{id}"),
-                &serde_json::to_string(&json).unwrap(),
-            ))
+            .oneshot(put(&format!("/api/notes/{id}"), &update_body))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
