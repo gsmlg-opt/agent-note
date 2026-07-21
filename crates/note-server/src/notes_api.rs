@@ -1275,6 +1275,11 @@ mod tests {
             "#/components/schemas/NoteDto"
         );
         assert_eq!(
+            document["paths"]["/api/notes/{id}"]["put"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/NoteDto"
+        );
+        assert_eq!(
             save["properties"]["attachments"]["default"],
             serde_json::json!([])
         );
@@ -2061,6 +2066,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let attachment = &json["attachments"][0];
+        assert_eq!(
+            attachment,
+            &serde_json::json!({
+                "id": "blob",
+                "path": "./blob.bin",
+                "mime": "application/octet-stream",
+                "description": "raw bytes"
+            })
+        );
+        assert!(attachment.get("content_base64").is_none());
+        assert!(attachment.get("content").is_none());
 
         let resp = app
             .clone()
