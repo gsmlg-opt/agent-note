@@ -1196,11 +1196,22 @@ mod tests {
         } else {
             &request["allOf"][0]["properties"]
         };
-        let response = &schemas["AttachmentResponse"];
+        let response = &schemas["AttachmentMetadataResponse"];
         let save = &schemas["SaveNoteRequest"];
 
         assert_eq!(request_properties["description"]["default"], "");
         assert_eq!(response["properties"]["description"]["default"], "");
+        let mut response_property_keys = response["properties"]
+            .as_object()
+            .expect("attachment metadata response properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        response_property_keys.sort_unstable();
+        assert_eq!(
+            response_property_keys,
+            vec!["description", "id", "mime", "path"]
+        );
         assert_eq!(
             save["properties"]["attachments"]["default"],
             serde_json::json!([])
@@ -1210,14 +1221,12 @@ mod tests {
             serde_json::json!([])
         );
 
-        for properties in [request_properties, &response["properties"]] {
-            let content_base64 = &properties["content_base64"];
-            assert_eq!(content_base64["contentEncoding"], "base64");
-            assert_eq!(
-                content_base64["contentMediaType"],
-                "application/octet-stream"
-            );
-        }
+        let content_base64 = &request_properties["content_base64"];
+        assert_eq!(content_base64["contentEncoding"], "base64");
+        assert_eq!(
+            content_base64["contentMediaType"],
+            "application/octet-stream"
+        );
 
         assert_eq!(
             request["allOf"][1]["anyOf"],
@@ -1839,16 +1848,8 @@ mod tests {
             attachments[0].get("description").and_then(|v| v.as_str()),
             Some("metadata")
         );
-        assert_eq!(
-            attachments[0]
-                .get("content_base64")
-                .and_then(|v| v.as_str()),
-            Some("eyJvayI6dHJ1ZX0=")
-        );
-        assert_eq!(
-            attachments[0].get("content").and_then(|v| v.as_str()),
-            Some(r#"{"ok":true}"#)
-        );
+        assert!(attachments[0].get("content_base64").is_none());
+        assert!(attachments[0].get("content").is_none());
 
         let resp = app
             .clone()
@@ -1887,6 +1888,31 @@ mod tests {
         let html = resp.into_body().collect().await.unwrap().to_bytes();
         let html = std::str::from_utf8(&html).unwrap();
         assert!(html.contains(&format!(r#"href="/api/notes/{id}/attachments/meta.json""#)));
+    }
+
+    #[tokio::test]
+    async fn get_note_returns_attachment_metadata_without_reading_files() {
+        let (app, _ctx, dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Proof","content":"See [proof](./proof.txt)","attachments":[{"id":"proof","path":"./proof.txt","mime":"text/plain","description":"proof","content":"evidence"}],"labels":[]}"#,
+        )
+        .await;
+        std::fs::remove_file(dir.path().join("attachments").join(&id).join("proof.txt")).unwrap();
+
+        let resp = app.oneshot(get(&format!("/api/notes/{id}"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["attachments"],
+            serde_json::json!([{
+                "id": "proof",
+                "path": "./proof.txt",
+                "mime": "text/plain",
+                "description": "proof"
+            }])
+        );
     }
 
     #[tokio::test]
