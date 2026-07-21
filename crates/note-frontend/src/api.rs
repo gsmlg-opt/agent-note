@@ -588,13 +588,14 @@ mod tests {
             "id": "file-1",
             "path": "./report.txt",
             "mime": "text/plain",
+            "description": "Quarterly report",
         }))
         .unwrap();
 
         assert_eq!(metadata.id, "file-1");
         assert_eq!(metadata.path, "./report.txt");
         assert_eq!(metadata.mime, "text/plain");
-        assert_eq!(metadata.description, "");
+        assert_eq!(metadata.description, "Quarterly report");
     }
 
     #[test]
