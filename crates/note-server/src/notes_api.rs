@@ -7,8 +7,8 @@ use axum::{
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
-    count_notes, delete_note, embedding_dashboard_status, get_note, get_note_attachment,
-    get_note_markdown, label_note_counts, list_deleted_note_summaries, list_label_keys,
+    count_notes, delete_note, embedding_dashboard_status, get_note_attachment, get_note_markdown,
+    get_note_metadata, label_note_counts, list_deleted_note_summaries, list_label_keys,
     list_note_summaries, permanently_delete_note, restore_notes, save_note, search_notes_filtered,
     update_note, Context, ListNotesParams, SaveNoteInput,
 };
@@ -151,7 +151,7 @@ pub struct NoteDto {
     pub id: String,
     pub title: String,
     pub content: String,
-    pub attachments: Vec<AttachmentResponse>,
+    pub attachments: Vec<AttachmentMetadataResponse>,
     #[schema(schema_with = crate::openapi::label_pairs_schema)]
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
@@ -159,31 +159,21 @@ pub struct NoteDto {
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
-pub struct AttachmentResponse {
+pub struct AttachmentMetadataResponse {
     pub id: String,
     pub path: String,
     pub mime: String,
     #[schema(default = "")]
     pub description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[schema(
-        content_encoding = "base64",
-        content_media_type = "application/octet-stream"
-    )]
-    pub content_base64: String,
 }
 
-impl From<NoteAttachment> for AttachmentResponse {
+impl From<NoteAttachment> for AttachmentMetadataResponse {
     fn from(attachment: NoteAttachment) -> Self {
-        let content = String::from_utf8(attachment.content.clone()).ok();
         Self {
             id: attachment.id,
             path: attachment.path,
             mime: attachment.mime,
             description: attachment.description,
-            content,
-            content_base64: note_core::encode_attachment_content(&attachment.content),
         }
     }
 }
@@ -593,7 +583,7 @@ async fn get_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
 ) -> Result<Json<NoteDto>, (axum::http::StatusCode, String)> {
-    match get_note(&ctx, &id)
+    match get_note_metadata(&ctx, &id)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
