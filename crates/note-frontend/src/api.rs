@@ -583,47 +583,32 @@ mod tests {
     }
 
     #[test]
-    fn attachment_responses_accept_legacy_text_and_canonical_base64() {
-        let legacy: NoteAttachmentResponseDto = serde_json::from_value(serde_json::json!({
-            "id": "legacy",
-            "path": "./legacy.txt",
+    fn attachment_metadata_responses_do_not_require_inline_content() {
+        let metadata: NoteAttachmentMetadataDto = serde_json::from_value(serde_json::json!({
+            "id": "file-1",
+            "path": "./report.txt",
             "mime": "text/plain",
-            "content": "hello"
         }))
         .unwrap();
-        assert_eq!(
-            NoteAttachment::try_from(legacy).unwrap().content,
-            AttachmentContent::Text("hello".to_string())
-        );
 
-        let binary: NoteAttachmentResponseDto = serde_json::from_value(serde_json::json!({
-            "id": "binary",
-            "path": "./binary.dat",
-            "mime": "application/octet-stream",
-            "content_base64": "/wA="
-        }))
-        .unwrap();
-        assert_eq!(
-            NoteAttachment::try_from(binary).unwrap().content,
-            AttachmentContent::Base64("/wA=".to_string())
-        );
+        assert_eq!(metadata.id, "file-1");
+        assert_eq!(metadata.path, "./report.txt");
+        assert_eq!(metadata.mime, "text/plain");
+        assert_eq!(metadata.description, "");
     }
 
     #[test]
-    fn attachment_responses_prefer_utf8_text_when_both_are_present() {
-        let response: NoteAttachmentResponseDto = serde_json::from_value(serde_json::json!({
-            "id": "text",
-            "path": "./text.txt",
-            "mime": "text/plain",
-            "content": "hello",
-            "content_base64": "aGVsbG8="
-        }))
-        .unwrap();
+    fn attachment_content_from_utf8_bytes_is_text() {
+        let content = attachment_content_from_bytes(b"hello".to_vec());
 
-        assert_eq!(
-            NoteAttachment::try_from(response).unwrap().content,
-            AttachmentContent::Text("hello".to_string())
-        );
+        assert_eq!(content, AttachmentContent::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn attachment_content_from_invalid_utf8_bytes_is_base64() {
+        let content = attachment_content_from_bytes(vec![0xff, 0x00]);
+
+        assert_eq!(content, AttachmentContent::Base64("/wA=".to_string()));
     }
 
     #[test]
