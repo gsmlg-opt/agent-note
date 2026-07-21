@@ -2,6 +2,7 @@ use crate::state::{
     AttachmentContent, DeletedNoteSummary, LabelFilter, LabelKey, NoteAttachment, NoteSummary,
     SearchResultSummary, SystemConfig, SystemInfo,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use gloo_net::http::{Request, Response};
 use serde::{Deserialize, Serialize};
 
@@ -191,40 +192,40 @@ impl<'a> From<&'a NoteAttachment> for NoteAttachmentRequestDto<'a> {
 }
 
 #[derive(Deserialize)]
-struct NoteAttachmentResponseDto {
+struct NoteAttachmentMetadataDto {
     id: String,
     path: String,
     mime: String,
     #[serde(default)]
     description: String,
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    content_base64: Option<String>,
 }
 
-impl TryFrom<NoteAttachmentResponseDto> for NoteAttachment {
-    type Error = String;
-
-    fn try_from(attachment: NoteAttachmentResponseDto) -> Result<Self, Self::Error> {
-        let content = match (attachment.content, attachment.content_base64) {
-            (Some(content), _) => AttachmentContent::Text(content),
-            (None, Some(content)) => AttachmentContent::Base64(content),
-            (None, None) => {
-                return Err(format!(
-                    "attachment {} has no content representation",
-                    attachment.id
-                ));
-            }
-        };
-        Ok(Self {
-            id: attachment.id,
-            path: attachment.path,
-            mime: attachment.mime,
-            description: attachment.description,
-            content,
-        })
+fn attachment_content_from_bytes(bytes: Vec<u8>) -> AttachmentContent {
+    match String::from_utf8(bytes) {
+        Ok(content) => AttachmentContent::Text(content),
+        Err(error) => AttachmentContent::Base64(STANDARD.encode(error.into_bytes())),
     }
+}
+
+async fn fetch_note_attachment(
+    note_id: &str,
+    metadata: NoteAttachmentMetadataDto,
+) -> Result<NoteAttachment, String> {
+    let base = format!("/api/notes/{note_id}/attachments");
+    let url = attachment_url(&base, &metadata.path);
+    let resp = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    let bytes = ok_or_body_error(resp)
+        .await?
+        .binary()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(NoteAttachment {
+        id: metadata.id,
+        path: metadata.path,
+        mime: metadata.mime,
+        description: metadata.description,
+        content: attachment_content_from_bytes(bytes),
+    })
 }
 
 #[derive(Deserialize)]
@@ -233,7 +234,7 @@ struct NoteDto {
     title: String,
     content: String,
     #[serde(default)]
-    attachments: Vec<NoteAttachmentResponseDto>,
+    attachments: Vec<NoteAttachmentMetadataDto>,
     labels: Vec<(String, String)>,
     #[serde(default)]
     created_at: i64,
@@ -391,11 +392,10 @@ pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    let attachments = d
-        .attachments
-        .into_iter()
-        .map(NoteAttachment::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut attachments = Vec::with_capacity(d.attachments.len());
+    for attachment in d.attachments {
+        attachments.push(fetch_note_attachment(&d.id, attachment).await?);
+    }
     Ok(NoteSummary {
         id: d.id,
         title: d.title,
