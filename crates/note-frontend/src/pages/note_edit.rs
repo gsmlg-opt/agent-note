@@ -16,7 +16,9 @@ pub struct NoteEditProps {
 #[function_component(NoteEditPage)]
 pub fn note_edit_page(props: &NoteEditProps) -> Html {
     let navigator = use_navigator().expect("router navigator");
-    let notes_query = use_location().and_then(|location| location.query::<NotesQueryParams>().ok());
+    let notes_query = use_location()
+        .and_then(|location| location.query::<NotesQueryParams>().ok())
+        .and_then(NotesQueryParams::validated);
     let note = use_state(|| None::<NoteSummary>);
     let available_labels = use_state(Vec::<LabelKey>::new);
     let loading = use_state(|| true);

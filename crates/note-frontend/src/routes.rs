@@ -16,6 +16,12 @@ pub struct NotesQueryParams {
     pub labels: Option<String>,
 }
 
+impl NotesQueryParams {
+    pub fn validated(self) -> Option<Self> {
+        (self.current >= 1 && matches!(self.page_size, 10 | 30 | 50 | 100 | 1000)).then_some(self)
+    }
+}
+
 #[derive(Clone, Routable, PartialEq)]
 pub enum Route {
     #[at("/")]
@@ -50,5 +56,34 @@ pub fn switch(route: Route) -> Html {
         Route::Trash => html! { <TrashPage /> },
         Route::System => html! { <SystemPage /> },
         Route::NotFound => html! { <p class="empty">{ "Page not found." }</p> },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NotesQueryParams;
+
+    #[test]
+    fn rejects_semantically_invalid_notes_return_context() {
+        let query = NotesQueryParams {
+            current: 0,
+            page_size: 17,
+            search: None,
+            labels: None,
+        };
+
+        assert_eq!(query.validated(), None);
+    }
+
+    #[test]
+    fn accepts_normalized_notes_return_context() {
+        let query = NotesQueryParams {
+            current: 3,
+            page_size: 30,
+            search: Some("release notes".to_string()),
+            labels: Some("status=draft".to_string()),
+        };
+
+        assert_eq!(query.clone().validated(), Some(query));
     }
 }

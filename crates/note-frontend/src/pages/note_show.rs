@@ -50,6 +50,15 @@ fn delete_confirmation_message(title: &str) -> String {
     format!("Move the note \u{201c}{title}\u{201d} to Trash? You can restore it later.")
 }
 
+fn try_start_delete(in_flight: &mut bool) -> bool {
+    if *in_flight {
+        false
+    } else {
+        *in_flight = true;
+        true
+    }
+}
+
 fn browser_clipboard() -> Option<web_sys::Clipboard> {
     let navigator = web_sys::window()?.navigator();
     let clipboard = js_sys::Reflect::get(
@@ -69,12 +78,16 @@ fn browser_clipboard() -> Option<web_sys::Clipboard> {
 #[function_component(NoteShowPage)]
 pub fn note_show_page(props: &NoteShowProps) -> Html {
     let navigator = use_navigator().expect("router navigator");
-    let notes_query = use_location().and_then(|location| location.query::<NotesQueryParams>().ok());
+    let notes_query = use_location()
+        .and_then(|location| location.query::<NotesQueryParams>().ok())
+        .and_then(NotesQueryParams::validated);
     let note = use_state(|| None::<NoteSummary>);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
     let copy_status = use_state(CopyStatus::default);
     let delete_open = use_state(|| false);
+    let delete_pending = use_state(|| false);
+    let delete_in_flight = use_mut_ref(|| false);
 
     {
         let note = note.clone();
@@ -82,6 +95,8 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         let error = error.clone();
         let copy_status = copy_status.clone();
         let delete_open = delete_open.clone();
+        let delete_pending = delete_pending.clone();
+        let delete_in_flight = delete_in_flight.clone();
         let id = props.id.clone();
         use_effect_with(props.id.clone(), move |_| {
             loading.set(true);
@@ -89,6 +104,8 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             error.set(None);
             copy_status.set(CopyStatus::Ready);
             delete_open.set(false);
+            delete_pending.set(false);
+            *delete_in_flight.borrow_mut() = false;
             wasm_bindgen_futures::spawn_local(async move {
                 match api::get_note(&id).await {
                     Ok(n) => note.set(Some(n)),
@@ -128,26 +145,51 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         (true, Some(note)) => {
             let on_close = {
                 let delete_open = delete_open.clone();
-                Callback::from(move |_: ()| delete_open.set(false))
+                let delete_pending = delete_pending.clone();
+                Callback::from(move |_: ()| {
+                    if !*delete_pending {
+                        delete_open.set(false);
+                    }
+                })
             };
             let on_cancel = {
                 let delete_open = delete_open.clone();
-                Callback::from(move |_: MouseEvent| delete_open.set(false))
+                let delete_pending = delete_pending.clone();
+                Callback::from(move |_: MouseEvent| {
+                    if !*delete_pending {
+                        delete_open.set(false);
+                    }
+                })
             };
             let on_confirm = {
                 let delete_open = delete_open.clone();
+                let delete_pending = delete_pending.clone();
+                let delete_in_flight = delete_in_flight.clone();
                 let error = error.clone();
                 let navigator = navigator.clone();
                 let notes_query = notes_query.clone();
                 let id = note.id.clone();
                 Callback::from(move |_: MouseEvent| {
+                    {
+                        let mut in_flight = delete_in_flight.borrow_mut();
+                        if !try_start_delete(&mut in_flight) {
+                            return;
+                        }
+                    }
                     let delete_open = delete_open.clone();
+                    let delete_pending = delete_pending.clone();
+                    let delete_in_flight = delete_in_flight.clone();
                     let error = error.clone();
                     let navigator = navigator.clone();
                     let notes_query = notes_query.clone();
                     let id = id.clone();
+                    delete_pending.set(true);
+                    error.set(None);
                     wasm_bindgen_futures::spawn_local(async move {
-                        match api::delete_note(&id).await {
+                        let result = api::delete_note(&id).await;
+                        *delete_in_flight.borrow_mut() = false;
+                        delete_pending.set(false);
+                        match result {
                             Ok(()) => {
                                 delete_open.set(false);
                                 if let Some(query) = notes_query {
@@ -165,12 +207,17 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             html! {
                 <Modal title="Move note to Trash" on_close={on_close}>
                     <p>{ delete_confirmation_message(&note.title) }</p>
+                    if let Some(delete_error) = &*error {
+                        <Alert variant={Some("error".to_string())}>
+                            <span>{ delete_error.clone() }</span>
+                        </Alert>
+                    }
                     <div class="app-modal-actions">
-                        <button type="button" class="btn btn-ghost" onclick={on_cancel}>
+                        <button type="button" class="btn btn-ghost" disabled={*delete_pending} onclick={on_cancel}>
                             { "Cancel" }
                         </button>
-                        <button type="button" class="btn btn-error" onclick={on_confirm}>
-                            { "Move to Trash" }
+                        <button type="button" class="btn btn-error" disabled={*delete_pending} onclick={on_confirm}>
+                            { if *delete_pending { "Moving…" } else { "Move to Trash" } }
                         </button>
                     </div>
                 </Modal>
@@ -216,7 +263,11 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                             class="btn btn-error"
                             onclick={{
                                 let delete_open = delete_open.clone();
-                                Callback::from(move |_| delete_open.set(true))
+                                let error = error.clone();
+                                Callback::from(move |_| {
+                                    error.set(None);
+                                    delete_open.set(true);
+                                })
                             }}
                         >
                             { "Delete note" }
@@ -419,7 +470,7 @@ fn markdown_options() -> Options {
 mod tests {
     use super::{
         copy_announcement, copy_chip_text, delete_confirmation_message, rewrite_attachment_urls,
-        CopyStatus,
+        try_start_delete, CopyStatus,
     };
     use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
@@ -431,6 +482,17 @@ mod tests {
             delete_confirmation_message("Release notes"),
             "Move the note \u{201c}Release notes\u{201d} to Trash? You can restore it later."
         );
+    }
+
+    #[test]
+    fn delete_request_gate_allows_only_one_in_flight_request() {
+        let mut in_flight = false;
+
+        assert!(try_start_delete(&mut in_flight));
+        assert!(!try_start_delete(&mut in_flight));
+
+        in_flight = false;
+        assert!(try_start_delete(&mut in_flight));
     }
 
     #[test]
