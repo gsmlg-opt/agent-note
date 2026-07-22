@@ -7,7 +7,7 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::components::icons;
 use crate::components::Modal;
-use crate::routes::Route;
+use crate::routes::{NotesQueryParams, Route};
 use crate::state::{LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
 
 /// Notes shown per page in the list view.
@@ -27,16 +27,6 @@ struct NotesUrlState {
     page_size: usize,
     search: String,
     labels: Vec<LabelFilter>,
-}
-
-#[derive(serde::Serialize)]
-struct NotesQueryParams {
-    current: usize,
-    page_size: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    search: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    labels: Option<String>,
 }
 
 fn default_notes_url_state() -> NotesUrlState {
@@ -177,6 +167,7 @@ pub fn notes_page() -> Html {
         .map(|location| location.query_str().to_string())
         .unwrap_or_default();
     let url_state = parse_notes_query(&query_string);
+    let notes_query = notes_query_params(&url_state);
 
     let replace_notes_url = {
         let navigator = navigator.clone();
@@ -488,9 +479,9 @@ pub fn notes_page() -> Html {
             if *loading {
                 <p class="loading">{ "Loading…" }</p>
             } else if let Some(hits) = &*results {
-                { search_results_view(hits, &page, &page_size, on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
+                { search_results_view(hits, &page, &page_size, &notes_query, on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
             } else {
-                { list_view(&notes, *total_notes, &page, &page_size, &delete_target, on_page_change, on_page_size_change, on_refresh) }
+                { list_view(&notes, *total_notes, &page, &page_size, &delete_target, &notes_query, on_page_change, on_page_size_change, on_refresh) }
             }
 
             { delete_modal }
@@ -611,12 +602,13 @@ fn list_view(
     page: &UseStateHandle<usize>,
     page_size: &UseStateHandle<usize>,
     delete_target: &UseStateHandle<Option<(String, String)>>,
+    notes_query: &NotesQueryParams,
     on_page_change: Callback<usize>,
     on_page_size_change: Callback<usize>,
     on_refresh: Callback<MouseEvent>,
 ) -> Html {
     if total == 0 {
-        return note_table(notes, delete_target);
+        return note_table(notes, delete_target, notes_query);
     }
     let per_page = **page_size;
     let total_pages = total.div_ceil(per_page);
@@ -626,7 +618,7 @@ fn list_view(
 
     html! {
         <>
-            { note_table(notes, delete_target) }
+            { note_table(notes, delete_target, notes_query) }
             { pagination_bar(current, total_pages, total, start, end, **page_size, on_page_change, on_page_size_change, on_refresh) }
         </>
     }
@@ -710,6 +702,7 @@ fn pagination_bar(
 fn note_table(
     notes: &[NoteSummary],
     delete_target: &UseStateHandle<Option<(String, String)>>,
+    notes_query: &NotesQueryParams,
 ) -> Html {
     if notes.is_empty() {
         return html! {
@@ -745,12 +738,13 @@ fn note_table(
                         html! {
                             <tr key={note.id.clone()}>
                                 <td class="col-title">
-                                    <Link<Route>
+                                    <Link<Route, NotesQueryParams>
                                         to={Route::NoteShow { id: id.clone() }}
+                                        query={Some(notes_query.clone())}
                                         classes={classes!("note-title-link")}
                                     >
                                         { note.title.clone() }
-                                    </Link<Route>>
+                                    </Link<Route, NotesQueryParams>>
                                 </td>
                                 <td>
                                     <div class="applied-labels">
@@ -763,14 +757,18 @@ fn note_table(
                                 <td class="col-time">{ format_timestamp(note.updated_at) }</td>
                                 <td class="col-actions">
                                     <div class="row-actions">
-                                        <Link<Route> to={Route::NoteShow { id: id.clone() }}
+                                        <Link<Route, NotesQueryParams>
+                                            to={Route::NoteShow { id: id.clone() }}
+                                            query={Some(notes_query.clone())}
                                             classes={classes!("btn","btn-ghost","btn-icon")}>
                                             { icons::eye() }<span class="sr-only">{ "View" }</span>
-                                        </Link<Route>>
-                                        <Link<Route> to={Route::NoteEdit { id: id.clone() }}
+                                        </Link<Route, NotesQueryParams>>
+                                        <Link<Route, NotesQueryParams>
+                                            to={Route::NoteEdit { id: id.clone() }}
+                                            query={Some(notes_query.clone())}
                                             classes={classes!("btn","btn-ghost","btn-icon")}>
                                             { icons::pencil() }<span class="sr-only">{ "Edit" }</span>
-                                        </Link<Route>>
+                                        </Link<Route, NotesQueryParams>>
                                         <button type="button" class="btn btn-ghost btn-icon icon-danger"
                                             onclick={on_remove}>
                                             { icons::trash() }<span class="sr-only">{ "Remove" }</span>
@@ -814,6 +812,7 @@ fn search_results_view(
     hits: &[SearchResultSummary],
     page: &UseStateHandle<usize>,
     page_size: &UseStateHandle<usize>,
+    notes_query: &NotesQueryParams,
     on_page_change: Callback<usize>,
     on_page_size_change: Callback<usize>,
     on_refresh: Callback<MouseEvent>,
@@ -832,9 +831,13 @@ fn search_results_view(
             <ul class="results">
                 { for hits[start..end].iter().map(|r| html! {
                     <li class="result" key={r.id.clone()}>
-                        <Link<Route> to={Route::NoteShow { id: r.id.clone() }} classes={classes!("result-title-link")}>
+                        <Link<Route, NotesQueryParams>
+                            to={Route::NoteShow { id: r.id.clone() }}
+                            query={Some(notes_query.clone())}
+                            classes={classes!("result-title-link")}
+                        >
                             <div class="result-title">{ r.title.clone() }</div>
-                        </Link<Route>>
+                        </Link<Route, NotesQueryParams>>
                         // RRF rank-fusion score, not a raw similarity/distance (docs/design.md §7).
                         <div class="result-score">{ format!("fused score: {:.4}", r.score) }</div>
                     </li>
@@ -853,6 +856,30 @@ mod tests {
     fn retrieval_copy_names_title_and_content() {
         assert_eq!(RETRIEVAL_PLACEHOLDER, "Retrieve by title or content");
         assert_eq!(RETRIEVE_BUTTON_LABEL, "Retrieve");
+    }
+
+    #[test]
+    fn notes_route_query_preserves_list_context() {
+        let state = NotesUrlState {
+            current: 3,
+            page_size: 30,
+            search: "release notes".to_string(),
+            labels: vec![LabelFilter {
+                key: "status".to_string(),
+                operator: "=".to_string(),
+                value: "draft".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            notes_query_params(&state),
+            crate::routes::NotesQueryParams {
+                current: 3,
+                page_size: 30,
+                search: Some("release notes".to_string()),
+                labels: Some("status=draft".to_string()),
+            }
+        );
     }
 
     #[test]

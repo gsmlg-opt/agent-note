@@ -4,7 +4,7 @@ use yew_router::prelude::*;
 
 use crate::api;
 use crate::components::NoteEditor;
-use crate::routes::Route;
+use crate::routes::{NotesQueryParams, Route};
 use crate::state::{LabelKey, NoteAttachment, NoteSummary};
 
 #[derive(Properties, PartialEq)]
@@ -16,6 +16,7 @@ pub struct NoteEditProps {
 #[function_component(NoteEditPage)]
 pub fn note_edit_page(props: &NoteEditProps) -> Html {
     let navigator = use_navigator().expect("router navigator");
+    let notes_query = use_location().and_then(|location| location.query::<NotesQueryParams>().ok());
     let note = use_state(|| None::<NoteSummary>);
     let available_labels = use_state(Vec::<LabelKey>::new);
     let loading = use_state(|| true);
@@ -49,14 +50,15 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
         let navigator = navigator.clone();
         let error = error.clone();
         let id = props.id.clone();
+        let notes_query = notes_query.clone();
         let submitting = submitting.clone();
         Callback::from(
-            move |(
-                title,
-                content,
-                labels,
-                attachments,
-            ): (String, String, Vec<(String, String)>, Vec<NoteAttachment>)| {
+            move |(title, content, labels, attachments): (
+                String,
+                String,
+                Vec<(String, String)>,
+                Vec<NoteAttachment>,
+            )| {
                 if *submitting {
                     return;
                 }
@@ -65,10 +67,18 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
                 let navigator = navigator.clone();
                 let error = error.clone();
                 let id = id.clone();
+                let notes_query = notes_query.clone();
                 let submitting = submitting.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     match api::update_note(&id, &title, &content, &attachments, &labels).await {
-                        Ok(()) => navigator.push(&Route::NoteShow { id }),
+                        Ok(()) => {
+                            let route = Route::NoteShow { id };
+                            if let Some(query) = notes_query {
+                                let _ = navigator.push_with_query(&route, query);
+                            } else {
+                                navigator.push(&route);
+                            }
+                        }
                         Err(e) => {
                             error.set(Some(e));
                             submitting.set(false);
@@ -87,6 +97,15 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
             if *loading {
                 <p class="loading">{ "Loading…" }</p>
             } else if let Some(n) = &*note {
+                <div class="note-page-actions">
+                    <Link<Route, NotesQueryParams>
+                        to={Route::NoteShow { id: n.id.clone() }}
+                        query={notes_query.clone()}
+                        classes={classes!("btn", "btn-ghost")}
+                    >
+                        { "Back to note" }
+                    </Link<Route, NotesQueryParams>>
+                </div>
                 <NoteEditor
                     available_labels={(*available_labels).clone()}
                     initial_title={n.title.clone()}

@@ -6,6 +6,16 @@ use crate::pages::{
     TrashPage,
 };
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct NotesQueryParams {
+    pub current: usize,
+    pub page_size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<String>,
+}
+
 #[derive(Clone, Routable, PartialEq)]
 pub enum Route {
     #[at("/")]

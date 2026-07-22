@@ -7,7 +7,8 @@ use yew_duskmoon::{Alert, Card, Chip, DmMarkdown};
 use yew_router::prelude::*;
 
 use crate::api;
-use crate::routes::Route;
+use crate::components::Modal;
+use crate::routes::{NotesQueryParams, Route};
 use crate::state::{AttachmentContent, NoteSummary};
 
 #[derive(Properties, PartialEq)]
@@ -45,6 +46,10 @@ fn copy_announcement(status: CopyStatus) -> &'static str {
     }
 }
 
+fn delete_confirmation_message(title: &str) -> String {
+    format!("Move the note \u{201c}{title}\u{201d} to Trash? You can restore it later.")
+}
+
 fn browser_clipboard() -> Option<web_sys::Clipboard> {
     let navigator = web_sys::window()?.navigator();
     let clipboard = js_sys::Reflect::get(
@@ -63,22 +68,27 @@ fn browser_clipboard() -> Option<web_sys::Clipboard> {
 /// Read-only view of a single note.
 #[function_component(NoteShowPage)]
 pub fn note_show_page(props: &NoteShowProps) -> Html {
+    let navigator = use_navigator().expect("router navigator");
+    let notes_query = use_location().and_then(|location| location.query::<NotesQueryParams>().ok());
     let note = use_state(|| None::<NoteSummary>);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
     let copy_status = use_state(CopyStatus::default);
+    let delete_open = use_state(|| false);
 
     {
         let note = note.clone();
         let loading = loading.clone();
         let error = error.clone();
         let copy_status = copy_status.clone();
+        let delete_open = delete_open.clone();
         let id = props.id.clone();
         use_effect_with(props.id.clone(), move |_| {
             loading.set(true);
             note.set(None);
             error.set(None);
             copy_status.set(CopyStatus::Ready);
+            delete_open.set(false);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::get_note(&id).await {
                     Ok(n) => note.set(Some(n)),
@@ -114,6 +124,61 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         })
     };
 
+    let delete_modal = match (*delete_open, (*note).clone()) {
+        (true, Some(note)) => {
+            let on_close = {
+                let delete_open = delete_open.clone();
+                Callback::from(move |_: ()| delete_open.set(false))
+            };
+            let on_cancel = {
+                let delete_open = delete_open.clone();
+                Callback::from(move |_: MouseEvent| delete_open.set(false))
+            };
+            let on_confirm = {
+                let delete_open = delete_open.clone();
+                let error = error.clone();
+                let navigator = navigator.clone();
+                let notes_query = notes_query.clone();
+                let id = note.id.clone();
+                Callback::from(move |_: MouseEvent| {
+                    let delete_open = delete_open.clone();
+                    let error = error.clone();
+                    let navigator = navigator.clone();
+                    let notes_query = notes_query.clone();
+                    let id = id.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match api::delete_note(&id).await {
+                            Ok(()) => {
+                                delete_open.set(false);
+                                if let Some(query) = notes_query {
+                                    let _ = navigator.push_with_query(&Route::Notes, query);
+                                } else {
+                                    navigator.push(&Route::Notes);
+                                }
+                            }
+                            Err(delete_error) => error.set(Some(delete_error)),
+                        }
+                    });
+                })
+            };
+
+            html! {
+                <Modal title="Move note to Trash" on_close={on_close}>
+                    <p>{ delete_confirmation_message(&note.title) }</p>
+                    <div class="app-modal-actions">
+                        <button type="button" class="btn btn-ghost" onclick={on_cancel}>
+                            { "Cancel" }
+                        </button>
+                        <button type="button" class="btn btn-error" onclick={on_confirm}>
+                            { "Move to Trash" }
+                        </button>
+                    </div>
+                </Modal>
+            }
+        }
+        _ => html! {},
+    };
+
     html! {
         <section class="stack">
             if let Some(err) = &*error {
@@ -139,13 +204,30 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                         </span>
                     </div>
                     <div class="note-page-actions">
-                        <Link<Route> to={Route::Notes} classes={classes!("btn","btn-ghost")}>
+                        <Link<Route, NotesQueryParams>
+                            to={Route::Notes}
+                            query={notes_query.clone()}
+                            classes={classes!("btn","btn-ghost")}
+                        >
                             { "Back" }
-                        </Link<Route>>
-                        <Link<Route> to={Route::NoteEdit { id: n.id.clone() }}
-                            classes={classes!("btn","btn-primary")}>
+                        </Link<Route, NotesQueryParams>>
+                        <button
+                            type="button"
+                            class="btn btn-error"
+                            onclick={{
+                                let delete_open = delete_open.clone();
+                                Callback::from(move |_| delete_open.set(true))
+                            }}
+                        >
+                            { "Delete note" }
+                        </button>
+                        <Link<Route, NotesQueryParams>
+                            to={Route::NoteEdit { id: n.id.clone() }}
+                            query={notes_query.clone()}
+                            classes={classes!("btn","btn-primary")}
+                        >
                             { "Edit note" }
-                        </Link<Route>>
+                        </Link<Route, NotesQueryParams>>
                     </div>
                     if !n.labels.is_empty() {
                         <div class="applied-labels">
@@ -197,6 +279,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             } else {
                 <p class="empty">{ "Note not found." }</p>
             }
+            { delete_modal }
         </section>
     }
 }
@@ -334,10 +417,21 @@ fn markdown_options() -> Options {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_announcement, copy_chip_text, rewrite_attachment_urls, CopyStatus};
+    use super::{
+        copy_announcement, copy_chip_text, delete_confirmation_message, rewrite_attachment_urls,
+        CopyStatus,
+    };
     use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
     const BASE: &str = "/api/notes/note-1/attachments";
+
+    #[test]
+    fn delete_confirmation_explains_that_the_note_can_be_restored() {
+        assert_eq!(
+            delete_confirmation_message("Release notes"),
+            "Move the note \u{201c}Release notes\u{201d} to Trash? You can restore it later."
+        );
+    }
 
     #[test]
     fn copy_chip_initially_offers_to_copy_the_canonical_id() {
