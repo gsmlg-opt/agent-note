@@ -1,13 +1,107 @@
 use crate::connection::map_sqlx_error;
 use crate::PgSession;
-use futures_util::TryStreamExt;
-use note_core::{label_matches_selector, LabelSelector, Note, NoteAttachment, NoteListItem};
+use note_core::{LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
-    ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate, NoteUpdate,
-    NotesRepository, StorageError, StorageErrorKind, StorageResult,
+    resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate,
+    NoteUpdate, NotesRepository, ResolvedLabelSelector, StorageError, StorageErrorKind,
+    StorageResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sqlx::{Postgres, QueryBuilder};
+
+impl PgSession {
+    async fn resolved_label_selectors(
+        &self,
+        selectors: &[LabelSelector],
+    ) -> StorageResult<Option<Vec<ResolvedLabelSelector>>> {
+        let mut keys = selectors
+            .iter()
+            .map(|selector| selector.key.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        if keys.is_empty() {
+            return Ok(resolve_label_selectors(selectors, &[]));
+        }
+
+        let mut connection = self.connection().await?;
+        let rows = sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT DISTINCT lk.key, nl.value, lk.description, lk.value_type
+             FROM label_keys lk
+             JOIN note_labels nl ON nl.label_key_id = lk.id
+             JOIN notes n ON n.id = nl.note_id AND n.deleted_at IS NULL
+             WHERE lk.key = ANY($1)",
+        )
+        .bind(keys)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("resolve label selector values", error))?;
+
+        let labels = rows
+            .into_iter()
+            .map(|(key, value, description, value_type)| {
+                Ok(note_core::Label {
+                    key,
+                    value,
+                    description,
+                    value_type: value_type
+                        .parse()
+                        .map_err(|error| StorageError::new(StorageErrorKind::Operation, error))?,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        Ok(resolve_label_selectors(selectors, &labels))
+    }
+}
+
+fn push_label_predicates(
+    builder: &mut QueryBuilder<Postgres>,
+    note_alias: &str,
+    selectors: &[ResolvedLabelSelector],
+) {
+    if selectors.is_empty() {
+        return;
+    }
+
+    builder.push(" AND ");
+    push_balanced_conjunction(builder, note_alias, selectors);
+}
+
+fn push_balanced_conjunction(
+    builder: &mut QueryBuilder<Postgres>,
+    note_alias: &str,
+    selectors: &[ResolvedLabelSelector],
+) {
+    if selectors.len() == 1 {
+        let selector = &selectors[0];
+        builder
+            .push(
+                "EXISTS (
+                     SELECT 1 FROM note_labels filtered_nl
+                     JOIN label_keys filtered_lk ON filtered_lk.id = filtered_nl.label_key_id
+                     WHERE filtered_nl.note_id = ",
+            )
+            .push(note_alias)
+            .push(".id AND filtered_lk.key = ")
+            .push_bind(selector.key.clone());
+        if let Some(values) = &selector.values {
+            builder
+                .push(" AND filtered_nl.value = ANY(")
+                .push_bind(values.clone())
+                .push(")");
+        }
+        builder.push(")");
+        return;
+    }
+
+    let middle = selectors.len() / 2;
+    builder.push("(");
+    push_balanced_conjunction(builder, note_alias, &selectors[..middle]);
+    builder.push(" AND ");
+    push_balanced_conjunction(builder, note_alias, &selectors[middle..]);
+    builder.push(")");
+}
 
 #[async_trait::async_trait]
 impl NotesRepository for PgSession {
@@ -301,7 +395,11 @@ impl NotesRepository for PgSession {
             let rows = self.active_note_page(limit, offset).await?;
             return rows.into_iter().map(NoteRow::into_note).collect();
         }
-        self.stream_matching_notes(selectors, limit, offset).await
+        let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = self.filtered_note_page(&resolved, limit, offset).await?;
+        rows.into_iter().map(NoteRow::into_note).collect()
     }
 
     async fn list_all_notes(&self) -> StorageResult<Vec<Note>> {
@@ -348,8 +446,11 @@ impl NotesRepository for PgSession {
             let rows = self.active_summary_page(limit, offset).await?;
             return rows.into_iter().map(SummaryRow::into_summary).collect();
         }
-        self.stream_matching_summaries(selectors, limit, offset)
-            .await
+        let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = self.filtered_summary_page(&resolved, limit, offset).await?;
+        rows.into_iter().map(SummaryRow::into_summary).collect()
     }
 
     async fn list_deleted_note_summaries(&self) -> StorageResult<Vec<NoteListItem>> {
@@ -391,9 +492,33 @@ impl NotesRepository for PgSession {
                     .fetch_one(&mut *connection)
                     .await
                     .map_err(|error| map_sqlx_error("count notes", error))?;
-            return Ok(count.max(0) as usize);
+            return usize::try_from(count.max(0)).map_err(|error| {
+                StorageError::with_source(
+                    StorageErrorKind::Operation,
+                    "convert PostgreSQL note count",
+                    error,
+                )
+            });
         }
-        self.count_matching_summaries(selectors).await
+        let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
+            return Ok(0);
+        };
+        let mut builder: QueryBuilder<Postgres> =
+            QueryBuilder::new("SELECT COUNT(*)::bigint FROM notes n WHERE n.deleted_at IS NULL");
+        push_label_predicates(&mut builder, "n", &resolved);
+        let mut connection = self.connection().await?;
+        let (count,) = builder
+            .build_query_as::<(i64,)>()
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|error| map_sqlx_error("count notes", error))?;
+        usize::try_from(count.max(0)).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "convert PostgreSQL note count",
+                error,
+            )
+        })
     }
 
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>> {
@@ -457,14 +582,13 @@ impl PgSession {
         .map_err(|error| map_sqlx_error("query notes", error))
     }
 
-    async fn stream_matching_notes(
+    async fn filtered_note_page(
         &self,
-        selectors: &[LabelSelector],
+        selectors: &[ResolvedLabelSelector],
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> StorageResult<Vec<Note>> {
-        let mut connection = self.connection().await?;
-        let mut rows = sqlx::query_as::<_, NoteRow>(
+    ) -> StorageResult<Vec<NoteRow>> {
+        let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
             "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
                     n.deleted_at, labels.labels
              FROM notes n
@@ -485,33 +609,20 @@ impl PgSession {
                  JOIN label_keys lk ON lk.id = nl.label_key_id
                  WHERE nl.note_id = n.id
              ) labels
-             WHERE n.deleted_at IS NULL
-             ORDER BY n.created_at DESC, n.id ASC",
-        )
-        .fetch(&mut *connection);
-        let skip = normalize_offset_usize(offset);
-        let take = normalize_limit_usize(limit);
-        let mut matched = 0usize;
-        let mut notes = Vec::new();
-        while let Some(row) = rows
-            .try_next()
+             WHERE n.deleted_at IS NULL",
+        );
+        push_label_predicates(&mut builder, "n", selectors);
+        builder
+            .push(" ORDER BY n.created_at DESC, n.id ASC LIMIT ")
+            .push_bind(normalize_limit(limit))
+            .push(" OFFSET ")
+            .push_bind(offset.unwrap_or(0).max(0));
+        let mut connection = self.connection().await?;
+        builder
+            .build_query_as::<NoteRow>()
+            .fetch_all(&mut *connection)
             .await
-            .map_err(|error| map_sqlx_error("read notes", error))?
-        {
-            let note = row.into_note()?;
-            if !note_matches_selectors(&note, selectors) {
-                continue;
-            }
-            if matched < skip {
-                matched = matched.saturating_add(1);
-                continue;
-            }
-            notes.push(note);
-            if take == Some(notes.len()) {
-                break;
-            }
-        }
-        Ok(notes)
+            .map_err(|error| map_sqlx_error("query notes", error))
     }
 
     async fn active_summary_page(
@@ -551,65 +662,13 @@ impl PgSession {
         .map_err(|error| map_sqlx_error("query note summaries", error))
     }
 
-    async fn stream_matching_summaries(
+    async fn filtered_summary_page(
         &self,
-        selectors: &[LabelSelector],
+        selectors: &[ResolvedLabelSelector],
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> StorageResult<Vec<NoteListItem>> {
-        let mut connection = self.connection().await?;
-        let mut rows = sqlx::query_as::<_, SummaryRow>(
-            "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at, labels.labels
-             FROM notes n
-             CROSS JOIN LATERAL (
-                 SELECT COALESCE(
-                     jsonb_agg(
-                         jsonb_build_object(
-                             'key', lk.key,
-                             'value', nl.value,
-                             'description', lk.description,
-                             'value_type', lk.value_type
-                         )
-                         ORDER BY lk.key
-                     ),
-                     '[]'::jsonb
-                 ) AS labels
-                 FROM note_labels nl
-                 JOIN label_keys lk ON lk.id = nl.label_key_id
-                 WHERE nl.note_id = n.id
-             ) labels
-             WHERE n.deleted_at IS NULL
-             ORDER BY n.created_at DESC, n.id ASC",
-        )
-        .fetch(&mut *connection);
-        let skip = normalize_offset_usize(offset);
-        let take = normalize_limit_usize(limit);
-        let mut matched = 0usize;
-        let mut notes = Vec::new();
-        while let Some(row) = rows
-            .try_next()
-            .await
-            .map_err(|error| map_sqlx_error("read note summaries", error))?
-        {
-            let note = row.into_summary()?;
-            if !summary_matches_selectors(&note, selectors) {
-                continue;
-            }
-            if matched < skip {
-                matched = matched.saturating_add(1);
-                continue;
-            }
-            notes.push(note);
-            if take == Some(notes.len()) {
-                break;
-            }
-        }
-        Ok(notes)
-    }
-
-    async fn count_matching_summaries(&self, selectors: &[LabelSelector]) -> StorageResult<usize> {
-        let mut connection = self.connection().await?;
-        let mut rows = sqlx::query_as::<_, SummaryRow>(
+    ) -> StorageResult<Vec<SummaryRow>> {
+        let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
             "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at, labels.labels
              FROM notes n
              CROSS JOIN LATERAL (
@@ -630,20 +689,19 @@ impl PgSession {
                  WHERE nl.note_id = n.id
              ) labels
              WHERE n.deleted_at IS NULL",
-        )
-        .fetch(&mut *connection);
-        let mut count = 0usize;
-        while let Some(row) = rows
-            .try_next()
+        );
+        push_label_predicates(&mut builder, "n", selectors);
+        builder
+            .push(" ORDER BY n.created_at DESC, n.id ASC LIMIT ")
+            .push_bind(normalize_limit(limit))
+            .push(" OFFSET ")
+            .push_bind(offset.unwrap_or(0).max(0));
+        let mut connection = self.connection().await?;
+        builder
+            .build_query_as::<SummaryRow>()
+            .fetch_all(&mut *connection)
             .await
-            .map_err(|error| map_sqlx_error("read note summaries for count", error))?
-        {
-            let note = row.into_summary()?;
-            if summary_matches_selectors(&note, selectors) {
-                count = count.saturating_add(1);
-            }
-        }
-        Ok(count)
+            .map_err(|error| map_sqlx_error("query note summaries", error))
     }
 }
 
@@ -777,30 +835,81 @@ fn deserialize_labels(value: Value) -> StorageResult<Vec<note_core::Label>> {
         .collect()
 }
 
-fn note_matches_selectors(note: &Note, selectors: &[LabelSelector]) -> bool {
-    selectors.iter().all(|selector| {
-        note.labels
-            .iter()
-            .any(|label| label_matches_selector(label, selector))
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn summary_matches_selectors(note: &NoteListItem, selectors: &[LabelSelector]) -> bool {
-    selectors.iter().all(|selector| {
-        note.labels
-            .iter()
-            .any(|label| label_matches_selector(label, selector))
-    })
+    #[test]
+    fn resolved_predicates_precede_order_and_limit() {
+        let resolved = vec![
+            ResolvedLabelSelector {
+                key: "status".into(),
+                values: Some(vec!["ready".into()]),
+            },
+            ResolvedLabelSelector {
+                key: "archived".into(),
+                values: None,
+            },
+        ];
+        let mut builder: QueryBuilder<Postgres> =
+            QueryBuilder::new("SELECT n.id FROM notes n WHERE n.deleted_at IS NULL");
+        push_label_predicates(&mut builder, "n", &resolved);
+        builder
+            .push(" ORDER BY n.created_at DESC, n.id ASC LIMIT ")
+            .push_bind(10_i64);
+        let sql = builder.sql();
+        let sql = sql.as_str();
+
+        assert_eq!(sql.matches("EXISTS").count(), 2);
+        assert!(sql.contains("= ANY("));
+        assert!(sql.find("EXISTS").unwrap() < sql.find("ORDER BY").unwrap());
+        assert!(sql.find("ORDER BY").unwrap() < sql.find("LIMIT").unwrap());
+    }
+
+    #[test]
+    fn balanced_predicates_preserve_placeholder_order_for_many_selectors() {
+        let resolved = (0..128)
+            .map(|index| ResolvedLabelSelector {
+                key: format!("key-{index}"),
+                values: None,
+            })
+            .collect::<Vec<_>>();
+        let mut builder: QueryBuilder<Postgres> =
+            QueryBuilder::new("SELECT n.id FROM notes n WHERE n.deleted_at IS NULL");
+
+        push_label_predicates(&mut builder, "n", &resolved);
+        let sql = builder.sql();
+        let sql = sql.as_str();
+
+        assert_eq!(sql.matches("EXISTS").count(), 128);
+        assert!(sql.contains("filtered_lk.key = $1)"));
+        assert!(sql.contains("filtered_lk.key = $128)"));
+        assert!(sql.find("filtered_lk.key = $1)") < sql.find("filtered_lk.key = $128)"));
+
+        let mut depth = 0usize;
+        let mut max_depth = 0usize;
+        for character in sql.chars() {
+            match character {
+                '(' => {
+                    depth += 1;
+                    max_depth = max_depth.max(depth);
+                }
+                ')' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("generated SQL has an unmatched closing parenthesis");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "generated SQL has unclosed parentheses");
+        assert!(
+            max_depth <= 10,
+            "balanced conjunction nesting depth was {max_depth}"
+        );
+    }
 }
 
 fn normalize_limit(limit: Option<i64>) -> Option<i64> {
     limit.and_then(|limit| (limit >= 0).then_some(limit))
-}
-
-fn normalize_limit_usize(limit: Option<i64>) -> Option<usize> {
-    normalize_limit(limit).map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))
-}
-
-fn normalize_offset_usize(offset: Option<i64>) -> usize {
-    usize::try_from(offset.unwrap_or(0).max(0)).unwrap_or(usize::MAX)
 }

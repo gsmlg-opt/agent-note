@@ -14,6 +14,114 @@ use serde_json::Value;
 use support::{configured_url_or_skip, TestDatabase};
 
 #[tokio::test]
+async fn filtered_pages_and_counts_use_resolved_value_arrays() {
+    let Some(admin_url) =
+        configured_url_or_skip("filtered_pages_and_counts_use_resolved_value_arrays")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    database.provision_vector().await;
+    let storage = PgStorage::connect(&database.url, 2)
+        .await
+        .expect("connect PostgreSQL storage");
+    let session = storage
+        .connect_session()
+        .await
+        .expect("connect PostgreSQL session");
+
+    session
+        .insert_label_key_with_type("status", "Status", LabelValueType::Text)
+        .await
+        .unwrap();
+    session
+        .insert_label_key_with_type("version", "Version", LabelValueType::Version)
+        .await
+        .unwrap();
+
+    for (index, version) in ["1.9.0", "1.10.0", "1.99.0", "2.0.0", "2.1.0"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = format!("blocked-{index}");
+        let created_at = 200 + index as i64;
+        session
+            .insert_note(NewNote {
+                id: &id,
+                title: &id,
+                content: &id,
+                attachments: &[],
+                created_at,
+                updated_at: created_at,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        session
+            .attach_label(&id, "status", "blocked")
+            .await
+            .unwrap();
+        session.attach_label(&id, "version", version).await.unwrap();
+    }
+
+    session
+        .insert_note(NewNote {
+            id: "ready",
+            title: "ready",
+            content: "ready",
+            attachments: &[],
+            created_at: 100,
+            updated_at: 100,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    session
+        .attach_label("ready", "status", "ready")
+        .await
+        .unwrap();
+
+    let ready_selector = parse_label_selectors("status=ready");
+    assert_eq!(
+        session
+            .list_note_summaries(&ready_selector, Some(1), Some(0))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["ready"]
+    );
+    assert_eq!(session.count_notes(&ready_selector).await.unwrap(), 1);
+
+    let version_selectors = parse_label_selectors("version>=1.10.0&version<2.0.0");
+    assert_eq!(
+        session
+            .list_note_summaries(&version_selectors, Some(1), Some(1))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|note| note.id)
+            .collect::<Vec<_>>(),
+        vec!["blocked-1"]
+    );
+    assert_eq!(session.count_notes(&version_selectors).await.unwrap(), 2);
+
+    let invalid_regex = parse_label_selectors("status~=[");
+    assert!(session
+        .list_note_summaries(&invalid_regex, Some(10), Some(0))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(session.count_notes(&invalid_regex).await.unwrap(), 0);
+
+    drop(session);
+    database.cleanup(Some(&storage)).await.unwrap();
+}
+
+#[tokio::test]
 async fn notes_and_labels_follow_repository_semantics() {
     let Some(admin_url) = configured_url_or_skip("notes_and_labels_follow_repository_semantics")
     else {
