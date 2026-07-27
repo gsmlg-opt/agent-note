@@ -283,8 +283,8 @@ non-disposable data before upgrading so recovery or deliberate import remains po
 
 ## 5. Retrieval Design
 
-Title FTS and dense content retrieval are independent queries, each producing a ranked note list.
-Rust Turso Database FTS ranks title matches with BM25. PostgreSQL title FTS uses its generated
+Title retrieval and dense content retrieval are independent queries, each producing a ranked note
+list. Rust Turso Database FTS ranks title matches with BM25. PostgreSQL title FTS uses its generated
 `simple`-configuration `tsvector` and GIN index. Both adapters perform an exact linear
 cosine-distance scan over body-chunk embeddings, grouping by note and using the closest chunk as
 that note's rank; PostgreSQL uses exact `<=>` over `vector(1024)` with no ANN index. The scores are
@@ -293,22 +293,36 @@ weighted rank rather than raw score:
 
 ```
 weighted_RRF(note) = Σ over retrievers r: weight_r / (60 + rank_r(note))
-title FTS weight = 3.0
+title retrieval weight = 3.0
 dense content weight = 1.0
 ```
 
 Fusion ordering is deterministic: equal fused scores are broken by note ID. The pipeline requests
 `clamp(requested_limit × 32, 128, 4096)` ranked IDs from each channel so fusion can consider notes
-beyond the requested top-k. Dense retrieval uses that overfetch length directly. Embedded Turso
-title FTS first materializes a fixed bounded pool of up to 4,096 BM25 hits, batch-filters deleted
-notes, and orders score ties by note ID before returning only the requested overfetch length. That
-fixed pool is Turso's physical FTS work bound for deterministic ties within the accepted pool.
+beyond the requested top-k. When label selectors are present, they are parsed before embedding. In
+a short storage session, storage evaluates selector operators and value types with the shared
+`note-core` matcher over distinct active stored label values, then turns the accepted raw values
+into SQL presence/value predicates. Those predicates constrain list pages before pagination,
+counts, and matching-active-ID selection. An empty matching collection returns before embedding.
 
-PostgreSQL title FTS queries the generated `simple`-configuration `tsvector` through its GIN index,
-filters active notes in SQL, ranks matches with `ts_rank_cd` and a note-ID tie-break, and applies
-the requested overfetch length directly as its SQL `LIMIT`. Both adapters feed their title and
-content rankings into the same weighted RRF pipeline. Label filtering and hydration happen after
-fusion, and iteration stops at the requested result limit.
+For a filtered search, the same allowed note IDs constrain both title and exact dense retrieval
+before their ranking limits, and the normal overfetch is capped by the allowed collection size.
+PostgreSQL adds optional text-array predicates to both its title FTS and dense SQL before `LIMIT`.
+Turso dense retrieval applies a JSON allowed-ID predicate before distance ranking and `LIMIT`.
+Deleted notes remain excluded in every path.
+
+Unfiltered Turso title retrieval retains its fixed bounded pool of up to 4,096 FTS/BM25 hits. The
+current Turso adapter cannot combine allowed-ID filtering with that bounded BM25 plan, so filtered
+title retrieval uses JSON-encoded allowed IDs to drive note-ID/primary-key lookups of active titles.
+It ranks only those titles by case-insensitive whole-token frequency, retaining a bounded top-K heap
+with a note-ID tie-break. This avoids the unbounded corpus-wide FTS fallback and SQL sorter that a
+residual allowed-ID predicate would trigger in the current adapter. PostgreSQL filtered title
+retrieval retains native FTS ranking. The Turso distinction should be reevaluated after backend
+upgrades.
+
+Both rankings feed weighted RRF. Final allowed-ID membership is checked defensively before the
+top-k notes are hydrated, and returned scores are fused RRF scores rather than raw BM25 or cosine
+scores.
 
 Exact scanning avoids approximate-index build and maintenance, produces deterministic results, and
 fits the expected personal-notes corpus. Its accepted trade-off is linear dense-search cost. If
@@ -340,10 +354,16 @@ referring to unavailable or previous bytes; it does not roll back that commit. T
 later claims each job, performs one dense inference call outside the database transaction, and
 atomically persists the dense body-chunk vector for the current chunk revision.
 
-**search_notes**: embed the query once for exact dense content retrieval → request the title FTS
-ranking and dense note ranking → combine the two ranked ID lists with weighted RRF (pure function,
-no I/O) → apply label filtering and hydrate labels/metadata for top-k → return
-`Vec<(Note, f32)>` where the score is the fused weighted-RRF score, not raw BM25 or cosine.
+**search_notes**: a blank query or zero limit returns without calling storage or embedding
+endpoints. Otherwise, when label selectors are present, parse them → acquire a short filter storage
+session → resolve matching active IDs → return before embedding if the collection is empty →
+release the filter session. Unfiltered searches skip that branch and proceed directly to embedding.
+Embed the query once → acquire a fresh retrieval session for retrieval and hydration → constrain
+title and exact dense candidate selection before their limits → apply bounded
+`clamp(requested_limit × 32, 128, 4096)` overfetch, capped by the allowed collection size when
+filtered → combine both rankings with weighted RRF (pure function, no I/O) → defensively check
+allowed-ID membership and hydrate the top-k → return `Vec<SearchResult>`, each containing a
+`NoteListItem` summary and fused weighted-RRF score rather than raw BM25 or cosine.
 
 Context/environment: one struct holds a shared `StorageBackend`, embedder, and `AttachmentStore`.
 The application composition root constructs it once and passes it explicitly — no global or
@@ -365,7 +385,8 @@ Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than 
 
 ## 8. MCP Integration
 
-**Tools**: `save_note_tool { title, content, labels }`, `semantic_search_tool { query, limit }`.
+**Tools**: `save_note_tool { title, content, labels }`,
+`semantic_search_tool { query, limit, label? }`.
 Both call the pipeline contracts in §6 directly — no MCP-specific business logic. Saving through
 MCP uses the same missing-label-key auto-creation behavior; explicit catalog management remains
 REST/UI-only.
@@ -374,7 +395,6 @@ REST/UI-only.
 
 ## 9. Open Decisions (resolve during implementation, not before)
 
-- Whether label filtering should move deeper into backend retrieval at larger corpus sizes.
 - Storage-session concurrency sizing for Axum's concurrent path.
 
 ## 10. Future Extensions
