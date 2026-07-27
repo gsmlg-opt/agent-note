@@ -157,8 +157,18 @@ pub trait RetrievalRepository: Send + Sync {
         chunk_idx: i64,
         embedding: &[f32],
     ) -> StorageResult<()>;
-    async fn dense_search(&self, query: &[f32], limit: usize) -> StorageResult<Vec<String>>;
-    async fn title_search(&self, query: &str, limit: usize) -> StorageResult<Vec<String>>;
+    async fn dense_search(
+        &self,
+        query: &[f32],
+        limit: usize,
+        allowed_note_ids: Option<&[String]>,
+    ) -> StorageResult<Vec<String>>;
+    async fn title_search(
+        &self,
+        query: &str,
+        limit: usize,
+        allowed_note_ids: Option<&[String]>,
+    ) -> StorageResult<Vec<String>>;
 }
 
 #[async_trait::async_trait]

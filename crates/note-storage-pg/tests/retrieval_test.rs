@@ -41,6 +41,68 @@ async fn insert_note(session: &PgSession, id: &str, title: &str, content: &str) 
 }
 
 #[tokio::test]
+async fn allowed_ids_are_applied_before_title_and_dense_limits() {
+    let Some(admin_url) =
+        configured_url_or_skip("allowed_ids_are_applied_before_title_and_dense_limits")
+    else {
+        return;
+    };
+    let _guard = real_database_test_guard().await;
+    let database = TestDatabase::create(&admin_url).await;
+    database.provision_vector().await;
+    let storage = PgStorage::connect(&database.url, 4)
+        .await
+        .expect("connect PostgreSQL storage");
+    let session = storage.connect_session().await.unwrap();
+
+    insert_note(&session, "allowed", "Needle", "allowed body").await;
+    insert_note(
+        &session,
+        "excluded",
+        "Needle Needle Needle",
+        "excluded body",
+    )
+    .await;
+    session
+        .insert_chunk_embedding("allowed", 0, &unit(1))
+        .await
+        .unwrap();
+    session
+        .insert_chunk_embedding("excluded", 0, &unit(0))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.title_search("Needle", 1, None).await.unwrap(),
+        vec!["excluded"]
+    );
+    assert_eq!(
+        session.dense_search(&unit(0), 1, None).await.unwrap(),
+        vec!["excluded"]
+    );
+    let allowed = vec!["allowed".to_string()];
+    assert_eq!(
+        session
+            .title_search("Needle", 1, Some(&allowed))
+            .await
+            .unwrap(),
+        allowed
+    );
+    assert_eq!(
+        session
+            .dense_search(&unit(0), 1, Some(&allowed))
+            .await
+            .unwrap(),
+        allowed
+    );
+
+    database
+        .cleanup(Some(&storage))
+        .await
+        .expect("clean up allowed retrieval test database");
+}
+
+#[tokio::test]
 async fn exact_dense_retrieval_validates_vectors_and_filters_active_notes() {
     let Some(admin_url) =
         configured_url_or_skip("exact_dense_retrieval_validates_vectors_and_filters_active_notes")
@@ -63,7 +125,7 @@ async fn exact_dense_retrieval_validates_vectors_and_filters_active_notes() {
             .unwrap_err();
         assert_eq!(insert_error.kind(), StorageErrorKind::Operation);
         let query_error = session
-            .dense_search(&vec![0.0; length], 10)
+            .dense_search(&vec![0.0; length], 10, None)
             .await
             .unwrap_err();
         assert_eq!(query_error.kind(), StorageErrorKind::Operation);
@@ -76,7 +138,7 @@ async fn exact_dense_retrieval_validates_vectors_and_filters_active_notes() {
             .await
             .unwrap_err();
         assert_eq!(insert_error.kind(), StorageErrorKind::Operation);
-        let query_error = session.dense_search(&vector, 10).await.unwrap_err();
+        let query_error = session.dense_search(&vector, 10, None).await.unwrap_err();
         assert_eq!(query_error.kind(), StorageErrorKind::Operation);
     }
 
@@ -104,17 +166,21 @@ async fn exact_dense_retrieval_validates_vectors_and_filters_active_notes() {
         .unwrap();
 
     assert_eq!(
-        session.dense_search(&unit(0), 10).await.unwrap(),
+        session.dense_search(&unit(0), 10, None).await.unwrap(),
         vec!["a", "b", "c"]
     );
-    assert!(session.dense_search(&unit(0), 0).await.unwrap().is_empty());
+    assert!(session
+        .dense_search(&unit(0), 0, None)
+        .await
+        .unwrap()
+        .is_empty());
     if let Some(unsupported_limit) = usize::try_from(i64::MAX)
         .ok()
         .and_then(|limit| limit.checked_add(1))
     {
         assert_eq!(
             session
-                .dense_search(&unit(0), unsupported_limit)
+                .dense_search(&unit(0), unsupported_limit, None)
                 .await
                 .unwrap_err()
                 .kind(),
@@ -126,7 +192,7 @@ async fn exact_dense_retrieval_validates_vectors_and_filters_active_notes() {
         .await
         .unwrap();
     assert_eq!(
-        session.dense_search(&unit(0), 10).await.unwrap(),
+        session.dense_search(&unit(0), 10, None).await.unwrap(),
         vec!["a", "c", "b"]
     );
     session
@@ -135,12 +201,12 @@ async fn exact_dense_retrieval_validates_vectors_and_filters_active_notes() {
         .unwrap();
     session.soft_delete_note("a", 2).await.unwrap();
     assert_eq!(
-        session.dense_search(&unit(0), 10).await.unwrap(),
+        session.dense_search(&unit(0), 10, None).await.unwrap(),
         vec!["b", "c"]
     );
     session.restore_note("a", 2).await.unwrap();
     assert_eq!(
-        session.dense_search(&unit(0), 10).await.unwrap(),
+        session.dense_search(&unit(0), 10, None).await.unwrap(),
         vec!["a", "b", "c"]
     );
 
@@ -195,39 +261,50 @@ async fn title_fts_is_literal_title_only_active_and_uses_gin() {
     insert_note(&session, "beta", "Beta reference", "body").await;
 
     assert_eq!(
-        session.title_search("rust", 10).await.unwrap(),
+        session.title_search("rust", 10, None).await.unwrap(),
         vec!["title"]
     );
     assert!(session
-        .title_search("appears", 10)
+        .title_search("appears", 10, None)
         .await
         .unwrap()
         .is_empty());
     assert_eq!(
-        session.title_search("(alpha / beta):", 10).await.unwrap(),
-        vec!["alpha", "beta"]
-    );
-    assert_eq!(
         session
-            .title_search(r#"alpha & !beta | gamma:* <-> '("#, 10)
+            .title_search("(alpha / beta):", 10, None)
             .await
             .unwrap(),
         vec!["alpha", "beta"]
     );
-    assert!(session.title_search("   ", 10).await.unwrap().is_empty());
+    assert_eq!(
+        session
+            .title_search(r#"alpha & !beta | gamma:* <-> '("#, 10, None)
+            .await
+            .unwrap(),
+        vec!["alpha", "beta"]
+    );
     assert!(session
-        .title_search(r#""():-!"#, 10)
+        .title_search("   ", 10, None)
         .await
         .unwrap()
         .is_empty());
-    assert!(session.title_search("alpha", 0).await.unwrap().is_empty());
+    assert!(session
+        .title_search(r#""():-!"#, 10, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(session
+        .title_search("alpha", 0, None)
+        .await
+        .unwrap()
+        .is_empty());
     if let Some(unsupported_limit) = usize::try_from(i64::MAX)
         .ok()
         .and_then(|limit| limit.checked_add(1))
     {
         assert_eq!(
             session
-                .title_search("alpha", unsupported_limit)
+                .title_search("alpha", unsupported_limit, None)
                 .await
                 .unwrap_err()
                 .kind(),
@@ -247,26 +324,30 @@ async fn title_fts_is_literal_title_only_active_and_uses_gin() {
         .await
         .unwrap();
     assert!(session
-        .title_search("ownership", 10)
+        .title_search("ownership", 10, None)
         .await
         .unwrap()
         .is_empty());
     assert_eq!(
-        session.title_search("new", 10).await.unwrap(),
+        session.title_search("new", 10, None).await.unwrap(),
         vec!["title"]
     );
     session.soft_delete_note("title", 3).await.unwrap();
-    assert!(session.title_search("new", 10).await.unwrap().is_empty());
+    assert!(session
+        .title_search("new", 10, None)
+        .await
+        .unwrap()
+        .is_empty());
     session.restore_note("title", 3).await.unwrap();
     assert_eq!(
-        session.title_search("new", 10).await.unwrap(),
+        session.title_search("new", 10, None).await.unwrap(),
         vec!["title"]
     );
 
     insert_note(&session, "tie-b", "Shared ranking heading", "body").await;
     insert_note(&session, "tie-a", "Shared ranking heading", "body").await;
     assert_eq!(
-        session.title_search("shared", 2).await.unwrap(),
+        session.title_search("shared", 2, None).await.unwrap(),
         vec!["tie-a", "tie-b"]
     );
 
@@ -290,6 +371,7 @@ async fn title_fts_is_literal_title_only_active_and_uses_gin() {
     let explain_sql = format!("EXPLAIN (COSTS OFF)\n{TITLE_SEARCH_SQL}");
     let plan: Vec<String> = sqlx::query_scalar(AssertSqlSafe(explain_sql))
         .bind("'new'")
+        .bind(Option::<Vec<String>>::None)
         .bind(10_i64)
         .fetch_all(&mut *transaction)
         .await

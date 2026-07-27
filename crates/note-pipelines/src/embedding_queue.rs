@@ -413,7 +413,7 @@ mod tests {
         let session = storage.session().await.unwrap();
         assert!(!session.chunk_embedding_exists(&note.id, 0).await.unwrap());
         assert!(session
-            .dense_search(&vec![0.1; 1024], 10)
+            .dense_search(&vec![0.1; 1024], 10, None)
             .await
             .unwrap()
             .is_empty());

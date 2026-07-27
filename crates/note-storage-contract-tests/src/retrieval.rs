@@ -42,7 +42,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .unwrap_err();
         assert_eq!(error.kind(), StorageErrorKind::Operation);
         let error = session
-            .dense_search(&vec![0.0; length], 10)
+            .dense_search(&vec![0.0; length], 10, None)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), StorageErrorKind::Operation);
@@ -55,7 +55,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), StorageErrorKind::Operation);
-        let error = session.dense_search(&vector, 10).await.unwrap_err();
+        let error = session.dense_search(&vector, 10, None).await.unwrap_err();
         assert_eq!(error.kind(), StorageErrorKind::Operation);
     }
 
@@ -86,20 +86,24 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap();
     assert_eq!(
-        session.dense_search(&unit(0), 3).await.unwrap(),
+        session.dense_search(&unit(0), 3, None).await.unwrap(),
         vec![
             "contract-retrieval-a",
             "contract-retrieval-c",
             "contract-retrieval-b"
         ]
     );
-    assert!(session.dense_search(&unit(0), 0).await.unwrap().is_empty());
+    assert!(session
+        .dense_search(&unit(0), 0, None)
+        .await
+        .unwrap()
+        .is_empty());
     session
         .soft_delete_note("contract-retrieval-a", 2)
         .await
         .unwrap();
     assert!(session
-        .dense_search(&unit(0), 10)
+        .dense_search(&unit(0), 10, None)
         .await
         .unwrap()
         .iter()
@@ -109,9 +113,72 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap();
     assert_eq!(
-        session.dense_search(&unit(0), 1).await.unwrap(),
+        session.dense_search(&unit(0), 1, None).await.unwrap(),
         vec!["contract-retrieval-a"]
     );
+    for id in [
+        "contract-retrieval-a",
+        "contract-retrieval-b",
+        "contract-retrieval-c",
+    ] {
+        session.clear_note_search_data(id).await.unwrap();
+    }
+
+    insert_note(
+        session.as_ref(),
+        "contract-retrieval-allowed",
+        "Needle",
+        "allowed body",
+    )
+    .await;
+    insert_note(
+        session.as_ref(),
+        "contract-retrieval-excluded",
+        "Needle Needle Needle",
+        "excluded body",
+    )
+    .await;
+    session
+        .insert_chunk_embedding("contract-retrieval-allowed", 0, &unit(1))
+        .await
+        .unwrap();
+    session
+        .insert_chunk_embedding("contract-retrieval-excluded", 0, &unit(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.title_search("Needle", 1, None).await.unwrap(),
+        vec!["contract-retrieval-excluded"]
+    );
+    assert_eq!(
+        session.dense_search(&unit(0), 1, None).await.unwrap(),
+        vec!["contract-retrieval-excluded"]
+    );
+    let allowed = vec!["contract-retrieval-allowed".to_string()];
+    assert_eq!(
+        session
+            .title_search("Needle", 1, Some(&allowed))
+            .await
+            .unwrap(),
+        allowed
+    );
+    assert_eq!(
+        session
+            .dense_search(&unit(0), 1, Some(&allowed))
+            .await
+            .unwrap(),
+        allowed
+    );
+    assert!(session
+        .title_search("Needle", 1, Some(&[]))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(session
+        .dense_search(&unit(0), 1, Some(&[]))
+        .await
+        .unwrap()
+        .is_empty());
 
     insert_note(
         session.as_ref(),
@@ -128,11 +195,11 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     )
     .await;
     assert_eq!(
-        session.title_search("Rust", 10).await.unwrap(),
+        session.title_search("Rust", 10, None).await.unwrap(),
         vec!["contract-retrieval-title"]
     );
     assert!(session
-        .title_search("unrelated", 10)
+        .title_search("unrelated", 10, None)
         .await
         .unwrap()
         .is_empty());
@@ -148,25 +215,29 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap();
     assert!(session
-        .title_search("ownership", 10)
+        .title_search("ownership", 10, None)
         .await
         .unwrap()
         .is_empty());
     assert_eq!(
-        session.title_search("New", 10).await.unwrap(),
+        session.title_search("New", 10, None).await.unwrap(),
         vec!["contract-retrieval-title"]
     );
     session
         .soft_delete_note("contract-retrieval-title", 3)
         .await
         .unwrap();
-    assert!(session.title_search("New", 10).await.unwrap().is_empty());
+    assert!(session
+        .title_search("New", 10, None)
+        .await
+        .unwrap()
+        .is_empty());
     session
         .restore_note("contract-retrieval-title", 3)
         .await
         .unwrap();
     assert_eq!(
-        session.title_search("New", 10).await.unwrap(),
+        session.title_search("New", 10, None).await.unwrap(),
         vec!["contract-retrieval-title"]
     );
 
@@ -184,7 +255,10 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         "body",
     )
     .await;
-    let punctuation = session.title_search("(alpha / beta):", 10).await.unwrap();
+    let punctuation = session
+        .title_search("(alpha / beta):", 10, None)
+        .await
+        .unwrap();
     assert_eq!(
         punctuation,
         vec![
@@ -192,13 +266,21 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             "contract-retrieval-punctuation-b"
         ]
     );
-    assert!(session.title_search("   ", 10).await.unwrap().is_empty());
     assert!(session
-        .title_search(r#""():-"#, 10)
+        .title_search("   ", 10, None)
         .await
         .unwrap()
         .is_empty());
-    assert!(session.title_search("Alpha", 0).await.unwrap().is_empty());
+    assert!(session
+        .title_search(r#""():-"#, 10, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(session
+        .title_search("Alpha", 0, None)
+        .await
+        .unwrap()
+        .is_empty());
 
     for id in [
         "contract-retrieval-title-tie-b",
@@ -207,7 +289,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         insert_note(session.as_ref(), id, "Shared ranking heading", "body").await;
     }
     assert_eq!(
-        session.title_search("Shared", 2).await.unwrap(),
+        session.title_search("Shared", 2, None).await.unwrap(),
         vec![
             "contract-retrieval-title-tie-a",
             "contract-retrieval-title-tie-b"
@@ -307,12 +389,12 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap());
     assert!(session
-        .title_search("Cascade", 10)
+        .title_search("Cascade", 10, None)
         .await
         .unwrap()
         .is_empty());
     assert!(session
-        .dense_search(&unit(0), 20)
+        .dense_search(&unit(0), 20, None)
         .await
         .unwrap()
         .iter()
@@ -331,11 +413,11 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     )
     .await;
     assert_eq!(
-        session.title_search("Reused", 10).await.unwrap(),
+        session.title_search("Reused", 10, None).await.unwrap(),
         vec!["contract-retrieval-cascade"]
     );
     assert!(session
-        .title_search("Cascade", 10)
+        .title_search("Cascade", 10, None)
         .await
         .unwrap()
         .is_empty());
@@ -344,7 +426,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap());
     assert!(session
-        .dense_search(&unit(0), 20)
+        .dense_search(&unit(0), 20, None)
         .await
         .unwrap()
         .iter()

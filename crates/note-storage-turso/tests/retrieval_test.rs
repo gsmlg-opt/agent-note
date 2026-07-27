@@ -24,26 +24,30 @@ async fn title_search_matches_titles_but_not_body_text() {
     .await;
 
     assert_eq!(
-        fixture.session.title_search("Rust", 10).await.unwrap(),
+        fixture
+            .session
+            .title_search("Rust", 10, None)
+            .await
+            .unwrap(),
         vec!["title-hit"]
     );
     assert_eq!(
         fixture
             .session
-            .title_search("Rust ownership", 10)
+            .title_search("Rust ownership", 10, None)
             .await
             .unwrap(),
         vec!["title-hit"]
     );
     assert!(fixture
         .session
-        .title_search("unrelated", 10)
+        .title_search("unrelated", 10, None)
         .await
         .unwrap()
         .is_empty());
     assert!(fixture
         .session
-        .title_search("Rust", 0)
+        .title_search("Rust", 0, None)
         .await
         .unwrap()
         .is_empty());
@@ -68,19 +72,27 @@ async fn title_search_tracks_updates_deletion_and_restoration() {
 
     let observer = fixture.storage.connect().await.unwrap();
     assert_eq!(
-        observer.title_search("New", 10).await.unwrap(),
+        observer.title_search("New", 10, None).await.unwrap(),
         vec!["note"]
     );
-    assert!(observer.title_search("Old", 10).await.unwrap().is_empty());
+    assert!(observer
+        .title_search("Old", 10, None)
+        .await
+        .unwrap()
+        .is_empty());
     observer.soft_delete_note("note", 3).await.unwrap();
 
     let observer = fixture.storage.connect().await.unwrap();
-    assert!(observer.title_search("New", 10).await.unwrap().is_empty());
+    assert!(observer
+        .title_search("New", 10, None)
+        .await
+        .unwrap()
+        .is_empty());
     observer.restore_note("note", 3).await.unwrap();
 
     let observer = fixture.storage.connect().await.unwrap();
     assert_eq!(
-        observer.title_search("New", 10).await.unwrap(),
+        observer.title_search("New", 10, None).await.unwrap(),
         vec!["note"]
     );
 }
@@ -100,7 +112,7 @@ async fn equal_title_scores_use_note_id_order() {
     let observer = storage.connect().await.unwrap();
 
     assert_eq!(
-        observer.title_search("Shared", 2).await.unwrap(),
+        observer.title_search("Shared", 2, None).await.unwrap(),
         vec!["a", "b"]
     );
 }
@@ -134,7 +146,7 @@ async fn title_search_treats_query_syntax_as_literal_term_separators() {
         ("AND OR NOT", "operators"),
         ("café / résumé", "unicode"),
     ] {
-        let results = fixture.session.title_search(query, 10).await.unwrap();
+        let results = fixture.session.title_search(query, 10, None).await.unwrap();
         assert!(
             results.iter().any(|id| id == expected_id),
             "expected {query:?} to retrieve {expected_id:?}, got {results:?}"
@@ -143,7 +155,7 @@ async fn title_search_treats_query_syntax_as_literal_term_separators() {
 
     assert!(fixture
         .session
-        .title_search(r#""():-"#, 10)
+        .title_search(r#""():-"#, 10, None)
         .await
         .unwrap()
         .is_empty());
@@ -157,10 +169,105 @@ async fn title_search_caps_direct_callers_before_limit_conversion() {
     assert_eq!(
         fixture
             .session
-            .title_search("Rust", usize::MAX)
+            .title_search("Rust", usize::MAX, None)
             .await
             .unwrap(),
         vec!["rust"]
+    );
+}
+
+#[tokio::test]
+async fn allowed_ids_are_applied_before_title_and_dense_limits() {
+    let fixture = fixture().await;
+    insert_named_note(&fixture.session, "allowed-single", "Needle", "allowed body").await;
+    insert_named_note(
+        &fixture.session,
+        "allowed-repeated",
+        "NEEDLE Needle",
+        "allowed repeated body",
+    )
+    .await;
+    insert_named_note(
+        &fixture.session,
+        "allowed-deleted",
+        "Needle Needle Needle Needle",
+        "deleted body",
+    )
+    .await;
+    insert_named_note(
+        &fixture.session,
+        "excluded",
+        "Needle Needle Needle",
+        "excluded body",
+    )
+    .await;
+    let mut farther = vec![0.0; note_storage::EMBEDDING_DIMENSION];
+    farther[0] = 0.8;
+    farther[1] = 0.6;
+    fixture
+        .session
+        .insert_chunk_embedding("allowed-single", 0, &farther)
+        .await
+        .unwrap();
+    fixture
+        .session
+        .insert_chunk_embedding("allowed-repeated", 0, &unit(1))
+        .await
+        .unwrap();
+    fixture
+        .session
+        .insert_chunk_embedding("allowed-deleted", 0, &unit(0))
+        .await
+        .unwrap();
+    fixture
+        .session
+        .insert_chunk_embedding("excluded", 0, &unit(0))
+        .await
+        .unwrap();
+    fixture
+        .session
+        .soft_delete_note("allowed-deleted", 2)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .session
+            .title_search("Needle", 1, None)
+            .await
+            .unwrap(),
+        vec!["excluded"]
+    );
+    assert_eq!(
+        fixture
+            .session
+            .dense_search(&unit(0), 1, None)
+            .await
+            .unwrap(),
+        vec!["excluded"]
+    );
+    let allowed = vec![
+        "allowed-single".to_string(),
+        "allowed-repeated".to_string(),
+        "allowed-single".to_string(),
+        "allowed-deleted".to_string(),
+        "allowed-repeated".to_string(),
+    ];
+    assert_eq!(
+        fixture
+            .session
+            .title_search("needle", 2, Some(&allowed))
+            .await
+            .unwrap(),
+        vec!["allowed-repeated", "allowed-single"]
+    );
+    assert_eq!(
+        fixture
+            .session
+            .dense_search(&unit(0), 1, Some(&allowed))
+            .await
+            .unwrap(),
+        vec!["allowed-single"]
     );
 }
 
@@ -186,7 +293,11 @@ async fn dense_query_returns_nearest_neighbors() {
         .unwrap();
 
     let query = vec![1.0_f32; note_storage::EMBEDDING_DIMENSION];
-    let ranked = fixture.session.dense_search(&query, 10).await.unwrap();
+    let ranked = fixture
+        .session
+        .dense_search(&query, 10, None)
+        .await
+        .unwrap();
     assert_eq!(ranked[0], "note-1");
 }
 
@@ -212,7 +323,11 @@ async fn dense_search_ranks_each_note_by_its_closest_chunk() {
         .unwrap();
 
     assert_eq!(
-        fixture.session.dense_search(&unit(0), 2).await.unwrap(),
+        fixture
+            .session
+            .dense_search(&unit(0), 2, None)
+            .await
+            .unwrap(),
         vec!["a", "b"]
     );
 }
@@ -233,7 +348,11 @@ async fn dense_search_deduplicates_chunks_to_note_ids() {
         .unwrap();
 
     assert_eq!(
-        fixture.session.dense_search(&unit(0), 10).await.unwrap(),
+        fixture
+            .session
+            .dense_search(&unit(0), 10, None)
+            .await
+            .unwrap(),
         vec!["note-1"]
     );
     assert!(fixture
@@ -270,13 +389,21 @@ async fn dense_search_excludes_soft_deleted_notes_and_restore_reuses_vectors() {
         .await
         .unwrap();
     assert_eq!(
-        fixture.session.dense_search(&unit(0), 10).await.unwrap(),
+        fixture
+            .session
+            .dense_search(&unit(0), 10, None)
+            .await
+            .unwrap(),
         vec!["active"]
     );
 
     fixture.session.restore_note("deleted", 2).await.unwrap();
     assert_eq!(
-        fixture.session.dense_search(&unit(0), 10).await.unwrap(),
+        fixture
+            .session
+            .dense_search(&unit(0), 10, None)
+            .await
+            .unwrap(),
         vec!["deleted", "active"]
     );
 }
@@ -298,7 +425,11 @@ async fn equal_dense_distances_use_note_id_order() {
         .unwrap();
 
     assert_eq!(
-        fixture.session.dense_search(&unit(0), 2).await.unwrap(),
+        fixture
+            .session
+            .dense_search(&unit(0), 2, None)
+            .await
+            .unwrap(),
         vec!["a", "b"]
     );
 }
@@ -316,7 +447,7 @@ async fn vectors_must_have_1024_finite_components() {
     assert_eq!(error.kind(), StorageErrorKind::Operation);
     let error = fixture
         .session
-        .dense_search(&[0.0; 3], 10)
+        .dense_search(&[0.0; 3], 10, None)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::Operation);
@@ -333,7 +464,7 @@ async fn vectors_must_have_1024_finite_components() {
     invalid_query[1] = f32::INFINITY;
     let error = fixture
         .session
-        .dense_search(&invalid_query, 10)
+        .dense_search(&invalid_query, 10, None)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::Operation);
@@ -351,7 +482,7 @@ async fn empty_inputs_and_zero_limits_return_no_results() {
 
     assert!(fixture
         .session
-        .dense_search(&unit(0), 0)
+        .dense_search(&unit(0), 0, None)
         .await
         .unwrap()
         .is_empty());
@@ -391,7 +522,11 @@ async fn deleting_a_note_cascades_chunks_jobs_and_retrieval() {
         .await
         .unwrap();
     assert_eq!(
-        fixture.session.title_search("cascade", 10).await.unwrap(),
+        fixture
+            .session
+            .title_search("cascade", 10, None)
+            .await
+            .unwrap(),
         vec!["a"]
     );
 
@@ -400,7 +535,7 @@ async fn deleting_a_note_cascades_chunks_jobs_and_retrieval() {
 
     let observer = fixture.storage.connect().await.unwrap();
     assert!(observer
-        .title_search("cascade", 10)
+        .title_search("cascade", 10, None)
         .await
         .unwrap()
         .is_empty());
@@ -412,7 +547,7 @@ async fn deleting_a_note_cascades_chunks_jobs_and_retrieval() {
         .is_empty());
     assert!(fixture
         .session
-        .dense_search(&unit(0), 10)
+        .dense_search(&unit(0), 10, None)
         .await
         .unwrap()
         .is_empty());

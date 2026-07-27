@@ -33,7 +33,16 @@ impl RetrievalRepository for PgSession {
         Ok(())
     }
 
-    async fn dense_search(&self, query: &[f32], limit: usize) -> StorageResult<Vec<String>> {
+    async fn dense_search(
+        &self,
+        query: &[f32],
+        limit: usize,
+        allowed_note_ids: Option<&[String]>,
+    ) -> StorageResult<Vec<String>> {
+        let allowed_note_ids = allowed_note_ids.map(|ids| ids.to_vec());
+        if allowed_note_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
         validate_vector(query)?;
         let limit = checked_limit(limit, "dense search")?;
         if limit == 0 {
@@ -47,18 +56,29 @@ impl RetrievalRepository for PgSession {
              FROM note_chunk_embeddings AS embedding
              JOIN notes ON notes.id = embedding.note_id
              WHERE notes.deleted_at IS NULL
+               AND ($2::text[] IS NULL OR embedding.note_id = ANY($2))
              GROUP BY embedding.note_id
              ORDER BY MIN(embedding.embedding <=> $1) ASC, embedding.note_id ASC
-             LIMIT $2",
+             LIMIT $3",
         )
         .bind(query)
+        .bind(allowed_note_ids)
         .bind(limit)
         .fetch_all(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("query exact dense search", error))
     }
 
-    async fn title_search(&self, query: &str, limit: usize) -> StorageResult<Vec<String>> {
+    async fn title_search(
+        &self,
+        query: &str,
+        limit: usize,
+        allowed_note_ids: Option<&[String]>,
+    ) -> StorageResult<Vec<String>> {
+        let allowed_note_ids = allowed_note_ids.map(|ids| ids.to_vec());
+        if allowed_note_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -70,6 +90,7 @@ impl RetrievalRepository for PgSession {
         let mut connection = self.connection().await?;
         sqlx::query_scalar(TITLE_SEARCH_SQL)
             .bind(query)
+            .bind(allowed_note_ids)
             .bind(limit)
             .fetch_all(&mut *connection)
             .await

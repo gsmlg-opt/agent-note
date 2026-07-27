@@ -616,7 +616,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap()
         .is_empty());
     assert!(session
-        .dense_search(&unit(1), 20)
+        .dense_search(&unit(1), 20, None)
         .await
         .unwrap()
         .iter()

@@ -1501,7 +1501,7 @@ async fn embedding_worker_populates_dense_recall_table_from_queue() {
     let session = backend.session().await.unwrap();
     assert!(session.chunk_embedding_exists(&note.id, 0).await.unwrap());
     assert!(session
-        .dense_search(&dense, 10)
+        .dense_search(&dense, 10, None)
         .await
         .unwrap()
         .contains(&note.id));

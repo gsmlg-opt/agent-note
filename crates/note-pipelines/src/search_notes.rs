@@ -53,8 +53,8 @@ pub async fn search_notes_filtered(
         .saturating_mul(RETRIEVAL_OVERFETCH_FACTOR)
         .clamp(MIN_RETRIEVAL_CANDIDATES, MAX_RETRIEVAL_CANDIDATES);
 
-    let title_ranking = session.title_search(query, retrieval_limit).await?;
-    let dense_ranking = session.dense_search(&dense, retrieval_limit).await?;
+    let title_ranking = session.title_search(query, retrieval_limit, None).await?;
+    let dense_ranking = session.dense_search(&dense, retrieval_limit, None).await?;
     let fused = weighted_rrf_fuse(
         &[
             (TITLE_RRF_WEIGHT, title_ranking.as_slice()),

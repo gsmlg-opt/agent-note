@@ -193,8 +193,16 @@ impl_forward_repository! {
 impl_forward_repository! {
     RetrievalRepository {
         fn insert_chunk_embedding(note_id: &str, chunk_idx: i64, embedding: &[f32]) -> ();
-        fn dense_search(query: &[f32], limit: usize) -> Vec<String>;
-        fn title_search(query: &str, limit: usize) -> Vec<String>;
+        fn dense_search(
+            query: &[f32],
+            limit: usize,
+            allowed_note_ids: Option<&[String]>,
+        ) -> Vec<String>;
+        fn title_search(
+            query: &str,
+            limit: usize,
+            allowed_note_ids: Option<&[String]>,
+        ) -> Vec<String>;
     }
 }
 
