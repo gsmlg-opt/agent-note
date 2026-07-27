@@ -669,6 +669,41 @@ impl NotesRepository for TursoSession {
             .max(0) as usize)
     }
 
+    async fn matching_note_ids(&self, selectors: &[LabelSelector]) -> StorageResult<Vec<String>> {
+        let resolved = if selectors.is_empty() {
+            None
+        } else {
+            let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
+                return Ok(Vec::new());
+            };
+            Some(resolved)
+        };
+        let mut sql = "SELECT n.id FROM notes n WHERE n.deleted_at IS NULL".to_string();
+        let mut params = Vec::<turso::Value>::new();
+        if let Some(resolved) = &resolved {
+            push_label_predicates(&mut sql, &mut params, "n", resolved)?;
+        }
+        sql.push_str(" ORDER BY n.id");
+
+        let mut rows = self
+            .connection
+            .query(&sql, turso::params_from_iter(params))
+            .await
+            .map_err(|error| map_turso_error("query matching note ids", error))?;
+        let mut note_ids = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read matching note ids", error))?
+        {
+            note_ids.push(
+                row.get(0)
+                    .map_err(|error| map_turso_error("decode matching note id", error))?,
+            );
+        }
+        Ok(note_ids)
+    }
+
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>> {
         let mut rows = self
             .connection

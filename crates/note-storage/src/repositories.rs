@@ -47,6 +47,10 @@ pub trait NotesRepository: Send + Sync {
     ) -> StorageResult<Vec<note_core::NoteListItem>>;
     async fn list_deleted_note_summaries(&self) -> StorageResult<Vec<note_core::NoteListItem>>;
     async fn count_notes(&self, selectors: &[note_core::LabelSelector]) -> StorageResult<usize>;
+    async fn matching_note_ids(
+        &self,
+        selectors: &[note_core::LabelSelector],
+    ) -> StorageResult<Vec<String>>;
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>>;
 }
 

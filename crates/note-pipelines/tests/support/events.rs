@@ -117,6 +117,7 @@ impl_forward_repository! {
         ) -> Vec<note_core::NoteListItem>;
         fn list_deleted_note_summaries() -> Vec<note_core::NoteListItem>;
         fn count_notes(selectors: &[LabelSelector]) -> usize;
+        fn matching_note_ids(selectors: &[LabelSelector]) -> Vec<String>;
         fn list_active_note_sources() -> Vec<ActiveNoteSource>;
     }
 }

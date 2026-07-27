@@ -406,7 +406,11 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .unwrap();
     }
 
-    let selectors = parse_label_selectors("contract-notes-priority>=2&contract-notes-status=ready");
+    let selectors = parse_label_selectors(
+        "contract-notes-priority>=2\
+         &contract-notes-priority<=10\
+         &contract-notes-status=ready",
+    );
     assert_eq!(session.count_notes(&selectors).await.unwrap(), 4);
     assert!(session
         .list_notes(&selectors, Some(0), Some(0))
@@ -467,6 +471,41 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             "contract-notes-active"
         ]
     );
+    assert_eq!(
+        session
+            .count_notes(&parse_label_selectors("contract-notes-status"))
+            .await
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        session
+            .count_notes(&parse_label_selectors("contract-notes-status!=blocked"))
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        session.matching_note_ids(&selectors).await.unwrap(),
+        vec![
+            "contract-notes-active",
+            "contract-notes-middle",
+            "contract-notes-newer",
+            "contract-notes-numeric-ten",
+        ]
+    );
+    let missing = parse_label_selectors("contract-notes-missing=value");
+    assert!(session
+        .matching_note_ids(&missing)
+        .await
+        .unwrap()
+        .is_empty());
+    let invalid = parse_label_selectors("contract-notes-status~=[");
+    assert!(session
+        .matching_note_ids(&invalid)
+        .await
+        .unwrap()
+        .is_empty());
 
     for selector in [
         "contract-notes-status^=RE",
@@ -495,6 +534,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             5
         );
     }
+    assert_eq!(
+        session
+            .count_notes(&parse_label_selectors("contract-notes-status^="))
+            .await
+            .unwrap(),
+        6
+    );
 
     let numeric_prefix_selectors = parse_label_selectors("contract-notes-priority^=1");
     assert_eq!(
@@ -509,6 +555,124 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     assert_eq!(
         session.count_notes(&invalid_regex_selectors).await.unwrap(),
         0
+    );
+
+    for (key, value_type) in [
+        ("contract-filter-text", LabelValueType::Text),
+        ("contract-filter-number", LabelValueType::Number),
+        ("contract-filter-version", LabelValueType::Version),
+        ("contract-filter-date", LabelValueType::Date),
+        ("contract-filter-datetime", LabelValueType::DateTime),
+        ("contract-filter-time", LabelValueType::Time),
+    ] {
+        session
+            .insert_label_key_with_type(key, key, value_type)
+            .await
+            .unwrap();
+    }
+    session
+        .insert_note(NewNote {
+            id: "contract-filter-all-types",
+            title: "All typed filters",
+            content: "All typed filters",
+            attachments: &[],
+            created_at: 50,
+            updated_at: 50,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    for (key, value) in [
+        ("contract-filter-text", "alpha"),
+        ("contract-filter-number", "2.5"),
+        ("contract-filter-version", "1.10.0"),
+        ("contract-filter-date", "2026-07-27"),
+        ("contract-filter-datetime", "2026-07-27T12:30:00"),
+        ("contract-filter-time", "12:30:00"),
+    ] {
+        session
+            .attach_label("contract-filter-all-types", key, value)
+            .await
+            .unwrap();
+    }
+    session
+        .insert_note(NewNote {
+            id: "contract-filter-nonmatching",
+            title: "Nonmatching typed filters",
+            content: "Nonmatching typed filters",
+            attachments: &[],
+            created_at: 40,
+            updated_at: 40,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    for (key, value) in [
+        ("contract-filter-text", "beta"),
+        ("contract-filter-number", "2.0"),
+        ("contract-filter-version", "1.2.0"),
+        ("contract-filter-date", "2026-07-26"),
+        ("contract-filter-datetime", "2026-07-27T14:00:00"),
+        ("contract-filter-time", "12:00:00"),
+    ] {
+        session
+            .attach_label("contract-filter-nonmatching", key, value)
+            .await
+            .unwrap();
+    }
+    for selector in [
+        "contract-filter-text=alpha",
+        "contract-filter-number>=2.5",
+        "contract-filter-version>=1.10.0",
+        "contract-filter-date=2026-07-27",
+        "contract-filter-datetime<2026-07-27T13:00:00",
+        "contract-filter-time>=12:30",
+    ] {
+        assert_eq!(
+            session
+                .matching_note_ids(&parse_label_selectors(selector))
+                .await
+                .unwrap(),
+            vec!["contract-filter-all-types"],
+            "selector: {selector}"
+        );
+    }
+    let all_types = parse_label_selectors(
+        "contract-filter-text=alpha\
+         &contract-filter-number>=2.5\
+         &contract-filter-version>=1.10.0\
+         &contract-filter-date=2026-07-27\
+         &contract-filter-datetime<2026-07-27T13:00:00\
+         &contract-filter-time>=12:30",
+    );
+    assert_eq!(
+        session.matching_note_ids(&all_types).await.unwrap(),
+        vec!["contract-filter-all-types"]
+    );
+    assert_eq!(session.count_notes(&all_types).await.unwrap(), 1);
+    assert_eq!(
+        session
+            .list_note_summaries(&all_types, Some(1), Some(0))
+            .await
+            .unwrap()[0]
+            .id,
+        "contract-filter-all-types"
+    );
+    assert_eq!(
+        session.matching_note_ids(&[]).await.unwrap(),
+        vec![
+            "contract-filter-all-types",
+            "contract-filter-nonmatching",
+            "contract-notes-active",
+            "contract-notes-middle",
+            "contract-notes-newer",
+            "contract-notes-numeric-low",
+            "contract-notes-numeric-ten",
+            "contract-notes-other",
+            "contract-notes-partial",
+        ]
     );
 
     for id in [
@@ -592,6 +756,14 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap()
         .is_none());
     assert_eq!(session.count_notes(&selectors).await.unwrap(), 3);
+    assert_eq!(
+        session.matching_note_ids(&selectors).await.unwrap(),
+        vec![
+            "contract-notes-middle",
+            "contract-notes-newer",
+            "contract-notes-numeric-ten",
+        ]
+    );
     assert!(session
         .list_notes(&selectors, None, None)
         .await
