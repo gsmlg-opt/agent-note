@@ -27,10 +27,6 @@ pub async fn search_notes_filtered(
         return Ok(Vec::new());
     }
 
-    let dense = ctx.embedder.embed(query).await?;
-
-    // Use one session for filtering, retrieval, and note metadata collection.
-    let session = ctx.storage().session().await?;
     let selectors = label
         .as_deref()
         .map(parse_label_selectors)
@@ -38,23 +34,37 @@ pub async fn search_notes_filtered(
     let allowed_note_ids = if selectors.is_empty() {
         None
     } else {
-        let ids = session
-            .list_notes(&selectors, None, None)
-            .await?
-            .into_iter()
-            .map(|note| note.id)
-            .collect::<HashSet<_>>();
+        // Release the filter session before embedding so slow inference does not hold a pooled
+        // database connection.
+        let ids = {
+            let filter_session = ctx.storage().session().await?;
+            filter_session.matching_note_ids(&selectors).await?
+        };
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         Some(ids)
     };
+
+    let dense = ctx.embedder.embed(query).await?;
+    // Use one session for retrieval and note metadata collection.
+    let session = ctx.storage().session().await?;
     let retrieval_limit = limit
         .saturating_mul(RETRIEVAL_OVERFETCH_FACTOR)
         .clamp(MIN_RETRIEVAL_CANDIDATES, MAX_RETRIEVAL_CANDIDATES);
-
-    let title_ranking = session.title_search(query, retrieval_limit, None).await?;
-    let dense_ranking = session.dense_search(&dense, retrieval_limit, None).await?;
+    let retrieval_limit = allowed_note_ids
+        .as_ref()
+        .map_or(retrieval_limit, |ids| retrieval_limit.min(ids.len()));
+    let allowed_slice = allowed_note_ids.as_deref();
+    let title_ranking = session
+        .title_search(query, retrieval_limit, allowed_slice)
+        .await?;
+    let dense_ranking = session
+        .dense_search(&dense, retrieval_limit, allowed_slice)
+        .await?;
+    let allowed_note_ids_set = allowed_note_ids
+        .as_ref()
+        .map(|ids| ids.iter().map(String::as_str).collect::<HashSet<&str>>());
     let fused = weighted_rrf_fuse(
         &[
             (TITLE_RRF_WEIGHT, title_ranking.as_slice()),
@@ -65,9 +75,9 @@ pub async fn search_notes_filtered(
 
     let mut notes = vec![];
     for (note_id, score) in fused {
-        if allowed_note_ids
+        if allowed_note_ids_set
             .as_ref()
-            .is_some_and(|allowed| !allowed.contains(&note_id))
+            .is_some_and(|allowed| !allowed.contains(note_id.as_str()))
         {
             continue;
         }
