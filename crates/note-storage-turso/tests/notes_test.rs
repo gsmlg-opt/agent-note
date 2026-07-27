@@ -439,6 +439,130 @@ async fn typed_selectors_preserve_ordering_pagination_summaries_and_counts() {
 }
 
 #[tokio::test]
+async fn filtered_limit_is_applied_after_label_predicates() {
+    let fixture = fixture().await;
+    fixture
+        .session
+        .insert_label_key("status", "Status")
+        .await
+        .unwrap();
+    fixture
+        .session
+        .insert_label_key_with_type("version", "Version", LabelValueType::Version)
+        .await
+        .unwrap();
+
+    insert_note(
+        &fixture.session,
+        "ready",
+        "Ready",
+        "Content",
+        &[],
+        100,
+        100,
+        1,
+        None,
+    )
+    .await;
+    fixture
+        .session
+        .attach_label("ready", "status", "ready")
+        .await
+        .unwrap();
+    fixture
+        .session
+        .attach_label("ready", "version", "1.10.0")
+        .await
+        .unwrap();
+
+    for (index, version) in ["1.2.0", "1.99.0", "2.0.0", "2.1.0", "3.0.0"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = format!("blocked-{index}");
+        let created_at = 200 + index as i64;
+        insert_note(
+            &fixture.session,
+            &id,
+            &id,
+            "Content",
+            &[],
+            created_at,
+            created_at,
+            1,
+            None,
+        )
+        .await;
+        fixture
+            .session
+            .attach_label(&id, "status", "blocked")
+            .await
+            .unwrap();
+        fixture
+            .session
+            .attach_label(&id, "version", version)
+            .await
+            .unwrap();
+    }
+
+    let ready_selectors = parse_label_selectors("status=ready");
+    let ready_page = fixture
+        .session
+        .list_note_summaries(&ready_selectors, Some(1), Some(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        ready_page
+            .iter()
+            .map(|note| note.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ready"]
+    );
+    assert_eq!(
+        fixture.session.count_notes(&ready_selectors).await.unwrap(),
+        1
+    );
+
+    let version_selectors = parse_label_selectors("version>=1.10.0&version<2.0.0");
+    let version_page = fixture
+        .session
+        .list_note_summaries(&version_selectors, Some(2), Some(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        version_page
+            .iter()
+            .map(|note| note.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["blocked-1", "ready"]
+    );
+    assert_eq!(
+        fixture
+            .session
+            .count_notes(&version_selectors)
+            .await
+            .unwrap(),
+        2
+    );
+
+    let invalid_regex_selectors = parse_label_selectors("status~=[");
+    assert!(fixture
+        .session
+        .list_note_summaries(&invalid_regex_selectors, Some(1), Some(0))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        fixture
+            .session
+            .count_notes(&invalid_regex_selectors)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn update_roundtrips_content_attachments_and_revision() {
     let fixture = fixture().await;
     insert_test_note(&fixture.session, "note-1").await;

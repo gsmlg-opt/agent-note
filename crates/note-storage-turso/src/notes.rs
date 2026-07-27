@@ -1,10 +1,131 @@
 use crate::connection::map_turso_error;
 use crate::TursoSession;
-use note_core::{label_matches_selector, LabelSelector, Note, NoteAttachment, NoteListItem};
+use note_core::{LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
-    ActiveNoteSource, AttachmentMetadataUpdate, LabelRepository, NewNote, NoteFieldsUpdate,
-    NoteUpdate, NotesRepository, StorageError, StorageErrorKind, StorageResult,
+    resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, LabelRepository, NewNote,
+    NoteFieldsUpdate, NoteUpdate, NotesRepository, ResolvedLabelSelector, StorageError,
+    StorageErrorKind, StorageResult,
 };
+
+impl TursoSession {
+    async fn resolved_label_selectors(
+        &self,
+        selectors: &[LabelSelector],
+    ) -> StorageResult<Option<Vec<ResolvedLabelSelector>>> {
+        let mut keys = selectors
+            .iter()
+            .map(|selector| selector.key.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        if keys.is_empty() {
+            return Ok(resolve_label_selectors(selectors, &[]));
+        }
+
+        let keys_json = serde_json::to_string(&keys).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize label selector keys",
+                error,
+            )
+        })?;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT DISTINCT lk.key, nl.value, lk.description, lk.value_type
+                 FROM label_keys lk
+                 JOIN note_labels nl ON nl.label_key_id = lk.id
+                 JOIN notes n ON n.id = nl.note_id AND n.deleted_at IS NULL
+                 WHERE lk.key IN (SELECT value FROM json_each(?1))",
+                turso::params![keys_json],
+            )
+            .await
+            .map_err(|error| map_turso_error("resolve label selector values", error))?;
+        let mut labels = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read label selector values", error))?
+        {
+            let value_type = row
+                .get::<String>(3)
+                .map_err(|error| map_turso_error("decode label selector value type", error))?
+                .parse::<note_core::LabelValueType>()
+                .map_err(|error| StorageError::new(StorageErrorKind::Operation, error))?;
+            labels.push(note_core::Label {
+                key: row
+                    .get(0)
+                    .map_err(|error| map_turso_error("decode label key", error))?,
+                value: row
+                    .get(1)
+                    .map_err(|error| map_turso_error("decode label value", error))?,
+                description: row
+                    .get(2)
+                    .map_err(|error| map_turso_error("decode label description", error))?,
+                value_type,
+            });
+        }
+        Ok(resolve_label_selectors(selectors, &labels))
+    }
+}
+
+fn push_label_predicates(
+    sql: &mut String,
+    params: &mut Vec<turso::Value>,
+    note_alias: &str,
+    selectors: &[ResolvedLabelSelector],
+) -> StorageResult<()> {
+    let mut predicates = Vec::with_capacity(selectors.len());
+    for selector in selectors {
+        params.push(selector.key.clone().into());
+        let key_param = params.len();
+        let mut predicate = format!(
+            "EXISTS (
+                 SELECT 1
+                 FROM note_labels filtered_nl
+                 JOIN label_keys filtered_lk ON filtered_lk.id = filtered_nl.label_key_id
+                 WHERE filtered_nl.note_id = {note_alias}.id
+                   AND filtered_lk.key = ?{key_param}"
+        );
+        if let Some(values) = &selector.values {
+            let values_json = serde_json::to_string(values).map_err(|error| {
+                StorageError::with_source(
+                    StorageErrorKind::Operation,
+                    "serialize resolved label values",
+                    error,
+                )
+            })?;
+            params.push(values_json.into());
+            let values_param = params.len();
+            predicate.push_str(&format!(
+                " AND filtered_nl.value IN (
+                     SELECT value FROM json_each(?{values_param})
+                 )"
+            ));
+        }
+        predicate.push(')');
+        predicates.push(predicate);
+    }
+    if !predicates.is_empty() {
+        sql.push_str(" AND ");
+        push_balanced_conjunction(sql, &predicates);
+    }
+    Ok(())
+}
+
+fn push_balanced_conjunction(sql: &mut String, predicates: &[String]) {
+    if predicates.len() == 1 {
+        sql.push_str(&predicates[0]);
+        return;
+    }
+
+    let middle = predicates.len() / 2;
+    sql.push('(');
+    push_balanced_conjunction(sql, &predicates[..middle]);
+    sql.push_str(" AND ");
+    push_balanced_conjunction(sql, &predicates[middle..]);
+    sql.push(')');
+}
 
 #[async_trait::async_trait]
 impl NotesRepository for TursoSession {
@@ -329,16 +450,28 @@ impl NotesRepository for TursoSession {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<Note>> {
-        let mut sql = "SELECT id, title, content, attachments, created_at, updated_at, deleted_at
-                       FROM notes WHERE deleted_at IS NULL"
+        let resolved = if selectors.is_empty() {
+            None
+        } else {
+            let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
+                return Ok(Vec::new());
+            };
+            Some(resolved)
+        };
+        let mut sql =
+            "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at, n.deleted_at
+                       FROM notes n WHERE n.deleted_at IS NULL"
             .to_string();
         let mut params = Vec::<turso::Value>::new();
+        if let Some(resolved) = &resolved {
+            push_label_predicates(&mut sql, &mut params, "n", resolved)?;
+        }
 
-        sql.push_str(" ORDER BY created_at DESC, id ASC");
-        if selectors.is_empty() && (limit.is_some() || offset.is_some()) {
+        sql.push_str(" ORDER BY n.created_at DESC, n.id ASC");
+        if limit.is_some() || offset.is_some() {
             sql.push_str(" LIMIT ? OFFSET ?");
             params.push(limit.unwrap_or(-1).into());
-            params.push(offset.unwrap_or(0).into());
+            params.push(offset.unwrap_or(0).max(0).into());
         }
 
         let mut rows = self
@@ -368,10 +501,6 @@ impl NotesRepository for TursoSession {
                 updated_at: row.updated_at,
                 deleted_at: row.deleted_at,
             });
-        }
-        if !selectors.is_empty() {
-            notes.retain(|note| note_matches_selectors(note, selectors));
-            notes = paginate(notes, limit, offset);
         }
         Ok(notes)
     }
@@ -419,16 +548,27 @@ impl NotesRepository for TursoSession {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<NoteListItem>> {
-        let mut sql = "SELECT id, title, created_at, updated_at, deleted_at
-                       FROM notes WHERE deleted_at IS NULL"
+        let resolved = if selectors.is_empty() {
+            None
+        } else {
+            let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
+                return Ok(Vec::new());
+            };
+            Some(resolved)
+        };
+        let mut sql = "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at
+                       FROM notes n WHERE n.deleted_at IS NULL"
             .to_string();
         let mut params = Vec::<turso::Value>::new();
+        if let Some(resolved) = &resolved {
+            push_label_predicates(&mut sql, &mut params, "n", resolved)?;
+        }
 
-        sql.push_str(" ORDER BY created_at DESC, id ASC");
-        if selectors.is_empty() && (limit.is_some() || offset.is_some()) {
+        sql.push_str(" ORDER BY n.created_at DESC, n.id ASC");
+        if limit.is_some() || offset.is_some() {
             sql.push_str(" LIMIT ? OFFSET ?");
             params.push(limit.unwrap_or(-1).into());
-            params.push(offset.unwrap_or(0).into());
+            params.push(offset.unwrap_or(0).max(0).into());
         }
 
         let mut rows = self
@@ -456,10 +596,6 @@ impl NotesRepository for TursoSession {
                 updated_at: row.updated_at,
                 deleted_at: row.deleted_at,
             });
-        }
-        if !selectors.is_empty() {
-            notes.retain(|note| summary_matches_selectors(note, selectors));
-            notes = paginate(notes, limit, offset);
         }
         Ok(notes)
     }
@@ -501,13 +637,23 @@ impl NotesRepository for TursoSession {
     }
 
     async fn count_notes(&self, selectors: &[LabelSelector]) -> StorageResult<usize> {
-        if !selectors.is_empty() {
-            return Ok(self.list_note_summaries(selectors, None, None).await?.len());
+        let resolved = if selectors.is_empty() {
+            None
+        } else {
+            let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
+                return Ok(0);
+            };
+            Some(resolved)
+        };
+        let mut sql = "SELECT COUNT(*) FROM notes n WHERE n.deleted_at IS NULL".to_string();
+        let mut params = Vec::<turso::Value>::new();
+        if let Some(resolved) = &resolved {
+            push_label_predicates(&mut sql, &mut params, "n", resolved)?;
         }
 
         let mut rows = self
             .connection
-            .query("SELECT COUNT(*) FROM notes WHERE deleted_at IS NULL", ())
+            .query(&sql, turso::params_from_iter(params))
             .await
             .map_err(|error| map_turso_error("count notes", error))?;
         let Some(row) = rows
@@ -670,36 +816,76 @@ struct StoredAttachment {
     description: String,
 }
 
-fn note_matches_selectors(note: &Note, selectors: &[LabelSelector]) -> bool {
-    selectors.iter().all(|selector| {
-        note.labels
-            .iter()
-            .any(|label| label_matches_selector(label, selector))
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TursoStorage;
+    use note_core::parse_label_selectors;
 
-fn summary_matches_selectors(note: &NoteListItem, selectors: &[LabelSelector]) -> bool {
-    selectors.iter().all(|selector| {
-        note.labels
-            .iter()
-            .any(|label| label_matches_selector(label, selector))
-    })
-}
+    #[test]
+    fn resolved_predicates_precede_order_and_limit() {
+        let mut sql = "SELECT n.id FROM notes n WHERE n.deleted_at IS NULL".to_string();
+        let mut params = Vec::new();
+        let resolved = vec![
+            ResolvedLabelSelector {
+                key: "status".into(),
+                values: Some(vec!["ready".into()]),
+            },
+            ResolvedLabelSelector {
+                key: "archived".into(),
+                values: None,
+            },
+        ];
+        push_label_predicates(&mut sql, &mut params, "n", &resolved).unwrap();
+        sql.push_str(" ORDER BY n.created_at DESC, n.id ASC LIMIT ? OFFSET ?");
 
-fn paginate<T>(items: Vec<T>, limit: Option<i64>, offset: Option<i64>) -> Vec<T> {
-    let start = offset.unwrap_or(0).max(0) as usize;
-    if start >= items.len() {
-        return Vec::new();
+        assert_eq!(sql.matches("EXISTS").count(), 2);
+        assert!(sql.contains("json_each"));
+        assert_eq!(params.len(), 3);
+        assert!(sql.contains("filtered_lk.key = ?1"));
+        assert!(sql.contains("json_each(?2)"));
+        assert!(sql.contains("filtered_lk.key = ?3"));
+        assert!(sql.find("EXISTS").unwrap() < sql.find("ORDER BY").unwrap());
+        assert!(sql.find("ORDER BY").unwrap() < sql.find("LIMIT").unwrap());
     }
-    let end = limit
-        .and_then(|limit| {
-            if limit < 0 {
-                None
-            } else {
-                Some(start.saturating_add(limit as usize))
-            }
-        })
-        .unwrap_or(items.len())
-        .min(items.len());
-    items.into_iter().skip(start).take(end - start).collect()
+
+    #[tokio::test]
+    async fn handles_128_value_label_selectors_without_expression_depth_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap();
+        let session = storage.connect().await.unwrap();
+        session.insert_label_key("status", "Status").await.unwrap();
+        session
+            .insert_note(NewNote {
+                id: "ready",
+                title: "Ready",
+                content: "Content",
+                attachments: &[],
+                created_at: 1,
+                updated_at: 1,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        session
+            .attach_label("ready", "status", "ready")
+            .await
+            .unwrap();
+        let selectors = parse_label_selectors(
+            &std::iter::repeat_n("status=ready", 128)
+                .collect::<Vec<_>>()
+                .join("&"),
+        );
+
+        let summaries = session
+            .list_note_summaries(&selectors, Some(1), Some(0))
+            .await
+            .unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "ready");
+    }
 }
