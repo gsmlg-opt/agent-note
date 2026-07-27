@@ -1,6 +1,17 @@
 use crate::context::Context;
 use note_core::{parse_label_selectors, Note, NoteListItem};
 
+pub const DEFAULT_LIST_LIMIT: i64 = 10;
+pub const MAX_LIST_LIMIT: i64 = 1_000;
+
+pub fn normalized_list_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(0, MAX_LIST_LIMIT)
+}
+
+pub fn normalized_list_offset(offset: Option<i64>) -> i64 {
+    offset.unwrap_or(0).max(0)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ListNotesParams {
     pub limit: Option<i64>,
@@ -62,4 +73,22 @@ pub async fn count_notes(ctx: &Context, label: Option<String>) -> anyhow::Result
 pub async fn list_deleted_note_summaries(ctx: &Context) -> anyhow::Result<Vec<NoteListItem>> {
     let session = ctx.storage().session().await?;
     Ok(session.list_deleted_note_summaries().await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_pagination_normalizes_defaults_bounds_and_offsets() {
+        assert_eq!(normalized_list_limit(None), 10);
+        assert_eq!(normalized_list_limit(Some(0)), 0);
+        assert_eq!(normalized_list_limit(Some(25)), 25);
+        assert_eq!(normalized_list_limit(Some(-1)), 0);
+        assert_eq!(normalized_list_limit(Some(2_000)), 1_000);
+
+        assert_eq!(normalized_list_offset(None), 0);
+        assert_eq!(normalized_list_offset(Some(-1)), 0);
+        assert_eq!(normalized_list_offset(Some(25)), 25);
+    }
 }

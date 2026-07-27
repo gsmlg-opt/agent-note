@@ -9,8 +9,9 @@ use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
     count_notes, delete_note, embedding_dashboard_status, get_note_attachment, get_note_markdown,
     get_note_metadata, label_note_counts, list_deleted_note_summaries, list_label_keys,
-    list_note_summaries, permanently_delete_note, restore_notes, save_note, search_notes_filtered,
-    update_note, Context, ListNotesParams, SaveNoteInput,
+    list_note_summaries, normalized_list_limit, normalized_list_offset, permanently_delete_note,
+    restore_notes, save_note, search_notes_filtered, update_note, Context, ListNotesParams,
+    SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,8 +24,6 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-const DEFAULT_LIST_LIMIT: i64 = 10;
-const MAX_LIST_LIMIT: i64 = 1000;
 const DASHBOARD_CACHE_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -507,14 +506,6 @@ struct CountNotesQuery {
     offset: Option<i64>,
 }
 
-fn normalized_limit(limit: Option<i64>) -> i64 {
-    limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(0, MAX_LIST_LIMIT)
-}
-
-fn normalized_offset(offset: Option<i64>) -> i64 {
-    offset.unwrap_or(0).max(0)
-}
-
 #[utoipa::path(
     get,
     path = "/api/notes",
@@ -532,8 +523,8 @@ async fn list_notes_handler(
     let notes = list_note_summaries(
         &ctx,
         ListNotesParams {
-            limit: Some(normalized_limit(req.limit)),
-            offset: Some(normalized_offset(req.offset)),
+            limit: Some(normalized_list_limit(req.limit)),
+            offset: Some(normalized_list_offset(req.offset)),
             label: req.label,
         },
     )
@@ -1605,11 +1596,6 @@ mod tests {
                 "{uri}: {body}"
             );
         }
-    }
-
-    #[test]
-    fn list_notes_clamps_limit_to_one_thousand() {
-        assert_eq!(normalized_limit(Some(2000)), 1000);
     }
 
     #[tokio::test]

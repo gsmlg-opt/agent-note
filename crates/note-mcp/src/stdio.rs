@@ -5,7 +5,9 @@
 
 use std::{borrow::Cow, sync::Arc};
 
-use note_pipelines::{AttachmentMutationError, Context};
+use note_pipelines::{
+    normalized_list_limit, normalized_list_offset, AttachmentMutationError, Context,
+};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Json, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
@@ -306,7 +308,7 @@ pub struct DeleteNoteResponse {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListNotesRequest {
-    /// Max notes to return.
+    /// Maximum notes to return; omission returns 10 notes and the maximum is 1,000.
     #[serde(default)]
     pub limit: Option<u32>,
     /// Number of notes to skip.
@@ -319,6 +321,14 @@ pub struct ListNotesRequest {
     /// the `&` separator is also reserved in operands.
     #[serde(default)]
     pub label: Option<String>,
+}
+
+fn normalized_list_notes_request(request: ListNotesRequest) -> (i64, i64, Option<String>) {
+    (
+        normalized_list_limit(request.limit.map(i64::from)),
+        normalized_list_offset(request.offset.map(i64::from)),
+        request.label,
+    )
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -672,15 +682,10 @@ impl NoteMcpServer {
         &self,
         params: Parameters<ListNotesRequest>,
     ) -> Result<Json<NoteListResponse>, ErrorData> {
-        let request = params.0;
-        let notes = list_notes_tool(
-            &self.ctx,
-            request.limit.map(i64::from),
-            request.offset.map(i64::from),
-            request.label,
-        )
-        .await
-        .map_err(to_error_data)?;
+        let (limit, offset, label) = normalized_list_notes_request(params.0);
+        let notes = list_notes_tool(&self.ctx, Some(limit), Some(offset), label)
+            .await
+            .map_err(to_error_data)?;
         Ok(Json(NoteListResponse {
             notes: notes.into_iter().map(Into::into).collect(),
         }))
@@ -825,7 +830,7 @@ mod tests {
     use super::*;
     use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
-    use note_storage::StorageBackend;
+    use note_storage::{StorageBackend, TransactionMode};
     use note_storage_turso::TursoStorage;
     use rmcp::model::ErrorCode;
     use serde_json::json;
@@ -846,6 +851,28 @@ mod tests {
             )),
         );
         (ctx, backend, dir)
+    }
+
+    async fn seed_summary_notes(backend: &dyn note_storage::StorageBackend, count: usize) {
+        let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
+        for index in 0..count {
+            let id = format!("mcp-list-{index:04}");
+            let timestamp = i64::try_from(index).unwrap();
+            transaction
+                .insert_note(note_storage::NewNote {
+                    id: &id,
+                    title: &id,
+                    content: "summary-only body",
+                    attachments: &[],
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    note_revision: 1,
+                    deleted_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        transaction.commit().await.unwrap();
     }
 
     fn put_request(
@@ -1012,6 +1039,75 @@ mod tests {
                 "semantic_search",
                 "update_note",
             ]
+        );
+    }
+
+    #[test]
+    fn list_notes_request_adapter_clamps_max_limit() {
+        let (limit, offset, label) = normalized_list_notes_request(ListNotesRequest {
+            limit: Some(u32::MAX),
+            offset: Some(7),
+            label: Some("topic=rust".into()),
+        });
+
+        assert_eq!(limit, 1_000);
+        assert_eq!(offset, 7);
+        assert_eq!(label.as_deref(), Some("topic=rust"));
+    }
+
+    #[tokio::test]
+    async fn list_notes_defaults_to_ten() {
+        let (ctx, backend, _dir) = test_context().await;
+        seed_summary_notes(backend.as_ref(), 12).await;
+        let server = NoteMcpServer::new(Arc::new(ctx));
+
+        let response = server
+            .list_notes(Parameters(ListNotesRequest {
+                limit: None,
+                offset: None,
+                label: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(response.notes.len(), 10);
+        assert_eq!(response.notes.first().unwrap().id, "mcp-list-0011");
+        assert_eq!(response.notes.last().unwrap().id, "mcp-list-0002");
+    }
+
+    #[tokio::test]
+    async fn list_notes_honors_zero_limit_and_explicit_offset() {
+        let (ctx, backend, _dir) = test_context().await;
+        seed_summary_notes(backend.as_ref(), 4).await;
+        let server = NoteMcpServer::new(Arc::new(ctx));
+
+        let empty = server
+            .list_notes(Parameters(ListNotesRequest {
+                limit: Some(0),
+                offset: None,
+                label: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(empty.notes.is_empty());
+
+        let page = server
+            .list_notes(Parameters(ListNotesRequest {
+                limit: Some(2),
+                offset: Some(1),
+                label: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            page.notes
+                .iter()
+                .map(|note| note.id.as_str())
+                .collect::<Vec<_>>(),
+            ["mcp-list-0002", "mcp-list-0001"]
         );
     }
 
