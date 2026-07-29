@@ -4,7 +4,7 @@
 
 **Goal:** Add a confirmed, best-effort `Delete selected` action to the existing Trash multi-selection toolbar.
 
-**Architecture:** Keep the change inside `TrashPage` and reuse the existing single-note permanent-delete API sequentially. Pure helpers create the visible ordered snapshot, reconcile selection after partial success, and format the partial-failure alert; the component adds a batch delete target and preserves the current single-delete flow.
+**Architecture:** Keep the change inside `TrashPage` and reuse the existing single-note permanent-delete API sequentially. Pure helpers create the visible ordered snapshot, reconcile selection after partial success, and format the partial-failure alert. A `SelectionState` reducer owns selection changes so async restore and delete completions dispatch against the latest state; the component adds a batch delete target and preserves the current single-delete flow.
 
 **Tech Stack:** Rust 2021, Yew 0.23, `web-sys`, existing `Modal` and DuskMoon button styles.
 
@@ -475,7 +475,102 @@ git add crates/note-frontend/src/pages/trash.rs
 git commit -m "feat(frontend): delete selected Trash notes"
 ```
 
-### Task 3: Verify the Trash Feature
+### Task 3: Apply Post-Implementation Quality Fixes
+
+**Files:**
+- Modify: `crates/note-frontend/src/pages/trash.rs`
+- Test: `crates/note-frontend/src/pages/trash.rs`
+
+- [ ] **Step 1: Write the failing latest-selection reducer regression**
+
+Add a focused test that starts with the successful and failed attempted IDs,
+then applies a later row-selection action before applying the batch result:
+
+```rust
+let state = Rc::new(SelectionState(HashSet::from([
+    "deleted".to_string(),
+    "failed".to_string(),
+])));
+let state = state.reduce(SelectionAction::Toggle {
+    id: "new-selection".to_string(),
+    selected: true,
+});
+let state = state.reduce(SelectionAction::ReconcileDelete {
+    attempted: vec!["deleted".to_string(), "failed".to_string()],
+    failed: HashSet::from(["failed".to_string()]),
+});
+
+assert_eq!(
+    **state,
+    HashSet::from(["failed".to_string(), "new-selection".to_string()])
+);
+```
+
+Run the focused test and verify RED because `SelectionState` and
+`SelectionAction` do not exist yet.
+
+- [ ] **Step 2: Move every selection mutation to reducer actions**
+
+Replace `use_state(HashSet<String>)` with `use_reducer(SelectionState::default)`
+and implement actions for:
+
+- `Replace` for select-all and clear;
+- `RetainVisible` after a successful refresh;
+- `Toggle` for a row checkbox;
+- `Remove` after restore succeeds;
+- `ReconcileDelete` with attempted and failed IDs after batch deletion.
+
+The batch completion must dispatch `ReconcileDelete` without dereferencing a
+selection handle captured by the confirmation render. Reducer dispatch then
+uses the latest selection, preserving `new-selection` while removing
+`deleted` and keeping `failed`.
+
+Keep selection checkboxes enabled during restore and delete requests. Pass the
+current `deleting` and `restoring` values into `trash_table`, disable both
+per-row mutation buttons when either is true, and repeat that check at the
+start of both row mutation callbacks.
+
+- [ ] **Step 3: Verify the reducer fix and commit it**
+
+Run the focused reducer test, the frontend suite, the Wasm check, formatting,
+and `git diff --check`. Then commit:
+
+```sh
+git add crates/note-frontend/src/pages/trash.rs
+git commit -m "fix(frontend): reconcile latest Trash selection"
+```
+
+- [ ] **Step 4: Write the failing singular-summary regression**
+
+Add this assertion while keeping the existing `(5, 2)` expectation unchanged:
+
+```rust
+assert_eq!(
+    batch_delete_failure_message(1, 1),
+    Some(
+        "Deleted 0 of 1 selected note; 1 failed. \
+         Failed note still in Trash remains selected."
+            .to_string()
+    )
+);
+```
+
+Run the focused test and verify RED against the old plural `notes` and `remain`
+copy.
+
+- [ ] **Step 5: Pluralize the summary, verify GREEN, and commit**
+
+Choose the total noun from `total`, and the failed noun plus `remains`/`remain`
+verb from `failed`. Do not change the modal title
+`Delete selected notes permanently`. Run the focused test, full frontend suite,
+Wasm check, formatting, and `git diff --check`, then commit:
+
+```sh
+git add crates/note-frontend/src/pages/trash.rs
+git commit -m "fix(frontend): pluralize Trash delete summary"
+```
+
+### Task 4: Verify the Trash Feature
 
 **Files:**
 - Verify: `crates/note-frontend/src/pages/trash.rs`

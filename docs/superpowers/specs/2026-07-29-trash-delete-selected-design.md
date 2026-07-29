@@ -36,9 +36,11 @@ later deletions.
 
 When all requests finish:
 
-- successfully deleted IDs are removed from the current selection;
+- successfully deleted attempted IDs are removed from the latest selection;
 - failed IDs that are still present after refresh remain selected so the user
   can retry them;
+- selections added while the sequential requests are running survive because
+  they were not part of the attempted snapshot;
 - Trash is refreshed once;
 - the modal closes;
 - if every request succeeds, no error alert is shown;
@@ -64,14 +66,23 @@ selected note IDs. The existing delete modal handles both target types:
 
 Small pure helpers select visible IDs and summarize batch outcomes. They keep
 selection reconciliation and failure copy deterministic and independently
-testable. A separate batch-outcome error state renders through the existing
-page-alert location so the refresh does not clear a partial-failure summary. No
-shared deletion abstraction or CSS changes are required.
+testable. Selection uses a reducer whose actions replace or clear the
+selection, retain visible IDs after refresh, toggle one row, remove restored
+IDs, or reconcile a batch-delete result. `ReconcileDelete` always reduces
+against the latest selection, so an async completion cannot overwrite row
+selections made after confirmation. A separate batch-outcome error state
+renders through the existing page-alert location so the refresh does not clear
+a partial-failure summary. No shared deletion abstraction or CSS changes are
+required.
 
 ## Error and Concurrency Handling
 
 - The existing `deleting` state prevents duplicate confirmation.
 - Restore and bulk-delete buttons cannot start overlapping batch operations.
+- Per-row Restore and Delete controls are disabled while either a restore or
+  delete request is running, and their callbacks repeat the same guard.
+- Selection checkboxes intentionally remain enabled during requests; reducer
+  reconciliation preserves selections that were not in the attempted batch.
 - The modal ignores close and cancel attempts while deletion is running.
 - Network and HTTP failures count only against the affected note; remaining
   requests continue.
@@ -85,7 +96,12 @@ Use test-driven development for pure Trash-page behavior:
 
 - visible selected notes produce an ordered batch snapshot;
 - successful IDs are removed while failed IDs remain selected;
+- reducer reconciliation keeps a row selected after it is toggled on during
+  the async delete loop, while removing the successful attempted ID and
+  retaining the failed attempted ID;
 - partial failure copy reports success, total, and failed counts;
+- a one-note failure reports `Deleted 0 of 1 selected note; 1 failed. Failed
+  note still in Trash remains selected.`;
 - all-success outcomes produce no error copy;
 - existing timestamp formatting and single-note behavior remain intact.
 
@@ -110,5 +126,7 @@ git diff --check
 6. Successfully deleted notes disappear after the final refresh.
 7. Failed notes that remain in Trash stay selected and the page reports the
    partial result.
-8. Existing single-note delete request/copy/result behavior, restore,
+8. Selections made while the sequential deletion is running survive when they
+   were not part of the attempted snapshot.
+9. Existing single-note delete request/copy/result behavior, restore,
    select-all, and retention behavior are unchanged.
