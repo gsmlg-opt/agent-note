@@ -23,6 +23,45 @@ impl RestoreTarget {
     }
 }
 
+#[derive(Clone, PartialEq)]
+enum DeleteTarget {
+    Single { id: String, title: String },
+    Batch { ids: Vec<String> },
+}
+
+impl DeleteTarget {
+    fn ids(&self) -> Vec<String> {
+        match self {
+            Self::Single { id, .. } => vec![id.clone()],
+            Self::Batch { ids } => ids.clone(),
+        }
+    }
+
+    fn modal_copy(&self) -> (String, String, String) {
+        match self {
+            Self::Single { title, .. } => (
+                "Delete note permanently".to_string(),
+                format!(
+                    "Permanently delete the note \u{201c}{title}\u{201d}? This cannot be undone."
+                ),
+                "Delete permanently".to_string(),
+            ),
+            Self::Batch { ids } => (
+                "Delete selected notes permanently".to_string(),
+                format!(
+                    "Permanently delete {} selected notes? This cannot be undone.",
+                    ids.len()
+                ),
+                format!("Delete {} notes", ids.len()),
+            ),
+        }
+    }
+
+    fn is_batch(&self) -> bool {
+        matches!(self, Self::Batch { .. })
+    }
+}
+
 fn selected_note_ids(notes: &[DeletedNoteSummary], selected: &HashSet<String>) -> Vec<String> {
     notes
         .iter()
@@ -57,10 +96,11 @@ pub fn trash_page() -> Html {
     let selected = use_state(HashSet::<String>::new);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
-    let delete_target = use_state(|| None::<(String, String)>);
+    let delete_target = use_state(|| None::<DeleteTarget>);
     let restore_target = use_state(|| None::<RestoreTarget>);
     let deleting = use_state(|| false);
     let restoring = use_state(|| false);
+    let batch_delete_error = use_state(|| None::<String>);
     let refresh_tick = use_state(|| 0usize);
     let select_all_ref = use_node_ref();
 
@@ -109,7 +149,11 @@ pub fn trash_page() -> Html {
 
     let on_refresh = {
         let refresh_tick = refresh_tick.clone();
-        Callback::from(move |_| refresh_tick.set((*refresh_tick).saturating_add(1)))
+        let batch_delete_error = batch_delete_error.clone();
+        Callback::from(move |_| {
+            batch_delete_error.set(None);
+            refresh_tick.set((*refresh_tick).saturating_add(1));
+        })
     };
 
     let on_select_all = {
@@ -137,6 +181,22 @@ pub fn trash_page() -> Html {
                 .collect::<Vec<_>>();
             if !ids.is_empty() {
                 restore_target.set(Some(RestoreTarget::Batch { ids }));
+            }
+        })
+    };
+
+    let open_batch_delete = {
+        let notes = notes.clone();
+        let selected = selected.clone();
+        let delete_target = delete_target.clone();
+        let error = error.clone();
+        let batch_delete_error = batch_delete_error.clone();
+        Callback::from(move |_| {
+            let ids = selected_note_ids(&notes, &selected);
+            error.set(None);
+            batch_delete_error.set(None);
+            if !ids.is_empty() {
+                delete_target.set(Some(DeleteTarget::Batch { ids }));
             }
         })
     };
@@ -227,19 +287,34 @@ pub fn trash_page() -> Html {
 
     let delete_modal = match (*delete_target).clone() {
         None => html! {},
-        Some((id, title)) => {
+        Some(target) => {
+            let ids = target.ids();
+            let is_batch = target.is_batch();
+            let (modal_title, message, confirm_label) = target.modal_copy();
             let on_close = {
                 let delete_target = delete_target.clone();
-                Callback::from(move |_: ()| delete_target.set(None))
+                let deleting = deleting.clone();
+                Callback::from(move |_: ()| {
+                    if !*deleting {
+                        delete_target.set(None);
+                    }
+                })
             };
             let on_cancel = {
                 let delete_target = delete_target.clone();
-                Callback::from(move |_| delete_target.set(None))
+                let deleting = deleting.clone();
+                Callback::from(move |_| {
+                    if !*deleting {
+                        delete_target.set(None);
+                    }
+                })
             };
             let on_confirm = {
                 let delete_target = delete_target.clone();
                 let deleting = deleting.clone();
                 let error = error.clone();
+                let batch_delete_error = batch_delete_error.clone();
+                let selected = selected.clone();
                 let refresh_tick = refresh_tick.clone();
                 Callback::from(move |_| {
                     if *deleting {
@@ -249,29 +324,46 @@ pub fn trash_page() -> Html {
                     let delete_target = delete_target.clone();
                     let deleting = deleting.clone();
                     let error = error.clone();
+                    let batch_delete_error = batch_delete_error.clone();
+                    let selected = selected.clone();
                     let refresh_tick = refresh_tick.clone();
-                    let id = id.clone();
+                    let ids = ids.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        match api::permanently_delete_note(&id).await {
-                            Ok(()) => {
-                                delete_target.set(None);
-                                refresh_tick.set((*refresh_tick).saturating_add(1));
+                        if is_batch {
+                            let mut failed = HashSet::new();
+                            for id in &ids {
+                                if api::permanently_delete_note(id).await.is_err() {
+                                    failed.insert(id.clone());
+                                }
                             }
-                            Err(message) => error.set(Some(message)),
+                            selected.set(reconcile_delete_selection(&selected, &ids, &failed));
+                            batch_delete_error
+                                .set(batch_delete_failure_message(ids.len(), failed.len()));
+                            delete_target.set(None);
+                            deleting.set(false);
+                            refresh_tick.set((*refresh_tick).saturating_add(1));
+                        } else {
+                            match api::permanently_delete_note(&ids[0]).await {
+                                Ok(()) => {
+                                    delete_target.set(None);
+                                    refresh_tick.set((*refresh_tick).saturating_add(1));
+                                }
+                                Err(message) => error.set(Some(message)),
+                            }
+                            deleting.set(false);
                         }
-                        deleting.set(false);
                     });
                 })
             };
             html! {
-                <Modal title="Delete note permanently" on_close={on_close}>
-                    <p>{ format!("Permanently delete the note \u{201c}{title}\u{201d}? This cannot be undone.") }</p>
+                <Modal title={modal_title} on_close={on_close}>
+                    <p>{ message }</p>
                     <div class="app-modal-actions">
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*deleting}>
                             { "Cancel" }
                         </button>
                         <button type="button" class="btn btn-error" onclick={on_confirm} disabled={*deleting}>
-                            { if *deleting { "Deleting..." } else { "Delete permanently" } }
+                            { if *deleting { "Deleting...".to_string() } else { confirm_label } }
                         </button>
                     </div>
                 </Modal>
@@ -295,6 +387,10 @@ pub fn trash_page() -> Html {
                 <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
             }
 
+            if let Some(message) = &*batch_delete_error {
+                <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
+            }
+
             if *loading {
                 <p class="loading">{ "Loading..." }</p>
             } else if notes.is_empty() {
@@ -304,21 +400,34 @@ pub fn trash_page() -> Html {
                     <span class="trash-selection-count" role="status">
                         { format!("{} selected", selected.len()) }
                     </span>
-                    <button
-                        type="button"
-                        class="btn btn-primary"
-                        disabled={selected.is_empty() || *restoring}
-                        onclick={open_batch_restore}
-                    >
-                        { icons::restore() }
-                        <span>{ "Restore selected" }</span>
-                    </button>
+                    <div class="row-actions">
+                        <button
+                            type="button"
+                            class="btn btn-primary"
+                            disabled={selected.is_empty() || *restoring || *deleting}
+                            onclick={open_batch_restore}
+                        >
+                            { icons::restore() }
+                            <span>{ "Restore selected" }</span>
+                        </button>
+                        <button
+                            type="button"
+                            class="btn btn-error"
+                            disabled={selected.is_empty() || *restoring || *deleting}
+                            onclick={open_batch_delete}
+                        >
+                            { icons::trash() }
+                            <span>{ "Delete selected" }</span>
+                        </button>
+                    </div>
                 </div>
                 { trash_table(
                     &notes,
                     &selected,
                     &restore_target,
                     &delete_target,
+                    &error,
+                    &batch_delete_error,
                     &select_all_ref,
                     on_select_all,
                 ) }
@@ -334,7 +443,9 @@ fn trash_table(
     notes: &[DeletedNoteSummary],
     selected: &UseStateHandle<HashSet<String>>,
     restore_target: &UseStateHandle<Option<RestoreTarget>>,
-    delete_target: &UseStateHandle<Option<(String, String)>>,
+    delete_target: &UseStateHandle<Option<DeleteTarget>>,
+    error: &UseStateHandle<Option<String>>,
+    batch_delete_error: &UseStateHandle<Option<String>>,
     select_all_ref: &NodeRef,
     on_select_all: Callback<Event>,
 ) -> Html {
@@ -389,9 +500,18 @@ fn trash_table(
                         };
                         let on_delete = {
                             let delete_target = delete_target.clone();
+                            let error = error.clone();
+                            let batch_delete_error = batch_delete_error.clone();
                             let id = note.id.clone();
                             let title = note.title.clone();
-                            Callback::from(move |_| delete_target.set(Some((id.clone(), title.clone()))))
+                            Callback::from(move |_| {
+                                error.set(None);
+                                batch_delete_error.set(None);
+                                delete_target.set(Some(DeleteTarget::Single {
+                                    id: id.clone(),
+                                    title: title.clone(),
+                                }));
+                            })
                         };
                         html! {
                             <tr key={note.id.clone()}>
@@ -457,7 +577,7 @@ fn format_timestamp(timestamp: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_delete_failure_message, reconcile_delete_selection, selected_note_ids,
+        batch_delete_failure_message, reconcile_delete_selection, selected_note_ids, DeleteTarget,
         DeletedNoteSummary,
     };
     use std::collections::HashSet;
@@ -505,6 +625,23 @@ mod tests {
             Some(
                 "Deleted 3 of 5 selected notes; 2 failed. Failed notes still in Trash remain selected."
                     .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn batch_delete_target_has_irreversible_count_copy() {
+        let target = DeleteTarget::Batch {
+            ids: vec!["one".to_string(), "two".to_string()],
+        };
+
+        assert_eq!(target.ids(), ["one", "two"]);
+        assert_eq!(
+            target.modal_copy(),
+            (
+                "Delete selected notes permanently".to_string(),
+                "Permanently delete 2 selected notes? This cannot be undone.".to_string(),
+                "Delete 2 notes".to_string(),
             )
         );
     }
