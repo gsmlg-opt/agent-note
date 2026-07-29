@@ -142,8 +142,11 @@ impl Reducible for SelectionState {
 }
 
 fn batch_delete_failure_message(total: usize, failed: usize) -> Option<String> {
+    let selected_noun = if total == 1 { "note" } else { "notes" };
+    let failed_noun = if failed == 1 { "note" } else { "notes" };
+    let remain = if failed == 1 { "remains" } else { "remain" };
     (failed > 0).then(|| format!(
-        "Deleted {} of {total} selected notes; {failed} failed. Failed notes still in Trash remain selected.",
+        "Deleted {} of {total} selected {selected_noun}; {failed} failed. Failed {failed_noun} still in Trash {remain} selected.",
         total.saturating_sub(failed)
     ))
 }
@@ -710,6 +713,13 @@ mod tests {
     #[test]
     fn batch_delete_failure_message_reports_failures() {
         assert_eq!(batch_delete_failure_message(5, 0), None);
+        assert_eq!(
+            batch_delete_failure_message(1, 1),
+            Some(
+                "Deleted 0 of 1 selected note; 1 failed. Failed note still in Trash remains selected."
+                    .to_string()
+            )
+        );
         assert_eq!(
             batch_delete_failure_message(5, 2),
             Some(
