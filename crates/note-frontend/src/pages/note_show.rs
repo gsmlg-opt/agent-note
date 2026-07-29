@@ -101,6 +101,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
     let copy_status = use_state(CopyStatus::default);
+    let content_copy_status = use_state(CopyStatus::default);
     let delete_open = use_state(|| false);
     let delete_pending = use_state(|| false);
     let delete_in_flight = use_mut_ref(|| false);
@@ -110,6 +111,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         let loading = loading.clone();
         let error = error.clone();
         let copy_status = copy_status.clone();
+        let content_copy_status = content_copy_status.clone();
         let delete_open = delete_open.clone();
         let delete_pending = delete_pending.clone();
         let delete_in_flight = delete_in_flight.clone();
@@ -119,6 +121,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             note.set(None);
             error.set(None);
             copy_status.set(CopyStatus::Ready);
+            content_copy_status.set(CopyStatus::Ready);
             delete_open.set(false);
             delete_pending.set(false);
             *delete_in_flight.borrow_mut() = false;
@@ -137,6 +140,10 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         .as_ref()
         .map(|loaded_note| loaded_note.id.clone())
         .unwrap_or_default();
+    let copy_content = (*note)
+        .as_ref()
+        .map(|loaded_note| content_copy_payload(&loaded_note.content).to_string())
+        .unwrap_or_default();
     let on_copy_id = {
         let id = copy_id;
         let copy_status = copy_status.clone();
@@ -149,6 +156,25 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                     None => false,
                 };
                 copy_status.set(if copied {
+                    CopyStatus::Copied
+                } else {
+                    CopyStatus::Failed
+                });
+            });
+        })
+    };
+    let on_copy_content = {
+        let content = copy_content;
+        let content_copy_status = content_copy_status.clone();
+        Callback::from(move |_| {
+            let content = content.clone();
+            let content_copy_status = content_copy_status.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let copied = match browser_clipboard() {
+                    Some(clipboard) => JsFuture::from(clipboard.write_text(&content)).await.is_ok(),
+                    None => false,
+                };
+                content_copy_status.set(if copied {
                     CopyStatus::Copied
                 } else {
                     CopyStatus::Failed
@@ -251,7 +277,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                 <p class="loading">{ "Loading…" }</p>
             } else if let Some(n) = &*note {
                 <Card title={Some(html! { <span>{ n.title.clone() }</span> })}>
-                    <div class="note-id-copy">
+                    <div class="note-copy-actions">
                         <button
                             type="button"
                             class="chip chip-clickable chip-primary note-id-copy-chip"
@@ -264,6 +290,17 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                         </button>
                         <span class="sr-only" aria-live="polite" aria-atomic="true">
                             { copy_announcement(*copy_status) }
+                        </span>
+                        <button
+                            type="button"
+                            class="chip chip-clickable chip-primary"
+                            aria-label="Copy note Markdown content"
+                            onclick={on_copy_content}
+                        >
+                            { content_copy_chip_text(*content_copy_status) }
+                        </button>
+                        <span class="sr-only" aria-live="polite" aria-atomic="true">
+                            { content_copy_announcement(*content_copy_status) }
                         </span>
                     </div>
                     <div class="note-page-actions">
