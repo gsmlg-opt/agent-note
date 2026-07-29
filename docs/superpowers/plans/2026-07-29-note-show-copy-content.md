@@ -4,7 +4,7 @@
 
 **Goal:** Add a Copy Content chip beside Copy ID that writes only the note's raw Markdown body to the clipboard.
 
-**Architecture:** Extend `NoteShowPage` with an independent content-copy status and callback while reusing the existing browser Clipboard lookup. Keep the two chip-label and announcement helpers separate so ID and content state cannot overwrite each other, then turn the existing copy container into a wrapping two-action row.
+**Architecture:** Extend `NoteShowPage` with an independent content-copy status and callback while reusing the existing browser Clipboard lookup. A content-copy generation token prevents older clicks or prior-note completions from overwriting the current result. Keep the two chip-label and announcement helpers separate, then turn the existing copy container into a wrapping two-action row.
 
 **Tech Stack:** Rust 2021, Yew 0.23, `web-sys::Clipboard`, `wasm-bindgen-futures`, existing DuskMoon chip styles.
 
@@ -258,6 +258,40 @@ Copy Content tests.
 ```sh
 git add crates/note-frontend/src/pages/note_show.rs crates/note-frontend/app.css
 git commit -m "feat(frontend): copy raw note content"
+```
+
+- [ ] **Step 7: Write the stale-completion regression test and verify RED**
+
+Add pure generation helpers to the test import and a test that starts at
+generation zero, verifies the first request becomes stale when the second
+begins, verifies the second is current, then increments once more to model note
+navigation and verifies the second is stale.
+
+Run the focused copied-frontend test. Expected: compilation fails because
+`next_copy_generation` and `copy_generation_is_current` do not exist.
+
+- [ ] **Step 8: Add the content-copy generation guard and verify GREEN**
+
+Add `content_copy_generation = use_mut_ref(|| 0_u64)` beside the content-copy
+status. Clone it into the `props.id` loading effect, increment it before
+resetting the content status to `Ready`, and thereby invalidate prior-note
+completions.
+
+On each content-copy click, increment and capture the request generation before
+spawning the clipboard future. After the write resolves, compare the captured
+generation with the current value and update `content_copy_status` only when
+they match. Older click and prior-note completions do nothing.
+
+Run the focused test again. Expected: the generation transition test passes.
+
+- [ ] **Step 9: Verify and commit the stale-result fix**
+
+Run the full copied frontend suite, copied wasm32 check, Rust formatting check
+for `note_show.rs`, and `git diff --check`. Then commit only the source file:
+
+```sh
+git add crates/note-frontend/src/pages/note_show.rs
+git commit -m "fix(frontend): ignore stale content copy results"
 ```
 
 ### Task 3: Verify the Copy Content Feature

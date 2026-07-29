@@ -28,11 +28,12 @@ one is ever loaded.
 - A successful write changes its text to `Content · Copied`.
 - A failed or unavailable clipboard changes its text to
   `Content · Copy failed`.
-- Starting another Copy Content attempt replaces the previous content-copy
-  result.
+- Each Copy Content attempt becomes the current request. Completions from older
+  attempts are ignored.
 - Copy ID and Copy Content have independent status, so using one does not reset
   or overwrite the other's visible or announced result.
-- Loading a different note resets both copy actions to their ready states.
+- Loading a different note resets both copy actions to their ready states and
+  invalidates outstanding content-copy requests from the previous note.
 
 ## Layout and Accessibility
 
@@ -52,22 +53,30 @@ announced through a polite, atomic live region:
 
 ## Component Design
 
-`NoteShowPage` adds a second `CopyStatus` state for content. The existing status
-labels and browser clipboard lookup are reused through small helpers that
-accept the copied value and announcement subject. The ID and content callbacks
-each capture their own source string and update only their own status.
+`NoteShowPage` adds a second `CopyStatus` state for content. The ID and content
+callbacks each capture their own source string and update only their own
+status.
+
+Content copy also owns a monotonically incremented request generation. Every
+click increments and captures that generation before starting the clipboard
+write. Loading a different note increments it again to invalidate outstanding
+requests. A clipboard completion may update the visible and live-region status
+only when its captured generation is still current.
 
 No generalized clipboard component is introduced because both actions are
-local to the same page and share only a small amount of behavior. CSS changes
-are limited to making the existing copy container a wrapping row with a
-consistent gap.
+local to the same page. CSS changes are limited to making the existing copy
+container a wrapping row with a consistent gap.
 
-## Error Handling
+## Error Handling and Concurrency
 
 Clipboard access can fail because permission is denied, the page is not in a
 secure context, or the browser does not expose the API. Failure changes only
 the Content chip and its live announcement. The note remains visible and no
 navigation, API request, or note mutation occurs.
+
+If multiple writes overlap, only the newest request may report success or
+failure. Completions from older clicks and from a previously loaded note are
+ignored, preventing stale `Copied` or `Copy failed` status.
 
 ## Testing and Verification
 
@@ -78,9 +87,11 @@ Use test-driven development for the content-copy labels and announcements:
   copied;
 - failure displays `Content · Copy failed` and announces the failure;
 - content-copy status changes do not alter ID-copy labels;
-- the callback source is the raw body string rather than rendered Markdown.
+- the callback source is the raw body string rather than rendered Markdown;
+- the first request becomes stale when a second begins, the second remains
+  current, and loading another note invalidates the second.
 
-Verify both planned frontend changes with:
+Verify the frontend changes with:
 
 ```sh
 cargo test --manifest-path crates/note-frontend/Cargo.toml
@@ -100,3 +111,5 @@ git diff --check
 6. The copy-action row wraps without horizontal overflow.
 7. Existing Copy ID, rendering, navigation, edit, and delete behavior is
    unchanged.
+8. An older click completion or prior-note completion cannot overwrite the
+   current note's content-copy status.
