@@ -46,6 +46,22 @@ fn copy_announcement(status: CopyStatus) -> &'static str {
     }
 }
 
+fn content_copy_chip_text(status: CopyStatus) -> String {
+    format!("Content · {}", status.action_label())
+}
+
+fn content_copy_announcement(status: CopyStatus) -> &'static str {
+    match status {
+        CopyStatus::Ready => "",
+        CopyStatus::Copied => "Note content copied to clipboard.",
+        CopyStatus::Failed => "Unable to copy note content.",
+    }
+}
+
+fn content_copy_payload(content: &str) -> &str {
+    content
+}
+
 fn delete_confirmation_message(title: &str) -> String {
     format!("Move the note \u{201c}{title}\u{201d} to Trash? You can restore it later.")
 }
@@ -469,8 +485,9 @@ fn markdown_options() -> Options {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_announcement, copy_chip_text, delete_confirmation_message, rewrite_attachment_urls,
-        try_start_delete, CopyStatus,
+        content_copy_announcement, content_copy_chip_text, content_copy_payload, copy_announcement,
+        copy_chip_text, delete_confirmation_message, rewrite_attachment_urls, try_start_delete,
+        CopyStatus,
     };
     use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
@@ -525,6 +542,43 @@ mod tests {
         assert_eq!(
             copy_announcement(CopyStatus::Failed),
             "Unable to copy note ID."
+        );
+    }
+
+    #[test]
+    fn content_copy_chip_starts_ready_and_preserves_raw_markdown() {
+        let markdown = "# Heading\n\n[attachment](./report.pdf)\n";
+
+        assert_eq!(content_copy_chip_text(CopyStatus::Ready), "Content · Copy");
+        assert_eq!(content_copy_payload(markdown), markdown);
+        assert_eq!(content_copy_announcement(CopyStatus::Ready), "");
+    }
+
+    #[test]
+    fn content_copy_chip_reports_success_independently_from_copy_id() {
+        assert_eq!(
+            copy_chip_text("note-123", CopyStatus::Ready),
+            "ID: note-123 · Copy"
+        );
+        assert_eq!(
+            content_copy_chip_text(CopyStatus::Copied),
+            "Content · Copied"
+        );
+        assert_eq!(
+            content_copy_announcement(CopyStatus::Copied),
+            "Note content copied to clipboard."
+        );
+    }
+
+    #[test]
+    fn content_copy_chip_reports_failure() {
+        assert_eq!(
+            content_copy_chip_text(CopyStatus::Failed),
+            "Content · Copy failed"
+        );
+        assert_eq!(
+            content_copy_announcement(CopyStatus::Failed),
+            "Unable to copy note content."
         );
     }
 
