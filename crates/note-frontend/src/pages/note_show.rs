@@ -62,6 +62,15 @@ fn content_copy_payload(content: &str) -> &str {
     content
 }
 
+fn next_copy_generation(generation: &mut u64) -> u64 {
+    *generation = generation.saturating_add(1);
+    *generation
+}
+
+fn copy_generation_is_current(current: u64, completed: u64) -> bool {
+    current == completed
+}
+
 fn delete_confirmation_message(title: &str) -> String {
     format!("Move the note \u{201c}{title}\u{201d} to Trash? You can restore it later.")
 }
@@ -102,6 +111,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
     let error = use_state(|| None::<String>);
     let copy_status = use_state(CopyStatus::default);
     let content_copy_status = use_state(CopyStatus::default);
+    let content_copy_generation = use_mut_ref(|| 0_u64);
     let delete_open = use_state(|| false);
     let delete_pending = use_state(|| false);
     let delete_in_flight = use_mut_ref(|| false);
@@ -112,6 +122,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         let error = error.clone();
         let copy_status = copy_status.clone();
         let content_copy_status = content_copy_status.clone();
+        let content_copy_generation = content_copy_generation.clone();
         let delete_open = delete_open.clone();
         let delete_pending = delete_pending.clone();
         let delete_in_flight = delete_in_flight.clone();
@@ -121,6 +132,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             note.set(None);
             error.set(None);
             copy_status.set(CopyStatus::Ready);
+            next_copy_generation(&mut content_copy_generation.borrow_mut());
             content_copy_status.set(CopyStatus::Ready);
             delete_open.set(false);
             delete_pending.set(false);
@@ -166,19 +178,26 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
     let on_copy_content = {
         let content = copy_content;
         let content_copy_status = content_copy_status.clone();
+        let content_copy_generation = content_copy_generation.clone();
         Callback::from(move |_| {
             let content = content.clone();
             let content_copy_status = content_copy_status.clone();
+            let request_generation =
+                next_copy_generation(&mut content_copy_generation.borrow_mut());
+            let content_copy_generation = content_copy_generation.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let copied = match browser_clipboard() {
                     Some(clipboard) => JsFuture::from(clipboard.write_text(&content)).await.is_ok(),
                     None => false,
                 };
-                content_copy_status.set(if copied {
-                    CopyStatus::Copied
-                } else {
-                    CopyStatus::Failed
-                });
+                if copy_generation_is_current(*content_copy_generation.borrow(), request_generation)
+                {
+                    content_copy_status.set(if copied {
+                        CopyStatus::Copied
+                    } else {
+                        CopyStatus::Failed
+                    });
+                }
             });
         })
     };
@@ -523,8 +542,8 @@ fn markdown_options() -> Options {
 mod tests {
     use super::{
         content_copy_announcement, content_copy_chip_text, content_copy_payload, copy_announcement,
-        copy_chip_text, delete_confirmation_message, rewrite_attachment_urls, try_start_delete,
-        CopyStatus,
+        copy_chip_text, copy_generation_is_current, delete_confirmation_message,
+        next_copy_generation, rewrite_attachment_urls, try_start_delete, CopyStatus,
     };
     use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
@@ -617,6 +636,24 @@ mod tests {
             content_copy_announcement(CopyStatus::Failed),
             "Unable to copy note content."
         );
+    }
+
+    #[test]
+    fn content_copy_generations_ignore_stale_completions() {
+        let mut generation = 0;
+
+        let first = next_copy_generation(&mut generation);
+        assert_eq!(first, 1);
+        assert!(copy_generation_is_current(generation, first));
+
+        let second = next_copy_generation(&mut generation);
+        assert_eq!(second, 2);
+        assert!(!copy_generation_is_current(generation, first));
+        assert!(copy_generation_is_current(generation, second));
+
+        let navigation = next_copy_generation(&mut generation);
+        assert_eq!(navigation, 3);
+        assert!(!copy_generation_is_current(generation, second));
     }
 
     #[test]
