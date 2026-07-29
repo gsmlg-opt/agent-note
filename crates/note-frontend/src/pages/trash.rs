@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, ops::Deref, rc::Rc};
 
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -86,6 +86,61 @@ fn reconcile_delete_selection(
         .collect()
 }
 
+#[derive(Clone, Default, PartialEq)]
+struct SelectionState(HashSet<String>);
+
+impl Deref for SelectionState {
+    type Target = HashSet<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+enum SelectionAction {
+    Replace(HashSet<String>),
+    RetainVisible(HashSet<String>),
+    Toggle {
+        id: String,
+        selected: bool,
+    },
+    Remove(Vec<String>),
+    ReconcileDelete {
+        attempted: Vec<String>,
+        failed: HashSet<String>,
+    },
+}
+
+impl Reducible for SelectionState {
+    type Action = SelectionAction;
+
+    fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
+        let mut next = self.0.clone();
+        match action {
+            SelectionAction::Replace(replacement) => next = replacement,
+            SelectionAction::RetainVisible(visible) => {
+                next.retain(|id| visible.contains(id));
+            }
+            SelectionAction::Toggle { id, selected } => {
+                if selected {
+                    next.insert(id);
+                } else {
+                    next.remove(&id);
+                }
+            }
+            SelectionAction::Remove(ids) => {
+                for id in ids {
+                    next.remove(&id);
+                }
+            }
+            SelectionAction::ReconcileDelete { attempted, failed } => {
+                next = reconcile_delete_selection(&next, &attempted, &failed);
+            }
+        }
+        Self(next).into()
+    }
+}
+
 fn batch_delete_failure_message(total: usize, failed: usize) -> Option<String> {
     (failed > 0).then(|| format!(
         "Deleted {} of {total} selected notes; {failed} failed. Failed notes still in Trash remain selected.",
@@ -96,7 +151,7 @@ fn batch_delete_failure_message(total: usize, failed: usize) -> Option<String> {
 #[function_component(TrashPage)]
 pub fn trash_page() -> Html {
     let notes = use_state(Vec::<DeletedNoteSummary>::new);
-    let selected = use_state(HashSet::<String>::new);
+    let selected = use_reducer(SelectionState::default);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
     let delete_target = use_state(|| None::<DeleteTarget>);
@@ -122,9 +177,7 @@ pub fn trash_page() -> Html {
                             .iter()
                             .map(|note| note.id.clone())
                             .collect::<HashSet<_>>();
-                        let mut next_selected = (*selected).clone();
-                        next_selected.retain(|id| visible.contains(id));
-                        selected.set(next_selected);
+                        selected.dispatch(SelectionAction::RetainVisible(visible));
                         notes.set(next);
                     }
                     Err(message) => error.set(Some(message)),
@@ -165,9 +218,11 @@ pub fn trash_page() -> Html {
         Callback::from(move |event: Event| {
             let input: HtmlInputElement = event.target_unchecked_into();
             if input.checked() {
-                selected.set(notes.iter().map(|note| note.id.clone()).collect());
+                selected.dispatch(SelectionAction::Replace(
+                    notes.iter().map(|note| note.id.clone()).collect(),
+                ));
             } else {
-                selected.set(HashSet::new());
+                selected.dispatch(SelectionAction::Replace(HashSet::new()));
             }
         })
     };
@@ -258,11 +313,7 @@ pub fn trash_page() -> Html {
                     wasm_bindgen_futures::spawn_local(async move {
                         match api::restore_deleted_notes(&ids).await {
                             Ok(()) => {
-                                let mut next_selected = (*selected).clone();
-                                for id in &ids {
-                                    next_selected.remove(id);
-                                }
-                                selected.set(next_selected);
+                                selected.dispatch(SelectionAction::Remove(ids.clone()));
                             }
                             Err(message) => error.set(Some(message)),
                         }
@@ -339,9 +390,13 @@ pub fn trash_page() -> Html {
                                     failed.insert(id.clone());
                                 }
                             }
-                            selected.set(reconcile_delete_selection(&selected, &ids, &failed));
+                            let failed_count = failed.len();
+                            selected.dispatch(SelectionAction::ReconcileDelete {
+                                attempted: ids.clone(),
+                                failed,
+                            });
                             batch_delete_error
-                                .set(batch_delete_failure_message(ids.len(), failed.len()));
+                                .set(batch_delete_failure_message(ids.len(), failed_count));
                             delete_target.set(None);
                             deleting.set(false);
                             refresh_tick.set((*refresh_tick).saturating_add(1));
@@ -446,7 +501,7 @@ pub fn trash_page() -> Html {
 
 fn trash_table(
     notes: &[DeletedNoteSummary],
-    selected: &UseStateHandle<HashSet<String>>,
+    selected: &UseReducerHandle<SelectionState>,
     restore_target: &UseStateHandle<Option<RestoreTarget>>,
     delete_target: &UseStateHandle<Option<DeleteTarget>>,
     error: &UseStateHandle<Option<String>>,
@@ -486,13 +541,10 @@ fn trash_table(
                             let id = note.id.clone();
                             Callback::from(move |event: Event| {
                                 let input: HtmlInputElement = event.target_unchecked_into();
-                                let mut next = (*selected).clone();
-                                if input.checked() {
-                                    next.insert(id.clone());
-                                } else {
-                                    next.remove(&id);
-                                }
-                                selected.set(next);
+                                selected.dispatch(SelectionAction::Toggle {
+                                    id: id.clone(),
+                                    selected: input.checked(),
+                                });
                             })
                         };
                         let on_restore = {
@@ -594,9 +646,10 @@ fn format_timestamp(timestamp: i64) -> String {
 mod tests {
     use super::{
         batch_delete_failure_message, reconcile_delete_selection, selected_note_ids, DeleteTarget,
-        DeletedNoteSummary,
+        DeletedNoteSummary, SelectionAction, SelectionState,
     };
-    use std::collections::HashSet;
+    use std::{collections::HashSet, rc::Rc};
+    use yew::Reducible;
 
     fn note(id: &str) -> DeletedNoteSummary {
         DeletedNoteSummary {
@@ -629,6 +682,27 @@ mod tests {
 
         assert_eq!(
             reconcile_delete_selection(&selected, &attempted, &failed),
+            HashSet::from(["failed".to_string(), "new-selection".to_string()])
+        );
+    }
+
+    #[test]
+    fn selection_reducer_reconciles_batch_delete_against_latest_selection() {
+        let state = Rc::new(SelectionState(HashSet::from([
+            "deleted".to_string(),
+            "failed".to_string(),
+        ])));
+        let state = state.reduce(SelectionAction::Toggle {
+            id: "new-selection".to_string(),
+            selected: true,
+        });
+        let state = state.reduce(SelectionAction::ReconcileDelete {
+            attempted: vec!["deleted".to_string(), "failed".to_string()],
+            failed: HashSet::from(["failed".to_string()]),
+        });
+
+        assert_eq!(
+            **state,
             HashSet::from(["failed".to_string(), "new-selection".to_string()])
         );
     }
