@@ -23,6 +23,34 @@ impl RestoreTarget {
     }
 }
 
+fn selected_note_ids(notes: &[DeletedNoteSummary], selected: &HashSet<String>) -> Vec<String> {
+    notes
+        .iter()
+        .filter(|note| selected.contains(&note.id))
+        .map(|note| note.id.clone())
+        .collect()
+}
+
+fn reconcile_delete_selection(
+    selected: &HashSet<String>,
+    attempted: &[String],
+    failed: &HashSet<String>,
+) -> HashSet<String> {
+    let attempted = attempted.iter().map(String::as_str).collect::<HashSet<_>>();
+    selected
+        .iter()
+        .filter(|id| !attempted.contains(id.as_str()) || failed.contains(*id))
+        .cloned()
+        .collect()
+}
+
+fn batch_delete_failure_message(total: usize, failed: usize) -> Option<String> {
+    (failed > 0).then(|| format!(
+        "Deleted {} of {total} selected notes; {failed} failed. Failed notes still in Trash remain selected.",
+        total.saturating_sub(failed)
+    ))
+}
+
 #[function_component(TrashPage)]
 pub fn trash_page() -> Html {
     let notes = use_state(Vec::<DeletedNoteSummary>::new);
@@ -424,4 +452,60 @@ fn format_timestamp(timestamp: i64) -> String {
     chrono::DateTime::from_timestamp(timestamp, 0)
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "-".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        batch_delete_failure_message, reconcile_delete_selection, selected_note_ids,
+        DeletedNoteSummary,
+    };
+    use std::collections::HashSet;
+
+    fn note(id: &str) -> DeletedNoteSummary {
+        DeletedNoteSummary {
+            id: id.to_string(),
+            title: format!("Note {id}"),
+            labels: vec![],
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: 0,
+        }
+    }
+
+    #[test]
+    fn selected_note_ids_follows_visible_note_order() {
+        let notes = vec![note("third"), note("second"), note("first")];
+        let selected = HashSet::from(["first".to_string(), "third".to_string()]);
+
+        assert_eq!(selected_note_ids(&notes, &selected), ["third", "first"]);
+    }
+
+    #[test]
+    fn reconcile_delete_selection_keeps_failed_and_new_selection() {
+        let selected = HashSet::from([
+            "deleted".to_string(),
+            "failed".to_string(),
+            "new-selection".to_string(),
+        ]);
+        let attempted = vec!["deleted".to_string(), "failed".to_string()];
+        let failed = HashSet::from(["failed".to_string()]);
+
+        assert_eq!(
+            reconcile_delete_selection(&selected, &attempted, &failed),
+            HashSet::from(["failed".to_string(), "new-selection".to_string()])
+        );
+    }
+
+    #[test]
+    fn batch_delete_failure_message_reports_failures() {
+        assert_eq!(batch_delete_failure_message(5, 0), None);
+        assert_eq!(
+            batch_delete_failure_message(5, 2),
+            Some(
+                "Deleted 3 of 5 selected notes; 2 failed. Failed notes still in Trash remain selected."
+                    .to_string()
+            )
+        );
+    }
 }
