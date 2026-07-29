@@ -46,14 +46,17 @@ impl DeleteTarget {
                 ),
                 "Delete permanently".to_string(),
             ),
-            Self::Batch { ids } => (
-                "Delete selected notes permanently".to_string(),
-                format!(
-                    "Permanently delete {} selected notes? This cannot be undone.",
-                    ids.len()
-                ),
-                format!("Delete {} notes", ids.len()),
-            ),
+            Self::Batch { ids } => {
+                let noun = if ids.len() == 1 { "note" } else { "notes" };
+                (
+                    "Delete selected notes permanently".to_string(),
+                    format!(
+                        "Permanently delete {} selected {noun}? This cannot be undone.",
+                        ids.len()
+                    ),
+                    format!("Delete {} {noun}", ids.len()),
+                )
+            }
         }
     }
 
@@ -428,6 +431,8 @@ pub fn trash_page() -> Html {
                     &delete_target,
                     &error,
                     &batch_delete_error,
+                    *deleting,
+                    *restoring,
                     &select_all_ref,
                     on_select_all,
                 ) }
@@ -446,10 +451,13 @@ fn trash_table(
     delete_target: &UseStateHandle<Option<DeleteTarget>>,
     error: &UseStateHandle<Option<String>>,
     batch_delete_error: &UseStateHandle<Option<String>>,
+    deleting: bool,
+    restoring: bool,
     select_all_ref: &NodeRef,
     on_select_all: Callback<Event>,
 ) -> Html {
     let all_selected = !notes.is_empty() && selected.len() == notes.len();
+    let mutations_disabled = deleting || restoring;
     html! {
         <div class="table-scroll">
             <table class="table note-table">
@@ -492,6 +500,9 @@ fn trash_table(
                             let id = note.id.clone();
                             let title = note.title.clone();
                             Callback::from(move |_| {
+                                if mutations_disabled {
+                                    return;
+                                }
                                 restore_target.set(Some(RestoreTarget::Single {
                                     id: id.clone(),
                                     title: title.clone(),
@@ -505,6 +516,9 @@ fn trash_table(
                             let id = note.id.clone();
                             let title = note.title.clone();
                             Callback::from(move |_| {
+                                if mutations_disabled {
+                                    return;
+                                }
                                 error.set(None);
                                 batch_delete_error.set(None);
                                 delete_target.set(Some(DeleteTarget::Single {
@@ -543,6 +557,7 @@ fn trash_table(
                                             title="Restore"
                                             aria-label={format!("Restore {}", note.title)}
                                             onclick={on_restore}
+                                            disabled={mutations_disabled}
                                         >
                                             { icons::restore() }
                                             <span class="sr-only">{ "Restore" }</span>
@@ -553,6 +568,7 @@ fn trash_table(
                                             title="Delete permanently"
                                             aria-label={format!("Delete {} permanently", note.title)}
                                             onclick={on_delete}
+                                            disabled={mutations_disabled}
                                         >
                                             { icons::trash() }
                                             <span class="sr-only">{ "Delete permanently" }</span>
@@ -642,6 +658,22 @@ mod tests {
                 "Delete selected notes permanently".to_string(),
                 "Permanently delete 2 selected notes? This cannot be undone.".to_string(),
                 "Delete 2 notes".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn one_item_batch_delete_target_uses_singular_count_copy() {
+        let target = DeleteTarget::Batch {
+            ids: vec!["one".to_string()],
+        };
+
+        assert_eq!(
+            target.modal_copy(),
+            (
+                "Delete selected notes permanently".to_string(),
+                "Permanently delete 1 selected note? This cannot be undone.".to_string(),
+                "Delete 1 note".to_string(),
             )
         );
     }
