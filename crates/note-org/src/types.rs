@@ -176,3 +176,15 @@ pub struct NewWorkItem {
     pub priority: Option<char>,
     pub tags: BTreeSet<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditedDocument {
+    pub source: String,
+    pub changed_items: BTreeSet<WorkItemId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedDocuments {
+    pub source: String,
+    pub target: String,
+}

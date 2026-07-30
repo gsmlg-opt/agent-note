@@ -1,6 +1,6 @@
 use crate::{
-    IndexedItem, NoteLink, OrgError, OrgTimestamp, ParseOptions, Span, WorkItem, WorkItemId,
-    WorkItemType,
+    EditedDocument, IndexedItem, MovedDocuments, NewWorkItem, NoteLink, OrgError, OrgTimestamp,
+    ParseOptions, PropertyKey, SemanticEdit, Span, WorkItem, WorkItemId, WorkItemType,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,11 +36,18 @@ enum SemanticProperty<'properties, 'source> {
     Ambiguous { line_start: usize },
 }
 
+enum PropertyDrawer {
+    Absent,
+    Valid { end: usize },
+    Malformed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgDocument {
     source: String,
     items: Vec<WorkItem>,
     index: BTreeMap<WorkItemId, IndexedItem>,
+    all_ids: BTreeSet<WorkItemId>,
     #[allow(dead_code)]
     options: ParseOptions,
 }
@@ -57,6 +64,719 @@ impl OrgDocument {
     pub fn item(&self, id: WorkItemId) -> Option<&WorkItem> {
         self.index.get(&id).map(|entry| &entry.item)
     }
+
+    pub fn apply(&self, edit: SemanticEdit) -> Result<EditedDocument, OrgError> {
+        match edit {
+            SemanticEdit::SetState { item_id, state } => self.set_state(item_id, &state),
+            SemanticEdit::SetProperty {
+                item_id,
+                key,
+                value,
+            } => self.set_property(item_id, key, value.as_deref()),
+            SemanticEdit::SetScheduled { item_id, value } => {
+                self.set_scheduled(item_id, value.as_deref())
+            }
+            SemanticEdit::SetTags { item_id, tags } => self.set_tags(item_id, &tags),
+            SemanticEdit::AppendItem { parent_id, item } => self.append_item(parent_id, item),
+        }
+    }
+
+    fn set_state(&self, item_id: WorkItemId, state: &str) -> Result<EditedDocument, OrgError> {
+        if !self.options.states.contains(state) {
+            return Err(parse_error(
+                &self.source,
+                0,
+                format!("state {state} is not configured"),
+            ));
+        }
+        let indexed = self
+            .index
+            .get(&item_id)
+            .ok_or(OrgError::ItemNotFound(item_id))?;
+        validate_indexed_item(&self.source, indexed, item_id)?;
+        let (span, replacement) = match indexed.state {
+            Some(span) => {
+                ensure_contained_span(&self.source, span, indexed.heading, item_id)?;
+                (span, state.to_string())
+            }
+            None => {
+                let marker_end = indexed
+                    .item
+                    .level
+                    .checked_add(1)
+                    .ok_or(OrgError::UnsafeEdit(item_id))?;
+                let offset =
+                    checked_offset(&self.source, indexed.heading.start, marker_end, item_id)?;
+                if offset > indexed.heading.end {
+                    return Err(OrgError::UnsafeEdit(item_id));
+                }
+                (
+                    Span {
+                        start: offset,
+                        end: offset,
+                    },
+                    format!("{state} "),
+                )
+            }
+        };
+        let source = replace_span(&self.source, span, &replacement);
+        let reparsed =
+            parse_document(&source, &self.options).map_err(|_| OrgError::UnsafeEdit(item_id))?;
+        let mut expected = indexed.item.clone();
+        expected.state = Some(state.to_string());
+        if reparsed.item(item_id) != Some(&expected) {
+            return Err(OrgError::UnsafeEdit(item_id));
+        }
+        Ok(EditedDocument {
+            source,
+            changed_items: BTreeSet::from([item_id]),
+        })
+    }
+
+    fn set_property(
+        &self,
+        item_id: WorkItemId,
+        key: PropertyKey,
+        value: Option<&str>,
+    ) -> Result<EditedDocument, OrgError> {
+        let indexed = self
+            .index
+            .get(&item_id)
+            .ok_or(OrgError::ItemNotFound(item_id))?;
+        validate_indexed_item(&self.source, indexed, item_id)?;
+        let (key_name, normalized) = match key {
+            PropertyKey::Assignee => {
+                if value
+                    .is_some_and(|value| value.trim().is_empty() || value.contains(['\r', '\n']))
+                {
+                    return Err(parse_error(
+                        &self.source,
+                        indexed.heading.start,
+                        "ASSIGNEE must be one nonempty line",
+                    ));
+                }
+                ("ASSIGNEE", value.map(str::to_string))
+            }
+            PropertyKey::DependsOn => {
+                let normalized = match value {
+                    Some(value) => {
+                        let mut dependencies = BTreeSet::new();
+                        for raw_id in value.split_whitespace() {
+                            let dependency = WorkItemId::from_str(raw_id).map_err(|_| {
+                                parse_error(
+                                    &self.source,
+                                    indexed.heading.start,
+                                    "DEPENDS_ON contains an invalid dependency ID",
+                                )
+                            })?;
+                            if dependency == item_id {
+                                return Err(parse_error(
+                                    &self.source,
+                                    indexed.heading.start,
+                                    "work item cannot depend on itself",
+                                ));
+                            }
+                            if !dependencies.insert(dependency) {
+                                return Err(parse_error(
+                                    &self.source,
+                                    indexed.heading.start,
+                                    "DEPENDS_ON contains a duplicate dependency ID",
+                                ));
+                            }
+                        }
+                        Some(
+                            dependencies
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                    }
+                    None => None,
+                };
+                ("DEPENDS_ON", normalized)
+            }
+            PropertyKey::RequiresReview => {
+                if value.is_some_and(|value| !matches!(value, "true" | "false")) {
+                    return Err(parse_error(
+                        &self.source,
+                        indexed.heading.start,
+                        "REQUIRES_REVIEW must be true or false",
+                    ));
+                }
+                ("REQUIRES_REVIEW", value.map(str::to_string))
+            }
+        };
+        let value = normalized.as_deref();
+        let source = match (indexed.properties.get(key_name).copied(), value) {
+            (Some(span), Some(value)) => {
+                ensure_contained_span(&self.source, span, indexed.subtree, item_id)?;
+                replace_span(&self.source, span, value)
+            }
+            (Some(span), None) => {
+                ensure_contained_span(&self.source, span, indexed.subtree, item_id)?;
+                let line = whole_line_span(&self.source, span, item_id)?;
+                ensure_contained_span(&self.source, line, indexed.subtree, item_id)?;
+                replace_span(&self.source, line, "")
+            }
+            (None, Some(value)) => {
+                let line_ending = preferred_line_ending(&self.source);
+                match property_drawer(&self.source, indexed, item_id)? {
+                    PropertyDrawer::Valid { end: offset } => {
+                        let span = Span {
+                            start: offset,
+                            end: offset,
+                        };
+                        ensure_editable_span(&self.source, span, item_id)?;
+                        replace_span(
+                            &self.source,
+                            span,
+                            &format!(":{key_name}: {value}{line_ending}"),
+                        )
+                    }
+                    PropertyDrawer::Absent => {
+                        let offset = planning_insertion_offset(&self.source, indexed, item_id)?;
+                        let span = Span {
+                            start: offset,
+                            end: offset,
+                        };
+                        ensure_editable_span(&self.source, span, item_id)?;
+                        replace_span(
+                            &self.source,
+                            span,
+                            &format!(
+                                ":PROPERTIES:{line_ending}:{key_name}: {value}{line_ending}:END:{line_ending}"
+                            ),
+                        )
+                    }
+                    PropertyDrawer::Malformed => return Err(OrgError::UnsafeEdit(item_id)),
+                }
+            }
+            (None, None) => self.source.clone(),
+        };
+        Ok(EditedDocument {
+            source,
+            changed_items: BTreeSet::from([item_id]),
+        })
+    }
+
+    fn set_scheduled(
+        &self,
+        item_id: WorkItemId,
+        value: Option<&str>,
+    ) -> Result<EditedDocument, OrgError> {
+        let indexed = self
+            .index
+            .get(&item_id)
+            .ok_or(OrgError::ItemNotFound(item_id))?;
+        validate_indexed_item(&self.source, indexed, item_id)?;
+        if let Some(value) = value {
+            parse_planning_timestamp(value).map_err(|message| {
+                parse_error(
+                    &self.source,
+                    indexed.heading.start,
+                    format!("SCHEDULED: {message}"),
+                )
+            })?;
+        }
+        let source = match (indexed.planning.get("SCHEDULED").copied(), value) {
+            (Some(span), Some(value)) => {
+                ensure_contained_span(&self.source, span, indexed.subtree, item_id)?;
+                let line_ending = span_line_ending(&self.source, span, item_id)?;
+                replace_span(
+                    &self.source,
+                    span,
+                    &format!("SCHEDULED: {value}{line_ending}"),
+                )
+            }
+            (Some(span), None) => {
+                ensure_contained_span(&self.source, span, indexed.subtree, item_id)?;
+                replace_span(&self.source, span, "")
+            }
+            (None, Some(value)) => {
+                let span = Span {
+                    start: indexed.heading.end,
+                    end: indexed.heading.end,
+                };
+                ensure_editable_span(&self.source, span, item_id)?;
+                let line_ending = span_line_ending(&self.source, indexed.heading, item_id)?;
+                replace_span(
+                    &self.source,
+                    span,
+                    &format!("SCHEDULED: {value}{line_ending}"),
+                )
+            }
+            (None, None) => self.source.clone(),
+        };
+        Ok(EditedDocument {
+            source,
+            changed_items: BTreeSet::from([item_id]),
+        })
+    }
+
+    fn set_tags(
+        &self,
+        item_id: WorkItemId,
+        tags: &BTreeSet<String>,
+    ) -> Result<EditedDocument, OrgError> {
+        let indexed = self
+            .index
+            .get(&item_id)
+            .ok_or(OrgError::ItemNotFound(item_id))?;
+        validate_indexed_item(&self.source, indexed, item_id)?;
+        if !valid_tags(tags) {
+            return Err(parse_error(
+                &self.source,
+                indexed.heading.start,
+                "work item tags are invalid",
+            ));
+        }
+        let rendered = render_tags(tags);
+        let source = match (indexed.tags, rendered.as_deref()) {
+            (Some(span), Some(tags)) => {
+                ensure_contained_span(&self.source, span, indexed.heading, item_id)?;
+                replace_span(&self.source, span, tags)
+            }
+            (Some(span), None) => {
+                ensure_contained_span(&self.source, span, indexed.heading, item_id)?;
+                let start = span
+                    .start
+                    .checked_sub(1)
+                    .filter(|offset| self.source.as_bytes().get(*offset) == Some(&b' '))
+                    .unwrap_or(span.start);
+                let removal = Span {
+                    start,
+                    end: span.end,
+                };
+                ensure_contained_span(&self.source, removal, indexed.heading, item_id)?;
+                replace_span(&self.source, removal, "")
+            }
+            (None, Some(tags)) => {
+                let heading = self
+                    .source
+                    .get(indexed.heading.start..indexed.heading.end)
+                    .ok_or(OrgError::UnsafeEdit(item_id))?;
+                let offset = checked_offset(
+                    &self.source,
+                    indexed.heading.start,
+                    line_content(heading).len(),
+                    item_id,
+                )?;
+                let insertion = Span {
+                    start: offset,
+                    end: offset,
+                };
+                ensure_contained_span(&self.source, insertion, indexed.heading, item_id)?;
+                replace_span(&self.source, insertion, &format!(" {tags}"))
+            }
+            (None, None) => self.source.clone(),
+        };
+        let reparsed =
+            parse_document(&source, &self.options).map_err(|_| OrgError::UnsafeEdit(item_id))?;
+        let mut expected = indexed.item.clone();
+        expected.tags = tags.clone();
+        if reparsed.item(item_id) != Some(&expected) {
+            return Err(OrgError::UnsafeEdit(item_id));
+        }
+        Ok(EditedDocument {
+            source,
+            changed_items: BTreeSet::from([item_id]),
+        })
+    }
+
+    fn append_item(
+        &self,
+        parent_id: Option<WorkItemId>,
+        item: NewWorkItem,
+    ) -> Result<EditedDocument, OrgError> {
+        if self.all_ids.contains(&item.id) {
+            return Err(OrgError::DuplicateId(item.id));
+        }
+        validate_new_item(&item, &self.options, &self.source)?;
+        let (level, offset) = match parent_id {
+            Some(parent_id) => {
+                let parent = self
+                    .index
+                    .get(&parent_id)
+                    .ok_or(OrgError::ItemNotFound(parent_id))?;
+                validate_indexed_item(&self.source, parent, parent_id)?;
+                (
+                    parent
+                        .item
+                        .level
+                        .checked_add(1)
+                        .ok_or(OrgError::UnsafeEdit(parent_id))?,
+                    parent.subtree.end,
+                )
+            }
+            None => (1, self.source.len()),
+        };
+        let span = Span {
+            start: offset,
+            end: offset,
+        };
+        ensure_editable_span(&self.source, span, item.id)?;
+        let line_ending = preferred_line_ending(&self.source);
+        let rendered = render_new_item(&item, level, line_ending);
+        let insertion =
+            insertion_with_boundaries(&self.source, offset, &rendered, line_ending, item.id)?;
+        let source = replace_span(&self.source, span, &insertion);
+        let reparsed =
+            parse_document(&source, &self.options).map_err(|_| OrgError::UnsafeEdit(item.id))?;
+        let Some(created) = reparsed.item(item.id) else {
+            return Err(OrgError::UnsafeEdit(item.id));
+        };
+        if created.item_type != item.item_type
+            || created.parent_id != parent_id
+            || created.level != level
+            || created.title != item.title
+            || created.state.as_deref() != Some(item.state.as_str())
+            || created.priority != item.priority
+            || created.tags != item.tags
+        {
+            return Err(OrgError::UnsafeEdit(item.id));
+        }
+        Ok(EditedDocument {
+            source,
+            changed_items: BTreeSet::from([item.id]),
+        })
+    }
+}
+
+fn whole_line_span(source: &str, contained: Span, item_id: WorkItemId) -> Result<Span, OrgError> {
+    ensure_editable_span(source, contained, item_id)?;
+    let before = source
+        .get(..contained.start)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let after = source
+        .get(contained.end..)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let start = before
+        .rfind('\n')
+        .map(|offset| offset.checked_add(1).ok_or(OrgError::UnsafeEdit(item_id)))
+        .transpose()?
+        .unwrap_or(0);
+    let end = match after.find('\n') {
+        Some(offset) => contained
+            .end
+            .checked_add(offset)
+            .and_then(|end| end.checked_add(1))
+            .ok_or(OrgError::UnsafeEdit(item_id))?,
+        None => source.len(),
+    };
+    let span = Span { start, end };
+    ensure_editable_span(source, span, item_id)?;
+    Ok(span)
+}
+
+fn property_drawer(
+    source: &str,
+    indexed: &IndexedItem,
+    item_id: WorkItemId,
+) -> Result<PropertyDrawer, OrgError> {
+    validate_indexed_item(source, indexed, item_id)?;
+    let Some(id_span) = indexed.properties.get("ID").copied() else {
+        return Ok(PropertyDrawer::Absent);
+    };
+    ensure_contained_span(source, id_span, indexed.subtree, item_id)?;
+    let scanned = scan_headings(source)
+        .into_iter()
+        .find(|heading| heading.heading.start == indexed.heading.start)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let section = Span {
+        start: indexed.heading.end,
+        end: scanned.section_end,
+    };
+    ensure_contained_span(source, section, indexed.subtree, item_id)?;
+    let mut drawer_start = None;
+    let mut saw_drawer = false;
+    let mut offset = section.start;
+    let section_source = source
+        .get(section.start..section.end)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    for line in section_source.split_inclusive('\n') {
+        let trimmed = line_content(line).trim();
+        if trimmed.eq_ignore_ascii_case(":PROPERTIES:") {
+            if drawer_start.is_some() {
+                return Ok(PropertyDrawer::Malformed);
+            }
+            drawer_start = Some(offset);
+            saw_drawer = true;
+        } else if drawer_start.is_some() && trimmed.eq_ignore_ascii_case(":END:") {
+            if drawer_start.is_some_and(|start| start <= id_span.start && id_span.end <= offset) {
+                return Ok(PropertyDrawer::Valid { end: offset });
+            }
+            drawer_start = None;
+        }
+        offset = offset
+            .checked_add(line.len())
+            .ok_or(OrgError::UnsafeEdit(item_id))?;
+    }
+    if drawer_start.is_some_and(|start| start <= id_span.start && id_span.end <= section.end) {
+        Ok(PropertyDrawer::Malformed)
+    } else if saw_drawer {
+        Err(OrgError::UnsafeEdit(item_id))
+    } else {
+        Ok(PropertyDrawer::Absent)
+    }
+}
+
+fn planning_insertion_offset(
+    source: &str,
+    indexed: &IndexedItem,
+    item_id: WorkItemId,
+) -> Result<usize, OrgError> {
+    validate_indexed_item(source, indexed, item_id)?;
+    let mut offset = indexed.heading.end;
+    for span in indexed.planning.values().copied() {
+        ensure_contained_span(source, span, indexed.subtree, item_id)?;
+        offset = offset.max(span.end);
+    }
+    let insertion = Span {
+        start: offset,
+        end: offset,
+    };
+    ensure_contained_span(source, insertion, indexed.subtree, item_id)?;
+    Ok(offset)
+}
+
+fn validate_new_item(
+    item: &NewWorkItem,
+    options: &ParseOptions,
+    source: &str,
+) -> Result<(), OrgError> {
+    if !options.states.contains(&item.state) {
+        return Err(parse_error(
+            source,
+            0,
+            format!("state {} is not configured", item.state),
+        ));
+    }
+    if item.title.trim().is_empty() || item.title.contains(['\r', '\n']) {
+        return Err(parse_error(
+            source,
+            0,
+            "work item title must be one nonempty line",
+        ));
+    }
+    if item
+        .priority
+        .is_some_and(|priority| !priority.is_ascii_uppercase())
+    {
+        return Err(parse_error(
+            source,
+            0,
+            "work item priority must be an uppercase ASCII letter",
+        ));
+    }
+    if !valid_tags(&item.tags) {
+        return Err(parse_error(source, 0, "work item tags are invalid"));
+    }
+    Ok(())
+}
+
+fn valid_tags(tags: &BTreeSet<String>) -> bool {
+    !tags.iter().any(|tag| {
+        tag.is_empty() || tag.contains(':') || tag.bytes().any(|byte| byte.is_ascii_whitespace())
+    })
+}
+
+fn render_new_item(item: &NewWorkItem, level: usize, line_ending: &str) -> String {
+    let priority = item
+        .priority
+        .map(|value| format!(" [#{value}]"))
+        .unwrap_or_default();
+    let tags = render_tags(&item.tags)
+        .map(|value| format!(" {value}"))
+        .unwrap_or_default();
+    let item_type = work_item_type_name(item.item_type);
+    format!(
+        "{} {}{} {}{}{}:PROPERTIES:{}:ID: {}{}:AGENT_NOTE_TYPE: {}{}:END:{}",
+        "*".repeat(level),
+        item.state,
+        priority,
+        item.title,
+        tags,
+        line_ending,
+        line_ending,
+        item.id,
+        line_ending,
+        item_type,
+        line_ending,
+        line_ending,
+    )
+}
+
+fn work_item_type_name(item_type: WorkItemType) -> &'static str {
+    match item_type {
+        WorkItemType::Project => "project",
+        WorkItemType::Epic => "epic",
+        WorkItemType::Issue => "issue",
+        WorkItemType::Task => "task",
+        WorkItemType::Subtask => "subtask",
+        WorkItemType::Review => "review",
+        WorkItemType::Approval => "approval",
+        WorkItemType::Incident => "incident",
+        WorkItemType::Milestone => "milestone",
+    }
+}
+
+fn preferred_line_ending(source: &str) -> &'static str {
+    if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn span_line_ending(
+    source: &str,
+    span: Span,
+    item_id: WorkItemId,
+) -> Result<&'static str, OrgError> {
+    ensure_editable_span(source, span, item_id)?;
+    let value = source
+        .get(span.start..span.end)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    Ok(if value.ends_with("\r\n") {
+        "\r\n"
+    } else if value.ends_with('\n') {
+        "\n"
+    } else {
+        preferred_line_ending(source)
+    })
+}
+
+fn insertion_with_boundaries(
+    source: &str,
+    offset: usize,
+    insertion: &str,
+    line_ending: &str,
+    item_id: WorkItemId,
+) -> Result<String, OrgError> {
+    let span = Span {
+        start: offset,
+        end: offset,
+    };
+    ensure_editable_span(source, span, item_id)?;
+    let before = source.get(..offset).ok_or(OrgError::UnsafeEdit(item_id))?;
+    let after = source.get(offset..).ok_or(OrgError::UnsafeEdit(item_id))?;
+    let needs_before = offset > 0 && !before.ends_with('\n');
+    let needs_after =
+        offset < source.len() && !insertion.ends_with('\n') && !after.starts_with('\n');
+    let capacity = insertion
+        .len()
+        .checked_add(if needs_before { line_ending.len() } else { 0 })
+        .and_then(|capacity| capacity.checked_add(if needs_after { line_ending.len() } else { 0 }))
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let mut result = String::with_capacity(capacity);
+    if needs_before {
+        result.push_str(line_ending);
+    }
+    result.push_str(insertion);
+    if needs_after {
+        result.push_str(line_ending);
+    }
+    Ok(result)
+}
+
+fn render_tags(tags: &BTreeSet<String>) -> Option<String> {
+    (!tags.is_empty()).then(|| format!(":{}:", tags.iter().cloned().collect::<Vec<_>>().join(":")))
+}
+
+fn ensure_editable_span(source: &str, span: Span, item_id: WorkItemId) -> Result<(), OrgError> {
+    if span == UNSAFE_SPAN
+        || span.start > span.end
+        || span.end > source.len()
+        || !source.is_char_boundary(span.start)
+        || !source.is_char_boundary(span.end)
+    {
+        Err(OrgError::UnsafeEdit(item_id))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_contained_span(
+    source: &str,
+    span: Span,
+    container: Span,
+    item_id: WorkItemId,
+) -> Result<(), OrgError> {
+    ensure_editable_span(source, container, item_id)?;
+    ensure_editable_span(source, span, item_id)?;
+    if span.start < container.start || span.end > container.end {
+        Err(OrgError::UnsafeEdit(item_id))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_indexed_item(
+    source: &str,
+    indexed: &IndexedItem,
+    item_id: WorkItemId,
+) -> Result<(), OrgError> {
+    ensure_editable_span(source, indexed.heading, item_id)?;
+    ensure_editable_span(source, indexed.subtree, item_id)?;
+    if indexed.heading.start != indexed.subtree.start
+        || indexed.heading.end > indexed.subtree.end
+        || source
+            .get(indexed.heading.start..indexed.heading.end)
+            .and_then(|heading| heading_level(line_content(heading)))
+            != Some(indexed.item.level)
+    {
+        return Err(OrgError::UnsafeEdit(item_id));
+    }
+    let scanned = scan_headings(source)
+        .into_iter()
+        .find(|heading| heading.heading.start == indexed.heading.start)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    if indexed.item.id != item_id
+        || scanned.heading != indexed.heading
+        || scanned.subtree != indexed.subtree
+    {
+        return Err(OrgError::UnsafeEdit(item_id));
+    }
+    let properties = parse_properties(source, scanned.heading.end, scanned.section_end);
+    let ids = occurrences(&properties, "ID");
+    let markers = occurrences(&properties, "AGENT_NOTE_TYPE");
+    if ids.len() != 1
+        || ids[0].accumulated
+        || WorkItemId::from_str(ids[0].value).ok() != Some(item_id)
+        || markers.len() != 1
+        || markers[0].accumulated
+        || WorkItemType::from_str(markers[0].value).ok() != Some(indexed.item.item_type)
+    {
+        return Err(OrgError::UnsafeEdit(item_id));
+    }
+    Ok(())
+}
+
+fn checked_offset(
+    source: &str,
+    start: usize,
+    length: usize,
+    item_id: WorkItemId,
+) -> Result<usize, OrgError> {
+    let offset = start
+        .checked_add(length)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let insertion = Span {
+        start: offset,
+        end: offset,
+    };
+    ensure_editable_span(source, insertion, item_id)?;
+    Ok(offset)
+}
+
+fn replace_span(source: &str, span: Span, replacement: &str) -> String {
+    let mut result =
+        String::with_capacity(source.len() - (span.end - span.start) + replacement.len());
+    result.push_str(&source[..span.start]);
+    result.push_str(replacement);
+    result.push_str(&source[span.end..]);
+    result
 }
 
 pub fn parse_document(
@@ -66,6 +786,205 @@ pub fn parse_document(
     let source = source.into();
     let headings = scan_headings(&source);
     project_document(source, headings, options.clone())
+}
+
+pub fn move_item(
+    source: &OrgDocument,
+    target: &OrgDocument,
+    item_id: WorkItemId,
+    target_parent: Option<WorkItemId>,
+) -> Result<MovedDocuments, OrgError> {
+    let indexed = source
+        .index
+        .get(&item_id)
+        .ok_or(OrgError::ItemNotFound(item_id))?;
+    validate_indexed_item(&source.source, indexed, item_id)?;
+    projected_ids_in_span(source, indexed.subtree, item_id)?;
+    let fragment = source
+        .source
+        .get(indexed.subtree.start..indexed.subtree.end)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let moved_ids = valid_heading_ids(fragment, item_id)?;
+    if let Some(duplicate) = moved_ids.intersection(&target.all_ids).next() {
+        return Err(OrgError::DuplicateId(*duplicate));
+    }
+    let (target_level, target_offset) = match target_parent {
+        Some(parent_id) => {
+            let parent = target
+                .index
+                .get(&parent_id)
+                .ok_or(OrgError::ItemNotFound(parent_id))?;
+            validate_indexed_item(&target.source, parent, parent_id)?;
+            (
+                parent
+                    .item
+                    .level
+                    .checked_add(1)
+                    .ok_or(OrgError::UnsafeEdit(item_id))?,
+                parent.subtree.end,
+            )
+        }
+        None => (1, target.source.len()),
+    };
+    let adjusted = adjust_heading_levels(fragment, indexed.item.level, target_level, item_id)?;
+    let target_span = Span {
+        start: target_offset,
+        end: target_offset,
+    };
+    ensure_editable_span(&target.source, target_span, item_id)?;
+    let insertion = insertion_with_boundaries(
+        &target.source,
+        target_offset,
+        &adjusted,
+        preferred_line_ending(&target.source),
+        item_id,
+    )?;
+
+    Ok(MovedDocuments {
+        source: replace_span(&source.source, indexed.subtree, ""),
+        target: replace_span(&target.source, target_span, &insertion),
+    })
+}
+
+pub fn reparent_item(
+    document: &OrgDocument,
+    item_id: WorkItemId,
+    target_parent: Option<WorkItemId>,
+) -> Result<EditedDocument, OrgError> {
+    let indexed = document
+        .index
+        .get(&item_id)
+        .ok_or(OrgError::ItemNotFound(item_id))?;
+    validate_indexed_item(&document.source, indexed, item_id)?;
+    let moved_ids = projected_ids_in_span(document, indexed.subtree, item_id)?;
+    let (target_level, original_offset) = match target_parent {
+        Some(parent_id) => {
+            let parent = document
+                .index
+                .get(&parent_id)
+                .ok_or(OrgError::ItemNotFound(parent_id))?;
+            validate_indexed_item(&document.source, parent, parent_id)?;
+            if indexed.subtree.start <= parent.heading.start
+                && parent.heading.start < indexed.subtree.end
+            {
+                return Err(OrgError::UnsafeEdit(item_id));
+            }
+            (
+                parent
+                    .item
+                    .level
+                    .checked_add(1)
+                    .ok_or(OrgError::UnsafeEdit(item_id))?,
+                parent.subtree.end,
+            )
+        }
+        None => (1, document.source.len()),
+    };
+    let fragment = document
+        .source
+        .get(indexed.subtree.start..indexed.subtree.end)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let adjusted = adjust_heading_levels(fragment, indexed.item.level, target_level, item_id)?;
+    let cut = replace_span(&document.source, indexed.subtree, "");
+    let cut_length = indexed.subtree.end - indexed.subtree.start;
+    let target_offset = if original_offset >= indexed.subtree.end {
+        original_offset
+            .checked_sub(cut_length)
+            .ok_or(OrgError::UnsafeEdit(item_id))?
+    } else if original_offset <= indexed.subtree.start {
+        original_offset
+    } else {
+        return Err(OrgError::UnsafeEdit(item_id));
+    };
+    let insertion_span = Span {
+        start: target_offset,
+        end: target_offset,
+    };
+    ensure_editable_span(&cut, insertion_span, item_id)?;
+    let insertion = insertion_with_boundaries(
+        &cut,
+        target_offset,
+        &adjusted,
+        preferred_line_ending(&document.source),
+        item_id,
+    )?;
+    Ok(EditedDocument {
+        source: replace_span(&cut, insertion_span, &insertion),
+        changed_items: moved_ids,
+    })
+}
+
+fn projected_ids_in_span(
+    document: &OrgDocument,
+    span: Span,
+    root_id: WorkItemId,
+) -> Result<BTreeSet<WorkItemId>, OrgError> {
+    ensure_editable_span(&document.source, span, root_id)?;
+    let mut moved_ids = BTreeSet::new();
+    for (id, indexed) in &document.index {
+        validate_indexed_item(&document.source, indexed, *id)?;
+        if span.start <= indexed.heading.start && indexed.heading.start < span.end {
+            ensure_contained_span(&document.source, indexed.heading, span, *id)?;
+            ensure_contained_span(&document.source, indexed.subtree, span, *id)?;
+            moved_ids.insert(*id);
+        }
+    }
+    Ok(moved_ids)
+}
+
+fn valid_heading_ids(source: &str, item_id: WorkItemId) -> Result<BTreeSet<WorkItemId>, OrgError> {
+    let mut ids = BTreeSet::new();
+    for heading in scan_headings(source) {
+        ensure_editable_span(source, heading.heading, item_id)?;
+        ensure_editable_span(source, heading.subtree, item_id)?;
+        let section = Span {
+            start: heading.heading.end,
+            end: heading.section_end,
+        };
+        ensure_contained_span(source, section, heading.subtree, item_id)?;
+        let properties = parse_properties(source, section.start, section.end);
+        for entry in occurrences(&properties, "ID")
+            .into_iter()
+            .filter(|entry| !entry.accumulated)
+        {
+            ensure_contained_span(source, entry.value_span, section, item_id)?;
+            if let Ok(id) = WorkItemId::from_str(entry.value) {
+                ids.insert(id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn adjust_heading_levels(
+    fragment: &str,
+    old_root_level: usize,
+    new_root_level: usize,
+    item_id: WorkItemId,
+) -> Result<String, OrgError> {
+    let increasing = new_root_level >= old_root_level;
+    let delta = new_root_level.abs_diff(old_root_level);
+    let mut adjusted = fragment.to_string();
+    for heading in scan_headings(fragment).into_iter().rev() {
+        let new_level = if increasing {
+            heading.level.checked_add(delta)
+        } else {
+            heading.level.checked_sub(delta)
+        }
+        .filter(|level| *level > 0)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+        let stars = Span {
+            start: heading.heading.start,
+            end: heading
+                .heading
+                .start
+                .checked_add(heading.level)
+                .ok_or(OrgError::UnsafeEdit(item_id))?,
+        };
+        ensure_editable_span(&adjusted, stars, item_id)?;
+        adjusted = replace_span(&adjusted, stars, &"*".repeat(new_level));
+    }
+    Ok(adjusted)
 }
 
 fn scan_headings(source: &str) -> Vec<ScannedHeading> {
@@ -109,7 +1028,7 @@ fn scan_headings(source: &str) -> Vec<ScannedHeading> {
         }
 
         if let Some(name) = drawer_start(trimmed) {
-            if !name.eq_ignore_ascii_case("PROPERTIES") && !name.eq_ignore_ascii_case("END") {
+            if !name.eq_ignore_ascii_case("END") {
                 opaque_drawer = true;
                 offset += line.len();
                 continue;
@@ -154,6 +1073,7 @@ fn project_document(
 ) -> Result<OrgDocument, OrgError> {
     let mut items = Vec::new();
     let mut index = BTreeMap::new();
+    let mut all_ids = BTreeSet::new();
     let mut projected_ancestors = Vec::<(usize, WorkItemId)>::new();
 
     for heading in headings {
@@ -165,6 +1085,12 @@ fn project_document(
         }
 
         let properties = parse_properties(&source, heading.heading.end, heading.section_end);
+        all_ids.extend(
+            occurrences(&properties, "ID")
+                .into_iter()
+                .filter(|entry| !entry.accumulated)
+                .filter_map(|entry| WorkItemId::from_str(entry.value).ok()),
+        );
         let marker = occurrences(&properties, "AGENT_NOTE_TYPE");
         if marker.is_empty() {
             continue;
@@ -271,6 +1197,7 @@ fn project_document(
         source,
         items,
         index,
+        all_ids,
         options,
     })
 }
@@ -793,8 +1720,33 @@ fn parse_error(source: &str, offset: usize, message: impl Into<String>) -> OrgEr
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_heading, scan_headings};
-    use crate::ParseOptions;
+    use super::{
+        move_item, parse_document, parse_heading, reparent_item, scan_headings, Span, UNSAFE_SPAN,
+    };
+    use crate::{
+        NewWorkItem, OrgError, ParseOptions, PropertyKey, SemanticEdit, WorkItemId, WorkItemType,
+    };
+    use std::{collections::BTreeSet, str::FromStr};
+
+    fn id() -> WorkItemId {
+        WorkItemId::from_str("11111111-1111-4111-8111-111111111111").unwrap()
+    }
+
+    fn options() -> ParseOptions {
+        ParseOptions::new(["BACKLOG", "READY", "RUNNING", "DONE"])
+    }
+
+    fn editable_document() -> super::OrgDocument {
+        parse_document(
+            "* READY Safe :tag:\nSCHEDULED: <2026-08-01 Sat>\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:ASSIGNEE: agent\n:END:\n",
+            &options(),
+        )
+        .unwrap()
+    }
+
+    fn assert_unsafe(result: Result<crate::EditedDocument, OrgError>) {
+        assert_eq!(result, Err(OrgError::UnsafeEdit(id())));
+    }
 
     #[test]
     fn scans_lf_heading_and_subtree_spans() {
@@ -899,5 +1851,142 @@ mod tests {
         let tags = parsed.tags_span.unwrap();
 
         assert_eq!(&source[tags.start..tags.end], ":urgent:");
+    }
+
+    #[test]
+    fn corrupt_semantic_edit_spans_return_unsafe_errors_without_panicking() {
+        let mut document = editable_document();
+        document.index.get_mut(&id()).unwrap().state = Some(UNSAFE_SPAN);
+        assert_unsafe(document.apply(SemanticEdit::SetState {
+            item_id: id(),
+            state: "RUNNING".to_string(),
+        }));
+
+        let mut document = editable_document();
+        document
+            .index
+            .get_mut(&id())
+            .unwrap()
+            .properties
+            .insert("ASSIGNEE".to_string(), UNSAFE_SPAN);
+        assert_unsafe(document.apply(SemanticEdit::SetProperty {
+            item_id: id(),
+            key: PropertyKey::Assignee,
+            value: Some("other".to_string()),
+        }));
+
+        let mut document = editable_document();
+        document
+            .index
+            .get_mut(&id())
+            .unwrap()
+            .planning
+            .insert("SCHEDULED".to_string(), UNSAFE_SPAN);
+        assert_unsafe(document.apply(SemanticEdit::SetScheduled {
+            item_id: id(),
+            value: Some("<2026-08-02 Sun>".to_string()),
+        }));
+
+        let mut document = editable_document();
+        document.index.get_mut(&id()).unwrap().tags = Some(UNSAFE_SPAN);
+        assert_unsafe(document.apply(SemanticEdit::SetTags {
+            item_id: id(),
+            tags: BTreeSet::from(["other".to_string()]),
+        }));
+
+        let source = "* READY Café :tag:\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n";
+        let mut document = parse_document(source, &options()).unwrap();
+        let inside_multibyte_character = source.find('é').unwrap() + 1;
+        document.index.get_mut(&id()).unwrap().tags = Some(Span {
+            start: inside_multibyte_character,
+            end: inside_multibyte_character,
+        });
+        assert_unsafe(document.apply(SemanticEdit::SetTags {
+            item_id: id(),
+            tags: BTreeSet::from(["other".to_string()]),
+        }));
+
+        let source = "* Missing state\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n";
+        let mut document = parse_document(source, &options()).unwrap();
+        document.index.get_mut(&id()).unwrap().item.level = usize::MAX;
+        assert_unsafe(document.apply(SemanticEdit::SetState {
+            item_id: id(),
+            state: "READY".to_string(),
+        }));
+
+        let mut document = parse_document(source, &options()).unwrap();
+        document.index.get_mut(&id()).unwrap().heading.end = usize::MAX;
+        assert_unsafe(document.apply(SemanticEdit::SetScheduled {
+            item_id: id(),
+            value: Some("<2026-08-02 Sun>".to_string()),
+        }));
+
+        let mut document = editable_document();
+        document.index.get_mut(&id()).unwrap().heading = Span {
+            start: usize::MAX,
+            end: usize::MAX,
+        };
+        assert_unsafe(document.apply(SemanticEdit::SetScheduled {
+            item_id: id(),
+            value: None,
+        }));
+
+        let mut document = editable_document();
+        document.index.get_mut(&id()).unwrap().subtree = UNSAFE_SPAN;
+        assert_unsafe(document.apply(SemanticEdit::SetProperty {
+            item_id: id(),
+            key: PropertyKey::Assignee,
+            value: None,
+        }));
+        assert_eq!(
+            move_item(
+                &document,
+                &parse_document("", &options()).unwrap(),
+                id(),
+                None
+            ),
+            Err(OrgError::UnsafeEdit(id()))
+        );
+        assert_unsafe(reparent_item(&document, id(), None));
+
+        let mut document = editable_document();
+        document.index.get_mut(&id()).unwrap().subtree = UNSAFE_SPAN;
+        assert_unsafe(document.apply(SemanticEdit::AppendItem {
+            parent_id: Some(id()),
+            item: NewWorkItem {
+                id: WorkItemId::from_str("22222222-2222-4222-8222-222222222222").unwrap(),
+                item_type: WorkItemType::Task,
+                title: "Child".to_string(),
+                state: "READY".to_string(),
+                priority: None,
+                tags: BTreeSet::new(),
+            },
+        }));
+    }
+
+    #[test]
+    fn corrupt_descendant_indices_make_move_and_reparent_unsafe() {
+        let child_id = WorkItemId::from_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let target_id = WorkItemId::from_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let source = "* READY Root\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: project\n:END:\n** READY Child\n:PROPERTIES:\n:ID: 22222222-2222-4222-8222-222222222222\n:AGENT_NOTE_TYPE: task\n:END:\n* READY Target\n:PROPERTIES:\n:ID: 33333333-3333-4333-8333-333333333333\n:AGENT_NOTE_TYPE: project\n:END:\n";
+
+        let mut document = parse_document(source, &options()).unwrap();
+        document.index.get_mut(&child_id).unwrap().heading = UNSAFE_SPAN;
+        assert_eq!(
+            move_item(
+                &document,
+                &parse_document("", &options()).unwrap(),
+                id(),
+                None,
+            ),
+            Err(OrgError::UnsafeEdit(child_id))
+        );
+
+        let mut document = parse_document(source, &options()).unwrap();
+        document.index.get_mut(&child_id).unwrap().heading = UNSAFE_SPAN;
+        assert_eq!(
+            reparent_item(&document, id(), Some(target_id)),
+            Err(OrgError::UnsafeEdit(child_id))
+        );
     }
 }
