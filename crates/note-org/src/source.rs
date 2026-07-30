@@ -1,8 +1,12 @@
-use crate::{IndexedItem, OrgError, ParseOptions, Span, WorkItem, WorkItemId, WorkItemType};
+use crate::{
+    IndexedItem, NoteLink, OrgError, OrgTimestamp, ParseOptions, Span, WorkItem, WorkItemId,
+    WorkItemType,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     str::FromStr,
 };
+use uuid::Uuid;
 
 const UNSAFE_SPAN: Span = Span {
     start: usize::MAX,
@@ -24,6 +28,12 @@ struct PropertyOccurrence<'a> {
     value: &'a str,
     value_span: Span,
     line_start: usize,
+}
+
+enum SemanticProperty<'properties, 'source> {
+    Missing,
+    Single(&'properties PropertyOccurrence<'source>),
+    Ambiguous { line_start: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,7 +203,36 @@ fn project_document(
         let item_type = WorkItemType::from_str(marker[0].value)
             .map_err(|message| parse_error(&source, marker[0].line_start, message))?;
         let parsed_heading = parse_heading(&source, &heading, &options);
-        let planning = planning_spans(&source, heading.heading.end, heading.section_end);
+        let planning = planning_spans(&source, heading.heading.end, heading.section_end)?;
+        let scheduled = parse_planning(&source, &planning, "SCHEDULED")?;
+        let deadline = parse_planning(&source, &planning, "DEADLINE")?;
+        let assignee = match semantic_property(&properties, "ASSIGNEE") {
+            SemanticProperty::Single(entry) => Some(entry.value.to_string()),
+            SemanticProperty::Missing | SemanticProperty::Ambiguous { .. } => None,
+        };
+        let requires_review = match semantic_property(&properties, "REQUIRES_REVIEW") {
+            SemanticProperty::Single(entry) => match entry.value {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(parse_error(
+                        &source,
+                        entry.line_start,
+                        "REQUIRES_REVIEW must be true or false",
+                    ));
+                }
+            },
+            SemanticProperty::Missing => false,
+            SemanticProperty::Ambiguous { line_start } => {
+                return Err(parse_error(
+                    &source,
+                    line_start,
+                    "REQUIRES_REVIEW must occur exactly once without accumulation",
+                ));
+            }
+        };
+        let depends_on = parse_dependencies(&source, &properties, id)?;
+        let note_links = parse_note_links(&source, heading.heading.end, heading.section_end);
 
         let parent_id = projected_ancestors.last().map(|(_, id)| *id);
 
@@ -203,15 +242,15 @@ fn project_document(
             parent_id,
             level: heading.level,
             title: parsed_heading.title,
-            state: None,
-            priority: None,
-            tags: BTreeSet::new(),
-            scheduled: None,
-            deadline: None,
-            assignee: None,
-            depends_on: BTreeSet::new(),
-            requires_review: false,
-            note_links: Vec::new(),
+            state: parsed_heading.state,
+            priority: parsed_heading.priority,
+            tags: parsed_heading.tags,
+            scheduled,
+            deadline,
+            assignee,
+            depends_on,
+            requires_review,
+            note_links,
         };
 
         let indexed = IndexedItem {
@@ -239,6 +278,9 @@ fn project_document(
 #[derive(Debug)]
 struct ParsedHeading {
     title: String,
+    state: Option<String>,
+    priority: Option<char>,
+    tags: BTreeSet<String>,
     state_span: Option<Span>,
     tags_span: Option<Span>,
 }
@@ -246,11 +288,14 @@ struct ParsedHeading {
 fn parse_heading(source: &str, heading: &ScannedHeading, options: &ParseOptions) -> ParsedHeading {
     let line = line_content(&source[heading.heading.start..heading.heading.end]);
     let mut cursor = heading.level + 1;
+    let mut state = None;
+    let mut priority = None;
     let mut state_span = None;
 
     if let Some((token_start, token_end)) = next_token(line, cursor) {
         let token = &line[token_start..token_end];
         if options.states.contains(token) {
+            state = Some(token.to_string());
             state_span = Some(Span {
                 start: heading.heading.start + token_start,
                 end: heading.heading.start + token_end,
@@ -262,6 +307,7 @@ fn parse_heading(source: &str, heading: &ScannedHeading, options: &ParseOptions)
                 && bytes.get(cursor + 3) == Some(&b']')
                 && bytes.get(cursor + 2).is_some_and(u8::is_ascii_uppercase)
             {
+                priority = Some(bytes[cursor + 2] as char);
                 cursor += 4;
             }
         }
@@ -277,11 +323,210 @@ fn parse_heading(source: &str, heading: &ScannedHeading, options: &ParseOptions)
         .map(|span| span.start - heading.heading.start)
         .unwrap_or(content_end);
     let title = line[cursor..title_end].trim().to_string();
+    let tags = tags_span
+        .map(|span| {
+            line[span.start - heading.heading.start..span.end - heading.heading.start]
+                .trim_matches(':')
+                .split(':')
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
 
     ParsedHeading {
         title,
+        state,
+        priority,
+        tags,
         state_span,
         tags_span,
+    }
+}
+
+fn semantic_property<'source, 'properties>(
+    properties: &'properties [PropertyOccurrence<'source>],
+    key: &str,
+) -> SemanticProperty<'properties, 'source> {
+    let entries = occurrences(properties, key);
+    if entries.is_empty() {
+        SemanticProperty::Missing
+    } else if entries.len() == 1 && !entries[0].accumulated {
+        SemanticProperty::Single(entries[0])
+    } else {
+        let ambiguous = if entries[0].accumulated {
+            entries[0]
+        } else {
+            entries[1]
+        };
+        SemanticProperty::Ambiguous {
+            line_start: ambiguous.line_start,
+        }
+    }
+}
+
+fn parse_dependencies(
+    source: &str,
+    properties: &[PropertyOccurrence<'_>],
+    item_id: WorkItemId,
+) -> Result<BTreeSet<WorkItemId>, OrgError> {
+    let entry = match semantic_property(properties, "DEPENDS_ON") {
+        SemanticProperty::Missing => return Ok(BTreeSet::new()),
+        SemanticProperty::Single(entry) => entry,
+        SemanticProperty::Ambiguous { line_start } => {
+            return Err(parse_error(
+                source,
+                line_start,
+                "DEPENDS_ON must occur exactly once without accumulation",
+            ));
+        }
+    };
+    let mut dependencies = BTreeSet::new();
+    for value in entry.value.split_whitespace() {
+        let dependency = WorkItemId::from_str(value).map_err(|_| {
+            parse_error(
+                source,
+                entry.line_start,
+                "DEPENDS_ON contains an invalid dependency ID",
+            )
+        })?;
+        if dependency == item_id {
+            return Err(parse_error(
+                source,
+                entry.line_start,
+                "work item cannot depend on itself",
+            ));
+        }
+        if !dependencies.insert(dependency) {
+            return Err(parse_error(
+                source,
+                entry.line_start,
+                "DEPENDS_ON contains a duplicate dependency ID",
+            ));
+        }
+    }
+    Ok(dependencies)
+}
+
+fn parse_planning(
+    source: &str,
+    planning: &BTreeMap<String, Span>,
+    key: &str,
+) -> Result<Option<OrgTimestamp>, OrgError> {
+    let Some(span) = planning.get(key) else {
+        return Ok(None);
+    };
+    let line = line_content(&source[span.start..span.end]).trim_start();
+    let raw = line
+        .strip_prefix(key)
+        .and_then(|value| value.strip_prefix(':'))
+        .map(str::trim)
+        .unwrap_or_default();
+    parse_planning_timestamp(raw)
+        .map(Some)
+        .map_err(|message| parse_error(source, span.start, format!("{key}: {message}")))
+}
+
+fn parse_planning_timestamp(raw: &str) -> Result<OrgTimestamp, String> {
+    let inner = raw
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .ok_or_else(|| "planning timestamp must be active Org syntax".to_string())?;
+    if inner.contains('+')
+        || inner.contains("++")
+        || inner.contains(".+")
+        || inner.matches('-').count() > 2
+    {
+        return Err("repeaters and time ranges are unsupported".to_string());
+    }
+    let parts = inner.split_whitespace().collect::<Vec<_>>();
+    let value = match parts.as_slice() {
+        [date, _weekday] => format!("{date} 00:00"),
+        [date, _weekday, time] => format!("{date} {time}"),
+        _ => return Err("unsupported planning timestamp".to_string()),
+    };
+    let local = chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M")
+        .map_err(|_| "invalid planning timestamp".to_string())?;
+    Ok(OrgTimestamp {
+        raw: raw.to_string(),
+        local,
+    })
+}
+
+fn parse_note_links(source: &str, start: usize, end: usize) -> Vec<NoteLink> {
+    let mut links = Vec::new();
+    let mut block_stack = Vec::<String>::new();
+    let mut drawer = false;
+
+    for line in source[start..end].split_inclusive('\n') {
+        let content = line_content(line);
+        let trimmed = content.trim_start();
+        if let Some(kind) = block_begin(trimmed) {
+            block_stack.push(kind.to_string());
+            continue;
+        }
+        if let Some(kind) = block_end(trimmed) {
+            if block_stack
+                .last()
+                .is_some_and(|open| open.eq_ignore_ascii_case(kind))
+            {
+                block_stack.pop();
+            }
+            continue;
+        }
+        if !block_stack.is_empty() {
+            continue;
+        }
+        if drawer {
+            if trimmed.eq_ignore_ascii_case(":END:") {
+                drawer = false;
+            }
+            continue;
+        }
+        if drawer_start(trimmed).is_some_and(|name| !name.eq_ignore_ascii_case("END")) {
+            drawer = true;
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        parse_note_links_in_line(content, &mut links);
+    }
+
+    links
+}
+
+fn parse_note_links_in_line(line: &str, links: &mut Vec<NoteLink>) {
+    let mut remaining = line;
+    while let Some(link_start) = remaining.find("[[") {
+        remaining = &remaining[link_start + 2..];
+        let Some(target_end) = remaining.find("][") else {
+            break;
+        };
+        let target = &remaining[..target_end];
+        remaining = &remaining[target_end + 2..];
+        let Some(description_end) = remaining.find("]]") else {
+            break;
+        };
+        let description = &remaining[..description_end];
+        remaining = &remaining[description_end + 2..];
+
+        let mut parts = target.split(':');
+        let (Some("agent-note"), Some(purpose), Some(note_id), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if purpose.is_empty() {
+            continue;
+        }
+        let Ok(note_id) = Uuid::parse_str(note_id) else {
+            continue;
+        };
+        links.push(NoteLink {
+            purpose: purpose.to_string(),
+            note_id,
+            description: description.to_string(),
+        });
     }
 }
 
@@ -388,63 +633,42 @@ fn property_spans(properties: &[PropertyOccurrence<'_>]) -> BTreeMap<String, Spa
         .collect()
 }
 
-fn planning_spans(source: &str, start: usize, end: usize) -> BTreeMap<String, Span> {
+fn planning_spans(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Result<BTreeMap<String, Span>, OrgError> {
     let mut spans = BTreeMap::new();
     let mut offset = start;
-    let mut block_stack = Vec::<String>::new();
-    let mut drawer = false;
 
     for line in source[start..end].split_inclusive('\n') {
         let content = line_content(line);
         let trimmed = content.trim_start();
-        if let Some(kind) = block_begin(trimmed) {
-            block_stack.push(kind.to_string());
-            offset += line.len();
-            continue;
+        let key = if trimmed.starts_with("SCHEDULED:") {
+            "SCHEDULED"
+        } else if trimmed.starts_with("DEADLINE:") {
+            "DEADLINE"
+        } else {
+            break;
+        };
+        if spans.contains_key(key) {
+            return Err(parse_error(
+                source,
+                offset,
+                format!("{key} planning keyword must not be repeated"),
+            ));
         }
-        if let Some(kind) = block_end(trimmed) {
-            if block_stack
-                .last()
-                .is_some_and(|open| open.eq_ignore_ascii_case(kind))
-            {
-                block_stack.pop();
-            }
-            offset += line.len();
-            continue;
-        }
-        if !block_stack.is_empty() {
-            offset += line.len();
-            continue;
-        }
-        if drawer {
-            if trimmed.eq_ignore_ascii_case(":END:") {
-                drawer = false;
-            }
-            offset += line.len();
-            continue;
-        }
-        if drawer_start(trimmed).is_some_and(|name| !name.eq_ignore_ascii_case("END")) {
-            drawer = true;
-            offset += line.len();
-            continue;
-        }
-
-        for key in ["SCHEDULED", "DEADLINE"] {
-            let prefix = format!("{key}:");
-            if trimmed.starts_with(&prefix) {
-                spans.insert(
-                    key.to_string(),
-                    Span {
-                        start: offset,
-                        end: offset + line.len(),
-                    },
-                );
-            }
-        }
+        spans.insert(
+            key.to_string(),
+            Span {
+                start: offset,
+                end: offset + line.len(),
+            },
+        );
         offset += line.len();
     }
 
-    spans
+    Ok(spans)
 }
 
 fn line_content(line: &str) -> &str {
