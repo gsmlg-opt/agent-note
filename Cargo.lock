@@ -3430,6 +3430,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "note-org"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "note-pipelines"
 version = "0.1.0"
 dependencies = [
