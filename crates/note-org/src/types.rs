@@ -1,7 +1,30 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, fmt, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+};
 use uuid::Uuid;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexedItem {
+    pub item: WorkItem,
+    pub heading: Span,
+    pub subtree: Span,
+    pub state: Option<Span>,
+    pub properties: BTreeMap<String, Span>,
+    pub planning: BTreeMap<String, Span>,
+    pub tags: Option<Span>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
