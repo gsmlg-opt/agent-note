@@ -19,7 +19,7 @@ async fn normalized_org_schema(connection: &turso::Connection) -> Vec<(String, S
         .query(
             "SELECT type, name, sql
              FROM sqlite_schema
-             WHERE type IN ('table', 'index')
+             WHERE type IN ('table', 'index', 'trigger')
                AND (name GLOB 'org_*' OR name GLOB 'idx_org_*')
                AND name NOT GLOB 'sqlite_autoindex_*'
                AND sql IS NOT NULL
@@ -289,6 +289,7 @@ async fn fresh_database_contains_current_schema_objects() {
         .unwrap();
     let mut tables = Vec::new();
     let mut indexes = Vec::new();
+    let mut triggers = Vec::new();
     let mut schema_sql = Vec::new();
     while let Some(row) = rows.next().await.unwrap() {
         let object_type = row.get::<String>(0).unwrap();
@@ -297,6 +298,8 @@ async fn fresh_database_contains_current_schema_objects() {
             tables.push(name);
         } else if object_type == "index" {
             indexes.push(name);
+        } else if object_type == "trigger" {
+            triggers.push(name);
         }
         if let Ok(sql) = row.get::<String>(2) {
             schema_sql.push(sql);
@@ -337,6 +340,9 @@ async fn fresh_database_contains_current_schema_objects() {
         );
     }
     assert!(indexes.iter().any(|index| index == "idx_notes_title_fts"));
+    assert!(triggers
+        .iter()
+        .any(|trigger| trigger == "org_events_advance_workspace_sequence"));
     assert!(!tables.iter().any(|table| table == "note_chunk_sparse"));
     assert!(!indexes
         .iter()

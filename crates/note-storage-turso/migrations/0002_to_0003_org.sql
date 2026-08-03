@@ -90,6 +90,23 @@ CREATE TABLE org_events (
     UNIQUE (workspace_id, sequence)
 );
 
+CREATE TRIGGER org_events_advance_workspace_sequence
+AFTER INSERT ON org_events
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NEW.sequence <> (
+            SELECT last_event_sequence + 1
+            FROM org_workspaces
+            WHERE id = NEW.workspace_id
+        )
+        THEN RAISE(ABORT, 'Org event sequence is not next for workspace')
+    END;
+    UPDATE org_workspaces
+    SET last_event_sequence = NEW.sequence
+    WHERE id = NEW.workspace_id;
+END;
+
 CREATE INDEX idx_org_events_subject
     ON org_events(workspace_id, subject_kind, subject_id, sequence);
 
