@@ -1,6 +1,6 @@
 mod support;
 
-use note_storage::{NewNote, NotesRepository, StorageErrorKind};
+use note_storage::{NotesRepository, StorageErrorKind};
 use note_storage_pg::PgStorage;
 use support::{configured_url_or_skip, TestDatabase};
 
@@ -153,29 +153,36 @@ async fn ordered_migrations_preserve_existing_notes() {
     let database = TestDatabase::create(&admin_url).await;
     database.provision_vector().await;
 
-    let storage = PgStorage::connect(&database.url, 2)
+    let seed_pool = database.inspect_pool().await;
+    sqlx::migrate!("./migrations")
+        .run_to(1, &seed_pool)
         .await
-        .expect("provision existing PostgreSQL fixture");
-    let session = storage.connect_session().await.unwrap();
-    session
-        .insert_note(NewNote {
-            id: "migration-survivor",
-            title: "Migration survivor",
-            content: "preserved",
-            attachments: &[],
-            created_at: 1,
-            updated_at: 1,
-            note_revision: 1,
-            deleted_at: None,
-        })
-        .await
-        .unwrap();
-    drop(session);
-    storage.close().await;
+        .expect("provision PostgreSQL schema at migration 1");
+    let seeded_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&seed_pool)
+            .await
+            .expect("read seeded migration version");
+    assert_eq!(seeded_versions, vec![1]);
+    sqlx::query(
+        "INSERT INTO notes (
+             id, title, content, attachments, created_at, updated_at, note_revision, deleted_at
+         ) VALUES ($1, $2, $3, '[]'::jsonb, $4, $5, $6, NULL)",
+    )
+    .bind("migration-survivor")
+    .bind("Migration survivor")
+    .bind("preserved")
+    .bind(1_i64)
+    .bind(1_i64)
+    .bind(1_i64)
+    .execute(&seed_pool)
+    .await
+    .expect("seed note before migration 2");
+    seed_pool.close().await;
 
-    let reopened = PgStorage::connect(&database.url, 2)
+    let migrated = PgStorage::connect(&database.url, 2)
         .await
-        .expect("reconnect after ordered migrations");
+        .expect("apply pending PostgreSQL migration 2");
     let inspection = database.inspect_pool().await;
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
@@ -185,7 +192,7 @@ async fn ordered_migrations_preserve_existing_notes() {
     assert_eq!(versions, vec![1, 2]);
     inspection.close().await;
 
-    let session = reopened.connect_session().await.unwrap();
+    let session = migrated.connect_session().await.unwrap();
     assert_eq!(
         session
             .get_note_content("migration-survivor")
@@ -195,7 +202,7 @@ async fn ordered_migrations_preserve_existing_notes() {
     );
     drop(session);
     database
-        .cleanup(Some(&reopened))
+        .cleanup(Some(&migrated))
         .await
         .expect("explicit cleanup without leaked connections");
 }

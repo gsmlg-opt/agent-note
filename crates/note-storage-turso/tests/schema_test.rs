@@ -5,6 +5,40 @@ use std::path::Path;
 const APPLICATION_ID: u32 = 0x414E4F54;
 const SCHEMA_VERSION: u32 = 3;
 
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("( ", "(")
+        .replace(" )", ")")
+        .replace(" ,", ",")
+}
+
+async fn normalized_org_schema(connection: &turso::Connection) -> Vec<(String, String, String)> {
+    let mut rows = connection
+        .query(
+            "SELECT type, name, sql
+             FROM sqlite_schema
+             WHERE type IN ('table', 'index')
+               AND (name GLOB 'org_*' OR name GLOB 'idx_org_*')
+               AND name NOT GLOB 'sqlite_autoindex_*'
+               AND sql IS NOT NULL
+             ORDER BY type, name",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut schema = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        schema.push((
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            normalize_schema_sql(&row.get::<String>(2).unwrap()),
+        ));
+    }
+    schema
+}
+
 async fn create_schema_v2_database(path: &Path) {
     let database = turso::Builder::new_local(path.to_str().unwrap())
         .experimental_index_method(true)
@@ -195,6 +229,22 @@ async fn schema_v2_is_migrated_without_losing_notes() {
     ] {
         assert!(tables.iter().any(|table| table == expected), "{expected}");
     }
+
+    let migrated_schema = normalized_org_schema(&connection).await;
+    drop(connection);
+    drop(database);
+
+    let fresh_path = dir.path().join("fresh-v3.db");
+    drop(TursoStorage::open(&fresh_path).await.unwrap());
+    let fresh_database = turso::Builder::new_local(fresh_path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let fresh_connection = fresh_database.connect().unwrap();
+    let fresh_schema = normalized_org_schema(&fresh_connection).await;
+
+    assert_eq!(migrated_schema, fresh_schema);
 }
 
 #[tokio::test]
