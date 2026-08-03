@@ -1,7 +1,7 @@
-use note_org::{DocumentId, WorkspaceId, WorkspacePolicy};
+use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewOrgDocument, NewOrgWorkspace, OrgDocumentUpdate, OrgWorkspaceUpdate,
-    StorageBackend, StorageErrorKind,
+    CompareAndSwap, NewOrgDocument, NewOrgWorkspace, OrgDocumentUpdate, OrgProjectedWorkItem,
+    OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StoredOrgTimestamp, TransactionMode,
 };
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -12,6 +12,48 @@ fn workspace_id(value: &str) -> WorkspaceId {
 
 fn document_id(value: &str) -> DocumentId {
     DocumentId::from_str(value).unwrap()
+}
+
+fn work_item_id(value: &str) -> WorkItemId {
+    WorkItemId::from_str(value).unwrap()
+}
+
+fn scheduled(raw: &str, local: &str, utc_timestamp: i64) -> StoredOrgTimestamp {
+    StoredOrgTimestamp {
+        raw: raw.into(),
+        local: local.into(),
+        timezone: "Asia/Shanghai".into(),
+        utc_timestamp,
+    }
+}
+
+fn projected_item(
+    id: WorkItemId,
+    workspace_id: WorkspaceId,
+    document_id: DocumentId,
+    parent_id: Option<WorkItemId>,
+    source_order: i64,
+    title: &str,
+) -> OrgProjectedWorkItem {
+    OrgProjectedWorkItem {
+        id,
+        workspace_id,
+        document_id,
+        parent_id,
+        source_order,
+        item_type: WorkItemType::Task,
+        title: title.into(),
+        state: Some("TODO".into()),
+        priority: Some('A'),
+        scheduled: None,
+        deadline: None,
+        assignee: Some("agent-one".into()),
+        requires_review: false,
+        created_at: 60,
+        tags: Vec::new(),
+        dependencies: Vec::new(),
+        note_links: Vec::new(),
+    }
 }
 
 pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
@@ -204,6 +246,262 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .unwrap(),
         CompareAndSwap::NotFound
     );
+
+    let parent_id = work_item_id("30000000-0000-0000-0000-000000000001");
+    let child_id = work_item_id("30000000-0000-0000-0000-000000000002");
+    let mut parent = projected_item(
+        parent_id,
+        alpha_id,
+        first_document_id,
+        None,
+        0,
+        "Release service",
+    );
+    parent.item_type = WorkItemType::Epic;
+    parent.state = Some("ACTIVE".into());
+    parent.priority = None;
+    parent.assignee = None;
+    let mut child = projected_item(
+        child_id,
+        alpha_id,
+        first_document_id,
+        Some(parent_id),
+        1,
+        "Ship backend",
+    );
+    child.tags = vec!["backend".into(), "release".into()];
+    child.dependencies = vec![parent_id];
+    child.scheduled = Some(scheduled(
+        "<2026-08-04 Tue 15:30>",
+        "2026-08-04T15:30:00",
+        1_785_828_600,
+    ));
+    child.note_links = vec![
+        NoteLink {
+            purpose: "context".into(),
+            note_id: "40000000-0000-0000-0000-000000000001".parse().unwrap(),
+            description: "available note".into(),
+        },
+        NoteLink {
+            purpose: "evidence".into(),
+            note_id: "40000000-0000-0000-0000-000000000099".parse().unwrap(),
+            description: "unavailable note".into(),
+        },
+    ];
+    let initial_projection = vec![parent.clone(), child.clone()];
+
+    let projection = storage.begin(TransactionMode::Immediate).await.unwrap();
+    projection
+        .replace_org_document_projection(first_document_id, &initial_projection)
+        .await
+        .unwrap();
+    projection.commit().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(first_document_id)
+            .await
+            .unwrap(),
+        initial_projection
+    );
+
+    let mut changed_parent = parent.clone();
+    changed_parent.title = "Release service safely".into();
+    let mut changed_child = child.clone();
+    changed_child.title = "Ship backend safely".into();
+    changed_child.tags = vec!["release".into()];
+    changed_child.dependencies.clear();
+    changed_child.note_links = vec![NoteLink {
+        purpose: "context".into(),
+        note_id: "40000000-0000-0000-0000-000000000001".parse().unwrap(),
+        description: "updated available note".into(),
+    }];
+    let changed_projection = vec![changed_parent.clone(), changed_child.clone()];
+    let replacement = storage.begin(TransactionMode::Immediate).await.unwrap();
+    replacement
+        .replace_org_document_projection(first_document_id, &changed_projection)
+        .await
+        .unwrap();
+    replacement.commit().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(first_document_id)
+            .await
+            .unwrap(),
+        changed_projection
+    );
+
+    let omitted = storage.begin(TransactionMode::Immediate).await.unwrap();
+    omitted
+        .replace_org_document_projection(first_document_id, &[changed_parent.clone()])
+        .await
+        .unwrap();
+    omitted.commit().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(first_document_id)
+            .await
+            .unwrap(),
+        changed_projection,
+        "replacement must not delete a work item omitted by the import candidate"
+    );
+
+    let duplicate_id = work_item_id("30000000-0000-0000-0000-000000000003");
+    let duplicate = projected_item(
+        duplicate_id,
+        alpha_id,
+        first_document_id,
+        None,
+        0,
+        "Duplicate source order",
+    );
+    let rollback_item_id = work_item_id("30000000-0000-0000-0000-000000000004");
+    let rollback_item = projected_item(
+        rollback_item_id,
+        alpha_id,
+        second_document_id,
+        None,
+        0,
+        "Must roll back",
+    );
+    let rollback = storage.begin(TransactionMode::Immediate).await.unwrap();
+    rollback
+        .replace_org_document_projection(second_document_id, &[rollback_item])
+        .await
+        .unwrap();
+    let error = rollback
+        .replace_org_document_projection(first_document_id, &[changed_parent.clone(), duplicate])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    rollback.rollback().await.unwrap();
+    assert!(session
+        .list_org_document_projection(second_document_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        session
+            .list_org_document_projection(first_document_id)
+            .await
+            .unwrap(),
+        changed_projection
+    );
+
+    let stale_id = work_item_id("30000000-0000-0000-0000-000000000005");
+    let stale = projected_item(
+        stale_id,
+        alpha_id,
+        second_document_id,
+        None,
+        0,
+        "Stale projection",
+    );
+    let seed_stale = storage.begin(TransactionMode::Immediate).await.unwrap();
+    seed_stale
+        .replace_org_document_projection(second_document_id, &[stale])
+        .await
+        .unwrap();
+    seed_stale.commit().await.unwrap();
+
+    let rebuilt_id = work_item_id("30000000-0000-0000-0000-000000000006");
+    let rebuilt = projected_item(
+        rebuilt_id,
+        alpha_id,
+        second_document_id,
+        None,
+        0,
+        "Rebuilt projection",
+    );
+    let mut all_rebuilt = changed_projection.clone();
+    all_rebuilt.push(rebuilt.clone());
+    let rebuild = storage.begin(TransactionMode::Immediate).await.unwrap();
+    rebuild
+        .rebuild_org_workspace_projection(alpha_id, &all_rebuilt)
+        .await
+        .unwrap();
+    rebuild.commit().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(first_document_id)
+            .await
+            .unwrap(),
+        changed_projection
+    );
+    assert_eq!(
+        session
+            .list_org_document_projection(second_document_id)
+            .await
+            .unwrap(),
+        vec![rebuilt]
+    );
+
+    let missing_parent_id = work_item_id("30000000-0000-0000-0000-000000000099");
+    let mut missing_parent = changed_child.clone();
+    missing_parent.parent_id = Some(missing_parent_id);
+    let invalid_parent = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let error = invalid_parent
+        .replace_org_document_projection(first_document_id, &[missing_parent])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    invalid_parent.rollback().await.unwrap();
+
+    let mut cyclic_parent = changed_parent.clone();
+    cyclic_parent.parent_id = Some(child_id);
+    let cycle = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let error = cycle
+        .replace_org_document_projection(first_document_id, &[cyclic_parent, changed_child.clone()])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    cycle.rollback().await.unwrap();
+
+    let beta_document_id = document_id("20000000-0000-0000-0000-000000000010");
+    session
+        .insert_org_document(NewOrgDocument {
+            id: beta_document_id,
+            workspace_id: beta_id,
+            path: "beta.org",
+            source: "* TODO Beta",
+            content_hash: "hash-beta",
+            now: 70,
+        })
+        .await
+        .unwrap();
+    let beta_item_id = work_item_id("30000000-0000-0000-0000-000000000010");
+    let beta_item = projected_item(
+        beta_item_id,
+        beta_id,
+        beta_document_id,
+        None,
+        0,
+        "Beta item",
+    );
+    let seed_beta = storage.begin(TransactionMode::Immediate).await.unwrap();
+    seed_beta
+        .replace_org_document_projection(beta_document_id, &[beta_item])
+        .await
+        .unwrap();
+    seed_beta.commit().await.unwrap();
+    let mut cross_workspace_dependency = changed_child.clone();
+    cross_workspace_dependency.dependencies = vec![beta_item_id];
+    let cross_workspace = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let error = cross_workspace
+        .replace_org_document_projection(first_document_id, &[cross_workspace_dependency])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    cross_workspace.rollback().await.unwrap();
+
+    let mut mismatched_workspace = changed_parent.clone();
+    mismatched_workspace.workspace_id = beta_id;
+    let mismatch = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let error = mismatch
+        .replace_org_document_projection(first_document_id, &[mismatched_workspace])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    mismatch.rollback().await.unwrap();
 
     let CompareAndSwap::Applied(archived_alpha) = session
         .compare_and_swap_org_workspace(OrgWorkspaceUpdate {
