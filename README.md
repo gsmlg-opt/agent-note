@@ -6,7 +6,8 @@ A Rust workspace: `note-core` (pure types/validation/RRF fusion), `note-storage`
 repository contracts), `note-storage-turso` (embedded Rust Turso Database adapter with title FTS
 and exact dense retrieval), `note-storage-pg` (external PostgreSQL adapter with title FTS and exact
 pgvector retrieval), `note-embedding` (BGE-M3 via local ONNX or a self-hosted OpenAI-compatible
-service, with a deterministic stub for offline dev), `note-pipelines` (save/search workflows),
+service, with a deterministic stub for offline dev), `note-org` (pure Org source projection/editing,
+workflow policy, dependency validation, and readiness), `note-pipelines` (save/search workflows),
 `note-mcp` (MCP over stdio + Streamable HTTP), `note-server` (Axum REST + `/mcp`), and
 `note-frontend` (Yew/Wasm UI built with the
 [`yew-duskmoon`](https://crates.io/crates/yew-duskmoon) component library).
@@ -25,6 +26,9 @@ inference) live at explicit boundaries and are threaded through one `Context` va
 global state. The crates form a strict dependency stack — each depends only on those above it:
 
 ```
+note-org         pure Org source projection/editing, workflow policy,
+                 dependency validation, and readiness (no I/O)
+
 note-core        pure: Note/Label/LabelKey types, input validation, RRF rank-fusion (no I/O)
    ▲
    ├── note-storage     backend-neutral repository/session/transaction contracts
@@ -43,6 +47,11 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
                         ▲
                    note-frontend   Yew MVU (AppState + pure reducer) → talks to note-server over REST
 ```
+
+**Org domain foundation.** Delivery Slice 1 covers a pure parser and loss-preserving source model,
+stable IDs and semantic metadata, workspace policy and transition validation, and dependency graph
+and readiness calculation. Org storage, pipelines, leases, events, MCP tools, and UI integration
+belong to later Org delivery slices.
 
 **One core, two front doors.** REST and both MCP transports call the exact same `note-pipelines`
 functions — no business logic is duplicated per transport (design.md §1–2). **Hybrid retrieval**
