@@ -353,9 +353,9 @@ impl OrgRepository for TursoSession {
             ));
         };
         let stored = decode_event(&row)?;
-        // Turso rolls back an unfinished writer when its Statement is dropped.
-        // Drive RETURNING to Done so success commits, while cancellation before
-        // this point drops `rows` and atomically aborts both trigger and insert.
+        // Drain RETURNING so a successful response is only produced after the
+        // statement reaches Done. Cancellation leaves no savepoint or statement
+        // lock, but after the first row it may commit without returning success.
         if rows
             .next()
             .await
