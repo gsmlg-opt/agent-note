@@ -50,6 +50,8 @@ pub enum ClaimPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspacePolicy {
+    #[serde(default)]
+    pub allow_cross_workspace_agenda: bool,
     pub allowed_types: BTreeSet<WorkItemType>,
     pub states: BTreeSet<String>,
     pub transitions: BTreeSet<(String, String)>,
@@ -97,6 +99,7 @@ pub enum TransitionError {
 impl WorkspacePolicy {
     pub fn engineering_default() -> Self {
         Self {
+            allow_cross_workspace_agenda: false,
             allowed_types: WorkItemType::ALL.into_iter().collect(),
             states: [
                 "BACKLOG",

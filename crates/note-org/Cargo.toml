@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "std"] }
+chrono-tz = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2"
 uuid = { version = "1.23.4", features = ["serde"] }
