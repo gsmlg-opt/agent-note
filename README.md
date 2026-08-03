@@ -48,10 +48,16 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
                    note-frontend   Yew MVU (AppState + pure reducer) → talks to note-server over REST
 ```
 
-**Org domain foundation.** Delivery Slice 1 covers a pure parser and loss-preserving source model,
-stable IDs and semantic metadata, workspace policy and transition validation, and dependency graph
-and readiness calculation. Org storage, pipelines, leases, events, MCP tools, and UI integration
-belong to later Org delivery slices.
+**Org canonical persistence.** `note-org` supplies the pure Org domain and workspace-time behavior.
+Storage schema v3 persists canonical Org workspaces and documents alongside derived, rebuildable
+work-item projections. The embedded Turso adapter atomically upgrades marked v2 databases to v3;
+PostgreSQL applies the ordered `0002_org_canonical.sql` migration. Markdown notes and their storage
+remain unchanged.
+
+Delivery Slice 2 does not include an Org pipeline service, leases, MCP, REST, CLI, or Web UI.
+Projection rows are derived and rebuildable, so direct projection deletion is recoverable. Org
+events and operation records are authoritative runtime data and projection recovery must not delete
+them.
 
 **One core, two front doors.** REST and both MCP transports call the exact same `note-pipelines`
 functions — no business logic is duplicated per transport (design.md §1–2). **Hybrid retrieval**
