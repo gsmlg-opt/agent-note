@@ -330,6 +330,32 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         changed_projection
     );
 
+    let mut reordered_parent = changed_parent.clone();
+    reordered_parent.source_order = 1;
+    let mut reordered_child = changed_child.clone();
+    reordered_child.source_order = 0;
+    let reordered_projection = vec![reordered_child, reordered_parent];
+    let reorder = storage.begin(TransactionMode::Immediate).await.unwrap();
+    reorder
+        .replace_org_document_projection(first_document_id, &reordered_projection)
+        .await
+        .unwrap();
+    reorder.commit().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(first_document_id)
+            .await
+            .unwrap(),
+        reordered_projection,
+        "stable work item IDs must be able to swap source order"
+    );
+    let restore_order = storage.begin(TransactionMode::Immediate).await.unwrap();
+    restore_order
+        .replace_org_document_projection(first_document_id, &changed_projection)
+        .await
+        .unwrap();
+    restore_order.commit().await.unwrap();
+
     let omitted = storage.begin(TransactionMode::Immediate).await.unwrap();
     omitted
         .replace_org_document_projection(first_document_id, &[changed_parent.clone()])
@@ -343,6 +369,23 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .unwrap(),
         changed_projection,
         "replacement must not delete a work item omitted by the import candidate"
+    );
+
+    let mut omitted_order_conflict = changed_parent.clone();
+    omitted_order_conflict.source_order = changed_child.source_order;
+    let conflict = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let error = conflict
+        .replace_org_document_projection(first_document_id, &[omitted_order_conflict])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    conflict.rollback().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(first_document_id)
+            .await
+            .unwrap(),
+        changed_projection
     );
 
     let duplicate_id = work_item_id("30000000-0000-0000-0000-000000000003");
@@ -502,6 +545,55 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::Constraint);
     mismatch.rollback().await.unwrap();
+
+    let mut candidate_cycle_parent = changed_parent.clone();
+    candidate_cycle_parent.dependencies = vec![child_id];
+    let mut candidate_cycle_child = changed_child.clone();
+    candidate_cycle_child.dependencies = vec![parent_id];
+    let candidate_cycle = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let error = candidate_cycle
+        .replace_org_document_projection(
+            first_document_id,
+            &[candidate_cycle_parent, candidate_cycle_child],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    candidate_cycle.rollback().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(first_document_id)
+            .await
+            .unwrap(),
+        changed_projection
+    );
+
+    let mut omitted_cycle_child = changed_child.clone();
+    omitted_cycle_child.dependencies = vec![parent_id];
+    let omitted_cycle_base = vec![changed_parent.clone(), omitted_cycle_child.clone()];
+    let seed_omitted_cycle = storage.begin(TransactionMode::Immediate).await.unwrap();
+    seed_omitted_cycle
+        .replace_org_document_projection(first_document_id, &omitted_cycle_base)
+        .await
+        .unwrap();
+    seed_omitted_cycle.commit().await.unwrap();
+    let mut closing_candidate = changed_parent.clone();
+    closing_candidate.dependencies = vec![child_id];
+    let omitted_cycle = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let error = omitted_cycle
+        .replace_org_document_projection(first_document_id, &[closing_candidate])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    omitted_cycle.rollback().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(first_document_id)
+            .await
+            .unwrap(),
+        omitted_cycle_base,
+        "dependency-cycle rejection must leave the prior projection unchanged"
+    );
 
     let CompareAndSwap::Applied(archived_alpha) = session
         .compare_and_swap_org_workspace(OrgWorkspaceUpdate {

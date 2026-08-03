@@ -8,7 +8,7 @@ use note_storage::{
 };
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
 
 #[async_trait::async_trait]
@@ -227,8 +227,9 @@ impl OrgRepository for PgSession {
         items: &[OrgProjectedWorkItem],
     ) -> StorageResult<()> {
         let mut connection = self.connection().await?;
-        let order = validate_document_projection(&mut connection, document_id, items).await?;
-        upsert_projection(&mut connection, items, &order).await
+        let plan = validate_document_projection(&mut connection, document_id, items).await?;
+        stage_source_orders(&mut connection, &plan.staged_existing).await?;
+        upsert_projection(&mut connection, items, &plan.order).await
     }
 
     async fn list_org_document_projection(
@@ -251,8 +252,9 @@ impl OrgRepository for PgSession {
         .map_err(|error| map_sqlx_error("list Org document projection", error))?;
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
-            items.push(decode_projected_item(&mut connection, row).await?);
+            items.push(decode_projected_item(row)?);
         }
+        load_projection_relations(&mut connection, document_id, &mut items).await?;
         Ok(items)
     }
 
@@ -262,7 +264,7 @@ impl OrgRepository for PgSession {
         items: &[OrgProjectedWorkItem],
     ) -> StorageResult<()> {
         let mut connection = self.connection().await?;
-        let order = validate_workspace_rebuild(&mut connection, workspace_id, items).await?;
+        let plan = validate_workspace_rebuild(&mut connection, workspace_id, items).await?;
         let workspace = workspace_id.to_string();
         for (sql, context) in [
             (
@@ -296,15 +298,27 @@ impl OrgRepository for PgSession {
                 .await
                 .map_err(|error| map_sqlx_error(context, error))?;
         }
-        upsert_projection(&mut connection, items, &order).await
+        upsert_projection(&mut connection, items, &plan.order).await
     }
+}
+
+struct ProjectionPlan {
+    order: Vec<usize>,
+    staged_existing: Vec<(WorkItemId, i64)>,
+}
+
+struct ExistingProjection {
+    workspace_id: WorkspaceId,
+    document_id: DocumentId,
+    parent_id: Option<WorkItemId>,
+    source_order: i64,
 }
 
 async fn validate_document_projection(
     connection: &mut PgConnection,
     document_id: DocumentId,
     items: &[OrgProjectedWorkItem],
-) -> StorageResult<Vec<usize>> {
+) -> StorageResult<ProjectionPlan> {
     let workspace_id = document_workspace(connection, document_id).await?;
     for item in items {
         if item.document_id != document_id || item.workspace_id != workspace_id {
@@ -320,7 +334,7 @@ async fn validate_workspace_rebuild(
     connection: &mut PgConnection,
     workspace_id: WorkspaceId,
     items: &[OrgProjectedWorkItem],
-) -> StorageResult<Vec<usize>> {
+) -> StorageResult<ProjectionPlan> {
     let mut documents = HashSet::new();
     for item in items {
         if item.workspace_id != workspace_id {
@@ -362,6 +376,7 @@ struct ProjectionIdentityRow {
     workspace_id: String,
     document_id: String,
     parent_id: Option<String>,
+    source_order: i64,
 }
 
 async fn validate_projection(
@@ -369,22 +384,35 @@ async fn validate_projection(
     workspace_id: WorkspaceId,
     items: &[OrgProjectedWorkItem],
     rebuilding: bool,
-) -> StorageResult<Vec<usize>> {
-    let rows = sqlx::query_as::<_, ProjectionIdentityRow>(
-        "SELECT id, workspace_id, document_id, parent_id FROM org_work_items",
-    )
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(|error| map_sqlx_error("query existing Org projection identities", error))?;
-    let mut existing = HashMap::<WorkItemId, (WorkspaceId, DocumentId, Option<WorkItemId>)>::new();
+) -> StorageResult<ProjectionPlan> {
+    let mut identity_query = QueryBuilder::<Postgres>::new(
+        "SELECT id, workspace_id, document_id, parent_id, source_order
+         FROM org_work_items WHERE workspace_id = ",
+    );
+    identity_query.push_bind(workspace_id.to_string());
+    if !items.is_empty() {
+        identity_query.push(" OR id IN (");
+        let mut ids = identity_query.separated(", ");
+        for item in items {
+            ids.push_bind(item.id.to_string());
+        }
+        ids.push_unseparated(")");
+    }
+    let rows = identity_query
+        .build_query_as::<ProjectionIdentityRow>()
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query existing Org projection identities", error))?;
+    let mut existing = HashMap::<WorkItemId, ExistingProjection>::new();
     for row in rows {
         existing.insert(
             decode_work_item_id(row.id)?,
-            (
-                decode_workspace_id(row.workspace_id)?,
-                decode_document_id(row.document_id)?,
-                row.parent_id.map(decode_work_item_id).transpose()?,
-            ),
+            ExistingProjection {
+                workspace_id: decode_workspace_id(row.workspace_id)?,
+                document_id: decode_document_id(row.document_id)?,
+                parent_id: row.parent_id.map(decode_work_item_id).transpose()?,
+                source_order: row.source_order,
+            },
         );
     }
 
@@ -396,14 +424,14 @@ async fn validate_projection(
                 "duplicate Org projected work item id",
             ));
         }
-        if !source_orders.insert((item.document_id, item.source_order)) {
+        if item.source_order < 0 || !source_orders.insert((item.document_id, item.source_order)) {
             return Err(projection_constraint(
-                "duplicate source order in Org document projection",
+                "invalid or duplicate source order in Org document projection",
             ));
         }
-        if let Some((stored_workspace, stored_document, _)) = existing.get(&item.id) {
-            if *stored_workspace != workspace_id
-                || (!rebuilding && *stored_document != item.document_id)
+        if let Some(stored) = existing.get(&item.id) {
+            if stored.workspace_id != workspace_id
+                || (!rebuilding && stored.document_id != item.document_id)
             {
                 return Err(projection_constraint(
                     "Org projected work item id is owned by another workspace or document",
@@ -412,10 +440,32 @@ async fn validate_projection(
         }
     }
 
+    if !rebuilding {
+        let omitted_orders = existing
+            .iter()
+            .filter(|(id, stored)| {
+                stored.workspace_id == workspace_id
+                    && items
+                        .first()
+                        .is_some_and(|item| stored.document_id == item.document_id)
+                    && !ids.contains(id)
+            })
+            .map(|(_, stored)| stored.source_order)
+            .collect::<HashSet<_>>();
+        if items
+            .iter()
+            .any(|item| omitted_orders.contains(&item.source_order))
+        {
+            return Err(projection_constraint(
+                "Org projection source order conflicts with an omitted work item",
+            ));
+        }
+    }
+
     let mut parents = existing
         .iter()
-        .filter(|(_, (stored_workspace, _, _))| *stored_workspace == workspace_id)
-        .map(|(id, (_, _, parent))| (*id, *parent))
+        .filter(|(_, stored)| stored.workspace_id == workspace_id)
+        .map(|(id, stored)| (*id, stored.parent_id))
         .collect::<HashMap<_, _>>();
     if rebuilding {
         parents.clear();
@@ -428,7 +478,7 @@ async fn validate_projection(
             let supplied = ids.contains(target);
             let stored_here = existing
                 .get(target)
-                .is_some_and(|(stored_workspace, _, _)| *stored_workspace == workspace_id);
+                .is_some_and(|stored| stored.workspace_id == workspace_id);
             if !supplied && (rebuilding || !stored_here) {
                 return Err(projection_constraint(
                     "Org projected parent or dependency target is missing or cross-workspace",
@@ -456,12 +506,141 @@ async fn validate_projection(
         }
         depths.insert(item.id, depth);
     }
+    let mut dependencies = if rebuilding {
+        HashMap::new()
+    } else {
+        load_workspace_dependencies(connection, workspace_id).await?
+    };
+    for item in items {
+        dependencies.insert(item.id, item.dependencies.clone());
+    }
+    let nodes = parents.keys().copied().collect::<HashSet<_>>();
+    if dependency_graph_has_cycle(&nodes, &dependencies)? {
+        return Err(projection_constraint(
+            "cyclic Org projected dependency structure",
+        ));
+    }
     let mut order = (0..items.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| {
         let item = &items[*index];
         (depths[&item.id], item.source_order, item.id)
     });
-    Ok(order)
+    let staged_existing = if rebuilding || items.is_empty() {
+        Vec::new()
+    } else {
+        let document_id = items[0].document_id;
+        let maximum = existing
+            .values()
+            .filter(|stored| stored.document_id == document_id)
+            .map(|stored| stored.source_order)
+            .chain(items.iter().map(|item| item.source_order))
+            .max()
+            .unwrap_or(0);
+        let mut supplied_existing = items
+            .iter()
+            .filter(|item| existing.contains_key(&item.id))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        supplied_existing.sort();
+        supplied_existing
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                maximum
+                    .checked_add(index as i64 + 1)
+                    .map(|source_order| (id, source_order))
+                    .ok_or_else(|| projection_constraint("Org projection source order overflow"))
+            })
+            .collect::<StorageResult<Vec<_>>>()?
+    };
+    Ok(ProjectionPlan {
+        order,
+        staged_existing,
+    })
+}
+
+async fn load_workspace_dependencies(
+    connection: &mut PgConnection,
+    workspace_id: WorkspaceId,
+) -> StorageResult<HashMap<WorkItemId, Vec<WorkItemId>>> {
+    let rows = sqlx::query_as::<_, DependencyRow>(
+        "SELECT dependency.work_item_id, dependency.depends_on_id
+         FROM org_dependencies dependency
+         JOIN org_work_items item ON item.id = dependency.work_item_id
+         WHERE item.workspace_id = $1
+         ORDER BY dependency.work_item_id, dependency.depends_on_id",
+    )
+    .bind(workspace_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|error| map_sqlx_error("query Org workspace dependencies", error))?;
+    let mut dependencies = HashMap::<WorkItemId, Vec<WorkItemId>>::new();
+    for row in rows {
+        dependencies
+            .entry(decode_work_item_id(row.work_item_id)?)
+            .or_default()
+            .push(decode_work_item_id(row.depends_on_id)?);
+    }
+    Ok(dependencies)
+}
+
+fn dependency_graph_has_cycle(
+    nodes: &HashSet<WorkItemId>,
+    dependencies: &HashMap<WorkItemId, Vec<WorkItemId>>,
+) -> StorageResult<bool> {
+    let mut incoming = nodes
+        .iter()
+        .map(|id| (*id, 0usize))
+        .collect::<HashMap<_, _>>();
+    for targets in dependencies.values() {
+        for target in targets {
+            let Some(count) = incoming.get_mut(target) else {
+                return Err(projection_constraint(
+                    "Org projected dependency target is missing or cross-workspace",
+                ));
+            };
+            *count += 1;
+        }
+    }
+    let mut ready = incoming
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(*id))
+        .collect::<VecDeque<_>>();
+    let mut visited = 0usize;
+    while let Some(source) = ready.pop_front() {
+        visited += 1;
+        for target in dependencies.get(&source).into_iter().flatten() {
+            let count = incoming
+                .get_mut(target)
+                .expect("dependency targets were validated above");
+            *count -= 1;
+            if *count == 0 {
+                ready.push_back(*target);
+            }
+        }
+    }
+    Ok(visited != nodes.len())
+}
+
+async fn stage_source_orders(
+    connection: &mut PgConnection,
+    staged_existing: &[(WorkItemId, i64)],
+) -> StorageResult<()> {
+    for (id, source_order) in staged_existing {
+        sqlx::query("UPDATE org_work_items SET source_order = $2 WHERE id = $1")
+            .bind(id.to_string())
+            .bind(*source_order)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| map_sqlx_error("stage Org projection source order", error))?;
+    }
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct DependencyRow {
+    work_item_id: String,
+    depends_on_id: String,
 }
 
 async fn upsert_projection(
@@ -544,39 +723,75 @@ async fn upsert_projection(
                 .await
                 .map_err(|error| map_sqlx_error(context, error))?;
         }
-        for tag in &item.tags {
-            sqlx::query("INSERT INTO org_work_item_tags (work_item_id, tag) VALUES ($1, $2)")
-                .bind(&id)
-                .bind(tag)
-                .execute(&mut *connection)
-                .await
-                .map_err(|error| map_sqlx_error("insert Org projected work item tag", error))?;
-        }
-        for dependency in &item.dependencies {
-            sqlx::query(
-                "INSERT INTO org_dependencies (work_item_id, depends_on_id) VALUES ($1, $2)",
-            )
-            .bind(&id)
-            .bind(dependency.to_string())
+    }
+    let tags = items
+        .iter()
+        .flat_map(|item| {
+            item.tags
+                .iter()
+                .map(move |tag| (item.id.to_string(), tag.as_str()))
+        })
+        .collect::<Vec<_>>();
+    for chunk in tags.chunks(1_000) {
+        let mut query =
+            QueryBuilder::<Postgres>::new("INSERT INTO org_work_item_tags (work_item_id, tag) ");
+        query.push_values(chunk, |mut row, (id, tag)| {
+            row.push_bind(id).push_bind(*tag);
+        });
+        query
+            .build()
             .execute(&mut *connection)
             .await
-            .map_err(|error| map_sqlx_error("insert Org projected work item dependency", error))?;
-        }
-        for (ordinal, link) in item.note_links.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO org_note_links (
-                     work_item_id, ordinal, purpose, note_id, description
-                 ) VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(&id)
-            .bind(ordinal as i64)
-            .bind(&link.purpose)
-            .bind(link.note_id.to_string())
-            .bind(&link.description)
+            .map_err(|error| map_sqlx_error("insert Org projected work item tags", error))?;
+    }
+    let dependencies = items
+        .iter()
+        .flat_map(|item| {
+            item.dependencies
+                .iter()
+                .map(move |target| (item.id.to_string(), target.to_string()))
+        })
+        .collect::<Vec<_>>();
+    for chunk in dependencies.chunks(1_000) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO org_dependencies (work_item_id, depends_on_id) ",
+        );
+        query.push_values(chunk, |mut row, (id, target)| {
+            row.push_bind(id).push_bind(target);
+        });
+        query
+            .build()
             .execute(&mut *connection)
             .await
-            .map_err(|error| map_sqlx_error("insert Org projected note link", error))?;
-        }
+            .map_err(|error| map_sqlx_error("insert Org projected dependencies", error))?;
+    }
+    let links = items
+        .iter()
+        .flat_map(|item| {
+            item.note_links
+                .iter()
+                .enumerate()
+                .map(move |(ordinal, link)| (item.id.to_string(), ordinal as i64, link))
+        })
+        .collect::<Vec<_>>();
+    for chunk in links.chunks(1_000) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO org_note_links (
+                 work_item_id, ordinal, purpose, note_id, description
+             ) ",
+        );
+        query.push_values(chunk, |mut row, (id, ordinal, link)| {
+            row.push_bind(id)
+                .push_bind(*ordinal)
+                .push_bind(&link.purpose)
+                .push_bind(link.note_id.to_string())
+                .push_bind(&link.description);
+        });
+        query
+            .build()
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| map_sqlx_error("insert Org projected note links", error))?;
     }
     Ok(())
 }
@@ -629,12 +844,9 @@ struct WorkItemRow {
     created_at: i64,
 }
 
-async fn decode_projected_item(
-    connection: &mut PgConnection,
-    row: WorkItemRow,
-) -> StorageResult<OrgProjectedWorkItem> {
+fn decode_projected_item(row: WorkItemRow) -> StorageResult<OrgProjectedWorkItem> {
     let id = decode_work_item_id(row.id)?;
-    let mut item = OrgProjectedWorkItem {
+    Ok(OrgProjectedWorkItem {
         id,
         workspace_id: decode_workspace_id(row.workspace_id)?,
         document_id: decode_document_id(row.document_id)?,
@@ -667,48 +879,24 @@ async fn decode_projected_item(
         tags: Vec::new(),
         dependencies: Vec::new(),
         note_links: Vec::new(),
-    };
-    item.tags = sqlx::query_scalar::<_, String>(
-        "SELECT tag FROM org_work_item_tags WHERE work_item_id = $1 ORDER BY tag",
-    )
-    .bind(id.to_string())
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(|error| map_sqlx_error("list Org projected tags", error))?;
-    item.dependencies = sqlx::query_scalar::<_, String>(
-        "SELECT depends_on_id FROM org_dependencies
-         WHERE work_item_id = $1 ORDER BY depends_on_id",
-    )
-    .bind(id.to_string())
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(|error| map_sqlx_error("list Org projected dependencies", error))?
-    .into_iter()
-    .map(decode_work_item_id)
-    .collect::<StorageResult<Vec<_>>>()?;
-    let links = sqlx::query_as::<_, NoteLinkRow>(
-        "SELECT purpose, note_id, description FROM org_note_links
-         WHERE work_item_id = $1 ORDER BY ordinal",
-    )
-    .bind(id.to_string())
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(|error| map_sqlx_error("list Org projected note links", error))?;
-    item.note_links = links
-        .into_iter()
-        .map(NoteLinkRow::into_note_link)
-        .collect::<StorageResult<Vec<_>>>()?;
-    Ok(item)
+    })
 }
 
 #[derive(sqlx::FromRow)]
-struct NoteLinkRow {
+struct TagRow {
+    work_item_id: String,
+    tag: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ListedNoteLinkRow {
+    work_item_id: String,
     purpose: String,
     note_id: String,
     description: String,
 }
 
-impl NoteLinkRow {
+impl ListedNoteLinkRow {
     fn into_note_link(self) -> StorageResult<NoteLink> {
         let note_id_text = self.note_id;
         Ok(NoteLink {
@@ -723,6 +911,74 @@ impl NoteLinkRow {
             description: self.description,
         })
     }
+}
+
+async fn load_projection_relations(
+    connection: &mut PgConnection,
+    document_id: DocumentId,
+    items: &mut [OrgProjectedWorkItem],
+) -> StorageResult<()> {
+    let index = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.id, index))
+        .collect::<HashMap<_, _>>();
+    let tags = sqlx::query_as::<_, TagRow>(
+        "SELECT tag.work_item_id, tag.tag
+         FROM org_work_item_tags tag
+         JOIN org_work_items item ON item.id = tag.work_item_id
+         WHERE item.document_id = $1
+         ORDER BY tag.work_item_id, tag.tag",
+    )
+    .bind(document_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|error| map_sqlx_error("list Org projected tags", error))?;
+    for row in tags {
+        let id = decode_work_item_id(row.work_item_id)?;
+        if let Some(item) = index.get(&id).and_then(|index| items.get_mut(*index)) {
+            item.tags.push(row.tag);
+        }
+    }
+
+    let dependencies = sqlx::query_as::<_, DependencyRow>(
+        "SELECT dependency.work_item_id, dependency.depends_on_id
+         FROM org_dependencies dependency
+         JOIN org_work_items item ON item.id = dependency.work_item_id
+         WHERE item.document_id = $1
+         ORDER BY dependency.work_item_id, dependency.depends_on_id",
+    )
+    .bind(document_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|error| map_sqlx_error("list Org projected dependencies", error))?;
+    for row in dependencies {
+        let id = decode_work_item_id(row.work_item_id)?;
+        let target = decode_work_item_id(row.depends_on_id)?;
+        if let Some(item) = index.get(&id).and_then(|index| items.get_mut(*index)) {
+            item.dependencies.push(target);
+        }
+    }
+
+    let links = sqlx::query_as::<_, ListedNoteLinkRow>(
+        "SELECT link.work_item_id, link.purpose, link.note_id, link.description
+         FROM org_note_links link
+         JOIN org_work_items item ON item.id = link.work_item_id
+         WHERE item.document_id = $1
+         ORDER BY link.work_item_id, link.ordinal",
+    )
+    .bind(document_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|error| map_sqlx_error("list Org projected note links", error))?;
+    for row in links {
+        let id = decode_work_item_id(row.work_item_id.clone())?;
+        let link = row.into_note_link()?;
+        if let Some(item) = index.get(&id).and_then(|index| items.get_mut(*index)) {
+            item.note_links.push(link);
+        }
+    }
+    Ok(())
 }
 
 fn decode_timestamp(

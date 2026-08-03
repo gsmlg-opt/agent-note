@@ -6,7 +6,7 @@ use note_storage::{
     OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate, StorageError,
     StorageErrorKind, StorageResult, StoredOrgTimestamp,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
 
 const WORKSPACE_COLUMNS: &str =
@@ -229,8 +229,9 @@ impl OrgRepository for TursoSession {
         document_id: DocumentId,
         items: &[OrgProjectedWorkItem],
     ) -> StorageResult<()> {
-        let order = validate_document_projection(self, document_id, items).await?;
-        upsert_projection(self, items, &order).await
+        let plan = validate_document_projection(self, document_id, items).await?;
+        stage_source_orders(self, &plan.staged_existing).await?;
+        upsert_projection(self, items, &plan.order).await
     }
 
     async fn list_org_document_projection(
@@ -254,8 +255,10 @@ impl OrgRepository for TursoSession {
             .await
             .map_err(|error| map_turso_error("read Org document projection", error))?
         {
-            items.push(decode_projected_item(self, &row).await?);
+            items.push(decode_projected_item(&row)?);
         }
+        drop(rows);
+        load_projection_relations(self, document_id, &mut items).await?;
         Ok(items)
     }
 
@@ -264,7 +267,7 @@ impl OrgRepository for TursoSession {
         workspace_id: WorkspaceId,
         items: &[OrgProjectedWorkItem],
     ) -> StorageResult<()> {
-        let order = validate_workspace_rebuild(self, workspace_id, items).await?;
+        let plan = validate_workspace_rebuild(self, workspace_id, items).await?;
         let workspace = workspace_id.to_string();
         for (sql, context) in [
             (
@@ -297,15 +300,27 @@ impl OrgRepository for TursoSession {
                 .await
                 .map_err(|error| map_turso_error(context, error))?;
         }
-        upsert_projection(self, items, &order).await
+        upsert_projection(self, items, &plan.order).await
     }
+}
+
+struct ProjectionPlan {
+    order: Vec<usize>,
+    staged_existing: Vec<(WorkItemId, i64)>,
+}
+
+struct ExistingProjection {
+    workspace_id: WorkspaceId,
+    document_id: DocumentId,
+    parent_id: Option<WorkItemId>,
+    source_order: i64,
 }
 
 async fn validate_document_projection(
     session: &TursoSession,
     document_id: DocumentId,
     items: &[OrgProjectedWorkItem],
-) -> StorageResult<Vec<usize>> {
+) -> StorageResult<ProjectionPlan> {
     let workspace_id = document_workspace(session, document_id).await?;
     for item in items {
         if item.document_id != document_id || item.workspace_id != workspace_id {
@@ -321,7 +336,7 @@ async fn validate_workspace_rebuild(
     session: &TursoSession,
     workspace_id: WorkspaceId,
     items: &[OrgProjectedWorkItem],
-) -> StorageResult<Vec<usize>> {
+) -> StorageResult<ProjectionPlan> {
     let mut documents = HashSet::new();
     for item in items {
         if item.workspace_id != workspace_id {
@@ -373,14 +388,28 @@ async fn validate_projection(
     workspace_id: WorkspaceId,
     items: &[OrgProjectedWorkItem],
     rebuilding: bool,
-) -> StorageResult<Vec<usize>> {
-    let mut existing = HashMap::<WorkItemId, (WorkspaceId, DocumentId, Option<WorkItemId>)>::new();
+) -> StorageResult<ProjectionPlan> {
+    let mut identity_sql = String::from(
+        "SELECT id, workspace_id, document_id, parent_id, source_order
+         FROM org_work_items WHERE workspace_id = ?1",
+    );
+    let mut identity_params = vec![turso::Value::from(workspace_id.to_string())];
+    if !items.is_empty() {
+        identity_sql.push_str(" OR id IN (");
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                identity_sql.push_str(", ");
+            }
+            identity_sql.push('?');
+            identity_sql.push_str(&(index + 2).to_string());
+            identity_params.push(turso::Value::from(item.id.to_string()));
+        }
+        identity_sql.push(')');
+    }
+    let mut existing = HashMap::<WorkItemId, ExistingProjection>::new();
     let mut rows = session
         .connection
-        .query(
-            "SELECT id, workspace_id, document_id, parent_id FROM org_work_items",
-            (),
-        )
+        .query(&identity_sql, turso::params_from_iter(identity_params))
         .await
         .map_err(|error| map_turso_error("query existing Org projection identities", error))?;
     while let Some(row) = rows
@@ -404,8 +433,20 @@ async fn validate_projection(
             .map_err(|error| map_turso_error("decode existing Org projection parent", error))?
             .map(decode_work_item_id)
             .transpose()?;
-        existing.insert(id, (stored_workspace, document, parent));
+        let source_order = row
+            .get(4)
+            .map_err(|error| map_turso_error("decode existing Org source order", error))?;
+        existing.insert(
+            id,
+            ExistingProjection {
+                workspace_id: stored_workspace,
+                document_id: document,
+                parent_id: parent,
+                source_order,
+            },
+        );
     }
+    drop(rows);
 
     let mut ids = HashSet::new();
     let mut source_orders = HashSet::new();
@@ -415,14 +456,14 @@ async fn validate_projection(
                 "duplicate Org projected work item id",
             ));
         }
-        if !source_orders.insert((item.document_id, item.source_order)) {
+        if item.source_order < 0 || !source_orders.insert((item.document_id, item.source_order)) {
             return Err(projection_constraint(
-                "duplicate source order in Org document projection",
+                "invalid or duplicate source order in Org document projection",
             ));
         }
-        if let Some((stored_workspace, stored_document, _)) = existing.get(&item.id) {
-            if *stored_workspace != workspace_id
-                || (!rebuilding && *stored_document != item.document_id)
+        if let Some(stored) = existing.get(&item.id) {
+            if stored.workspace_id != workspace_id
+                || (!rebuilding && stored.document_id != item.document_id)
             {
                 return Err(projection_constraint(
                     "Org projected work item id is owned by another workspace or document",
@@ -431,10 +472,32 @@ async fn validate_projection(
         }
     }
 
+    if !rebuilding {
+        let omitted_orders = existing
+            .iter()
+            .filter(|(id, stored)| {
+                stored.workspace_id == workspace_id
+                    && items
+                        .first()
+                        .is_some_and(|item| stored.document_id == item.document_id)
+                    && !ids.contains(id)
+            })
+            .map(|(_, stored)| stored.source_order)
+            .collect::<HashSet<_>>();
+        if items
+            .iter()
+            .any(|item| omitted_orders.contains(&item.source_order))
+        {
+            return Err(projection_constraint(
+                "Org projection source order conflicts with an omitted work item",
+            ));
+        }
+    }
+
     let mut parents = existing
         .iter()
-        .filter(|(_, (stored_workspace, _, _))| *stored_workspace == workspace_id)
-        .map(|(id, (_, _, parent))| (*id, *parent))
+        .filter(|(_, stored)| stored.workspace_id == workspace_id)
+        .map(|(id, stored)| (*id, stored.parent_id))
         .collect::<HashMap<_, _>>();
     if rebuilding {
         parents.clear();
@@ -448,7 +511,7 @@ async fn validate_projection(
             let supplied = ids.contains(target);
             let stored_here = existing
                 .get(target)
-                .is_some_and(|(stored_workspace, _, _)| *stored_workspace == workspace_id);
+                .is_some_and(|stored| stored.workspace_id == workspace_id);
             if !supplied && (rebuilding || !stored_here) {
                 return Err(projection_constraint(
                     "Org projected parent or dependency target is missing or cross-workspace",
@@ -477,12 +540,148 @@ async fn validate_projection(
         depths.insert(item.id, depth);
     }
 
+    let mut dependencies = if rebuilding {
+        HashMap::new()
+    } else {
+        load_workspace_dependencies(session, workspace_id).await?
+    };
+    for item in items {
+        dependencies.insert(item.id, item.dependencies.clone());
+    }
+    let nodes = parents.keys().copied().collect::<HashSet<_>>();
+    if dependency_graph_has_cycle(&nodes, &dependencies)? {
+        return Err(projection_constraint(
+            "cyclic Org projected dependency structure",
+        ));
+    }
+
     let mut order = (0..items.len()).collect::<Vec<_>>();
     order.sort_by_key(|index| {
         let item = &items[*index];
         (depths[&item.id], item.source_order, item.id)
     });
-    Ok(order)
+    let staged_existing = if rebuilding || items.is_empty() {
+        Vec::new()
+    } else {
+        let document_id = items[0].document_id;
+        let maximum = existing
+            .values()
+            .filter(|stored| stored.document_id == document_id)
+            .map(|stored| stored.source_order)
+            .chain(items.iter().map(|item| item.source_order))
+            .max()
+            .unwrap_or(0);
+        let mut supplied_existing = items
+            .iter()
+            .filter(|item| existing.contains_key(&item.id))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        supplied_existing.sort();
+        supplied_existing
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                maximum
+                    .checked_add(index as i64 + 1)
+                    .map(|source_order| (id, source_order))
+                    .ok_or_else(|| projection_constraint("Org projection source order overflow"))
+            })
+            .collect::<StorageResult<Vec<_>>>()?
+    };
+    Ok(ProjectionPlan {
+        order,
+        staged_existing,
+    })
+}
+
+async fn load_workspace_dependencies(
+    session: &TursoSession,
+    workspace_id: WorkspaceId,
+) -> StorageResult<HashMap<WorkItemId, Vec<WorkItemId>>> {
+    let mut rows = session
+        .connection
+        .query(
+            "SELECT dependency.work_item_id, dependency.depends_on_id
+             FROM org_dependencies dependency
+             JOIN org_work_items item ON item.id = dependency.work_item_id
+             WHERE item.workspace_id = ?1
+             ORDER BY dependency.work_item_id, dependency.depends_on_id",
+            turso::params![workspace_id.to_string()],
+        )
+        .await
+        .map_err(|error| map_turso_error("query Org workspace dependencies", error))?;
+    let mut dependencies = HashMap::<WorkItemId, Vec<WorkItemId>>::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read Org workspace dependencies", error))?
+    {
+        let source = decode_work_item_id(
+            row.get(0)
+                .map_err(|error| map_turso_error("decode Org dependency source", error))?,
+        )?;
+        let target = decode_work_item_id(
+            row.get(1)
+                .map_err(|error| map_turso_error("decode Org dependency target", error))?,
+        )?;
+        dependencies.entry(source).or_default().push(target);
+    }
+    Ok(dependencies)
+}
+
+fn dependency_graph_has_cycle(
+    nodes: &HashSet<WorkItemId>,
+    dependencies: &HashMap<WorkItemId, Vec<WorkItemId>>,
+) -> StorageResult<bool> {
+    let mut incoming = nodes
+        .iter()
+        .map(|id| (*id, 0usize))
+        .collect::<HashMap<_, _>>();
+    for targets in dependencies.values() {
+        for target in targets {
+            let Some(count) = incoming.get_mut(target) else {
+                return Err(projection_constraint(
+                    "Org projected dependency target is missing or cross-workspace",
+                ));
+            };
+            *count += 1;
+        }
+    }
+    let mut ready = incoming
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(*id))
+        .collect::<VecDeque<_>>();
+    let mut visited = 0usize;
+    while let Some(source) = ready.pop_front() {
+        visited += 1;
+        for target in dependencies.get(&source).into_iter().flatten() {
+            let count = incoming
+                .get_mut(target)
+                .expect("dependency targets were validated above");
+            *count -= 1;
+            if *count == 0 {
+                ready.push_back(*target);
+            }
+        }
+    }
+    Ok(visited != nodes.len())
+}
+
+async fn stage_source_orders(
+    session: &TursoSession,
+    staged_existing: &[(WorkItemId, i64)],
+) -> StorageResult<()> {
+    for (id, source_order) in staged_existing {
+        session
+            .connection
+            .execute(
+                "UPDATE org_work_items SET source_order = ?2 WHERE id = ?1",
+                turso::params![id.to_string(), *source_order],
+            )
+            .await
+            .map_err(|error| map_turso_error("stage Org projection source order", error))?;
+    }
+    Ok(())
 }
 
 async fn upsert_projection(
@@ -575,46 +774,117 @@ async fn upsert_projection(
                 .await
                 .map_err(|error| map_turso_error(context, error))?;
         }
-        for tag in &item.tags {
-            session
-                .connection
-                .execute(
-                    "INSERT INTO org_work_item_tags (work_item_id, tag) VALUES (?1, ?2)",
-                    turso::params![id.clone(), tag.clone()],
-                )
-                .await
-                .map_err(|error| map_turso_error("insert Org projected work item tag", error))?;
+    }
+    insert_projection_relations(session, items).await?;
+    Ok(())
+}
+
+async fn insert_projection_relations(
+    session: &TursoSession,
+    items: &[OrgProjectedWorkItem],
+) -> StorageResult<()> {
+    let tags = items
+        .iter()
+        .flat_map(|item| {
+            item.tags
+                .iter()
+                .map(move |tag| vec![item.id.to_string(), tag.clone()])
+        })
+        .collect::<Vec<_>>();
+    execute_turso_bulk_insert(
+        session,
+        "INSERT INTO org_work_item_tags (work_item_id, tag) VALUES ",
+        &tags,
+        "insert Org projected work item tags",
+    )
+    .await?;
+
+    let dependencies = items
+        .iter()
+        .flat_map(|item| {
+            item.dependencies
+                .iter()
+                .map(move |target| vec![item.id.to_string(), target.to_string()])
+        })
+        .collect::<Vec<_>>();
+    execute_turso_bulk_insert(
+        session,
+        "INSERT INTO org_dependencies (work_item_id, depends_on_id) VALUES ",
+        &dependencies,
+        "insert Org projected dependencies",
+    )
+    .await?;
+
+    let links = items
+        .iter()
+        .flat_map(|item| {
+            item.note_links
+                .iter()
+                .enumerate()
+                .map(move |(ordinal, link)| {
+                    vec![
+                        turso::Value::from(item.id.to_string()),
+                        turso::Value::from(ordinal as i64),
+                        turso::Value::from(link.purpose.clone()),
+                        turso::Value::from(link.note_id.to_string()),
+                        turso::Value::from(link.description.clone()),
+                    ]
+                })
+        })
+        .collect::<Vec<_>>();
+    execute_turso_value_bulk_insert(
+        session,
+        "INSERT INTO org_note_links (
+             work_item_id, ordinal, purpose, note_id, description
+         ) VALUES ",
+        &links,
+        "insert Org projected note links",
+    )
+    .await
+}
+
+async fn execute_turso_bulk_insert(
+    session: &TursoSession,
+    prefix: &str,
+    rows: &[Vec<String>],
+    context: &str,
+) -> StorageResult<()> {
+    let values = rows
+        .iter()
+        .map(|row| row.iter().cloned().map(turso::Value::from).collect())
+        .collect::<Vec<Vec<turso::Value>>>();
+    execute_turso_value_bulk_insert(session, prefix, &values, context).await
+}
+
+async fn execute_turso_value_bulk_insert(
+    session: &TursoSession,
+    prefix: &str,
+    rows: &[Vec<turso::Value>],
+    context: &str,
+) -> StorageResult<()> {
+    for chunk in rows.chunks(500) {
+        let mut sql = String::from(prefix);
+        let mut params = Vec::new();
+        for (row_index, row) in chunk.iter().enumerate() {
+            if row_index > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('(');
+            for (column_index, value) in row.iter().enumerate() {
+                if column_index > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+                sql.push_str(&(params.len() + 1).to_string());
+                params.push(value.clone());
+            }
+            sql.push(')');
         }
-        for dependency in &item.dependencies {
-            session
-                .connection
-                .execute(
-                    "INSERT INTO org_dependencies (work_item_id, depends_on_id) VALUES (?1, ?2)",
-                    turso::params![id.clone(), dependency.to_string()],
-                )
-                .await
-                .map_err(|error| {
-                    map_turso_error("insert Org projected work item dependency", error)
-                })?;
-        }
-        for (ordinal, link) in item.note_links.iter().enumerate() {
-            session
-                .connection
-                .execute(
-                    "INSERT INTO org_note_links (
-                         work_item_id, ordinal, purpose, note_id, description
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    turso::params![
-                        id.clone(),
-                        ordinal as i64,
-                        link.purpose.clone(),
-                        link.note_id.to_string(),
-                        link.description.clone()
-                    ],
-                )
-                .await
-                .map_err(|error| map_turso_error("insert Org projected note link", error))?;
-        }
+        session
+            .connection
+            .execute(&sql, turso::params_from_iter(params))
+            .await
+            .map_err(|error| map_turso_error(context, error))?;
     }
     Ok(())
 }
@@ -632,10 +902,7 @@ fn timestamp_columns(
     })
 }
 
-async fn decode_projected_item(
-    session: &TursoSession,
-    row: &turso::Row,
-) -> StorageResult<OrgProjectedWorkItem> {
+fn decode_projected_item(row: &turso::Row) -> StorageResult<OrgProjectedWorkItem> {
     let id = decode_work_item_id(
         row.get(0)
             .map_err(|error| map_turso_error("decode Org projected work item id", error))?,
@@ -645,7 +912,7 @@ async fn decode_projected_item(
         .map_err(|error| map_turso_error("decode Org projected priority", error))?
         .map(|value| decode_priority(&value))
         .transpose()?;
-    let mut item = OrgProjectedWorkItem {
+    Ok(OrgProjectedWorkItem {
         id,
         workspace_id: decode_workspace_id(
             row.get(1)
@@ -689,44 +956,107 @@ async fn decode_projected_item(
         tags: Vec::new(),
         dependencies: Vec::new(),
         note_links: Vec::new(),
-    };
-    item.tags = query_strings(
-        session,
-        "SELECT tag FROM org_work_item_tags WHERE work_item_id = ?1 ORDER BY tag",
-        id,
-        "list Org projected tags",
-    )
-    .await?;
-    item.dependencies = query_strings(
-        session,
-        "SELECT depends_on_id FROM org_dependencies WHERE work_item_id = ?1 ORDER BY depends_on_id",
-        id,
-        "list Org projected dependencies",
-    )
-    .await?
-    .into_iter()
-    .map(decode_work_item_id)
-    .collect::<StorageResult<Vec<_>>>()?;
+    })
+}
+
+async fn load_projection_relations(
+    session: &TursoSession,
+    document_id: DocumentId,
+    items: &mut [OrgProjectedWorkItem],
+) -> StorageResult<()> {
+    let index = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.id, index))
+        .collect::<HashMap<_, _>>();
+    let mut tags = session
+        .connection
+        .query(
+            "SELECT tag.work_item_id, tag.tag
+             FROM org_work_item_tags tag
+             JOIN org_work_items item ON item.id = tag.work_item_id
+             WHERE item.document_id = ?1
+             ORDER BY tag.work_item_id, tag.tag",
+            turso::params![document_id.to_string()],
+        )
+        .await
+        .map_err(|error| map_turso_error("list Org projected tags", error))?;
+    while let Some(row) = tags
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read Org projected tags", error))?
+    {
+        let id = decode_work_item_id(
+            row.get(0)
+                .map_err(|error| map_turso_error("decode Org projected tag owner", error))?,
+        )?;
+        let tag = row
+            .get(1)
+            .map_err(|error| map_turso_error("decode Org projected tag", error))?;
+        if let Some(item) = index.get(&id).and_then(|index| items.get_mut(*index)) {
+            item.tags.push(tag);
+        }
+    }
+    drop(tags);
+
+    let mut dependencies = session
+        .connection
+        .query(
+            "SELECT dependency.work_item_id, dependency.depends_on_id
+             FROM org_dependencies dependency
+             JOIN org_work_items item ON item.id = dependency.work_item_id
+             WHERE item.document_id = ?1
+             ORDER BY dependency.work_item_id, dependency.depends_on_id",
+            turso::params![document_id.to_string()],
+        )
+        .await
+        .map_err(|error| map_turso_error("list Org projected dependencies", error))?;
+    while let Some(row) = dependencies
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read Org projected dependencies", error))?
+    {
+        let id =
+            decode_work_item_id(row.get(0).map_err(|error| {
+                map_turso_error("decode Org projected dependency owner", error)
+            })?)?;
+        let target =
+            decode_work_item_id(row.get(1).map_err(|error| {
+                map_turso_error("decode Org projected dependency target", error)
+            })?)?;
+        if let Some(item) = index.get(&id).and_then(|index| items.get_mut(*index)) {
+            item.dependencies.push(target);
+        }
+    }
+    drop(dependencies);
+
     let mut links = session
         .connection
         .query(
-            "SELECT purpose, note_id, description FROM org_note_links
-             WHERE work_item_id = ?1 ORDER BY ordinal",
-            turso::params![id.to_string()],
+            "SELECT link.work_item_id, link.purpose, link.note_id, link.description
+             FROM org_note_links link
+             JOIN org_work_items item ON item.id = link.work_item_id
+             WHERE item.document_id = ?1
+             ORDER BY link.work_item_id, link.ordinal",
+            turso::params![document_id.to_string()],
         )
         .await
         .map_err(|error| map_turso_error("list Org projected note links", error))?;
-    while let Some(link) = links
+    while let Some(row) = links
         .next()
         .await
         .map_err(|error| map_turso_error("read Org projected note links", error))?
     {
-        let note_id_text: String = link
-            .get(1)
+        let id =
+            decode_work_item_id(row.get(0).map_err(|error| {
+                map_turso_error("decode Org projected note link owner", error)
+            })?)?;
+        let note_id_text: String = row
+            .get(2)
             .map_err(|error| map_turso_error("decode Org projected note id", error))?;
-        item.note_links.push(NoteLink {
-            purpose: link
-                .get(0)
+        let link = NoteLink {
+            purpose: row
+                .get(1)
                 .map_err(|error| map_turso_error("decode Org projected note purpose", error))?,
             note_id: note_id_text.parse().map_err(|error| {
                 StorageError::with_source(
@@ -735,37 +1065,15 @@ async fn decode_projected_item(
                     error,
                 )
             })?,
-            description: link
-                .get(2)
+            description: row
+                .get(3)
                 .map_err(|error| map_turso_error("decode Org projected note description", error))?,
-        });
+        };
+        if let Some(item) = index.get(&id).and_then(|index| items.get_mut(*index)) {
+            item.note_links.push(link);
+        }
     }
-    Ok(item)
-}
-
-async fn query_strings(
-    session: &TursoSession,
-    sql: &str,
-    id: WorkItemId,
-    context: &str,
-) -> StorageResult<Vec<String>> {
-    let mut rows = session
-        .connection
-        .query(sql, turso::params![id.to_string()])
-        .await
-        .map_err(|error| map_turso_error(context, error))?;
-    let mut values = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|error| map_turso_error(context, error))?
-    {
-        values.push(
-            row.get(0)
-                .map_err(|error| map_turso_error(context, error))?,
-        );
-    }
-    Ok(values)
+    Ok(())
 }
 
 fn decode_timestamp(
