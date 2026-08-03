@@ -51,6 +51,7 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
     // The currently-selected label key and value being staged in the picker.
     let picker_key = use_state(String::new);
     let picker_value = use_state(String::new);
+    let editing_label_index = use_state(|| None::<usize>);
     let attachment_path = use_state(String::new);
     let attachment_mime = use_state(|| "text/plain".to_string());
     let attachment_description = use_state(String::new);
@@ -155,10 +156,11 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         })
     };
 
-    let on_add_label = {
+    let on_apply_label = {
         let labels = labels.clone();
         let picker_key = picker_key.clone();
         let picker_value = picker_value.clone();
+        let editing_label_index = editing_label_index.clone();
         Callback::from(move |_| {
             let key = (*picker_key).clone();
             let value = (*picker_value).clone();
@@ -166,7 +168,14 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                 return;
             }
             let mut next = (*labels).clone();
-            next.push((key, value));
+            if let Some(index) = *editing_label_index {
+                if !replace_label_at(&mut next, index, key, value) {
+                    return;
+                }
+                editing_label_index.set(None);
+            } else {
+                next.push((key, value));
+            }
             labels.set(next);
             picker_value.set(String::new());
         })
@@ -325,18 +334,73 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                         />
                         // Native <button type="button"> so it never submits the form
                         // (yew-duskmoon's Button renders a submit-type <button>).
-                        <button type="button" class="btn btn-outline" onclick={on_add_label}>
-                            { "Add label" }
+                        <button type="button" class="btn btn-outline" onclick={on_apply_label}>
+                            { if editing_label_index.is_some() { "Update label" } else { "Add label" } }
                         </button>
                     </div>
                     if let Some(hint) = selected_hint {
                         <p class="label-hint">{ hint }</p>
                     }
                     <div class="applied-labels">
-                        { for labels.iter().map(|(key, value)| {
+                        { for labels.iter().enumerate().map(|(index, (key, value))| {
+                            let on_edit = {
+                                let picker_key = picker_key.clone();
+                                let picker_value = picker_value.clone();
+                                let editing_label_index = editing_label_index.clone();
+                                let key = key.clone();
+                                let value = value.clone();
+                                Callback::from(move |_| {
+                                    picker_key.set(key.clone());
+                                    picker_value.set(value.clone());
+                                    editing_label_index.set(Some(index));
+                                })
+                            };
+                            let on_remove = {
+                                let labels = labels.clone();
+                                let picker_key = picker_key.clone();
+                                let picker_value = picker_value.clone();
+                                let editing_label_index = editing_label_index.clone();
+                                Callback::from(move |_| {
+                                    let mut next = (*labels).clone();
+                                    if !remove_label_at(&mut next, index) {
+                                        return;
+                                    }
+                                    let previous_editing_index = *editing_label_index;
+                                    let next_editing_index = editing_index_after_removal(
+                                        previous_editing_index,
+                                        index,
+                                    );
+                                    labels.set(next);
+                                    editing_label_index.set(next_editing_index);
+                                    if previous_editing_index == Some(index) {
+                                        picker_key.set(String::new());
+                                        picker_value.set(String::new());
+                                    }
+                                })
+                            };
                             html! {
-                                <Chip variant={Some("primary".to_string())}>
-                                    <span>{ format!("{key}: {value}") }</span>
+                                <Chip key={index} variant={Some("primary".to_string())}>
+                                    <span class="applied-label-content">
+                                        <span>{ format!("{key}: {value}") }</span>
+                                        <span class="applied-label-actions">
+                                            <button
+                                                type="button"
+                                                class="applied-label-action"
+                                                aria-label={format!("Edit label {key}")}
+                                                onclick={on_edit}
+                                            >
+                                                { "Edit" }
+                                            </button>
+                                            <button
+                                                type="button"
+                                                class="applied-label-action"
+                                                aria-label={format!("Remove label {key}")}
+                                                onclick={on_remove}
+                                            >
+                                                { "Remove" }
+                                            </button>
+                                        </span>
+                                    </span>
                                 </Chip>
                             }
                         }) }

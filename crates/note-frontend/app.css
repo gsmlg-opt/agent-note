@@ -1193,6 +1193,33 @@ a.dashboard-metric-detail:hover {
     margin-top: 0.6rem;
 }
 
+.applied-label-content {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.applied-label-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.2rem;
+}
+
+.applied-label-action {
+    padding: 0.1rem 0.2rem;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.applied-label-action:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 1px;
+}
+
 .attachment-picker-grid,
 .attachment-item-grid {
     display: grid;
