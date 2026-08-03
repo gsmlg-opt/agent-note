@@ -268,7 +268,6 @@ administration controls remain deferred.
    - retry limit;
    - concurrency limit;
    - allowed or required Org tags by work-item type;
-   - archive behavior; and
    - whether cross-workspace agenda queries are allowed.
 3. Policy updates must be revision-safe and must reject a policy that would
    make existing work invalid.
