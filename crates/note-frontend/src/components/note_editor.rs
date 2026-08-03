@@ -648,6 +648,38 @@ fn attachment_content_for_bytes(bytes: Vec<u8>) -> AttachmentContent {
     }
 }
 
+fn replace_label_at(
+    labels: &mut [(String, String)],
+    index: usize,
+    key: String,
+    value: String,
+) -> bool {
+    let Some(label) = labels.get_mut(index) else {
+        return false;
+    };
+    *label = (key, value);
+    true
+}
+
+fn remove_label_at(labels: &mut Vec<(String, String)>, index: usize) -> bool {
+    if index >= labels.len() {
+        return false;
+    }
+    labels.remove(index);
+    true
+}
+
+fn editing_index_after_removal(
+    editing_index: Option<usize>,
+    removed_index: usize,
+) -> Option<usize> {
+    match editing_index {
+        Some(index) if index == removed_index => None,
+        Some(index) if index > removed_index => Some(index - 1),
+        editing_index => editing_index,
+    }
+}
+
 fn label_value_input_type(value_type: &str) -> &'static str {
     match value_type {
         "number" => "number",
@@ -661,6 +693,66 @@ fn label_value_input_type(value_type: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_a_draft_label_replaces_its_key_and_value_in_place() {
+        let mut labels = vec![
+            ("status".to_string(), "draft".to_string()),
+            ("priority".to_string(), "1".to_string()),
+        ];
+
+        assert!(replace_label_at(
+            &mut labels,
+            0,
+            "stage".to_string(),
+            "review".to_string()
+        ));
+        assert_eq!(
+            labels,
+            vec![
+                ("stage".to_string(), "review".to_string()),
+                ("priority".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn removing_a_draft_label_removes_only_the_target() {
+        let mut labels = vec![
+            ("status".to_string(), "draft".to_string()),
+            ("priority".to_string(), "1".to_string()),
+        ];
+
+        assert!(remove_label_at(&mut labels, 0));
+        assert_eq!(labels, vec![("priority".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn invalid_label_indices_leave_the_draft_unchanged() {
+        let initial = vec![
+            ("status".to_string(), "draft".to_string()),
+            ("priority".to_string(), "1".to_string()),
+        ];
+        let mut labels = initial.clone();
+
+        assert!(!replace_label_at(
+            &mut labels,
+            2,
+            "stage".to_string(),
+            "review".to_string()
+        ));
+        assert_eq!(labels, initial);
+        assert!(!remove_label_at(&mut labels, 2));
+        assert_eq!(labels, initial);
+    }
+
+    #[test]
+    fn removing_a_label_reconciles_the_current_edit_index() {
+        assert_eq!(editing_index_after_removal(Some(2), 0), Some(1));
+        assert_eq!(editing_index_after_removal(Some(1), 1), None);
+        assert_eq!(editing_index_after_removal(Some(0), 2), Some(0));
+        assert_eq!(editing_index_after_removal(None, 0), None);
+    }
 
     fn attachment(id: &str) -> NoteAttachment {
         NoteAttachment {
