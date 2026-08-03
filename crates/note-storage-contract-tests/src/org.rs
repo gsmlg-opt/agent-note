@@ -687,6 +687,47 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         assert_eq!(error.kind(), StorageErrorKind::Operation);
     }
 
+    let duplicate_event_metadata = json!({"duplicate": true});
+    let duplicate_event = session
+        .append_org_event(NewOrgEvent {
+            id: "50000000-0000-0000-0000-000000000001",
+            workspace_id: alpha_id,
+            subject_kind: "work_item",
+            subject_id: "30000000-0000-0000-0000-000000000001",
+            actor_id: "agent-duplicate",
+            event_type: "duplicate_attempted",
+            occurred_at: 250,
+            summary: "Duplicate event id",
+            metadata: &duplicate_event_metadata,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate_event.kind(), StorageErrorKind::Constraint);
+    let alpha_third_metadata = json!({"after_failed_append": true});
+    let alpha_third = session
+        .append_org_event(NewOrgEvent {
+            id: "50000000-0000-0000-0000-000000000004",
+            workspace_id: alpha_id,
+            subject_kind: "work_item",
+            subject_id: "30000000-0000-0000-0000-000000000002",
+            actor_id: "agent-four",
+            event_type: "append_recovered",
+            occurred_at: 260,
+            summary: "Appended after failed duplicate",
+            metadata: &alpha_third_metadata,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        alpha_third.sequence, 3,
+        "a failed Org event insert must not consume its allocated sequence"
+    );
+    assert_eq!(
+        session.list_org_events(alpha_id, None, 200).await.unwrap(),
+        vec![alpha_first.clone(), alpha_second.clone(), alpha_third],
+        "failed Org event inserts must not leave sequence gaps"
+    );
+
     let operation = StoredOrgOperation {
         workspace_id: alpha_id,
         operation_id: "operation-alpha-1".into(),

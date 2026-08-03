@@ -8,6 +8,7 @@ use note_storage::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const WORKSPACE_COLUMNS: &str =
     "id, slug, display_name, description, timezone, policy_schema_version, policy, revision, created_at, updated_at, archived_at";
@@ -20,6 +21,8 @@ const WORK_ITEM_COLUMNS: &str =
      assignee, requires_review, created_at";
 const EVENT_COLUMNS: &str =
     "id, workspace_id, sequence, subject_kind, subject_id, actor_id, event_type, occurred_at, summary, metadata";
+const EVENT_APPEND_SAVEPOINT: &str = "org_event_append";
+static EVENT_APPEND_BUSY: AtomicBool = AtomicBool::new(false);
 
 #[async_trait::async_trait]
 impl OrgRepository for TursoSession {
@@ -306,32 +309,6 @@ impl OrgRepository for TursoSession {
     }
 
     async fn append_org_event(&self, event: NewOrgEvent<'_>) -> StorageResult<OrgEvent> {
-        let mut sequence_rows = self
-            .connection
-            .query(
-                "UPDATE org_workspaces
-                 SET last_event_sequence=last_event_sequence+1
-                 WHERE id=?1
-                 RETURNING last_event_sequence",
-                turso::params![event.workspace_id.to_string()],
-            )
-            .await
-            .map_err(|error| map_turso_error("allocate Org event sequence", error))?;
-        let Some(sequence_row) = sequence_rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read allocated Org event sequence", error))?
-        else {
-            return Err(StorageError::new(
-                StorageErrorKind::Constraint,
-                "Org event workspace does not exist",
-            ));
-        };
-        let sequence: i64 = sequence_row
-            .get(0)
-            .map_err(|error| map_turso_error("decode allocated Org event sequence", error))?;
-        drop(sequence_rows);
-
         let metadata = serde_json::to_string(event.metadata).map_err(|error| {
             StorageError::with_source(
                 StorageErrorKind::Operation,
@@ -339,43 +316,26 @@ impl OrgRepository for TursoSession {
                 error,
             )
         })?;
-        let sql = format!(
-            "INSERT INTO org_events (
-                 id, workspace_id, sequence, subject_kind, subject_id,
-                 actor_id, event_type, occurred_at, summary, metadata
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             RETURNING {EVENT_COLUMNS}"
-        );
-        let mut rows = self
-            .connection
-            .query(
-                &sql,
-                turso::params![
-                    event.id,
-                    event.workspace_id.to_string(),
-                    sequence,
-                    event.subject_kind,
-                    event.subject_id,
-                    event.actor_id,
-                    event.event_type,
-                    event.occurred_at,
-                    event.summary,
-                    metadata
-                ],
-            )
+        let _gate = acquire_event_append_gate().await;
+        self.connection
+            .execute("SAVEPOINT org_event_append", ())
             .await
-            .map_err(|error| map_turso_error("insert Org event", error))?;
-        let row = rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read inserted Org event", error))?
-            .ok_or_else(|| {
-                StorageError::new(
-                    StorageErrorKind::Operation,
-                    "insert Org event returned no row",
-                )
-            })?;
-        decode_event(&row)
+            .map_err(|error| map_turso_error("begin atomic Org event append", error))?;
+
+        match append_org_event_in_savepoint(self, event, metadata).await {
+            Ok(stored) => {
+                if let Err(error) = self
+                    .connection
+                    .execute("RELEASE SAVEPOINT org_event_append", ())
+                    .await
+                {
+                    let primary = map_turso_error("commit atomic Org event append", error);
+                    return Err(rollback_event_append(self, primary).await);
+                }
+                Ok(stored)
+            }
+            Err(primary) => Err(rollback_event_append(self, primary).await),
+        }
     }
 
     async fn list_org_events(
@@ -463,6 +423,121 @@ impl OrgRepository for TursoSession {
             .map(decode_operation)
             .transpose()
     }
+}
+
+struct EventAppendGate;
+
+impl Drop for EventAppendGate {
+    fn drop(&mut self) {
+        EVENT_APPEND_BUSY.store(false, Ordering::Release);
+    }
+}
+
+async fn acquire_event_append_gate() -> EventAppendGate {
+    loop {
+        if EVENT_APPEND_BUSY
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return EventAppendGate;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn append_org_event_in_savepoint(
+    session: &TursoSession,
+    event: NewOrgEvent<'_>,
+    metadata: String,
+) -> StorageResult<OrgEvent> {
+    let mut sequence_rows = session
+        .connection
+        .query(
+            "UPDATE org_workspaces
+                 SET last_event_sequence=last_event_sequence+1
+                 WHERE id=?1
+                 RETURNING last_event_sequence",
+            turso::params![event.workspace_id.to_string()],
+        )
+        .await
+        .map_err(|error| map_turso_error("allocate Org event sequence", error))?;
+    let Some(sequence_row) = sequence_rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read allocated Org event sequence", error))?
+    else {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "Org event workspace does not exist",
+        ));
+    };
+    let sequence: i64 = sequence_row
+        .get(0)
+        .map_err(|error| map_turso_error("decode allocated Org event sequence", error))?;
+    drop(sequence_rows);
+
+    let sql = format!(
+        "INSERT INTO org_events (
+             id, workspace_id, sequence, subject_kind, subject_id,
+             actor_id, event_type, occurred_at, summary, metadata
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         RETURNING {EVENT_COLUMNS}"
+    );
+    let mut rows = session
+        .connection
+        .query(
+            &sql,
+            turso::params![
+                event.id,
+                event.workspace_id.to_string(),
+                sequence,
+                event.subject_kind,
+                event.subject_id,
+                event.actor_id,
+                event.event_type,
+                event.occurred_at,
+                event.summary,
+                metadata
+            ],
+        )
+        .await
+        .map_err(|error| map_turso_error("insert Org event", error))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read inserted Org event", error))?
+        .ok_or_else(|| {
+            StorageError::new(
+                StorageErrorKind::Operation,
+                "insert Org event returned no row",
+            )
+        })?;
+    decode_event(&row)
+}
+
+async fn rollback_event_append(session: &TursoSession, primary: StorageError) -> StorageError {
+    let rollback = session
+        .connection
+        .execute("ROLLBACK TO SAVEPOINT org_event_append", ())
+        .await
+        .err();
+    let release = session
+        .connection
+        .execute("RELEASE SAVEPOINT org_event_append", ())
+        .await
+        .err();
+    if rollback.is_none() && release.is_none() {
+        return primary;
+    }
+
+    let mut message = format!("{primary}; cleanup of {EVENT_APPEND_SAVEPOINT} savepoint failed");
+    if let Some(error) = rollback {
+        message.push_str(&format!("; rollback: {error}"));
+    }
+    if let Some(error) = release {
+        message.push_str(&format!("; release: {error}"));
+    }
+    StorageError::with_source(primary.kind(), message, primary)
 }
 
 fn validate_event_limit(limit: usize) -> StorageResult<()> {
