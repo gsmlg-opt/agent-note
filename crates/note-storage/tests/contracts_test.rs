@@ -7,8 +7,13 @@ use std::sync::Arc;
 fn accepts_backend(_: Arc<dyn StorageBackend>) {}
 fn accepts_session(_: Box<dyn StorageSession>) {}
 fn accepts_transaction(_: Box<dyn StorageTransaction>) {}
-fn accepts_org_repository(_: &dyn OrgRepository) {}
-fn accepts_org_storage_session(_: Box<dyn StorageSession>) {}
+fn accepts_org_repository_object(_: &dyn OrgRepository) {}
+
+fn accepts_org_repository<T: OrgRepository + ?Sized>(_: &T) {}
+
+fn accepts_org_storage_session(session: &dyn StorageSession) {
+    accepts_org_repository(session);
+}
 
 #[test]
 fn storage_contracts_are_dyn_compatible() {
@@ -19,7 +24,7 @@ fn storage_contracts_are_dyn_compatible() {
 
 #[test]
 fn storage_sessions_include_org_persistence() {
-    let _ = accepts_org_repository;
+    let _ = accepts_org_repository_object;
     let _ = accepts_org_storage_session;
 }
 
