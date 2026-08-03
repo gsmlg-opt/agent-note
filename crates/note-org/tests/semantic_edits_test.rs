@@ -325,6 +325,147 @@ fn assignment_edits_preserve_every_other_byte() {
 }
 
 #[test]
+fn property_edits_insert_only_into_the_direct_drawer() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* READY Assigned\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\nBody.\n:PROPERTIES:\n:ASSIGNEE: hidden-agent\n:CUSTOM: byte-identical\n:END:\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    let edited = document
+        .apply(SemanticEdit::SetProperty {
+            item_id,
+            key: PropertyKey::Assignee,
+            value: Some("direct-agent".to_string()),
+        })
+        .unwrap();
+
+    assert_eq!(
+        edited.source,
+        source.replacen(":END:", ":ASSIGNEE: direct-agent\n:END:", 1)
+    );
+    assert!(edited
+        .source
+        .contains(":ASSIGNEE: hidden-agent\n:CUSTOM: byte-identical\n:END:\n"));
+    assert_eq!(
+        parse_document(&edited.source, &options())
+            .unwrap()
+            .item(item_id)
+            .unwrap()
+            .assignee
+            .as_deref(),
+        Some("direct-agent")
+    );
+}
+
+#[test]
+fn property_drawers_end_before_body_properties_despite_literal_block_markers() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* READY Assigned\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n#+BEGIN_SRC org\n:END:\n#+END_SRC\n:ASSIGNEE: opaque\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    assert_eq!(document.item(item_id).unwrap().assignee, None);
+
+    let edited = document
+        .apply(SemanticEdit::SetProperty {
+            item_id,
+            key: PropertyKey::Assignee,
+            value: Some("direct-agent".to_string()),
+        })
+        .unwrap();
+
+    assert_eq!(
+        edited.source,
+        source.replacen(":END:", ":ASSIGNEE: direct-agent\n:END:", 1)
+    );
+    assert!(edited.source.ends_with("#+END_SRC\n:ASSIGNEE: opaque\n"));
+}
+
+#[test]
+fn property_edits_preserve_lf_drawer_terminator_trailing_spaces() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* READY Assigned\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:   \nBody.\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    let edited = document
+        .apply(SemanticEdit::SetProperty {
+            item_id,
+            key: PropertyKey::Assignee,
+            value: Some("agent".to_string()),
+        })
+        .unwrap();
+
+    assert_eq!(
+        edited.source,
+        source.replacen(":END:   \n", ":ASSIGNEE: agent\n:END:   \n", 1)
+    );
+}
+
+#[test]
+fn property_edits_preserve_crlf_drawer_terminator_trailing_spaces() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* READY Assigned\r\n:PROPERTIES:\r\n:ID: 11111111-1111-4111-8111-111111111111\r\n:AGENT_NOTE_TYPE: task\r\n:END:   \r\nBody.\r\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    let edited = document
+        .apply(SemanticEdit::SetProperty {
+            item_id,
+            key: PropertyKey::Assignee,
+            value: Some("agent".to_string()),
+        })
+        .unwrap();
+
+    assert_eq!(
+        edited.source,
+        source.replacen(":END:   \r\n", ":ASSIGNEE: agent\r\n:END:   \r\n", 1,)
+    );
+}
+
+#[test]
+fn property_edits_insert_into_lf_drawers_with_spaced_openers() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* READY Assigned\n:PROPERTIES:\x20\x20\x20\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\nBody.\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    assert_eq!(document.source(), source);
+    assert_eq!(document.item(item_id).unwrap().assignee, None);
+
+    let edited = document
+        .apply(SemanticEdit::SetProperty {
+            item_id,
+            key: PropertyKey::Assignee,
+            value: Some("agent".to_string()),
+        })
+        .unwrap();
+
+    assert_eq!(
+        edited.source,
+        source.replacen(":END:\n", ":ASSIGNEE: agent\n:END:\n", 1)
+    );
+}
+
+#[test]
+fn property_edits_replace_inside_crlf_drawers_with_spaced_openers() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* READY Assigned\r\n:PROPERTIES:   \r\n:ID: 11111111-1111-4111-8111-111111111111\r\n:AGENT_NOTE_TYPE: task\r\n:ASSIGNEE: old-agent\r\n:END:\r\nBody.\r\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    assert_eq!(document.source(), source);
+    assert_eq!(
+        document.item(item_id).unwrap().assignee.as_deref(),
+        Some("old-agent")
+    );
+
+    let edited = document
+        .apply(SemanticEdit::SetProperty {
+            item_id,
+            key: PropertyKey::Assignee,
+            value: Some("new-agent".to_string()),
+        })
+        .unwrap();
+
+    assert_eq!(edited.source, source.replacen("old-agent", "new-agent", 1));
+}
+
+#[test]
 fn dependency_edits_validate_and_render_a_sorted_uuid_set() {
     let item_id = id("11111111-1111-4111-8111-111111111111");
     let source = "* READY Dependencies\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:DEPENDS_ON: 44444444-4444-4444-8444-444444444444\n:END:\n";

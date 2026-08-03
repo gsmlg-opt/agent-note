@@ -118,6 +118,79 @@ fn heading_looking_lines_inside_blocks_remain_opaque() {
 }
 
 #[test]
+fn unmatched_block_text_inside_custom_drawers_stays_opaque() {
+    let source = "\
+:CUSTOM_DRAWER:
+#+BEGIN_SRC org
+* READY Hidden item
+:ID: 22222222-2222-4222-8222-222222222222
+:AGENT_NOTE_TYPE: task
+[[agent-note:hidden:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb][Hidden link]]
+:END:
+* READY Visible item
+:PROPERTIES:
+:ID: 11111111-1111-4111-8111-111111111111
+:AGENT_NOTE_TYPE: task
+:END:
+[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][Visible link]]
+";
+
+    let document = parse_document(source, &options()).unwrap();
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert_eq!(document.items().len(), 1);
+    let item = &document.items()[0];
+    assert_eq!(item.id, support::id("11111111-1111-4111-8111-111111111111"));
+    assert_eq!(item.note_links.len(), 1);
+    assert_eq!(item.note_links[0].purpose, "design");
+    assert_eq!(item.note_links[0].description, "Visible link");
+}
+
+#[test]
+fn spaced_lf_drawer_ends_restore_heading_and_link_scanning() {
+    let source = "\
+:CUSTOM_DRAWER:
+* READY Hidden item
+:ID: 22222222-2222-4222-8222-222222222222
+:AGENT_NOTE_TYPE: task
+[[agent-note:hidden:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb]]
+:END:\x20\x20\x20
+* READY Visible item
+:PROPERTIES:
+:ID: 11111111-1111-4111-8111-111111111111
+:AGENT_NOTE_TYPE: task
+:END:
+:CUSTOM_DRAWER:
+[[agent-note:hidden:cccccccc-cccc-4ccc-8ccc-cccccccccccc]]
+:END:\x20\x20\x20
+[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa]]
+";
+
+    let document = parse_document(source, &options()).unwrap();
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert_eq!(document.items().len(), 1);
+    let item = &document.items()[0];
+    assert_eq!(item.id, support::id("11111111-1111-4111-8111-111111111111"));
+    assert_eq!(item.note_links.len(), 1);
+    assert_eq!(item.note_links[0].purpose, "design");
+}
+
+#[test]
+fn spaced_crlf_drawer_ends_restore_heading_and_link_scanning() {
+    let source = ":CUSTOM_DRAWER:\r\n* READY Hidden item\r\n:ID: 22222222-2222-4222-8222-222222222222\r\n:AGENT_NOTE_TYPE: task\r\n[[agent-note:hidden:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb]]\r\n:END:   \r\n* READY Visible item\r\n:PROPERTIES:\r\n:ID: 11111111-1111-4111-8111-111111111111\r\n:AGENT_NOTE_TYPE: task\r\n:END:\r\n:CUSTOM_DRAWER:\r\n[[agent-note:hidden:cccccccc-cccc-4ccc-8ccc-cccccccccccc]]\r\n:END:   \r\n[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa]]\r\n";
+
+    let document = parse_document(source, &options()).unwrap();
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert_eq!(document.items().len(), 1);
+    let item = &document.items()[0];
+    assert_eq!(item.id, support::id("11111111-1111-4111-8111-111111111111"));
+    assert_eq!(item.note_links.len(), 1);
+    assert_eq!(item.note_links[0].purpose, "design");
+}
+
+#[test]
 fn crlf_source_roundtrips_without_normalization() {
     let source = "* READY CRLF item\r\n:PROPERTIES:\r\n:ID: 11111111-1111-4111-8111-111111111111\r\n:AGENT_NOTE_TYPE: task\r\n:END:\r\n";
     let document = parse_document(source, &options()).unwrap();
@@ -144,15 +217,167 @@ fn malformed_agent_note_links_and_unknown_properties_remain_opaque() {
 }
 
 #[test]
-fn agent_note_links_in_comments_and_keywords_remain_opaque() {
+fn descriptionless_agent_note_links_project_with_an_empty_description() {
+    let source = "\
+* READY Links
+:PROPERTIES:
+:ID: 11111111-1111-4111-8111-111111111111
+:AGENT_NOTE_TYPE: task
+:END:
+[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa]] and [[agent-note:review:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb][Review note]].
+";
+
+    let document = parse_document(source, &options()).unwrap();
+    let links = &document.items()[0].note_links;
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert_eq!(links.len(), 2);
+    assert_eq!(links[0].purpose, "design");
+    assert_eq!(links[0].description, "");
+    assert_eq!(links[1].purpose, "review");
+    assert_eq!(links[1].description, "Review note");
+}
+
+#[test]
+fn balanced_brackets_are_valid_in_agent_note_link_descriptions() {
+    let source = "\
+* READY Link coverage
+:PROPERTIES:
+:ID: 11111111-1111-4111-8111-111111111111
+:AGENT_NOTE_TYPE: task
+:END:
+[[agent-note:context:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][Coverage [50%] report]]
+[[agent-note:context:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb][[nested [ok]][sibling]]]
+";
+
+    let document = parse_document(source, &options()).unwrap();
+    let links = &document.items()[0].note_links;
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert_eq!(links.len(), 2);
+    assert_eq!(links[0].purpose, "context");
+    assert_eq!(links[0].description, "Coverage [50%] report");
+    assert_eq!(links[1].description, "[nested [ok]][sibling]");
+}
+
+#[test]
+fn malformed_outer_links_do_not_hide_later_valid_links() {
+    let source = "\
+* READY Link recovery
+:PROPERTIES:
+:ID: 11111111-1111-4111-8111-111111111111
+:AGENT_NOTE_TYPE: task
+:END:
+[[broken [[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa]]
+";
+
+    let document = parse_document(source, &options()).unwrap();
+    let links = &document.items()[0].note_links;
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].purpose, "design");
+    assert_eq!(links[0].description, "");
+}
+
+#[test]
+fn large_malformed_link_prefix_recovers_the_final_valid_link() {
+    let mut source = "* READY Link recovery\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n".to_string();
+    source.push_str(&"[[x".repeat(20_000));
+    source.push_str("[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa]]\n");
+
+    let document = parse_document(&source, &options()).unwrap();
+    let links = &document.items()[0].note_links;
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].purpose, "design");
+    assert_eq!(links[0].description, "");
+}
+
+#[test]
+fn malformed_agent_note_link_grammar_remains_opaque() {
+    let source = "\
+* READY Opaque links
+:PROPERTIES:
+:ID: 11111111-1111-4111-8111-111111111111
+:AGENT_NOTE_TYPE: task
+:END:
+[[agent-note:design]]
+[[agent-note::aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa]]
+[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:extra]]
+[[agent-note:design:not-a-uuid]]
+[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][desc][extra]]
+[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][desc[extra]]
+[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][desc]extra]]
+";
+
+    let document = parse_document(source, &options()).unwrap();
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert!(document.items()[0].note_links.is_empty());
+}
+
+#[test]
+fn body_property_drawers_do_not_orchestrate_ordinary_headings() {
+    let source = "\
+* Ordinary heading
+Body text keeps the later drawer in the body.
+:PROPERTIES:
+:ID: 11111111-1111-4111-8111-111111111111
+:AGENT_NOTE_TYPE: task
+:ASSIGNEE: hidden-agent
+:END:
+";
+
+    let document = parse_document(source, &options()).unwrap();
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert!(document.items().is_empty());
+}
+
+#[test]
+fn projected_items_use_only_the_direct_property_drawer() {
+    let source = "\
+* READY Direct metadata
+:PROPERTIES:
+:ID: 11111111-1111-4111-8111-111111111111
+:AGENT_NOTE_TYPE: task
+:ASSIGNEE: direct-agent
+:END:
+Body text.
+:PROPERTIES:
+:ASSIGNEE: hidden-agent
+:DEPENDS_ON: 22222222-2222-4222-8222-222222222222
+:REQUIRES_REVIEW: true
+:END:
+";
+
+    let document = parse_document(source, &options()).unwrap();
+    let item = &document.items()[0];
+
+    assert_eq!(document.source().as_bytes(), source.as_bytes());
+    assert_eq!(item.assignee.as_deref(), Some("direct-agent"));
+    assert!(item.depends_on.is_empty());
+    assert!(!item.requires_review);
+}
+
+#[test]
+fn agent_note_links_in_opaque_constructs_remain_opaque() {
     let source = "\
 * READY Opaque examples
 :PROPERTIES:
 :ID: 11111111-1111-4111-8111-111111111111
 :AGENT_NOTE_TYPE: task
 :END:
-# [[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][comment example]]
-#+CAPTION: [[agent-note:design:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb][keyword example]]
+# [[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa]]
+#+CAPTION: [[agent-note:design:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb]]
+#+BEGIN_SRC org
+[[agent-note:design:cccccccc-cccc-4ccc-8ccc-cccccccccccc]]
+#+END_SRC
+:CUSTOM_DRAWER:
+[[agent-note:design:dddddddd-dddd-4ddd-8ddd-dddddddddddd]]
+:END:
 ";
 
     let document = parse_document(source, &options()).unwrap();
@@ -434,7 +659,7 @@ fn planning_time_ranges_are_rejected_for_scheduled_and_deadline() {
 }
 
 #[test]
-fn planning_lines_after_body_content_remain_opaque() {
+fn planning_and_properties_after_body_content_remain_opaque() {
     let source = "\
 * READY Late planning
 Normal body content.
@@ -447,11 +672,9 @@ DEADLINE: <2026-08-03 Mon>
 ";
 
     let document = parse_document(source, &options()).unwrap();
-    let item = &document.items()[0];
 
     assert_eq!(document.source(), source);
-    assert_eq!(item.scheduled, None);
-    assert_eq!(item.deadline, None);
+    assert!(document.items().is_empty());
 }
 
 #[test]

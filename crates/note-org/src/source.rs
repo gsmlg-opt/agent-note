@@ -42,6 +42,12 @@ enum PropertyDrawer {
     Malformed,
 }
 
+struct DirectPropertyDrawer {
+    contents: Span,
+    terminator: Option<usize>,
+    nested: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgDocument {
     source: String,
@@ -488,36 +494,18 @@ fn property_drawer(
         end: scanned.section_end,
     };
     ensure_contained_span(source, section, indexed.subtree, item_id)?;
-    let mut drawer_start = None;
-    let mut saw_drawer = false;
-    let mut offset = section.start;
-    let section_source = source
-        .get(section.start..section.end)
-        .ok_or(OrgError::UnsafeEdit(item_id))?;
-    for line in section_source.split_inclusive('\n') {
-        let trimmed = line_content(line).trim();
-        if trimmed.eq_ignore_ascii_case(":PROPERTIES:") {
-            if drawer_start.is_some() {
-                return Ok(PropertyDrawer::Malformed);
-            }
-            drawer_start = Some(offset);
-            saw_drawer = true;
-        } else if drawer_start.is_some() && trimmed.eq_ignore_ascii_case(":END:") {
-            if drawer_start.is_some_and(|start| start <= id_span.start && id_span.end <= offset) {
-                return Ok(PropertyDrawer::Valid { end: offset });
-            }
-            drawer_start = None;
-        }
-        offset = offset
-            .checked_add(line.len())
-            .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let Some(drawer) = direct_property_drawer(source, section.start, section.end) else {
+        return Ok(PropertyDrawer::Absent);
+    };
+    if drawer.nested {
+        return Ok(PropertyDrawer::Malformed);
     }
-    if drawer_start.is_some_and(|start| start <= id_span.start && id_span.end <= section.end) {
-        Ok(PropertyDrawer::Malformed)
-    } else if saw_drawer {
-        Err(OrgError::UnsafeEdit(item_id))
-    } else {
-        Ok(PropertyDrawer::Absent)
+    if id_span.start < drawer.contents.start || id_span.end > drawer.contents.end {
+        return Err(OrgError::UnsafeEdit(item_id));
+    }
+    match drawer.terminator {
+        Some(end) => Ok(PropertyDrawer::Valid { end }),
+        None => Ok(PropertyDrawer::Malformed),
     }
 }
 
@@ -997,32 +985,31 @@ fn scan_headings(source: &str) -> Vec<ScannedHeading> {
         let content = line_content(line);
         let trimmed = content.trim_start();
 
-        if let Some(kind) = block_begin(trimmed) {
-            block_stack.push(kind.to_string());
-            offset += line.len();
-            continue;
-        }
-
-        if let Some(kind) = block_end(trimmed) {
-            if block_stack
-                .last()
-                .is_some_and(|open| open.eq_ignore_ascii_case(kind))
-            {
-                block_stack.pop();
-            }
-            offset += line.len();
-            continue;
-        }
-
         if !block_stack.is_empty() {
+            if let Some(kind) = block_begin(trimmed) {
+                block_stack.push(kind.to_string());
+            } else if let Some(kind) = block_end(trimmed) {
+                if block_stack
+                    .last()
+                    .is_some_and(|open| open.eq_ignore_ascii_case(kind))
+                {
+                    block_stack.pop();
+                }
+            }
             offset += line.len();
             continue;
         }
 
         if opaque_drawer {
-            if trimmed.eq_ignore_ascii_case(":END:") {
+            if is_drawer_end(content) {
                 opaque_drawer = false;
             }
+            offset += line.len();
+            continue;
+        }
+
+        if let Some(kind) = block_begin(trimmed) {
+            block_stack.push(kind.to_string());
             offset += line.len();
             continue;
         }
@@ -1387,26 +1374,27 @@ fn parse_note_links(source: &str, start: usize, end: usize) -> Vec<NoteLink> {
     for line in source[start..end].split_inclusive('\n') {
         let content = line_content(line);
         let trimmed = content.trim_start();
-        if let Some(kind) = block_begin(trimmed) {
-            block_stack.push(kind.to_string());
-            continue;
-        }
-        if let Some(kind) = block_end(trimmed) {
-            if block_stack
-                .last()
-                .is_some_and(|open| open.eq_ignore_ascii_case(kind))
-            {
-                block_stack.pop();
-            }
-            continue;
-        }
         if !block_stack.is_empty() {
+            if let Some(kind) = block_begin(trimmed) {
+                block_stack.push(kind.to_string());
+            } else if let Some(kind) = block_end(trimmed) {
+                if block_stack
+                    .last()
+                    .is_some_and(|open| open.eq_ignore_ascii_case(kind))
+                {
+                    block_stack.pop();
+                }
+            }
             continue;
         }
         if drawer {
-            if trimmed.eq_ignore_ascii_case(":END:") {
+            if is_drawer_end(content) {
                 drawer = false;
             }
+            continue;
+        }
+        if let Some(kind) = block_begin(trimmed) {
+            block_stack.push(kind.to_string());
             continue;
         }
         if drawer_start(trimmed).is_some_and(|name| !name.eq_ignore_ascii_case("END")) {
@@ -1423,90 +1411,140 @@ fn parse_note_links(source: &str, start: usize, end: usize) -> Vec<NoteLink> {
 }
 
 fn parse_note_links_in_line(line: &str, links: &mut Vec<NoteLink>) {
-    let mut remaining = line;
-    while let Some(link_start) = remaining.find("[[") {
-        remaining = &remaining[link_start + 2..];
-        let Some(target_end) = remaining.find("][") else {
-            break;
-        };
-        let target = &remaining[..target_end];
-        remaining = &remaining[target_end + 2..];
-        let Some(description_end) = remaining.find("]]") else {
-            break;
-        };
-        let description = &remaining[..description_end];
-        remaining = &remaining[description_end + 2..];
-
-        let mut parts = target.split(':');
-        let (Some("agent-note"), Some(purpose), Some(note_id), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        if purpose.is_empty() {
-            continue;
-        }
-        let Ok(note_id) = Uuid::parse_str(note_id) else {
-            continue;
-        };
-        links.push(NoteLink {
-            purpose: purpose.to_string(),
-            note_id,
-            description: description.to_string(),
-        });
+    enum State {
+        Searching,
+        Target {
+            start: usize,
+        },
+        Description {
+            target_start: usize,
+            target_end: usize,
+            description_start: usize,
+            depth: usize,
+        },
+        Discarding,
     }
+
+    let bytes = line.as_bytes();
+    let mut state = State::Searching;
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let next = bytes.get(cursor + 1).copied();
+        match &mut state {
+            State::Searching => {
+                if bytes[cursor] == b'[' && next == Some(b'[') {
+                    state = State::Target { start: cursor + 2 };
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            State::Target { start } => {
+                if bytes[cursor] == b'[' && next == Some(b'[') {
+                    *start = cursor + 2;
+                    cursor += 2;
+                } else if bytes[cursor] == b']' && next == Some(b']') {
+                    if let Some((purpose, note_id)) = parse_note_link_target(&line[*start..cursor])
+                    {
+                        links.push(NoteLink {
+                            purpose: purpose.to_string(),
+                            note_id,
+                            description: String::new(),
+                        });
+                    }
+                    state = State::Searching;
+                    cursor += 2;
+                } else if bytes[cursor] == b']' && next == Some(b'[') {
+                    if parse_note_link_target(&line[*start..cursor]).is_some() {
+                        state = State::Description {
+                            target_start: *start,
+                            target_end: cursor,
+                            description_start: cursor + 2,
+                            depth: 0,
+                        };
+                    } else {
+                        state = State::Discarding;
+                    }
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            State::Description {
+                target_start,
+                target_end,
+                description_start,
+                depth,
+            } => match bytes[cursor] {
+                b'[' => {
+                    *depth += 1;
+                    cursor += 1;
+                }
+                b']' if *depth > 0 => {
+                    *depth -= 1;
+                    cursor += 1;
+                }
+                b']' if next == Some(b']') => {
+                    if let Some((purpose, note_id)) =
+                        parse_note_link_target(&line[*target_start..*target_end])
+                    {
+                        links.push(NoteLink {
+                            purpose: purpose.to_string(),
+                            note_id,
+                            description: line[*description_start..cursor].to_string(),
+                        });
+                    }
+                    state = State::Searching;
+                    cursor += 2;
+                }
+                b']' => {
+                    state = State::Discarding;
+                    cursor += 1;
+                }
+                _ => cursor += 1,
+            },
+            State::Discarding => {
+                if bytes[cursor] == b'[' && next == Some(b'[') {
+                    state = State::Target { start: cursor + 2 };
+                    cursor += 2;
+                } else if bytes[cursor] == b']' && next == Some(b']') {
+                    state = State::Searching;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+        }
+    }
+}
+
+fn parse_note_link_target(target: &str) -> Option<(&str, Uuid)> {
+    if target.contains(['[', ']']) {
+        return None;
+    }
+
+    let mut parts = target.split(':');
+    let (Some("agent-note"), Some(purpose), Some(note_id), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if purpose.is_empty() {
+        return None;
+    }
+    let note_id = Uuid::parse_str(note_id).ok()?;
+    Some((purpose, note_id))
 }
 
 fn parse_properties<'a>(source: &'a str, start: usize, end: usize) -> Vec<PropertyOccurrence<'a>> {
     let mut properties = Vec::new();
-    let mut in_drawer = false;
-    let mut opaque_drawer = false;
-    let mut block_stack = Vec::<String>::new();
-    let mut offset = start;
+    let Some(drawer) = direct_property_drawer(source, start, end) else {
+        return properties;
+    };
+    let mut offset = drawer.contents.start;
 
-    for line in source[start..end].split_inclusive('\n') {
+    for line in source[drawer.contents.start..drawer.contents.end].split_inclusive('\n') {
         let content = line_content(line);
-        let trimmed = content.trim_start();
-        if let Some(kind) = block_begin(trimmed) {
-            block_stack.push(kind.to_string());
-            offset += line.len();
-            continue;
-        }
-        if let Some(kind) = block_end(trimmed) {
-            if block_stack
-                .last()
-                .is_some_and(|open| open.eq_ignore_ascii_case(kind))
-            {
-                block_stack.pop();
-            }
-            offset += line.len();
-            continue;
-        }
-        if !block_stack.is_empty() {
-            offset += line.len();
-            continue;
-        }
-        if opaque_drawer {
-            if trimmed.eq_ignore_ascii_case(":END:") {
-                opaque_drawer = false;
-            }
-            offset += line.len();
-            continue;
-        }
-        if !in_drawer {
-            if trimmed.eq_ignore_ascii_case(":PROPERTIES:") {
-                in_drawer = true;
-            } else if drawer_start(trimmed).is_some_and(|name| !name.eq_ignore_ascii_case("END")) {
-                opaque_drawer = true;
-            }
-            offset += line.len();
-            continue;
-        }
-        if trimmed.eq_ignore_ascii_case(":END:") {
-            in_drawer = false;
-            offset += line.len();
-            continue;
-        }
         if let Some((raw_key, value_start, value_end)) = property_parts(content) {
             let accumulated = raw_key.ends_with('+');
             let key = raw_key
@@ -1528,6 +1566,64 @@ fn parse_properties<'a>(source: &'a str, start: usize, end: usize) -> Vec<Proper
     }
 
     properties
+}
+
+fn direct_property_drawer(source: &str, start: usize, end: usize) -> Option<DirectPropertyDrawer> {
+    let drawer_start = direct_property_drawer_start(source, start, end)?;
+    let opening_line = source[drawer_start..end].split_inclusive('\n').next()?;
+    let contents_start = drawer_start + opening_line.len();
+    let mut offset = contents_start;
+    let mut nested = false;
+
+    for line in source[contents_start..end].split_inclusive('\n') {
+        let content = line_content(line);
+        if is_drawer_end(content) {
+            return Some(DirectPropertyDrawer {
+                contents: Span {
+                    start: contents_start,
+                    end: offset,
+                },
+                terminator: Some(offset),
+                nested,
+            });
+        }
+        if is_properties_drawer_start(content) {
+            nested = true;
+        }
+        offset += line.len();
+    }
+
+    Some(DirectPropertyDrawer {
+        contents: Span {
+            start: contents_start,
+            end,
+        },
+        terminator: None,
+        nested,
+    })
+}
+
+fn direct_property_drawer_start(source: &str, start: usize, end: usize) -> Option<usize> {
+    let mut offset = start;
+    for line in source[start..end].split_inclusive('\n') {
+        let content = line_content(line);
+        let trimmed = content.trim_start();
+        if trimmed.starts_with("SCHEDULED:") || trimmed.starts_with("DEADLINE:") {
+            offset += line.len();
+            continue;
+        }
+        return is_properties_drawer_start(content).then_some(offset);
+    }
+    None
+}
+
+fn is_properties_drawer_start(line_content: &str) -> bool {
+    drawer_start(line_content.trim_start())
+        .is_some_and(|name| name.eq_ignore_ascii_case("PROPERTIES"))
+}
+
+fn is_drawer_end(line_content: &str) -> bool {
+    line_content.trim().eq_ignore_ascii_case(":END:")
 }
 
 fn occurrences<'a, 'b>(
