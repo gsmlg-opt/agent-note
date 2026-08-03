@@ -50,11 +50,7 @@ impl TursoStorage {
         let session = storage.connect().await?;
 
         match state {
-            Preflight::Fresh => session.initialize(path).await?,
-            Preflight::Existing => match session.opened_state(path).await? {
-                connection::OpenedState::Existing => {}
-                connection::OpenedState::Empty => return Err(incompatible_database(path)),
-            },
+            Preflight::Fresh | Preflight::Existing { .. } => session.initialize(path).await?,
             Preflight::Missing => return Err(incompatible_database(path)),
         }
 
@@ -197,7 +193,7 @@ mod tests {
         let error = match TursoStorage::open_preflighted(
             &path,
             path.to_str().unwrap(),
-            Preflight::Existing,
+            Preflight::Existing { version: 2 },
         )
         .await
         {

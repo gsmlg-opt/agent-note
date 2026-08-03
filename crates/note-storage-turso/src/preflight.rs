@@ -11,13 +11,14 @@ use turso::core::{
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_HEADER_LEN: usize = 100;
 pub(crate) const APPLICATION_ID: u32 = 0x414E4F54;
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const PREVIOUS_SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Preflight {
     Missing,
     Fresh,
-    Existing,
+    Existing { version: u32 },
 }
 
 /// Keeps the validated main-file handle stable while Turso opens its sidecars.
@@ -58,8 +59,8 @@ impl PinnedIo {
         });
         let actual = io.pinned_state(path)?;
         match (eligible, actual) {
-            (Preflight::Fresh, Preflight::Fresh | Preflight::Existing)
-            | (Preflight::Existing, Preflight::Existing) => Ok((io, actual)),
+            (Preflight::Fresh, Preflight::Fresh | Preflight::Existing { .. })
+            | (Preflight::Existing { .. }, Preflight::Existing { .. }) => Ok((io, actual)),
             _ => Err(incompatible_database(path)),
         }
     }
@@ -73,7 +74,10 @@ impl PinnedIo {
             return Err(path_changed(path));
         }
         match self.pinned_state(path)? {
-            Preflight::Existing => Ok(()),
+            Preflight::Existing {
+                version: SCHEMA_VERSION,
+            } => Ok(()),
+            Preflight::Existing { version } => Err(unsupported_schema(version)),
             Preflight::Missing | Preflight::Fresh => Err(incompatible_database(path)),
         }
     }
@@ -193,11 +197,13 @@ fn classify_header(path: &Path, header: &[u8]) -> StorageResult<Preflight> {
     if application_id != APPLICATION_ID {
         return Err(incompatible_database(path));
     }
-    if user_version != SCHEMA_VERSION {
+    if !matches!(user_version, PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION) {
         return Err(unsupported_schema(user_version));
     }
 
-    Ok(Preflight::Existing)
+    Ok(Preflight::Existing {
+        version: user_version,
+    })
 }
 
 pub(crate) fn preflight_and_reserve(path: &Path) -> StorageResult<Preflight> {

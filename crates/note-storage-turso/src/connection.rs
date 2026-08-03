@@ -5,16 +5,18 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::preflight::{
-    incompatible_database, preflight, unsupported_schema, Preflight, APPLICATION_ID, SCHEMA_VERSION,
+    incompatible_database, preflight, unsupported_schema, Preflight, APPLICATION_ID,
+    PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 
 const SCHEMA: &str = include_str!("../schema.sql");
+const MIGRATION_2_TO_3: &str = include_str!("../migrations/0002_to_0003_org.sql");
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OpenedState {
     Empty,
-    Existing,
+    Existing { version: u32 },
 }
 
 pub struct TursoSession {
@@ -84,10 +86,11 @@ impl TursoSession {
         let has_user_schema = has_user_schema(&self.connection).await?;
 
         if application_id == i64::from(APPLICATION_ID) {
-            if user_version != i64::from(SCHEMA_VERSION) {
-                return Err(unsupported_schema(user_version as u32));
+            let version = user_version as u32;
+            if !matches!(version, PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION) {
+                return Err(unsupported_schema(version));
             }
-            return Ok(OpenedState::Existing);
+            return Ok(OpenedState::Existing { version });
         }
         if application_id == 0 && user_version == 0 && !has_user_schema {
             return Ok(OpenedState::Empty);
@@ -96,41 +99,69 @@ impl TursoSession {
     }
 
     pub(crate) async fn initialize(&self, path: &Path) -> StorageResult<()> {
-        if let Err(primary) = self.connection.execute("BEGIN IMMEDIATE", ()).await {
-            return Err(initialization_error(primary, None));
-        }
+        self.initialize_with_migration(path, MIGRATION_2_TO_3).await
+    }
 
-        let state = match self.opened_state(path).await {
-            Ok(state) => state,
-            Err(primary) => {
-                let _ = self.connection.execute("ROLLBACK", ()).await;
-                return Err(primary);
-            }
-        };
+    async fn initialize_with_migration(
+        &self,
+        path: &Path,
+        migration_2_to_3: &str,
+    ) -> StorageResult<()> {
+        self.connection
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|error| initialization_error(error, None))?;
 
-        let result = match state {
-            OpenedState::Existing => self.connection.execute("COMMIT", ()).await.map(|_| ()),
-            OpenedState::Empty => {
-                async {
-                    self.connection.execute_batch(SCHEMA).await?;
-                    self.connection
-                        .execute("PRAGMA application_id = 1095651156", ())
-                        .await?;
-                    let user_version_sql = format!("PRAGMA user_version = {SCHEMA_VERSION}");
-                    self.connection.execute(&user_version_sql, ()).await?;
-                    self.connection.execute("COMMIT", ()).await?;
-                    Ok(())
-                }
-                .await
-            }
-        };
-
+        let result = self
+            .initialize_transaction_body(path, migration_2_to_3)
+            .await;
         if let Err(primary) = result {
             let rollback = self.connection.execute("ROLLBACK", ()).await.err();
-            return Err(initialization_error(primary, rollback));
+            return Err(initialization_storage_error(primary, rollback));
         }
 
         self.ensure_durable(path).await
+    }
+
+    async fn initialize_transaction_body(
+        &self,
+        path: &Path,
+        migration_2_to_3: &str,
+    ) -> StorageResult<()> {
+        match self.opened_state(path).await? {
+            OpenedState::Empty => {
+                self.connection
+                    .execute_batch(SCHEMA)
+                    .await
+                    .map_err(|error| map_turso_error("initialize database schema", error))?;
+                self.connection
+                    .execute("PRAGMA application_id = 1095651156", ())
+                    .await
+                    .map_err(|error| map_turso_error("mark agent-note database", error))?;
+                set_user_version(&self.connection, SCHEMA_VERSION).await?;
+            }
+            OpenedState::Existing {
+                version: PREVIOUS_SCHEMA_VERSION,
+            } => {
+                self.connection
+                    .execute_batch(migration_2_to_3)
+                    .await
+                    .map_err(|error| {
+                        map_turso_error("migrate database schema from v2 to v3", error)
+                    })?;
+                set_user_version(&self.connection, SCHEMA_VERSION).await?;
+            }
+            OpenedState::Existing {
+                version: SCHEMA_VERSION,
+            } => {}
+            OpenedState::Existing { version } => return Err(unsupported_schema(version)),
+        }
+
+        self.connection
+            .execute("COMMIT", ())
+            .await
+            .map_err(|error| map_transaction_error("commit database initialization", error))?;
+        Ok(())
     }
 
     pub(crate) async fn ensure_durable(&self, path: &Path) -> StorageResult<()> {
@@ -139,6 +170,15 @@ impl TursoSession {
             .map_err(|error| map_turso_error("flush initialized database", error))?;
         checkpoint(&self.connection, path).await
     }
+}
+
+async fn set_user_version(connection: &turso::Connection, version: u32) -> StorageResult<()> {
+    let sql = format!("PRAGMA user_version = {version}");
+    connection
+        .execute(&sql, ())
+        .await
+        .map_err(|error| map_turso_error("mark database schema version", error))?;
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -230,7 +270,12 @@ async fn checkpoint(connection: &turso::Connection, path: &Path) -> StorageResul
 
 fn verify_checkpoint_result(path: &Path, busy: i64) -> StorageResult<()> {
     let durable = preflight(path);
-    if matches!(durable, Ok(Preflight::Existing)) {
+    if matches!(
+        durable,
+        Ok(Preflight::Existing {
+            version: SCHEMA_VERSION
+        })
+    ) {
         return Ok(());
     }
     if busy != 0 {
@@ -251,7 +296,10 @@ fn verify_checkpoint_result(path: &Path, busy: i64) -> StorageResult<()> {
                 path.display()
             ),
         )),
-        Ok(Preflight::Existing) => Ok(()),
+        Ok(Preflight::Existing {
+            version: SCHEMA_VERSION,
+        }) => Ok(()),
+        Ok(Preflight::Existing { version }) => Err(unsupported_schema(version)),
         Err(error) => Err(error),
     }
 }
@@ -281,9 +329,26 @@ fn initialization_error(primary: turso::Error, rollback: Option<turso::Error>) -
     map_turso_error(&message, primary)
 }
 
+fn initialization_storage_error(
+    primary: StorageError,
+    rollback: Option<turso::Error>,
+) -> StorageError {
+    if let Some(rollback) = rollback {
+        StorageError::with_source(
+            primary.kind(),
+            format!("{primary}; rollback also failed: {rollback}"),
+            primary,
+        )
+    } else {
+        primary
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{map_turso_error, verify_checkpoint_result, StorageErrorKind};
+    use super::{
+        map_turso_error, verify_checkpoint_result, StorageErrorKind, TursoSession, MIGRATION_2_TO_3,
+    };
     use crate::TursoStorage;
 
     async fn pragma_value(connection: &turso::Connection, pragma: &str) -> i64 {
@@ -306,6 +371,77 @@ mod tests {
         assert_eq!(
             pragma_value(&session.connection, "PRAGMA busy_timeout").await,
             30_000
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_migration_rolls_back_schema_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration-rollback.db");
+        let database = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let connection = database.connect().unwrap();
+        connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        connection
+            .execute_batch(include_str!("../tests/fixtures/schema-v2.sql"))
+            .await
+            .unwrap();
+        connection
+            .execute("PRAGMA application_id = 1095651156", ())
+            .await
+            .unwrap();
+        connection
+            .execute("PRAGMA user_version = 2", ())
+            .await
+            .unwrap();
+        connection.execute("COMMIT", ()).await.unwrap();
+        connection.cacheflush().unwrap();
+        let mut rows = connection
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .unwrap();
+        while rows.next().await.unwrap().is_some() {}
+        drop(connection);
+        drop(database);
+
+        let database = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let session = TursoSession::configured(&database).await.unwrap();
+        let bad_migration = format!(
+            "{MIGRATION_2_TO_3}\n\
+             CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);\n\
+             INSERT INTO missing_migration_table(id) VALUES (1);"
+        );
+
+        session
+            .initialize_with_migration(&path, &bad_migration)
+            .await
+            .expect_err("bad migration tail must fail");
+
+        assert_eq!(
+            pragma_value(&session.connection, "PRAGMA user_version").await,
+            2
+        );
+        let mut rows = session
+            .connection
+            .query(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                     WHERE type = 'table' AND name = 'migration_probe'
+                 )",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            0
         );
     }
 

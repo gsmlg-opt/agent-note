@@ -1,9 +1,47 @@
-use note_storage::StorageErrorKind;
+use note_storage::{NotesRepository, StorageErrorKind};
 use note_storage_turso::TursoStorage;
 use std::path::Path;
 
 const APPLICATION_ID: u32 = 0x414E4F54;
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
+
+async fn create_schema_v2_database(path: &Path) {
+    let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/schema-v2.sql"))
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO notes (
+                 id, title, content, attachments, created_at, updated_at, note_revision, deleted_at
+             ) VALUES ('migration-survivor', 'Migration survivor', 'preserved', '[]', 1, 1, 1, NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA application_id = 1095651156", ())
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA user_version = 2", ())
+        .await
+        .unwrap();
+    connection.execute("COMMIT", ()).await.unwrap();
+    connection.cacheflush().unwrap();
+    let mut rows = connection
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+}
 
 fn database_header(path: &Path) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap();
@@ -93,7 +131,7 @@ async fn unsupported_marked_schema_is_rejected_without_modification() {
     let path = dir.path().join("future.db");
     drop(TursoStorage::open(&path).await.unwrap());
     let mut before = std::fs::read(&path).unwrap();
-    before[60..64].copy_from_slice(&(SCHEMA_VERSION + 1).to_be_bytes());
+    before[60..64].copy_from_slice(&4_u32.to_be_bytes());
     std::fs::write(&path, &before).unwrap();
 
     let error = match TursoStorage::open(&path).await {
@@ -103,6 +141,60 @@ async fn unsupported_marked_schema_is_rejected_without_modification() {
 
     assert_eq!(error.kind(), StorageErrorKind::UnsupportedSchema);
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn schema_v2_is_migrated_without_losing_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v2.db");
+    create_schema_v2_database(&path).await;
+
+    let storage = TursoStorage::open(&path).await.unwrap();
+
+    database_header(&path);
+    let session = storage.connect().await.unwrap();
+    assert_eq!(
+        session
+            .get_note_content("migration-survivor")
+            .await
+            .unwrap(),
+        Some("preserved".to_owned())
+    );
+    drop(session);
+    drop(storage);
+
+    let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    let mut rows = connection
+        .query(
+            "SELECT name
+             FROM sqlite_schema
+             WHERE type = 'table' AND name LIKE 'org_%'
+             ORDER BY name",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut tables = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        tables.push(row.get::<String>(0).unwrap());
+    }
+    for expected in [
+        "org_workspaces",
+        "org_documents",
+        "org_work_items",
+        "org_work_item_tags",
+        "org_dependencies",
+        "org_note_links",
+        "org_events",
+        "org_operations",
+    ] {
+        assert!(tables.iter().any(|table| table == expected), "{expected}");
+    }
 }
 
 #[tokio::test]
@@ -124,7 +216,7 @@ async fn schema_v1_is_rejected_without_modification() {
 }
 
 #[tokio::test]
-async fn fresh_database_contains_schema_v2_retrieval_objects() {
+async fn fresh_database_contains_current_schema_objects() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("schema.db");
     drop(TursoStorage::open(&path).await.unwrap());
@@ -169,6 +261,14 @@ async fn fresh_database_contains_schema_v2_retrieval_objects() {
         "embedding_jobs",
         "note_chunk_embeddings",
         "app_settings",
+        "org_workspaces",
+        "org_documents",
+        "org_work_items",
+        "org_work_item_tags",
+        "org_dependencies",
+        "org_note_links",
+        "org_events",
+        "org_operations",
     ] {
         assert!(
             tables.iter().any(|table| table == expected),

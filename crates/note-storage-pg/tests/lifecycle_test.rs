@@ -1,6 +1,6 @@
 mod support;
 
-use note_storage::StorageErrorKind;
+use note_storage::{NewNote, NotesRepository, StorageErrorKind};
 use note_storage_pg::PgStorage;
 use support::{configured_url_or_skip, TestDatabase};
 
@@ -91,6 +91,14 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
         "note_chunks",
         "note_labels",
         "notes",
+        "org_dependencies",
+        "org_documents",
+        "org_events",
+        "org_note_links",
+        "org_operations",
+        "org_work_item_tags",
+        "org_work_items",
+        "org_workspaces",
     ] {
         assert!(tables.iter().any(|table| table == expected), "{expected}");
     }
@@ -132,6 +140,62 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
     inspection.close().await;
     database
         .cleanup(Some(&storage))
+        .await
+        .expect("explicit cleanup without leaked connections");
+}
+
+#[tokio::test]
+async fn ordered_migrations_preserve_existing_notes() {
+    let Some(admin_url) = configured_url_or_skip("ordered_migrations_preserve_existing_notes")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    database.provision_vector().await;
+
+    let storage = PgStorage::connect(&database.url, 2)
+        .await
+        .expect("provision existing PostgreSQL fixture");
+    let session = storage.connect_session().await.unwrap();
+    session
+        .insert_note(NewNote {
+            id: "migration-survivor",
+            title: "Migration survivor",
+            content: "preserved",
+            attachments: &[],
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    drop(session);
+    storage.close().await;
+
+    let reopened = PgStorage::connect(&database.url, 2)
+        .await
+        .expect("reconnect after ordered migrations");
+    let inspection = database.inspect_pool().await;
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&inspection)
+            .await
+            .expect("read ordered migration versions");
+    assert_eq!(versions, vec![1, 2]);
+    inspection.close().await;
+
+    let session = reopened.connect_session().await.unwrap();
+    assert_eq!(
+        session
+            .get_note_content("migration-survivor")
+            .await
+            .unwrap(),
+        Some("preserved".to_owned())
+    );
+    drop(session);
+    database
+        .cleanup(Some(&reopened))
         .await
         .expect("explicit cleanup without leaked connections");
 }
