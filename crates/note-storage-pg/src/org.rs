@@ -11,6 +11,10 @@ use sqlx::{PgConnection, Postgres, QueryBuilder};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
 
+// The widest projection statement binds 20 values per row, so 64 rows remain
+// comfortably below both embedded and PostgreSQL driver parameter limits.
+const PROJECTION_BATCH_SIZE: usize = 64;
+
 #[async_trait::async_trait]
 impl OrgRepository for PgSession {
     async fn insert_org_workspace(&self, value: NewOrgWorkspace<'_>) -> StorageResult<()> {
@@ -544,31 +548,50 @@ struct ProjectionIdentityRow {
     source_order: i64,
 }
 
-async fn validate_projection(
+fn projection_batches<T>(values: &[T]) -> impl Iterator<Item = &[T]> {
+    values.chunks(PROJECTION_BATCH_SIZE)
+}
+
+async fn load_existing_projections(
     connection: &mut PgConnection,
     workspace_id: WorkspaceId,
     items: &[OrgProjectedWorkItem],
-    rebuilding: bool,
-) -> StorageResult<ProjectionPlan> {
-    let mut identity_query = QueryBuilder::<Postgres>::new(
+) -> StorageResult<HashMap<WorkItemId, ExistingProjection>> {
+    let mut existing = HashMap::new();
+    let workspace_rows = sqlx::query_as::<_, ProjectionIdentityRow>(
         "SELECT id, workspace_id, document_id, parent_id, source_order
-         FROM org_work_items WHERE workspace_id = ",
-    );
-    identity_query.push_bind(workspace_id.to_string());
-    if !items.is_empty() {
-        identity_query.push(" OR id IN (");
-        let mut ids = identity_query.separated(", ");
-        for item in items {
+         FROM org_work_items WHERE workspace_id = $1",
+    )
+    .bind(workspace_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|error| map_sqlx_error("query existing Org projection identities", error))?;
+    merge_existing_projection_rows(workspace_rows, &mut existing)?;
+
+    for batch in projection_batches(items) {
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT id, workspace_id, document_id, parent_id, source_order
+             FROM org_work_items WHERE id IN (",
+        );
+        let mut ids = query.separated(", ");
+        for item in batch {
             ids.push_bind(item.id.to_string());
         }
         ids.push_unseparated(")");
+        let rows = query
+            .build_query_as::<ProjectionIdentityRow>()
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|error| map_sqlx_error("query candidate Org projection identities", error))?;
+        merge_existing_projection_rows(rows, &mut existing)?;
     }
-    let rows = identity_query
-        .build_query_as::<ProjectionIdentityRow>()
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| map_sqlx_error("query existing Org projection identities", error))?;
-    let mut existing = HashMap::<WorkItemId, ExistingProjection>::new();
+    Ok(existing)
+}
+
+fn merge_existing_projection_rows(
+    rows: Vec<ProjectionIdentityRow>,
+    existing: &mut HashMap<WorkItemId, ExistingProjection>,
+) -> StorageResult<()> {
     for row in rows {
         existing.insert(
             decode_work_item_id(row.id)?,
@@ -580,6 +603,16 @@ async fn validate_projection(
             },
         );
     }
+    Ok(())
+}
+
+async fn validate_projection(
+    connection: &mut PgConnection,
+    workspace_id: WorkspaceId,
+    items: &[OrgProjectedWorkItem],
+    rebuilding: bool,
+) -> StorageResult<ProjectionPlan> {
+    let existing = load_existing_projections(connection, workspace_id, items).await?;
 
     let mut ids = HashSet::new();
     let mut source_orders = HashSet::new();
@@ -652,25 +685,7 @@ async fn validate_projection(
         }
     }
 
-    let mut depths = HashMap::new();
-    for item in items {
-        let mut path = HashSet::new();
-        let mut current = item.id;
-        let mut depth = 0usize;
-        loop {
-            if !path.insert(current) {
-                return Err(projection_constraint(
-                    "cyclic Org projected parent structure",
-                ));
-            }
-            let Some(parent) = parents.get(&current).copied().flatten() else {
-                break;
-            };
-            depth += 1;
-            current = parent;
-        }
-        depths.insert(item.id, depth);
-    }
+    let depths = compute_candidate_depths(&parents, items)?;
     let mut dependencies = if rebuilding {
         HashMap::new()
     } else {
@@ -722,6 +737,50 @@ async fn validate_projection(
         order,
         staged_existing,
     })
+}
+
+fn compute_candidate_depths(
+    parents: &HashMap<WorkItemId, Option<WorkItemId>>,
+    items: &[OrgProjectedWorkItem],
+) -> StorageResult<HashMap<WorkItemId, usize>> {
+    let mut depths = HashMap::<WorkItemId, usize>::new();
+    for item in items {
+        if depths.contains_key(&item.id) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut visiting = HashSet::new();
+        let mut current = item.id;
+        let mut next_depth = loop {
+            if let Some(depth) = depths.get(&current) {
+                break depth
+                    .checked_add(1)
+                    .ok_or_else(|| projection_constraint("Org projected parent depth overflow"))?;
+            }
+            if !visiting.insert(current) {
+                return Err(projection_constraint(
+                    "cyclic Org projected parent structure",
+                ));
+            }
+            path.push(current);
+            match parents.get(&current) {
+                Some(Some(parent)) => current = *parent,
+                Some(None) => break 0,
+                None => {
+                    return Err(projection_constraint(
+                        "Org projected parent target is missing or cross-workspace",
+                    ));
+                }
+            }
+        };
+        while let Some(id) = path.pop() {
+            depths.insert(id, next_depth);
+            next_depth = next_depth
+                .checked_add(1)
+                .ok_or_else(|| projection_constraint("Org projected parent depth overflow"))?;
+        }
+    }
+    Ok(depths)
 }
 
 async fn load_workspace_dependencies(
@@ -813,7 +872,7 @@ async fn upsert_projection(
     items: &[OrgProjectedWorkItem],
     order: &[usize],
 ) -> StorageResult<()> {
-    for chunk in order.chunks(1_000) {
+    for chunk in projection_batches(order) {
         let mut query = QueryBuilder::<Postgres>::new(
             "INSERT INTO org_work_items (
                  id, workspace_id, document_id, parent_id, source_order, item_type,
@@ -897,7 +956,7 @@ async fn upsert_projection(
                 .map(move |tag| (item.id.to_string(), tag.as_str()))
         })
         .collect::<Vec<_>>();
-    for chunk in tags.chunks(1_000) {
+    for chunk in projection_batches(&tags) {
         let mut query =
             QueryBuilder::<Postgres>::new("INSERT INTO org_work_item_tags (work_item_id, tag) ");
         query.push_values(chunk, |mut row, (id, tag)| {
@@ -917,7 +976,7 @@ async fn upsert_projection(
                 .map(move |target| (item.id.to_string(), target.to_string()))
         })
         .collect::<Vec<_>>();
-    for chunk in dependencies.chunks(1_000) {
+    for chunk in projection_batches(&dependencies) {
         let mut query = QueryBuilder::<Postgres>::new(
             "INSERT INTO org_dependencies (work_item_id, depends_on_id) ",
         );
@@ -939,7 +998,7 @@ async fn upsert_projection(
                 .map(move |(ordinal, link)| (item.id.to_string(), ordinal as i64, link))
         })
         .collect::<Vec<_>>();
-    for chunk in links.chunks(1_000) {
+    for chunk in projection_batches(&links) {
         let mut query = QueryBuilder::<Postgres>::new(
             "INSERT INTO org_note_links (
                  work_item_id, ordinal, purpose, note_id, description
@@ -1296,4 +1355,20 @@ fn decode_work_item_id(value: String) -> StorageResult<WorkItemId> {
             error,
         )
     })
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    #[test]
+    fn projection_batches_bound_every_driver_statement() {
+        let values = (0..257).collect::<Vec<_>>();
+        let sizes = projection_batches(&values)
+            .map(<[_]>::len)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sizes, vec![64, 64, 64, 64, 1]);
+        assert!(sizes.iter().all(|size| *size <= PROJECTION_BATCH_SIZE));
+    }
 }

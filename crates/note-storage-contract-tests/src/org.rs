@@ -597,6 +597,78 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         "dependency-cycle rejection must leave the prior projection unchanged"
     );
 
+    let scale_workspace_id = workspace_id("10000000-0000-0000-0000-000000000020");
+    let scale_document_id = document_id("20000000-0000-0000-0000-000000000020");
+    session
+        .insert_org_workspace(NewOrgWorkspace {
+            id: scale_workspace_id,
+            slug: "scale",
+            display_name: "Scale",
+            description: "projection validation stress workspace",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            now: 80,
+        })
+        .await
+        .unwrap();
+    session
+        .insert_org_document(NewOrgDocument {
+            id: scale_document_id,
+            workspace_id: scale_workspace_id,
+            path: "deep.org",
+            source: "* TODO Deep projection",
+            content_hash: "hash-deep",
+            now: 81,
+        })
+        .await
+        .unwrap();
+    let mut deep_projection = Vec::new();
+    let mut previous_id = None;
+    for index in 0..257 {
+        let id = work_item_id(&format!("60000000-0000-0000-0000-{index:012x}"));
+        deep_projection.push(projected_item(
+            id,
+            scale_workspace_id,
+            scale_document_id,
+            previous_id,
+            index,
+            &format!("Deep item {index}"),
+        ));
+        previous_id = Some(id);
+    }
+    let persist_deep = storage.begin(TransactionMode::Immediate).await.unwrap();
+    persist_deep
+        .replace_org_document_projection(scale_document_id, &deep_projection)
+        .await
+        .unwrap();
+    persist_deep.commit().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(scale_document_id)
+            .await
+            .unwrap(),
+        deep_projection
+    );
+
+    let mut deep_cycle = deep_projection.clone();
+    let last_id = deep_cycle.last().unwrap().id;
+    deep_cycle.last_mut().unwrap().parent_id = Some(last_id);
+    let reject_deep_cycle = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let error = reject_deep_cycle
+        .replace_org_document_projection(scale_document_id, &deep_cycle)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Constraint);
+    reject_deep_cycle.rollback().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_document_projection(scale_document_id)
+            .await
+            .unwrap(),
+        deep_projection
+    );
+
     let alpha_first_metadata = json!({
         "change": {"from": "TODO", "to": "ACTIVE"},
         "labels": ["backend", "release"]
@@ -845,13 +917,17 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .iter()
             .map(|workspace| (workspace.slug.as_str(), workspace.id))
             .collect::<Vec<_>>(),
-        vec![("beta", beta_id)]
+        vec![("beta", beta_id), ("scale", scale_workspace_id)]
     );
     let all = session.list_org_workspaces(true).await.unwrap();
     assert_eq!(
         all.iter()
             .map(|workspace| (workspace.slug.as_str(), workspace.id))
             .collect::<Vec<_>>(),
-        vec![("alpha", alpha_id), ("beta", beta_id)]
+        vec![
+            ("alpha", alpha_id),
+            ("beta", beta_id),
+            ("scale", scale_workspace_id)
+        ]
     );
 }

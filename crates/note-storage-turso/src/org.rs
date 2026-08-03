@@ -18,6 +18,9 @@ const WORK_ITEM_COLUMNS: &str =
      scheduled_raw, scheduled_local, scheduled_timezone, scheduled_utc,
      deadline_raw, deadline_local, deadline_timezone, deadline_utc,
      assignee, requires_review, created_at";
+// The widest projection statement binds 20 values per row, so 64 rows remain
+// comfortably below both embedded and PostgreSQL driver parameter limits.
+const PROJECTION_BATCH_SIZE: usize = 64;
 const EVENT_COLUMNS: &str =
     "id, workspace_id, sequence, subject_kind, subject_id, actor_id, event_type, occurred_at, summary, metadata";
 
@@ -619,33 +622,53 @@ async fn document_workspace(
     )
 }
 
-async fn validate_projection(
+fn projection_batches<T>(values: &[T]) -> impl Iterator<Item = &[T]> {
+    values.chunks(PROJECTION_BATCH_SIZE)
+}
+
+async fn load_existing_projections(
     session: &TursoSession,
     workspace_id: WorkspaceId,
     items: &[OrgProjectedWorkItem],
-    rebuilding: bool,
-) -> StorageResult<ProjectionPlan> {
-    let mut identity_sql = String::from(
+) -> StorageResult<HashMap<WorkItemId, ExistingProjection>> {
+    let mut existing = HashMap::new();
+    load_existing_projection_query(
+        session,
         "SELECT id, workspace_id, document_id, parent_id, source_order
          FROM org_work_items WHERE workspace_id = ?1",
-    );
-    let mut identity_params = vec![turso::Value::from(workspace_id.to_string())];
-    if !items.is_empty() {
-        identity_sql.push_str(" OR id IN (");
-        for (index, item) in items.iter().enumerate() {
+        vec![turso::Value::from(workspace_id.to_string())],
+        &mut existing,
+    )
+    .await?;
+    for batch in projection_batches(items) {
+        let mut sql = String::from(
+            "SELECT id, workspace_id, document_id, parent_id, source_order
+             FROM org_work_items WHERE id IN (",
+        );
+        let mut params = Vec::with_capacity(batch.len());
+        for (index, item) in batch.iter().enumerate() {
             if index > 0 {
-                identity_sql.push_str(", ");
+                sql.push_str(", ");
             }
-            identity_sql.push('?');
-            identity_sql.push_str(&(index + 2).to_string());
-            identity_params.push(turso::Value::from(item.id.to_string()));
+            sql.push('?');
+            sql.push_str(&(index + 1).to_string());
+            params.push(turso::Value::from(item.id.to_string()));
         }
-        identity_sql.push(')');
+        sql.push(')');
+        load_existing_projection_query(session, &sql, params, &mut existing).await?;
     }
-    let mut existing = HashMap::<WorkItemId, ExistingProjection>::new();
+    Ok(existing)
+}
+
+async fn load_existing_projection_query(
+    session: &TursoSession,
+    sql: &str,
+    params: Vec<turso::Value>,
+    existing: &mut HashMap<WorkItemId, ExistingProjection>,
+) -> StorageResult<()> {
     let mut rows = session
         .connection
-        .query(&identity_sql, turso::params_from_iter(identity_params))
+        .query(sql, turso::params_from_iter(params))
         .await
         .map_err(|error| map_turso_error("query existing Org projection identities", error))?;
     while let Some(row) = rows
@@ -682,7 +705,16 @@ async fn validate_projection(
             },
         );
     }
-    drop(rows);
+    Ok(())
+}
+
+async fn validate_projection(
+    session: &TursoSession,
+    workspace_id: WorkspaceId,
+    items: &[OrgProjectedWorkItem],
+    rebuilding: bool,
+) -> StorageResult<ProjectionPlan> {
+    let existing = load_existing_projections(session, workspace_id, items).await?;
 
     let mut ids = HashSet::new();
     let mut source_orders = HashSet::new();
@@ -756,25 +788,7 @@ async fn validate_projection(
         }
     }
 
-    let mut depths = HashMap::new();
-    for item in items {
-        let mut path = HashSet::new();
-        let mut current = item.id;
-        let mut depth = 0usize;
-        loop {
-            if !path.insert(current) {
-                return Err(projection_constraint(
-                    "cyclic Org projected parent structure",
-                ));
-            }
-            let Some(parent) = parents.get(&current).copied().flatten() else {
-                break;
-            };
-            depth += 1;
-            current = parent;
-        }
-        depths.insert(item.id, depth);
-    }
+    let depths = compute_candidate_depths(&parents, items)?;
 
     let mut dependencies = if rebuilding {
         HashMap::new()
@@ -828,6 +842,50 @@ async fn validate_projection(
         order,
         staged_existing,
     })
+}
+
+fn compute_candidate_depths(
+    parents: &HashMap<WorkItemId, Option<WorkItemId>>,
+    items: &[OrgProjectedWorkItem],
+) -> StorageResult<HashMap<WorkItemId, usize>> {
+    let mut depths = HashMap::<WorkItemId, usize>::new();
+    for item in items {
+        if depths.contains_key(&item.id) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut visiting = HashSet::new();
+        let mut current = item.id;
+        let mut next_depth = loop {
+            if let Some(depth) = depths.get(&current) {
+                break depth
+                    .checked_add(1)
+                    .ok_or_else(|| projection_constraint("Org projected parent depth overflow"))?;
+            }
+            if !visiting.insert(current) {
+                return Err(projection_constraint(
+                    "cyclic Org projected parent structure",
+                ));
+            }
+            path.push(current);
+            match parents.get(&current) {
+                Some(Some(parent)) => current = *parent,
+                Some(None) => break 0,
+                None => {
+                    return Err(projection_constraint(
+                        "Org projected parent target is missing or cross-workspace",
+                    ));
+                }
+            }
+        };
+        while let Some(id) = path.pop() {
+            depths.insert(id, next_depth);
+            next_depth = next_depth
+                .checked_add(1)
+                .ok_or_else(|| projection_constraint("Org projected parent depth overflow"))?;
+        }
+    }
+    Ok(depths)
 }
 
 async fn load_workspace_dependencies(
@@ -1098,7 +1156,7 @@ async fn execute_turso_value_bulk_insert(
     rows: &[Vec<turso::Value>],
     context: &str,
 ) -> StorageResult<()> {
-    for chunk in rows.chunks(500) {
+    for chunk in projection_batches(rows) {
         let mut sql = String::from(prefix);
         let mut params = Vec::new();
         for (row_index, row) in chunk.iter().enumerate() {
@@ -1592,4 +1650,20 @@ fn decode_work_item_id(value: String) -> StorageResult<WorkItemId> {
             error,
         )
     })
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    #[test]
+    fn projection_batches_bound_every_driver_statement() {
+        let values = (0..257).collect::<Vec<_>>();
+        let sizes = projection_batches(&values)
+            .map(<[_]>::len)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sizes, vec![64, 64, 64, 64, 1]);
+        assert!(sizes.iter().all(|size| *size <= PROJECTION_BATCH_SIZE));
+    }
 }
