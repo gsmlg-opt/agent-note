@@ -2,9 +2,9 @@ use crate::connection::map_sqlx_error;
 use crate::PgSession;
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewOrgDocument, NewOrgWorkspace, OrgDocument, OrgDocumentUpdate,
-    OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate, StorageError,
-    StorageErrorKind, StorageResult, StoredOrgTimestamp,
+    CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocument, OrgDocumentUpdate,
+    OrgEvent, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate, StorageError,
+    StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
 };
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
@@ -299,6 +299,171 @@ impl OrgRepository for PgSession {
                 .map_err(|error| map_sqlx_error(context, error))?;
         }
         upsert_projection(&mut connection, items, &plan.order).await
+    }
+
+    async fn append_org_event(&self, event: NewOrgEvent<'_>) -> StorageResult<OrgEvent> {
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, EventRow>(
+            "WITH next_sequence AS (
+                 UPDATE org_workspaces
+                 SET last_event_sequence=last_event_sequence+1
+                 WHERE id=$1
+                 RETURNING last_event_sequence
+             )
+             INSERT INTO org_events (
+                 id, workspace_id, sequence, subject_kind, subject_id,
+                 actor_id, event_type, occurred_at, summary, metadata
+             )
+             SELECT $2, $1, last_event_sequence, $3, $4, $5, $6, $7, $8, $9
+             FROM next_sequence
+             RETURNING id, workspace_id, sequence, subject_kind, subject_id,
+                       actor_id, event_type, occurred_at, summary, metadata",
+        )
+        .bind(event.workspace_id.to_string())
+        .bind(event.id)
+        .bind(event.subject_kind)
+        .bind(event.subject_id)
+        .bind(event.actor_id)
+        .bind(event.event_type)
+        .bind(event.occurred_at)
+        .bind(event.summary)
+        .bind(event.metadata)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("append Org event", error))?;
+        row.map(EventRow::into_event).transpose()?.ok_or_else(|| {
+            StorageError::new(
+                StorageErrorKind::Constraint,
+                "Org event workspace does not exist",
+            )
+        })
+    }
+
+    async fn list_org_events(
+        &self,
+        workspace_id: WorkspaceId,
+        after_sequence: Option<i64>,
+        limit: usize,
+    ) -> StorageResult<Vec<OrgEvent>> {
+        validate_event_limit(limit)?;
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, EventRow>(
+            "SELECT id, workspace_id, sequence, subject_kind, subject_id,
+                    actor_id, event_type, occurred_at, summary, metadata
+             FROM org_events
+             WHERE workspace_id=$1 AND sequence>$2
+             ORDER BY sequence
+             LIMIT $3",
+        )
+        .bind(workspace_id.to_string())
+        .bind(after_sequence.unwrap_or(0))
+        .bind(limit as i64)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("list Org events", error))?
+        .into_iter()
+        .map(EventRow::into_event)
+        .collect()
+    }
+
+    async fn insert_org_operation(&self, operation: &StoredOrgOperation) -> StorageResult<()> {
+        let mut connection = self.connection().await?;
+        sqlx::query(
+            "INSERT INTO org_operations (
+                 workspace_id, operation_id, request_fingerprint, result, created_at
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(operation.workspace_id.to_string())
+        .bind(&operation.operation_id)
+        .bind(&operation.request_fingerprint)
+        .bind(&operation.result)
+        .bind(operation.created_at)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("insert Org operation", error))?;
+        Ok(())
+    }
+
+    async fn get_org_operation(
+        &self,
+        workspace_id: WorkspaceId,
+        operation_id: &str,
+    ) -> StorageResult<Option<StoredOrgOperation>> {
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, OperationRow>(
+            "SELECT workspace_id, operation_id, request_fingerprint, result, created_at
+             FROM org_operations
+             WHERE workspace_id=$1 AND operation_id=$2",
+        )
+        .bind(workspace_id.to_string())
+        .bind(operation_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query Org operation", error))?
+        .map(OperationRow::into_operation)
+        .transpose()
+    }
+}
+
+fn validate_event_limit(limit: usize) -> StorageResult<()> {
+    if !(1..=200).contains(&limit) {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org event list limit must be between 1 and 200",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct EventRow {
+    id: String,
+    workspace_id: String,
+    sequence: i64,
+    subject_kind: String,
+    subject_id: String,
+    actor_id: String,
+    event_type: String,
+    occurred_at: i64,
+    summary: String,
+    metadata: Value,
+}
+
+impl EventRow {
+    fn into_event(self) -> StorageResult<OrgEvent> {
+        Ok(OrgEvent {
+            id: self.id,
+            workspace_id: decode_workspace_id(self.workspace_id)?,
+            sequence: self.sequence,
+            subject_kind: self.subject_kind,
+            subject_id: self.subject_id,
+            actor_id: self.actor_id,
+            event_type: self.event_type,
+            occurred_at: self.occurred_at,
+            summary: self.summary,
+            metadata: self.metadata,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct OperationRow {
+    workspace_id: String,
+    operation_id: String,
+    request_fingerprint: String,
+    result: Value,
+    created_at: i64,
+}
+
+impl OperationRow {
+    fn into_operation(self) -> StorageResult<StoredOrgOperation> {
+        Ok(StoredOrgOperation {
+            workspace_id: decode_workspace_id(self.workspace_id)?,
+            operation_id: self.operation_id,
+            request_fingerprint: self.request_fingerprint,
+            result: self.result,
+            created_at: self.created_at,
+        })
     }
 }
 

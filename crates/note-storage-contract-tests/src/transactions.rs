@@ -1,7 +1,12 @@
 use crate::unit;
+use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    NewNote, StorageBackend, StorageErrorKind, StorageTransaction, TransactionMode, UpsertNoteChunk,
+    CompareAndSwap, NewNote, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocumentUpdate,
+    OrgProjectedWorkItem, StorageBackend, StorageErrorKind, StorageTransaction, StoredOrgOperation,
+    TransactionMode, UpsertNoteChunk,
 };
+use serde_json::json;
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,6 +156,207 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap()
         .is_empty());
+
+    let workspace_id = WorkspaceId::from_str("60000000-0000-0000-0000-000000000001").unwrap();
+    let document_id = DocumentId::from_str("61000000-0000-0000-0000-000000000001").unwrap();
+    let original_item_id = WorkItemId::from_str("62000000-0000-0000-0000-000000000001").unwrap();
+    let replacement_item_id = WorkItemId::from_str("62000000-0000-0000-0000-000000000002").unwrap();
+    let policy = WorkspacePolicy::engineering_default();
+    let org_seed = storage.begin(TransactionMode::Immediate).await.unwrap();
+    org_seed
+        .insert_org_workspace(NewOrgWorkspace {
+            id: workspace_id,
+            slug: "transaction-ledger",
+            display_name: "Transaction ledger",
+            description: "shared Org rollback contract",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            now: 500,
+        })
+        .await
+        .unwrap();
+    org_seed
+        .insert_org_document(NewOrgDocument {
+            id: document_id,
+            workspace_id,
+            path: "transaction.org",
+            source: "* TODO Revision one",
+            content_hash: "transaction-hash-one",
+            now: 501,
+        })
+        .await
+        .unwrap();
+    let CompareAndSwap::Applied(revision_two) = org_seed
+        .compare_and_swap_org_document(OrgDocumentUpdate {
+            id: document_id,
+            expected_revision: 1,
+            path: "transaction.org",
+            source: "* TODO Revision two",
+            content_hash: "transaction-hash-two",
+            updated_at: 502,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("Org transaction seed compare-and-swap was not applied");
+    };
+    let original_projection = vec![OrgProjectedWorkItem {
+        id: original_item_id,
+        workspace_id,
+        document_id,
+        parent_id: None,
+        source_order: 0,
+        item_type: WorkItemType::Task,
+        title: "Original projection".into(),
+        state: Some("TODO".into()),
+        priority: None,
+        scheduled: None,
+        deadline: None,
+        assignee: None,
+        requires_review: false,
+        created_at: 503,
+        tags: vec!["original".into()],
+        dependencies: Vec::new(),
+        note_links: Vec::new(),
+    }];
+    org_seed
+        .replace_org_document_projection(document_id, &original_projection)
+        .await
+        .unwrap();
+    for (id, occurred_at) in [
+        ("63000000-0000-0000-0000-000000000001", 505),
+        ("63000000-0000-0000-0000-000000000002", 504),
+    ] {
+        org_seed
+            .append_org_event(NewOrgEvent {
+                id,
+                workspace_id,
+                subject_kind: "document",
+                subject_id: "61000000-0000-0000-0000-000000000001",
+                actor_id: "contract-seed",
+                event_type: "seeded",
+                occurred_at,
+                summary: "Seeded event",
+                metadata: &json!({"seed": true}),
+            })
+            .await
+            .unwrap();
+    }
+    org_seed.commit().await.unwrap();
+    assert_eq!(revision_two.revision, 2);
+
+    let replacement_projection = vec![OrgProjectedWorkItem {
+        id: replacement_item_id,
+        workspace_id,
+        document_id,
+        parent_id: None,
+        source_order: 1,
+        item_type: WorkItemType::Task,
+        title: "Replacement projection".into(),
+        state: Some("ACTIVE".into()),
+        priority: Some('B'),
+        scheduled: None,
+        deadline: None,
+        assignee: Some("agent-rollback".into()),
+        requires_review: true,
+        created_at: 510,
+        tags: vec!["replacement".into()],
+        dependencies: Vec::new(),
+        note_links: Vec::new(),
+    }];
+    let rolled_back_operation = StoredOrgOperation {
+        workspace_id,
+        operation_id: "rolled-back-operation".into(),
+        request_fingerprint: "sha256:rolled-back".into(),
+        result: json!({"document_revision": 3, "nested": {"atomic": true}}),
+        created_at: 513,
+    };
+    let org_atomic = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let CompareAndSwap::Applied(revision_three) = org_atomic
+        .compare_and_swap_org_document(OrgDocumentUpdate {
+            id: document_id,
+            expected_revision: 2,
+            path: "transaction.org",
+            source: "* ACTIVE Revision three",
+            content_hash: "transaction-hash-three",
+            updated_at: 511,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("Org rollback compare-and-swap was not applied");
+    };
+    assert_eq!(revision_three.revision, 3);
+    org_atomic
+        .replace_org_document_projection(document_id, &replacement_projection)
+        .await
+        .unwrap();
+    assert_eq!(
+        org_atomic
+            .append_org_event(NewOrgEvent {
+                id: "63000000-0000-0000-0000-000000000003",
+                workspace_id,
+                subject_kind: "document",
+                subject_id: "61000000-0000-0000-0000-000000000001",
+                actor_id: "contract-rollback",
+                event_type: "updated",
+                occurred_at: 512,
+                summary: "Rolled-back event",
+                metadata: &json!({"revision": 3}),
+            })
+            .await
+            .unwrap()
+            .sequence,
+        3
+    );
+    org_atomic
+        .insert_org_operation(&rolled_back_operation)
+        .await
+        .unwrap();
+    let duplicate_operation = org_atomic
+        .insert_org_operation(&rolled_back_operation)
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate_operation.kind(), StorageErrorKind::Constraint);
+    org_atomic.rollback().await.unwrap();
+
+    let org_observer = storage.session().await.unwrap();
+    let stored_revision_two = org_observer
+        .get_org_document(document_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_revision_two.revision, 2);
+    assert_eq!(stored_revision_two.source, "* TODO Revision two");
+    assert_eq!(
+        org_observer
+            .list_org_document_projection(document_id)
+            .await
+            .unwrap(),
+        original_projection
+    );
+    assert!(org_observer
+        .get_org_operation(workspace_id, "rolled-back-operation")
+        .await
+        .unwrap()
+        .is_none());
+    let after_rollback_metadata = json!({"revision": 2, "after_rollback": true});
+    let next_event = org_observer
+        .append_org_event(NewOrgEvent {
+            id: "63000000-0000-0000-0000-000000000004",
+            workspace_id,
+            subject_kind: "document",
+            subject_id: "61000000-0000-0000-0000-000000000001",
+            actor_id: "contract-observer",
+            event_type: "rollback_verified",
+            occurred_at: 514,
+            summary: "Verified rollback",
+            metadata: &after_rollback_metadata,
+        })
+        .await
+        .unwrap();
+    assert_eq!(next_event.sequence, 3);
 
     let first = storage.begin(TransactionMode::Immediate).await.unwrap();
     let second_storage = storage.clone();

@@ -2,9 +2,9 @@ use crate::connection::map_turso_error;
 use crate::TursoSession;
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewOrgDocument, NewOrgWorkspace, OrgDocument, OrgDocumentUpdate,
-    OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate, StorageError,
-    StorageErrorKind, StorageResult, StoredOrgTimestamp,
+    CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocument, OrgDocumentUpdate,
+    OrgEvent, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate, StorageError,
+    StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
@@ -18,6 +18,8 @@ const WORK_ITEM_COLUMNS: &str =
      scheduled_raw, scheduled_local, scheduled_timezone, scheduled_utc,
      deadline_raw, deadline_local, deadline_timezone, deadline_utc,
      assignee, requires_review, created_at";
+const EVENT_COLUMNS: &str =
+    "id, workspace_id, sequence, subject_kind, subject_id, actor_id, event_type, occurred_at, summary, metadata";
 
 #[async_trait::async_trait]
 impl OrgRepository for TursoSession {
@@ -302,6 +304,248 @@ impl OrgRepository for TursoSession {
         }
         upsert_projection(self, items, &plan.order).await
     }
+
+    async fn append_org_event(&self, event: NewOrgEvent<'_>) -> StorageResult<OrgEvent> {
+        let mut sequence_rows = self
+            .connection
+            .query(
+                "UPDATE org_workspaces
+                 SET last_event_sequence=last_event_sequence+1
+                 WHERE id=?1
+                 RETURNING last_event_sequence",
+                turso::params![event.workspace_id.to_string()],
+            )
+            .await
+            .map_err(|error| map_turso_error("allocate Org event sequence", error))?;
+        let Some(sequence_row) = sequence_rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read allocated Org event sequence", error))?
+        else {
+            return Err(StorageError::new(
+                StorageErrorKind::Constraint,
+                "Org event workspace does not exist",
+            ));
+        };
+        let sequence: i64 = sequence_row
+            .get(0)
+            .map_err(|error| map_turso_error("decode allocated Org event sequence", error))?;
+        drop(sequence_rows);
+
+        let metadata = serde_json::to_string(event.metadata).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize Org event metadata",
+                error,
+            )
+        })?;
+        let sql = format!(
+            "INSERT INTO org_events (
+                 id, workspace_id, sequence, subject_kind, subject_id,
+                 actor_id, event_type, occurred_at, summary, metadata
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             RETURNING {EVENT_COLUMNS}"
+        );
+        let mut rows = self
+            .connection
+            .query(
+                &sql,
+                turso::params![
+                    event.id,
+                    event.workspace_id.to_string(),
+                    sequence,
+                    event.subject_kind,
+                    event.subject_id,
+                    event.actor_id,
+                    event.event_type,
+                    event.occurred_at,
+                    event.summary,
+                    metadata
+                ],
+            )
+            .await
+            .map_err(|error| map_turso_error("insert Org event", error))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read inserted Org event", error))?
+            .ok_or_else(|| {
+                StorageError::new(
+                    StorageErrorKind::Operation,
+                    "insert Org event returned no row",
+                )
+            })?;
+        decode_event(&row)
+    }
+
+    async fn list_org_events(
+        &self,
+        workspace_id: WorkspaceId,
+        after_sequence: Option<i64>,
+        limit: usize,
+    ) -> StorageResult<Vec<OrgEvent>> {
+        validate_event_limit(limit)?;
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS}
+             FROM org_events
+             WHERE workspace_id=?1 AND sequence>?2
+             ORDER BY sequence
+             LIMIT ?3"
+        );
+        let mut rows = self
+            .connection
+            .query(
+                &sql,
+                turso::params![
+                    workspace_id.to_string(),
+                    after_sequence.unwrap_or(0),
+                    limit as i64
+                ],
+            )
+            .await
+            .map_err(|error| map_turso_error("list Org events", error))?;
+        let mut events = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read Org event list", error))?
+        {
+            events.push(decode_event(&row)?);
+        }
+        Ok(events)
+    }
+
+    async fn insert_org_operation(&self, operation: &StoredOrgOperation) -> StorageResult<()> {
+        let result = serde_json::to_string(&operation.result).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize Org operation result",
+                error,
+            )
+        })?;
+        self.connection
+            .execute(
+                "INSERT INTO org_operations (
+                     workspace_id, operation_id, request_fingerprint, result, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                turso::params![
+                    operation.workspace_id.to_string(),
+                    operation.operation_id.as_str(),
+                    operation.request_fingerprint.as_str(),
+                    result,
+                    operation.created_at
+                ],
+            )
+            .await
+            .map_err(|error| map_turso_error("insert Org operation", error))?;
+        Ok(())
+    }
+
+    async fn get_org_operation(
+        &self,
+        workspace_id: WorkspaceId,
+        operation_id: &str,
+    ) -> StorageResult<Option<StoredOrgOperation>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT workspace_id, operation_id, request_fingerprint, result, created_at
+                 FROM org_operations
+                 WHERE workspace_id=?1 AND operation_id=?2",
+                turso::params![workspace_id.to_string(), operation_id],
+            )
+            .await
+            .map_err(|error| map_turso_error("query Org operation", error))?;
+        rows.next()
+            .await
+            .map_err(|error| map_turso_error("read Org operation", error))?
+            .as_ref()
+            .map(decode_operation)
+            .transpose()
+    }
+}
+
+fn validate_event_limit(limit: usize) -> StorageResult<()> {
+    if !(1..=200).contains(&limit) {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org event list limit must be between 1 and 200",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_event(row: &turso::Row) -> StorageResult<OrgEvent> {
+    let metadata_text: String = row
+        .get(9)
+        .map_err(|error| map_turso_error("decode Org event metadata", error))?;
+    let metadata = serde_json::from_str(&metadata_text).map_err(|error| {
+        StorageError::with_source(
+            StorageErrorKind::Corrupt,
+            "decode stored Org event metadata",
+            error,
+        )
+    })?;
+    Ok(OrgEvent {
+        id: row
+            .get(0)
+            .map_err(|error| map_turso_error("decode Org event id", error))?,
+        workspace_id: decode_workspace_id(
+            row.get(1)
+                .map_err(|error| map_turso_error("decode Org event workspace id", error))?,
+        )?,
+        sequence: row
+            .get(2)
+            .map_err(|error| map_turso_error("decode Org event sequence", error))?,
+        subject_kind: row
+            .get(3)
+            .map_err(|error| map_turso_error("decode Org event subject kind", error))?,
+        subject_id: row
+            .get(4)
+            .map_err(|error| map_turso_error("decode Org event subject id", error))?,
+        actor_id: row
+            .get(5)
+            .map_err(|error| map_turso_error("decode Org event actor id", error))?,
+        event_type: row
+            .get(6)
+            .map_err(|error| map_turso_error("decode Org event type", error))?,
+        occurred_at: row
+            .get(7)
+            .map_err(|error| map_turso_error("decode Org event occurred at", error))?,
+        summary: row
+            .get(8)
+            .map_err(|error| map_turso_error("decode Org event summary", error))?,
+        metadata,
+    })
+}
+
+fn decode_operation(row: &turso::Row) -> StorageResult<StoredOrgOperation> {
+    let result_text: String = row
+        .get(3)
+        .map_err(|error| map_turso_error("decode Org operation result", error))?;
+    let result = serde_json::from_str(&result_text).map_err(|error| {
+        StorageError::with_source(
+            StorageErrorKind::Corrupt,
+            "decode stored Org operation result",
+            error,
+        )
+    })?;
+    Ok(StoredOrgOperation {
+        workspace_id: decode_workspace_id(
+            row.get(0)
+                .map_err(|error| map_turso_error("decode Org operation workspace id", error))?,
+        )?,
+        operation_id: row
+            .get(1)
+            .map_err(|error| map_turso_error("decode Org operation id", error))?,
+        request_fingerprint: row
+            .get(2)
+            .map_err(|error| map_turso_error("decode Org operation fingerprint", error))?,
+        result,
+        created_at: row
+            .get(4)
+            .map_err(|error| map_turso_error("decode Org operation created at", error))?,
+    })
 }
 
 struct ProjectionPlan {

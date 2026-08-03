@@ -1,8 +1,10 @@
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewOrgDocument, NewOrgWorkspace, OrgDocumentUpdate, OrgProjectedWorkItem,
-    OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StoredOrgTimestamp, TransactionMode,
+    CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocumentUpdate,
+    OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StoredOrgOperation,
+    StoredOrgTimestamp, TransactionMode,
 };
+use serde_json::json;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
@@ -475,7 +477,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .list_org_document_projection(second_document_id)
             .await
             .unwrap(),
-        vec![rebuilt]
+        vec![rebuilt.clone()]
     );
 
     let missing_parent_id = work_item_id("30000000-0000-0000-0000-000000000099");
@@ -593,6 +595,145 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .unwrap(),
         omitted_cycle_base,
         "dependency-cycle rejection must leave the prior projection unchanged"
+    );
+
+    let alpha_first_metadata = json!({
+        "change": {"from": "TODO", "to": "ACTIVE"},
+        "labels": ["backend", "release"]
+    });
+    let alpha_first = session
+        .append_org_event(NewOrgEvent {
+            id: "50000000-0000-0000-0000-000000000001",
+            workspace_id: alpha_id,
+            subject_kind: "work_item",
+            subject_id: "30000000-0000-0000-0000-000000000001",
+            actor_id: "agent-one",
+            event_type: "state_changed",
+            occurred_at: 200,
+            summary: "Activated release",
+            metadata: &alpha_first_metadata,
+        })
+        .await
+        .unwrap();
+    let alpha_second_metadata = json!({"revision": 2, "nested": {"verified": true}});
+    let alpha_second = session
+        .append_org_event(NewOrgEvent {
+            id: "50000000-0000-0000-0000-000000000002",
+            workspace_id: alpha_id,
+            subject_kind: "document",
+            subject_id: "20000000-0000-0000-0000-000000000001",
+            actor_id: "agent-two",
+            event_type: "document_updated",
+            occurred_at: 100,
+            summary: "Updated canonical source",
+            metadata: &alpha_second_metadata,
+        })
+        .await
+        .unwrap();
+    let beta_metadata = json!({"queue": "triage"});
+    let beta_first = session
+        .append_org_event(NewOrgEvent {
+            id: "50000000-0000-0000-0000-000000000003",
+            workspace_id: beta_id,
+            subject_kind: "workspace",
+            subject_id: "10000000-0000-0000-0000-000000000002",
+            actor_id: "agent-three",
+            event_type: "workspace_checked",
+            occurred_at: 150,
+            summary: "Checked beta workspace",
+            metadata: &beta_metadata,
+        })
+        .await
+        .unwrap();
+    assert_eq!(alpha_first.sequence, 1);
+    assert_eq!(alpha_second.sequence, 2);
+    assert_eq!(beta_first.sequence, 1);
+
+    let alpha_events = session.list_org_events(alpha_id, None, 200).await.unwrap();
+    assert_eq!(
+        alpha_events,
+        vec![alpha_first.clone(), alpha_second.clone()]
+    );
+    assert_eq!(
+        alpha_events
+            .iter()
+            .map(|event| event.occurred_at)
+            .collect::<Vec<_>>(),
+        vec![200, 100],
+        "Org events must be ordered by sequence rather than occurrence time"
+    );
+    assert_eq!(
+        session
+            .list_org_events(alpha_id, Some(1), 200)
+            .await
+            .unwrap(),
+        vec![alpha_second.clone()],
+        "after_sequence must be exclusive"
+    );
+    assert_eq!(
+        session.list_org_events(alpha_id, None, 1).await.unwrap(),
+        vec![alpha_first.clone()],
+        "Org event list limit must be honored"
+    );
+    assert_eq!(
+        session.list_org_events(beta_id, None, 200).await.unwrap(),
+        vec![beta_first]
+    );
+    for invalid_limit in [0, 201] {
+        let error = session
+            .list_org_events(alpha_id, None, invalid_limit)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Operation);
+    }
+
+    let operation = StoredOrgOperation {
+        workspace_id: alpha_id,
+        operation_id: "operation-alpha-1".into(),
+        request_fingerprint: "sha256:alpha-1".into(),
+        result: json!({
+            "status": "applied",
+            "document": {"id": first_document_id.to_string(), "revision": 2},
+            "warnings": [{"code": "none", "details": {"count": 0}}]
+        }),
+        created_at: 300,
+    };
+    session.insert_org_operation(&operation).await.unwrap();
+    assert_eq!(
+        session
+            .get_org_operation(alpha_id, "operation-alpha-1")
+            .await
+            .unwrap(),
+        Some(operation.clone())
+    );
+    let duplicate_operation = session.insert_org_operation(&operation).await.unwrap_err();
+    assert_eq!(duplicate_operation.kind(), StorageErrorKind::Constraint);
+
+    let events_before_rebuild = session.list_org_events(alpha_id, None, 200).await.unwrap();
+    let operation_before_rebuild = session
+        .get_org_operation(alpha_id, "operation-alpha-1")
+        .await
+        .unwrap();
+    let mut preserved_rebuild = omitted_cycle_base.clone();
+    preserved_rebuild.push(rebuilt.clone());
+    let preserve_ledger = storage.begin(TransactionMode::Immediate).await.unwrap();
+    preserve_ledger
+        .rebuild_org_workspace_projection(alpha_id, &preserved_rebuild)
+        .await
+        .unwrap();
+    preserve_ledger.commit().await.unwrap();
+    assert_eq!(
+        session.list_org_events(alpha_id, None, 200).await.unwrap(),
+        events_before_rebuild,
+        "projection rebuild must preserve Org event sequence, content, and metadata"
+    );
+    assert_eq!(
+        session
+            .get_org_operation(alpha_id, "operation-alpha-1")
+            .await
+            .unwrap(),
+        operation_before_rebuild,
+        "projection rebuild must preserve Org operation results"
     );
 
     let CompareAndSwap::Applied(archived_alpha) = session
