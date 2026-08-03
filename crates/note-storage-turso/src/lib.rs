@@ -2,6 +2,7 @@ mod connection;
 mod embedding_jobs;
 mod labels;
 mod notes;
+mod org;
 mod preflight;
 mod retrieval;
 mod settings;

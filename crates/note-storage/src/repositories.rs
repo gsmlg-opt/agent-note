@@ -1,6 +1,9 @@
 use crate::{
-    ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, EmbeddingDashboardStatus,
-    EmbeddingJob, NewNote, NoteChunk, NoteFieldsUpdate, NoteUpdate, StorageResult, UpsertNoteChunk,
+    ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, CompareAndSwap,
+    EmbeddingDashboardStatus, EmbeddingJob, NewNote, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
+    NoteChunk, NoteFieldsUpdate, NoteUpdate, OrgDocument, OrgDocumentUpdate, OrgEvent,
+    OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceUpdate, StorageError, StorageErrorKind,
+    StorageResult, StoredOrgOperation, UpsertNoteChunk,
 };
 
 #[async_trait::async_trait]
@@ -179,6 +182,179 @@ pub trait SettingsRepository: Send + Sync {
     async fn set_embedding_fingerprint(&self, fingerprint: &str) -> StorageResult<()>;
 }
 
+#[async_trait::async_trait]
+pub trait OrgRepository: Send + Sync {
+    async fn insert_org_workspace(&self, value: NewOrgWorkspace<'_>) -> StorageResult<()> {
+        let _ = value;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn get_org_workspace(
+        &self,
+        id: note_org::WorkspaceId,
+    ) -> StorageResult<Option<OrgWorkspace>> {
+        let _ = id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn get_org_workspace_by_slug(&self, slug: &str) -> StorageResult<Option<OrgWorkspace>> {
+        let _ = slug;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_workspaces(
+        &self,
+        include_archived: bool,
+    ) -> StorageResult<Vec<OrgWorkspace>> {
+        let _ = include_archived;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn compare_and_swap_org_workspace(
+        &self,
+        update: OrgWorkspaceUpdate<'_>,
+    ) -> StorageResult<CompareAndSwap<OrgWorkspace>> {
+        let _ = update;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn insert_org_document(&self, value: NewOrgDocument<'_>) -> StorageResult<()> {
+        let _ = value;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn get_org_document(
+        &self,
+        id: note_org::DocumentId,
+    ) -> StorageResult<Option<OrgDocument>> {
+        let _ = id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_documents(
+        &self,
+        workspace_id: note_org::WorkspaceId,
+    ) -> StorageResult<Vec<OrgDocument>> {
+        let _ = workspace_id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn compare_and_swap_org_document(
+        &self,
+        update: OrgDocumentUpdate<'_>,
+    ) -> StorageResult<CompareAndSwap<OrgDocument>> {
+        let _ = update;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    /// Must be called inside a storage transaction with the document write.
+    async fn replace_org_document_projection(
+        &self,
+        document_id: note_org::DocumentId,
+        items: &[OrgProjectedWorkItem],
+    ) -> StorageResult<()> {
+        let _ = (document_id, items);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_document_projection(
+        &self,
+        document_id: note_org::DocumentId,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let _ = document_id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    /// Rebuilds every projection row for a workspace from all canonical documents; events and operation records are not modified.
+    async fn rebuild_org_workspace_projection(
+        &self,
+        workspace_id: note_org::WorkspaceId,
+        items: &[OrgProjectedWorkItem],
+    ) -> StorageResult<()> {
+        let _ = (workspace_id, items);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    /// Must be called inside the same transaction as the mutation it records.
+    async fn append_org_event(&self, event: NewOrgEvent<'_>) -> StorageResult<OrgEvent> {
+        let _ = event;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_events(
+        &self,
+        workspace_id: note_org::WorkspaceId,
+        after_sequence: Option<i64>,
+        limit: usize,
+    ) -> StorageResult<Vec<OrgEvent>> {
+        let _ = (workspace_id, after_sequence, limit);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    /// Must be called inside the same transaction as the mutation result.
+    async fn insert_org_operation(&self, operation: &StoredOrgOperation) -> StorageResult<()> {
+        let _ = operation;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn get_org_operation(
+        &self,
+        workspace_id: note_org::WorkspaceId,
+        operation_id: &str,
+    ) -> StorageResult<Option<StoredOrgOperation>> {
+        let _ = (workspace_id, operation_id);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionMode {
     Deferred,
@@ -191,6 +367,7 @@ pub trait StorageSession:
     + EmbeddingRepository
     + RetrievalRepository
     + SettingsRepository
+    + OrgRepository
     + Send
     + Sync
 {
@@ -202,6 +379,7 @@ impl<T> StorageSession for T where
         + EmbeddingRepository
         + RetrievalRepository
         + SettingsRepository
+        + OrgRepository
         + Send
         + Sync
 {

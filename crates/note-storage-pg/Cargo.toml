@@ -7,6 +7,7 @@ edition.workspace = true
 async-trait = "0.1.89"
 futures-util = "0.3.32"
 note-core = { path = "../note-core" }
+note-org = { path = "../note-org" }
 note-storage = { path = "../note-storage" }
 pgvector = { version = "0.4.2", features = ["sqlx"] }
 serde = { version = "1.0.228", features = ["derive"] }

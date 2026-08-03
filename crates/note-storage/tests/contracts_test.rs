@@ -1,17 +1,26 @@
 use note_storage::{
-    StorageBackend, StorageError, StorageErrorKind, StorageSession, StorageTransaction,
+    OrgRepository, StorageBackend, StorageError, StorageErrorKind, StorageSession,
+    StorageTransaction,
 };
 use std::sync::Arc;
 
 fn accepts_backend(_: Arc<dyn StorageBackend>) {}
 fn accepts_session(_: Box<dyn StorageSession>) {}
 fn accepts_transaction(_: Box<dyn StorageTransaction>) {}
+fn accepts_org_repository(_: &dyn OrgRepository) {}
+fn accepts_org_storage_session(_: Box<dyn StorageSession>) {}
 
 #[test]
 fn storage_contracts_are_dyn_compatible() {
     let _ = accepts_backend;
     let _ = accepts_session;
     let _ = accepts_transaction;
+}
+
+#[test]
+fn storage_sessions_include_org_persistence() {
+    let _ = accepts_org_repository;
+    let _ = accepts_org_storage_session;
 }
 
 #[test]

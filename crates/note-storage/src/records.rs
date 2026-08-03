@@ -3,6 +3,146 @@ use std::path::PathBuf;
 pub const EMBEDDING_DIMENSION: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareAndSwap<T> {
+    Applied(T),
+    NotFound,
+    Conflict { current_revision: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgWorkspace {
+    pub id: note_org::WorkspaceId,
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub timezone: String,
+    pub policy_schema_version: i64,
+    pub policy: note_org::WorkspacePolicy,
+    pub revision: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived_at: Option<i64>,
+}
+
+pub struct NewOrgWorkspace<'a> {
+    pub id: note_org::WorkspaceId,
+    pub slug: &'a str,
+    pub display_name: &'a str,
+    pub description: &'a str,
+    pub timezone: &'a str,
+    pub policy_schema_version: i64,
+    pub policy: &'a note_org::WorkspacePolicy,
+    pub now: i64,
+}
+
+pub struct OrgWorkspaceUpdate<'a> {
+    pub id: note_org::WorkspaceId,
+    pub expected_revision: i64,
+    pub slug: &'a str,
+    pub display_name: &'a str,
+    pub description: &'a str,
+    pub timezone: &'a str,
+    pub policy_schema_version: i64,
+    pub policy: &'a note_org::WorkspacePolicy,
+    pub archived_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgDocument {
+    pub id: note_org::DocumentId,
+    pub workspace_id: note_org::WorkspaceId,
+    pub path: String,
+    pub source: String,
+    pub content_hash: String,
+    pub revision: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub struct NewOrgDocument<'a> {
+    pub id: note_org::DocumentId,
+    pub workspace_id: note_org::WorkspaceId,
+    pub path: &'a str,
+    pub source: &'a str,
+    pub content_hash: &'a str,
+    pub now: i64,
+}
+
+pub struct OrgDocumentUpdate<'a> {
+    pub id: note_org::DocumentId,
+    pub expected_revision: i64,
+    pub path: &'a str,
+    pub source: &'a str,
+    pub content_hash: &'a str,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOrgTimestamp {
+    pub raw: String,
+    pub local: String,
+    pub timezone: String,
+    pub utc_timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgProjectedWorkItem {
+    pub id: note_org::WorkItemId,
+    pub workspace_id: note_org::WorkspaceId,
+    pub document_id: note_org::DocumentId,
+    pub parent_id: Option<note_org::WorkItemId>,
+    pub source_order: i64,
+    pub item_type: note_org::WorkItemType,
+    pub title: String,
+    pub state: Option<String>,
+    pub priority: Option<char>,
+    pub scheduled: Option<StoredOrgTimestamp>,
+    pub deadline: Option<StoredOrgTimestamp>,
+    pub assignee: Option<String>,
+    pub requires_review: bool,
+    pub created_at: i64,
+    pub tags: Vec<String>,
+    pub dependencies: Vec<note_org::WorkItemId>,
+    pub note_links: Vec<note_org::NoteLink>,
+}
+
+pub struct NewOrgEvent<'a> {
+    pub id: &'a str,
+    pub workspace_id: note_org::WorkspaceId,
+    pub subject_kind: &'a str,
+    pub subject_id: &'a str,
+    pub actor_id: &'a str,
+    pub event_type: &'a str,
+    pub occurred_at: i64,
+    pub summary: &'a str,
+    pub metadata: &'a serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgEvent {
+    pub id: String,
+    pub workspace_id: note_org::WorkspaceId,
+    pub sequence: i64,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub actor_id: String,
+    pub event_type: String,
+    pub occurred_at: i64,
+    pub summary: String,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOrgOperation {
+    pub workspace_id: note_org::WorkspaceId,
+    pub operation_id: String,
+    pub request_fingerprint: String,
+    pub result: serde_json::Value,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteChunk {
     pub note_id: String,
     pub chunk_idx: i64,

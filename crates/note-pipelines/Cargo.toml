@@ -21,6 +21,7 @@ uuid = { version = "1.23.4", features = ["v4"] }
 
 [dev-dependencies]
 async-trait = "0.1.89"
+note-org = { version = "0.1.0", path = "../note-org" }
 note-storage-turso = { version = "0.1.0", path = "../note-storage-turso" }
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["full"] }

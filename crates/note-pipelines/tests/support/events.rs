@@ -4,11 +4,13 @@ use note_attachments::{
 use note_core::{LabelSelector, NoteAttachment};
 use note_pipelines::EmbeddingJobNotifier;
 use note_storage::{
-    ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, EmbeddingDashboardStatus,
-    EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteFieldsUpdate,
-    NoteUpdate, NotesRepository, RetrievalRepository, SettingsRepository, StorageBackend,
+    ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, CompareAndSwap,
+    EmbeddingDashboardStatus, EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote,
+    NewOrgDocument, NewOrgEvent, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteUpdate,
+    NotesRepository, OrgDocument, OrgDocumentUpdate, OrgEvent, OrgProjectedWorkItem, OrgRepository,
+    OrgWorkspace, OrgWorkspaceUpdate, RetrievalRepository, SettingsRepository, StorageBackend,
     StorageError, StorageErrorKind, StorageResult, StorageSession, StorageTransaction,
-    TransactionMode, UpsertNoteChunk,
+    StoredOrgOperation, TransactionMode, UpsertNoteChunk,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -212,6 +214,48 @@ impl_forward_repository! {
         fn set_system_config(config: &note_core::SystemConfig) -> ();
         fn get_embedding_fingerprint() -> Option<String>;
         fn set_embedding_fingerprint(fingerprint: &str) -> ();
+    }
+}
+
+impl_forward_repository! {
+    OrgRepository {
+        fn insert_org_workspace(value: NewOrgWorkspace<'_>) -> ();
+        fn get_org_workspace(id: note_org::WorkspaceId) -> Option<OrgWorkspace>;
+        fn get_org_workspace_by_slug(slug: &str) -> Option<OrgWorkspace>;
+        fn list_org_workspaces(include_archived: bool) -> Vec<OrgWorkspace>;
+        fn compare_and_swap_org_workspace(
+            update: OrgWorkspaceUpdate<'_>,
+        ) -> CompareAndSwap<OrgWorkspace>;
+        fn insert_org_document(value: NewOrgDocument<'_>) -> ();
+        fn get_org_document(id: note_org::DocumentId) -> Option<OrgDocument>;
+        fn list_org_documents(
+            workspace_id: note_org::WorkspaceId,
+        ) -> Vec<OrgDocument>;
+        fn compare_and_swap_org_document(
+            update: OrgDocumentUpdate<'_>,
+        ) -> CompareAndSwap<OrgDocument>;
+        fn replace_org_document_projection(
+            document_id: note_org::DocumentId,
+            items: &[OrgProjectedWorkItem],
+        ) -> ();
+        fn list_org_document_projection(
+            document_id: note_org::DocumentId,
+        ) -> Vec<OrgProjectedWorkItem>;
+        fn rebuild_org_workspace_projection(
+            workspace_id: note_org::WorkspaceId,
+            items: &[OrgProjectedWorkItem],
+        ) -> ();
+        fn append_org_event(event: NewOrgEvent<'_>) -> OrgEvent;
+        fn list_org_events(
+            workspace_id: note_org::WorkspaceId,
+            after_sequence: Option<i64>,
+            limit: usize,
+        ) -> Vec<OrgEvent>;
+        fn insert_org_operation(operation: &StoredOrgOperation) -> ();
+        fn get_org_operation(
+            workspace_id: note_org::WorkspaceId,
+            operation_id: &str,
+        ) -> Option<StoredOrgOperation>;
     }
 }
 
