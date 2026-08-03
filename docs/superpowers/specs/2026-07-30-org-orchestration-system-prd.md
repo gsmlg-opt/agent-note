@@ -2,9 +2,12 @@
 
 **Date:** 2026-07-30
 
-**Status:** Approved
+**Status:** Approved; interface scope revised 2026-08-04
 
 **Source design:** [`../../org-module-design.md`](../../org-module-design.md)
+
+**Interface expansion design:**
+[`2026-08-04-org-delivery-interfaces-design.md`](2026-08-04-org-delivery-interfaces-design.md)
 
 ## Problem Statement
 
@@ -39,9 +42,12 @@ Add a multi-workspace, Org-native orchestration subsystem to Agent Note.
 Standard Org text will remain the canonical, exportable representation of
 plans and work items. Agent Note will store that source together with a
 monotonic document revision, derive queryable work-item projections, validate
-workspace workflow policy, and record execution events. Agents will interact
-through structured MCP operations for queues, claims, transitions,
-dependencies, reviews, and progress rather than rewriting whole documents.
+workspace workflow policy, and record execution events. Agents and API clients
+will interact through equivalent structured MCP and REST operations for
+queues, claims, transitions, dependencies, reviews, and progress rather than
+rewriting whole documents. A workspace-first Web operations console will
+expose the resulting state to human operators without adding browser mutations
+in its first release.
 
 The subsystem will establish two complementary product planes:
 
@@ -53,9 +59,9 @@ The two planes will be connected through stable links without merging their
 data models.
 
 The first release will support concurrent agents through one active Agent Note
-server process. It will provide the storage and API foundations needed for
-future web administration and autonomous scheduling, but it will not implement
-either feature.
+server process, complete MCP and REST interfaces, offline import/export, and a
+read-only Web operations console. Autonomous scheduling and browser mutation or
+administration controls remain deferred.
 
 ## Goals and Success Measures
 
@@ -75,8 +81,11 @@ either feature.
 7. Preserve recovery context across agent failure, lease expiry, and retry.
 8. Link work items to Markdown notes used as context or produced as results.
 9. Keep existing Markdown note behavior and APIs unchanged.
-10. Provide a foundation for later human UI and automatic dispatch without
-    implementing them in this release.
+10. Provide complete and equivalent MCP and REST access to every initial Org
+    operation.
+11. Provide a read-only, workspace-first Web operations console without
+    exposing mutation controls.
+12. Keep automatic dispatch and browser administration out of this release.
 
 ### Success Measures
 
@@ -93,7 +102,12 @@ either feature.
 7. The embedded and PostgreSQL adapters pass the same Org storage contract
    suite.
 8. MCP over stdio and Streamable HTTP expose the same Org tools and behavior.
-9. Existing Markdown behavior remains unchanged and its tests continue to pass.
+9. REST exposes an OpenAPI operation equivalent to every initial Org MCP tool,
+   and cross-transport conformance tests produce equivalent normalized results
+   and errors.
+10. Operators can inspect workspaces, operational queues, agendas, work-item
+    context, leases, and ordered event history through a read-only Web UI.
+11. Existing Markdown behavior remains unchanged and its tests continue to pass.
    Aggregate MCP inventory assertions are intentionally updated for the added
    Org tools.
 
@@ -220,13 +234,27 @@ either feature.
 58. As an existing Agent Note user, I want all current note behavior to remain
     unchanged, so that enabling Org orchestration does not disrupt my knowledge
     base.
+59. As an API client, I want every Org MCP capability available through REST,
+    so that non-MCP integrations do not need a separate business model.
+60. As an API client, I want retries of one mutation operation to return the
+    original result, so that network uncertainty cannot duplicate a claim,
+    transition, or review.
+61. As an operator, I want to enter Org through a workspace directory, so that
+    policy, time, and queue boundaries remain explicit.
+62. As an operator, I want workspace-scoped operational views in a browser, so
+    that ready, assigned, running, blocked, review, scheduled, deadline, failed,
+    expired-lease, and completed work are visible without MCP tooling.
+63. As an operator, I want a work-item context page that preserves my source
+    list filters when I return, so that investigation does not disrupt triage.
+64. As an operator, I want the first browser console to be read-only, so that
+    observing work does not accidentally mutate workflow state.
 
 ## Functional Requirements
 
 ### Workspace and Policy
 
 1. A workspace must have a stable ID, unique slug, display name, description,
-   policy, revision, and timestamps.
+   required IANA timezone, policy, revision, archive state, and timestamps.
 2. Workspace policy must define:
    - allowed work-item types;
    - workflow states;
@@ -252,6 +280,14 @@ either feature.
    attempts.
 7. Workspace deletion is not required. Workspaces may be archived and remain
    queryable and exportable.
+8. Archiving must require the expected workspace revision and must be rejected
+   while the workspace has any active lease.
+9. An archived workspace must reject imports, semantic source changes, claims,
+   heartbeats, transitions, reviews, and all other mutations while remaining
+   queryable, exportable, and auditable.
+10. Archived workspaces must be excluded from normal lists, queues, and agendas
+    unless the caller explicitly requests archived data.
+11. Unarchiving is not required in the first release.
 
 ### Org Documents and Identity
 
@@ -403,6 +439,19 @@ either feature.
    Client operations require an asserted non-empty actor ID and may not assert
    the reserved value.
 
+### Mutation Idempotency
+
+1. Every client-initiated mutation over MCP or REST must require a non-empty,
+   client-generated `operation_id` in addition to the asserted `actor_id`.
+2. The service must persist the operation ID, a canonical request fingerprint,
+   and the transport-neutral result in the same transaction as the mutation.
+3. Retrying an operation ID with the same request fingerprint must return the
+   original result without appending another event or repeating any mutation.
+4. Reusing an operation ID with a different request fingerprint must return an
+   `idempotency_conflict` without side effects.
+5. Internal lease-expiry bookkeeping remains independently idempotent and uses
+   the reserved `system` actor.
+
 ### Queues and Agendas
 
 1. The ready queue must include only items whose:
@@ -422,11 +471,15 @@ either feature.
    completed views.
 6. Queue and agenda queries must support filtering by work-item type, state,
    priority, tags, assignment, and time window.
-7. Queue and agenda queries must support bounded pagination.
+7. Queue and agenda queries must use opaque cursor pagination with a default
+   limit of 50, a maximum limit of 200, and stable-ID tie-breaking.
 8. A query must be scoped to one workspace unless the caller explicitly
    supplies multiple workspace IDs.
 9. Cross-workspace results must preserve workspace identity on every item.
-10. Queue clients must not need to parse Org documents.
+10. An explicit multi-workspace query must be rejected unless every selected
+    workspace policy permits cross-workspace agenda queries.
+11. Queue clients must not need to parse Org documents or reimplement
+    readiness rules.
 
 ### Markdown Knowledge Links
 
@@ -462,11 +515,12 @@ either feature.
 8. Multi-document moves and imports must commit all affected document sources,
    projections, and events atomically or change nothing.
 
-### Agent Interfaces
+### MCP and REST Interfaces
 
 1. MCP must be the canonical agent interface.
 2. Org tools must use an `org_` prefix and remain separate from Markdown note
-   tools.
+   tools. REST must expose an equivalent operation for every initial Org MCP
+   tool.
 3. The initial MCP tool family must expose these operations:
    - `org_list_workspaces`, `org_create_workspace`, `org_get_workspace`,
      `org_update_workspace`, and `org_archive_workspace`;
@@ -494,14 +548,27 @@ either feature.
    `org_move_document` must accept the document revision plus source and target
    workspace revisions.
 8. Every lease-bound operation must accept the opaque fencing token.
-9. Every meaningful operation must accept a non-empty actor ID for audit.
+9. Every client mutation must accept a non-empty actor ID and operation ID.
 10. Actor ID in this release is an asserted client identity, not an
    authenticated principal.
 11. MCP stdio and Streamable HTTP must register the same schemas and call the
     same pipelines.
-12. Tool errors must distinguish invalid input, missing resource, stale
-    revision, invalid transition, unmet dependency, active lease, stale lease,
-    concurrency limit, and storage failure.
+12. MCP and REST errors must distinguish invalid input, missing resource, stale
+    revision, idempotency conflict, invalid transition, unmet dependency,
+    active lease, stale lease, concurrency limit, and storage failure.
+13. REST must expose all 36 initial Org operations under `/api/org` and include
+    every operation in the generated OpenAPI document.
+14. Each Org REST OpenAPI `operationId` must equal the corresponding `org_*`
+    MCP tool name.
+15. REST and MCP must use the same pipeline operations, transport-neutral DTOs,
+    validation rules, idempotency behavior, result semantics, and error codes.
+16. REST must use structured JSON errors with stable `code`, `message`,
+    `details`, and `retryable` fields. MCP structured errors must expose the
+    same fields.
+17. List operations must use opaque cursors, a default limit of 50, and a
+    maximum limit of 200 unless an operation defines a stricter bound.
+18. Fencing tokens must be returned to a successful claiming client and must
+    never be included in general read-only operational DTOs.
 
 ### Human Import and Export Interface
 
@@ -513,6 +580,30 @@ either feature.
    report per-document validation and conflict results.
 4. Offline commands must load the normal storage configuration and must not
    start embedding workers or mutate Markdown note data.
+
+### Read-Only Web Operations Interface
+
+1. The frontend navigation must add an `Org` destination.
+2. `/org` must list workspace summaries and default to active workspaces, with
+   an explicit option to include archived workspaces.
+3. `/org/:workspace_id` must expose workspace-scoped ready, assigned, running,
+   blocked, review, scheduled, upcoming-deadline, failed, expired-lease, and
+   completed views using server-computed operational data.
+4. `/org/:workspace_id/items/:item_id` must expose hierarchy, dependencies,
+   Markdown note availability, attempts, lease metadata, recovery context, and
+   sequence-ordered event history.
+5. Operational views must use tables rather than a board. Current view,
+   filters, cursor or page state, and typed return context must be represented
+   in the URL so returning from an item restores its originating list.
+6. The UI must default to workspace time and may show browser-local time as
+   secondary information.
+7. Missing or deleted Markdown note targets must remain visible and be marked
+   unavailable.
+8. The UI must provide explicit loading, empty, structured error, and manual
+   refresh states.
+9. The first Web UI must not expose create, edit, claim, release, transition,
+   review, archive, import, or raw Org editing controls.
+10. The UI must not display fencing tokens or call MCP directly.
 
 ## Implementation Decisions
 
@@ -534,7 +625,7 @@ either feature.
   sibling crates.
 - Extend the existing storage abstraction with cohesive Org repository
   contracts for workspaces, canonical documents, projections, dependencies,
-  note links, leases, attempts, and events.
+  note links, leases, attempts, events, and idempotent operation results.
 - Implement those contracts in both existing database adapters. Do not add a
   separate Org database adapter or storage crate.
 - Extend the shared storage contract suite so both adapters prove identical Org
@@ -547,10 +638,12 @@ either feature.
   offline Org commands construct it without embedding or attachment services.
 - Add the semantic `org_*` tool family to the existing MCP server and reuse it
   unchanged across stdio and Streamable HTTP.
-- Extend the existing server binary only with offline Org import/export command
-  modes. Do not add an Org REST surface in this release.
-- Keep the frontend, embedding, and attachment modules unchanged in the first
-  release.
+- Extend the existing server binary with offline Org import/export command
+  modes and a complete Org REST surface. REST handlers call the same pipelines
+  as MCP, and every operation is included in OpenAPI.
+- Extend the Yew frontend with a read-only, REST-backed Org operations console.
+  Do not add browser mutation controls in the first UI slice.
+- Keep the embedding and attachment modules unchanged.
 
 ### Canonical Source and Projections
 
@@ -569,6 +662,9 @@ either feature.
   The supported semantic subset may grow without requiring document migration.
 - True storage-level compare-and-swap is required. Existing note content-tag
   checks are not sufficient for Org concurrency.
+- Projections must be rebuildable from canonical Org source. Events, attempts,
+  leases, and operation results are authoritative runtime data and are not
+  discarded during projection rebuilds.
 
 ### Persistence Model
 
@@ -576,7 +672,10 @@ either feature.
 - Derived data consists of work items, hierarchy, dependencies, schedules,
   deadlines, priorities, tags, assignments, and Markdown note links.
 - Associated runtime data consists of leases, execution attempts, progress,
-  and append-only events.
+  append-only events, and idempotent operation results.
+- Canonical persistence introduces a minimal event ledger and per-workspace
+  event sequence in Slice 2 so import, source, projections, and their event can
+  commit atomically. Slice 3 adds the complete workflow event vocabulary.
 - Embedded storage must admit existing schema-version-2 databases during
   preflight, migrate them atomically to version 3 under an immediate
   transaction, and update the schema version only after every DDL and data
@@ -609,8 +708,15 @@ either feature.
 
 ### Queue and Time Semantics
 
-- All persisted timestamps use UTC Unix time, while Org timestamps preserve
-  their original textual form and timezone information where present.
+- Every workspace has a required IANA timezone. Org timestamps preserve their
+  original text and explicit timezone or offset where present.
+- Org timestamps without an explicit zone are interpreted in the workspace
+  timezone and persisted with the resolved UTC instant used for queries.
+- Ambiguous or nonexistent local times caused by daylight-saving transitions
+  are rejected rather than silently shifted or guessed.
+- API DTOs return the original local representation, workspace timezone, and
+  resolved UTC instant where applicable. The Web UI defaults to workspace time
+  and may show browser-local time secondarily.
 - A schedule is an earliest-start constraint. A deadline affects agenda and
   ordering but does not by itself make work executable.
 - Lease expiry is evaluated transactionally at read/claim time so recovery does
@@ -622,20 +728,28 @@ either feature.
 
 ### API and Conflict Semantics
 
-- Pipeline errors use stable domain categories that MCP and offline command
-  modes map into their respective error responses.
+- Pipeline errors use stable domain categories that MCP, REST, and offline
+  command modes map into their respective error responses.
+- Every client mutation requires an operation ID. The mutation transaction
+  stores its canonical request fingerprint and transport-neutral result;
+  identical retries replay that result and divergent reuse returns an
+  idempotency conflict.
 - Source-changing mutations return the resulting item and new document
   revision. Event-only and lease-only mutations leave the document revision
   unchanged and return the resulting event or lease state.
 - Multi-document operations accept an expected-revision map keyed by document
   ID. Raw imports that touch leased items additionally accept a fencing-token
   map keyed by work-item ID.
-- A conflict never partially mutates source, projections, leases, or events.
+- A conflict never partially mutates source, projections, leases, events, or
+  operation results.
 - Claim responses include complete execution context: item, parent, workspace
   policy, dependencies, linked notes, prior attempts, recent events, lease,
   and current revision.
 - Actor IDs are recorded for audit but are not trusted authorization data in
   this release.
+- Agent Note implements no authentication, authorization, session, or
+  workspace ACL behavior. A front proxy owns the deployment security boundary,
+  and direct exposure to an untrusted network is unsupported.
 
 ### Delivery Slices
 
@@ -647,20 +761,31 @@ either feature.
 2. **Canonical persistence**
    - workspace and document storage;
    - derived projections and note links;
+   - minimal event ledger, per-workspace event sequence, and operation records;
    - schema migrations and cross-backend contract tests;
    - revision-safe import, update, and export.
 3. **Workflow and audit**
    - semantic item mutations;
    - state transitions and dependency gating;
-   - append-only events, attempts, progress, review, and recovery context.
+   - complete append-only events, attempts, progress, review, idempotent
+     command behavior, and recovery context.
 4. **Claims and operational views**
    - fencing-token leases and heartbeats;
    - expiry, release, retry, and concurrency limits;
    - ready queues and agendas.
-5. **Agent and human interfaces**
-   - MCP tool family over both existing transports;
+5. **MCP and offline interfaces**
+   - all 36 MCP Org tools over both existing transports;
    - offline workspace/document import and export;
    - end-to-end conflict, recovery, and compatibility verification.
+6. **REST and OpenAPI parity**
+   - REST equivalents for all 36 initial Org MCP operations;
+   - shared DTO, validation, idempotency, result, and error semantics;
+   - generated OpenAPI coverage and cross-transport conformance tests.
+7. **Read-only Web operations console**
+   - workspace directory, workspace operations, and work-item context routes;
+   - URL-backed filters, pagination, and typed return context;
+   - loading, empty, error, time, missing-note, and archived-workspace states;
+   - no browser mutations or raw Org editing.
 
 ## Testing Decisions
 
@@ -692,6 +817,7 @@ either feature.
   - workspace isolation;
   - canonical source and projection atomicity;
   - compare-and-swap revisions;
+  - operation-ID replay and divergent-request conflict;
   - append-only per-workspace event sequencing and the reserved system actor;
   - atomic claim winner;
   - fencing-token rejection;
@@ -711,12 +837,27 @@ either feature.
   - recovery context hydration;
   - weak note-link behavior after soft and permanent note deletion;
   - explicit cross-workspace agenda behavior;
+  - workspace-timezone resolution and daylight-saving rejection;
+  - archived-workspace mutation rejection and continued read/export access;
+  - idempotent original-result replay without duplicate events;
   - no partial events or projections after conflict.
 - MCP
-  - exact tool inventory and schemas;
+  - exact 36-tool Org inventory and schemas;
   - DTO mapping and stable error categories;
   - identical registration for stdio and Streamable HTTP;
   - complete claimed-task context.
+- REST and OpenAPI
+  - all 36 equivalent Org operation IDs;
+  - shared DTO, validation, result, idempotency, and error semantics;
+  - cursor bounds and structured error envelopes;
+  - cross-transport conformance against MCP.
+- Frontend
+  - workspace directory, operational table, and work-item context routes;
+  - URL-backed views, filters, pagination, and return context;
+  - workspace and browser-local time rendering;
+  - archived workspaces, unavailable notes, lease metadata without fencing
+    tokens, event sequence, loading, empty, and error states;
+  - absence of mutation and raw Org editing controls.
 - Offline command modes
   - raw document and workspace export;
   - revision-safe import and conflict reporting;
@@ -724,7 +865,7 @@ either feature.
 - Regression
   - all existing note storage contract, pipeline, MCP, REST, import/export, and
     frontend suites appropriate to unchanged behavior, with only aggregate MCP
-    inventory expectations intentionally expanded.
+    inventory and OpenAPI expectations intentionally expanded.
 
 ### High-Risk Acceptance Scenarios
 
@@ -751,13 +892,30 @@ either feature.
     links.
 11. An import omits a stored heading without moving it elsewhere in the same
     batch and is rejected rather than deleting its execution history.
+12. A successful mutation is retried with the same operation ID and returns
+    the original result without a second event; different request data with the
+    same operation ID is rejected without side effects.
+13. The same representative create, claim, transition, review, and conflict
+    scenarios produce equivalent normalized outcomes through MCP and REST.
+14. An ambiguous or nonexistent local Org timestamp is rejected, while a valid
+    timestamp is resolved through the workspace IANA timezone and displayed in
+    workspace time by the Web UI.
+15. Archiving fails while a lease is active; after release, archive succeeds,
+    all mutations are rejected, and queries, export, and event history remain
+    available.
+16. A browser operator opens a filtered workspace queue, inspects one item, and
+    returns to the same view, filters, and pagination context without any
+    mutation control or exposed fencing token.
 
 ## Out of Scope
 
 - Autonomous scheduling, agent dispatch, or continuous task execution.
 - Agent capability matching, resource scoring, or performance-based assignment.
-- A browser Org workspace, board, agenda, or administration UI.
-- Org REST routes or OpenAPI operations.
+- Browser create, edit, claim, release, transition, review, archive, import, or
+  administration controls.
+- A browser raw Org editor, board view, or global cross-workspace operations
+  homepage.
+- Automatic Web UI polling, push updates, or live event streaming.
 - Multiple concurrently active Agent Note server replicas.
 - Live filesystem-canonical workspaces, file watching, bidirectional sync,
   FUSE, or automatic merge of Emacs changes.
@@ -765,9 +923,11 @@ either feature.
 - Cross-workspace dependencies in the first release.
 - Recurring-task expansion, notifications, calendar synchronization, or email
   integration.
-- Authentication, authorization, and enforcement of workspace access-control
-  lists. Existing deployment security expectations remain unchanged.
+- Authentication, authorization, sessions, proxy identity protocols, and
+  enforcement of workspace access-control lists. A front proxy owns this
+  deployment boundary.
 - Trusting asserted actor IDs as authenticated identities.
+- Unarchiving workspaces in the first release.
 - Automatic archival or deletion of completed work.
 - Physical deletion of work items or execution history.
 - Distributed transactions with external artifact stores.
@@ -790,6 +950,12 @@ either feature.
   later against the same document APIs.
 - The asserted actor-ID limitation must be visible in API documentation. It
   provides attribution, not security.
+- README, OpenAPI, configuration, and Web deployment documentation must state
+  that Agent Note implements no authentication or authorization and must not be
+  exposed directly to an untrusted network; a front proxy owns that boundary.
+- MCP and REST are complete peers at the application contract. The first Web UI
+  deliberately consumes only read operations even though REST also exposes
+  mutations.
 - Each delivery slice must receive a scoped implementation plan and scoped test
   commands before implementation begins.
 - The repository currently has no configured GitHub issue tracker or
