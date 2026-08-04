@@ -632,10 +632,11 @@ async fn validate_new_note_targets(
             if old_links.contains(&key) || !checked.insert(link.note_id) {
                 continue;
             }
-            if !transaction
-                .note_exists(&link.note_id.to_string())
+            if transaction
+                .get_note(&link.note_id.to_string())
                 .await
                 .map_err(OrgError::storage)?
+                .is_none()
             {
                 return Err(OrgError::new(
                     OrgErrorCode::NoteUnavailable,

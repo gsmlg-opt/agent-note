@@ -7,8 +7,8 @@ use note_pipelines::org::{
     MoveDocumentRequest, OrgContext, OrgErrorCode, PutDocumentRequest, UpdateWorkspaceRequest,
 };
 use note_storage::{
-    OrgDocument, OrgEvent, OrgEventType, OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceUpdate,
-    StorageBackend,
+    NewNote, OrgDocument, OrgEvent, OrgEventType, OrgProjectedWorkItem, OrgWorkspace,
+    OrgWorkspaceUpdate, StorageBackend,
 };
 use note_storage_turso::TursoStorage;
 use std::collections::BTreeMap;
@@ -878,6 +878,114 @@ async fn complete_dependency_graph_and_new_note_targets_are_validated_before_wri
             .unwrap()
             .is_none());
     }
+}
+
+#[tokio::test]
+async fn raw_import_keeps_existing_weak_links_but_rejects_new_links_to_soft_deleted_notes() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-000000000065");
+    create_test_workspace(&context, workspace, "create-weak-link-workspace", "UTC").await;
+    let note_id = "40000000-0000-4000-8000-000000000065";
+    backend
+        .session()
+        .await
+        .unwrap()
+        .insert_note(NewNote {
+            id: note_id,
+            title: "Weak target",
+            content: "context",
+            attachments: &[],
+            created_at: NOW,
+            updated_at: NOW,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    let existing_document = document_id("20000000-0000-4000-8000-000000000065");
+    let existing_item = work_item_id("30000000-0000-4000-8000-000000000065");
+    let linked_source = source(
+        existing_item,
+        "READY",
+        &format!("[[agent-note:design:{note_id}][Context]]\r\n"),
+    );
+    put_document(
+        &context,
+        &envelope(workspace, "seed-active-weak-link"),
+        &PutDocumentRequest {
+            document_id: existing_document,
+            path: "existing-link.org".into(),
+            source: linked_source.clone(),
+            expected_revision: None,
+        },
+    )
+    .await
+    .unwrap();
+    backend
+        .session()
+        .await
+        .unwrap()
+        .soft_delete_note(note_id, NOW + 1)
+        .await
+        .unwrap();
+
+    put_document(
+        &context,
+        &envelope(workspace, "preserve-existing-weak-link"),
+        &PutDocumentRequest {
+            document_id: existing_document,
+            path: "existing-link.org".into(),
+            source: linked_source.replace("Context]]", "Context]]\r\nOpaque change."),
+            expected_revision: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend
+            .session()
+            .await
+            .unwrap()
+            .get_org_work_item(existing_item)
+            .await
+            .unwrap()
+            .unwrap()
+            .note_links
+            .len(),
+        1
+    );
+
+    let baseline = workspace_snapshot(backend.as_ref(), workspace).await;
+    let new_document = document_id("20000000-0000-4000-8000-000000000066");
+    let error = put_document(
+        &context,
+        &envelope(workspace, "new-link-to-soft-deleted-note"),
+        &PutDocumentRequest {
+            document_id: new_document,
+            path: "new-link.org".into(),
+            source: source(
+                work_item_id("30000000-0000-4000-8000-000000000066"),
+                "READY",
+                &format!("[[agent-note:design:{note_id}][Deleted]]\r\n"),
+            ),
+            expected_revision: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, OrgErrorCode::NoteUnavailable);
+    assert_eq!(
+        workspace_snapshot(backend.as_ref(), workspace).await,
+        baseline
+    );
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(workspace, "new-link-to-soft-deleted-note")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
