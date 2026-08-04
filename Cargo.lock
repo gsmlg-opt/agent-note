@@ -3519,6 +3519,7 @@ dependencies = [
  "async-trait",
  "note-core",
  "note-org",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
 ]

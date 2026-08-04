@@ -1,9 +1,11 @@
-use note_storage::{NotesRepository, StorageErrorKind};
+use note_org::WorkspaceId;
+use note_storage::{NewOrgEvent, NotesRepository, OrgEventType, OrgRepository, StorageErrorKind};
 use note_storage_turso::TursoStorage;
 use std::path::Path;
+use std::str::FromStr as _;
 
 const APPLICATION_ID: u32 = 0x414E4F54;
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 fn normalize_schema_sql(sql: &str) -> String {
     sql.split_whitespace()
@@ -66,6 +68,76 @@ async fn create_schema_v2_database(path: &Path) {
         .unwrap();
     connection
         .execute("PRAGMA user_version = 2", ())
+        .await
+        .unwrap();
+    connection.execute("COMMIT", ()).await.unwrap();
+    connection.cacheflush().unwrap();
+    let mut rows = connection
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+}
+
+async fn create_schema_v3_database(path: &Path) {
+    let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/schema-v3.sql"))
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO org_workspaces (
+                 id, slug, display_name, description, timezone,
+                 policy_schema_version, policy, revision, last_event_sequence,
+                 created_at, updated_at, archived_at
+             ) VALUES (
+                 '11111111-1111-4111-8111-111111111111', 'migration',
+                 'Migration', '', 'UTC', 1, '{}', 1, 0, 1, 1, NULL
+             )",
+            (),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO org_events (
+                 id, workspace_id, sequence, subject_kind, subject_id,
+                 actor_id, event_type, occurred_at, summary, metadata
+             ) VALUES (
+                 'event-before-v4', '11111111-1111-4111-8111-111111111111',
+                 1, 'workspace', '11111111-1111-4111-8111-111111111111',
+                 'migration-test', 'legacy_custom_event', 1, 'created', '{}'
+             )",
+            (),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO org_events (
+                 id, workspace_id, sequence, subject_kind, subject_id,
+                 actor_id, event_type, occurred_at, summary, metadata
+             ) VALUES (
+                 'event-before-v4-blank', '11111111-1111-4111-8111-111111111111',
+                 2, '', '   ', '', '', 2, ' ', '{}'
+             )",
+            (),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA application_id = 1095651156", ())
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA user_version = 3", ())
         .await
         .unwrap();
     connection.execute("COMMIT", ()).await.unwrap();
@@ -165,7 +237,7 @@ async fn unsupported_marked_schema_is_rejected_without_modification() {
     let path = dir.path().join("future.db");
     drop(TursoStorage::open(&path).await.unwrap());
     let mut before = std::fs::read(&path).unwrap();
-    before[60..64].copy_from_slice(&4_u32.to_be_bytes());
+    before[60..64].copy_from_slice(&5_u32.to_be_bytes());
     std::fs::write(&path, &before).unwrap();
 
     let error = match TursoStorage::open(&path).await {
@@ -226,6 +298,7 @@ async fn schema_v2_is_migrated_without_losing_notes() {
         "org_note_links",
         "org_events",
         "org_operations",
+        "org_attempts",
     ] {
         assert!(tables.iter().any(|table| table == expected), "{expected}");
     }
@@ -234,7 +307,7 @@ async fn schema_v2_is_migrated_without_losing_notes() {
     drop(connection);
     drop(database);
 
-    let fresh_path = dir.path().join("fresh-v3.db");
+    let fresh_path = dir.path().join("fresh-v4.db");
     drop(TursoStorage::open(&fresh_path).await.unwrap());
     let fresh_database = turso::Builder::new_local(fresh_path.to_str().unwrap())
         .experimental_index_method(true)
@@ -244,6 +317,129 @@ async fn schema_v2_is_migrated_without_losing_notes() {
     let fresh_connection = fresh_database.connect().unwrap();
     let fresh_schema = normalized_org_schema(&fresh_connection).await;
 
+    assert_eq!(migrated_schema, fresh_schema);
+}
+
+#[tokio::test]
+async fn schema_v3_is_migrated_without_rewriting_existing_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v3.db");
+    create_schema_v3_database(&path).await;
+
+    let storage = TursoStorage::open(&path).await.unwrap();
+    database_header(&path);
+
+    let session = storage.connect().await.unwrap();
+    let events = session
+        .list_org_events(
+            WorkspaceId::from_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            None,
+            50,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        events[0].event_type,
+        OrgEventType::Other("legacy_custom_event".into())
+    );
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].subject_kind, "");
+    assert_eq!(events[1].subject_id, "   ");
+    assert_eq!(events[1].actor_id, "");
+    assert_eq!(events[1].event_type, OrgEventType::Other(String::new()));
+    assert_eq!(events[1].summary, " ");
+
+    let metadata = serde_json::json!({"migrated": true});
+    let appended = session
+        .append_org_event(NewOrgEvent {
+            id: "event-after-v4",
+            workspace_id: WorkspaceId::from_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            subject_kind: "workspace",
+            subject_id: "11111111-1111-4111-8111-111111111111",
+            actor_id: "migration-test",
+            attempt_id: None,
+            event_type: OrgEventType::WorkspaceChange,
+            occurred_at: 3,
+            summary: "migration completed",
+            metadata: &metadata,
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(appended.sequence, 3);
+
+    let invalid = session
+        .append_org_event(NewOrgEvent {
+            id: "invalid-v4-event",
+            workspace_id: appended.workspace_id,
+            subject_kind: " ",
+            subject_id: "workspace",
+            actor_id: "migration-test",
+            attempt_id: None,
+            event_type: OrgEventType::Other(" ".into()),
+            occurred_at: 4,
+            summary: "invalid",
+            metadata: &metadata,
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .expect_err("new v4 event fields must be nonblank");
+    assert_eq!(invalid.kind(), StorageErrorKind::Constraint);
+    drop(session);
+    drop(storage);
+
+    let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    let mut rows = connection
+        .query(
+            "SELECT event_type, actor_id, attempt_id, previous_state, resulting_state
+             FROM org_events WHERE id = 'event-before-v4'",
+            (),
+        )
+        .await
+        .unwrap();
+    let event = rows.next().await.unwrap().unwrap();
+    assert_eq!(event.get::<String>(0).unwrap(), "legacy_custom_event");
+    assert_eq!(event.get::<String>(1).unwrap(), "migration-test");
+    assert_eq!(event.get::<Option<String>>(2).unwrap(), None);
+    assert_eq!(event.get::<Option<String>>(3).unwrap(), None);
+    assert_eq!(event.get::<Option<String>>(4).unwrap(), None);
+
+    let sequence: i64 = connection
+        .query(
+            "SELECT last_event_sequence FROM org_workspaces
+             WHERE id = '11111111-1111-4111-8111-111111111111'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(sequence, 3);
+
+    let migrated_schema = normalized_org_schema(&connection).await;
+    drop(connection);
+    drop(database);
+
+    let fresh_path = dir.path().join("fresh-v4.db");
+    drop(TursoStorage::open(&fresh_path).await.unwrap());
+    let fresh_database = turso::Builder::new_local(fresh_path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let fresh_connection = fresh_database.connect().unwrap();
+    let fresh_schema = normalized_org_schema(&fresh_connection).await;
     assert_eq!(migrated_schema, fresh_schema);
 }
 
@@ -322,6 +518,7 @@ async fn fresh_database_contains_current_schema_objects() {
         "org_note_links",
         "org_events",
         "org_operations",
+        "org_attempts",
     ] {
         assert!(
             tables.iter().any(|table| table == expected),
@@ -343,6 +540,12 @@ async fn fresh_database_contains_current_schema_objects() {
     assert!(triggers
         .iter()
         .any(|trigger| trigger == "org_events_advance_workspace_sequence"));
+    assert!(indexes
+        .iter()
+        .any(|index| index == "idx_org_attempts_item_number"));
+    assert!(indexes
+        .iter()
+        .any(|index| index == "idx_org_events_attempt"));
     assert!(!tables.iter().any(|table| table == "note_chunk_sparse"));
     assert!(!indexes
         .iter()

@@ -1,6 +1,6 @@
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocumentUpdate,
+    CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocumentUpdate, OrgEventType,
     OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StoredOrgOperation,
     StoredOrgTimestamp, TransactionMode,
 };
@@ -680,10 +680,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             subject_kind: "work_item",
             subject_id: "30000000-0000-0000-0000-000000000001",
             actor_id: "agent-one",
-            event_type: "state_changed",
+            attempt_id: None,
+            event_type: OrgEventType::Start,
             occurred_at: 200,
             summary: "Activated release",
             metadata: &alpha_first_metadata,
+            previous_state: Some("TODO"),
+            resulting_state: Some("ACTIVE"),
         })
         .await
         .unwrap();
@@ -695,10 +698,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             subject_kind: "document",
             subject_id: "20000000-0000-0000-0000-000000000001",
             actor_id: "agent-two",
-            event_type: "document_updated",
+            attempt_id: None,
+            event_type: OrgEventType::DocumentImport,
             occurred_at: 100,
             summary: "Updated canonical source",
             metadata: &alpha_second_metadata,
+            previous_state: None,
+            resulting_state: None,
         })
         .await
         .unwrap();
@@ -710,10 +716,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             subject_kind: "workspace",
             subject_id: "10000000-0000-0000-0000-000000000002",
             actor_id: "agent-three",
-            event_type: "workspace_checked",
+            attempt_id: None,
+            event_type: OrgEventType::WorkspaceChange,
             occurred_at: 150,
             summary: "Checked beta workspace",
             metadata: &beta_metadata,
+            previous_state: None,
+            resulting_state: None,
         })
         .await
         .unwrap();
@@ -767,10 +776,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             subject_kind: "work_item",
             subject_id: "30000000-0000-0000-0000-000000000001",
             actor_id: "agent-duplicate",
-            event_type: "duplicate_attempted",
+            attempt_id: None,
+            event_type: OrgEventType::Progress,
             occurred_at: 250,
             summary: "Duplicate event id",
             metadata: &duplicate_event_metadata,
+            previous_state: None,
+            resulting_state: None,
         })
         .await
         .unwrap_err();
@@ -783,10 +795,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             subject_kind: "work_item",
             subject_id: "30000000-0000-0000-0000-000000000002",
             actor_id: "agent-four",
-            event_type: "append_recovered",
+            attempt_id: None,
+            event_type: OrgEventType::Progress,
             occurred_at: 260,
             summary: "Appended after failed duplicate",
             metadata: &alpha_third_metadata,
+            previous_state: None,
+            resulting_state: None,
         })
         .await
         .unwrap();

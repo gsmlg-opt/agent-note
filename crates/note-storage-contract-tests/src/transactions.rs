@@ -2,8 +2,8 @@ use crate::unit;
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
     CompareAndSwap, NewNote, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocumentUpdate,
-    OrgProjectedWorkItem, StorageBackend, StorageErrorKind, StorageTransaction, StoredOrgOperation,
-    TransactionMode, UpsertNoteChunk,
+    OrgEventType, OrgProjectedWorkItem, StorageBackend, StorageErrorKind, StorageTransaction,
+    StoredOrgOperation, TransactionMode, UpsertNoteChunk,
 };
 use serde_json::json;
 use std::str::FromStr as _;
@@ -235,10 +235,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                 subject_kind: "document",
                 subject_id: "61000000-0000-0000-0000-000000000001",
                 actor_id: "contract-seed",
-                event_type: "seeded",
+                attempt_id: None,
+                event_type: OrgEventType::Creation,
                 occurred_at,
                 summary: "Seeded event",
                 metadata: &json!({"seed": true}),
+                previous_state: None,
+                resulting_state: None,
             })
             .await
             .unwrap();
@@ -300,10 +303,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                 subject_kind: "document",
                 subject_id: "61000000-0000-0000-0000-000000000001",
                 actor_id: "contract-rollback",
-                event_type: "updated",
+                attempt_id: None,
+                event_type: OrgEventType::DocumentImport,
                 occurred_at: 512,
                 summary: "Rolled-back event",
                 metadata: &json!({"revision": 3}),
+                previous_state: None,
+                resulting_state: None,
             })
             .await
             .unwrap()
@@ -349,10 +355,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             subject_kind: "document",
             subject_id: "61000000-0000-0000-0000-000000000001",
             actor_id: "contract-observer",
-            event_type: "rollback_verified",
+            attempt_id: None,
+            event_type: OrgEventType::Progress,
             occurred_at: 514,
             summary: "Verified rollback",
             metadata: &after_rollback_metadata,
+            previous_state: None,
+            resulting_state: None,
         })
         .await
         .unwrap();

@@ -1,7 +1,7 @@
 use note_org::{WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    NewNote, NewOrgEvent, NewOrgWorkspace, OrgRepository, StorageBackend, StorageErrorKind,
-    StorageTransaction, TransactionMode, UpsertNoteChunk, EMBEDDING_DIMENSION,
+    NewNote, NewOrgEvent, NewOrgWorkspace, OrgEventType, OrgRepository, StorageBackend,
+    StorageErrorKind, StorageTransaction, TransactionMode, UpsertNoteChunk, EMBEDDING_DIMENSION,
 };
 use note_storage_turso::TursoStorage;
 use serde_json::json;
@@ -78,10 +78,13 @@ async fn waiting_event_append_does_not_block_owning_outer_transaction() {
         subject_kind: "workspace",
         subject_id: "70000000-0000-0000-0000-000000000001",
         actor_id: "waiting-session",
-        event_type: "waited",
+        attempt_id: None,
+        event_type: OrgEventType::Progress,
         occurred_at: 2,
         summary: "Waited for outer transaction",
         metadata: &waiting_metadata,
+        previous_state: None,
+        resulting_state: None,
     }));
     assert_pending(
         waiting.as_mut(),
@@ -97,10 +100,13 @@ async fn waiting_event_append_does_not_block_owning_outer_transaction() {
             subject_kind: "workspace",
             subject_id: "70000000-0000-0000-0000-000000000001",
             actor_id: "outer-transaction",
-            event_type: "owned_lock",
+            attempt_id: None,
+            event_type: OrgEventType::Progress,
             occurred_at: 1,
             summary: "Outer transaction retained writer ownership",
             metadata: &outer_metadata,
+            previous_state: None,
+            resulting_state: None,
         }),
     )
     .await
@@ -148,10 +154,13 @@ async fn waiting_event_append_does_not_serialize_an_independent_database() {
         subject_kind: "workspace",
         subject_id: "70000000-0000-0000-0000-000000000003",
         actor_id: "blocked-database",
-        event_type: "waited",
+        attempt_id: None,
+        event_type: OrgEventType::Progress,
         occurred_at: 1,
         summary: "Waited on first database",
         metadata: &waiting_metadata,
+        previous_state: None,
+        resulting_state: None,
     }));
     assert_pending(
         waiting.as_mut(),
@@ -168,10 +177,13 @@ async fn waiting_event_append_does_not_serialize_an_independent_database() {
             subject_kind: "workspace",
             subject_id: "70000000-0000-0000-0000-000000000004",
             actor_id: "independent-database",
-            event_type: "completed",
+            attempt_id: None,
+            event_type: OrgEventType::Completion,
             occurred_at: 1,
             summary: "Independent database was not serialized",
             metadata: &metadata,
+            previous_state: None,
+            resulting_state: None,
         }),
     )
     .await
@@ -198,10 +210,13 @@ async fn cancelling_waiting_event_append_leaves_session_and_writer_lock_usable()
         subject_kind: "workspace",
         subject_id: "70000000-0000-0000-0000-000000000002",
         actor_id: "cancelled-session",
-        event_type: "cancelled",
+        attempt_id: None,
+        event_type: OrgEventType::Cancellation,
         occurred_at: 1,
         summary: "Cancelled while waiting for writer lock",
         metadata: &cancelled_metadata,
+        previous_state: None,
+        resulting_state: None,
     }));
     assert_pending(
         cancelled.as_mut(),
@@ -231,10 +246,13 @@ async fn cancelling_waiting_event_append_leaves_session_and_writer_lock_usable()
             subject_kind: "workspace",
             subject_id: "70000000-0000-0000-0000-000000000002",
             actor_id: "fresh-writer",
-            event_type: "committed",
+            attempt_id: None,
+            event_type: OrgEventType::Progress,
             occurred_at: 2,
             summary: "Fresh transaction committed after cancellation",
             metadata: &committed_metadata,
+            previous_state: None,
+            resulting_state: None,
         })
         .await
         .unwrap();
@@ -262,10 +280,13 @@ async fn cancelling_waiting_event_append_leaves_session_and_writer_lock_usable()
             subject_kind: "workspace",
             subject_id: "70000000-0000-0000-0000-000000000002",
             actor_id: "reused-session",
-            event_type: "reused",
+            attempt_id: None,
+            event_type: OrgEventType::Progress,
             occurred_at: 3,
             summary: "Session remained usable after cancellation",
             metadata: &metadata,
+            previous_state: None,
+            resulting_state: None,
         }),
     )
     .await

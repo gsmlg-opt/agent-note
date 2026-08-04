@@ -3,8 +3,8 @@ use crate::TursoSession;
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
     CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocument, OrgDocumentUpdate,
-    OrgEvent, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate, StorageError,
-    StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
+    OrgEvent, OrgEventType, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate,
+    StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
@@ -22,7 +22,8 @@ const WORK_ITEM_COLUMNS: &str =
 // comfortably below both embedded and PostgreSQL driver parameter limits.
 const PROJECTION_BATCH_SIZE: usize = 64;
 const EVENT_COLUMNS: &str =
-    "id, workspace_id, sequence, subject_kind, subject_id, actor_id, event_type, occurred_at, summary, metadata";
+    "id, workspace_id, sequence, subject_kind, subject_id, actor_id, attempt_id,
+     event_type, occurred_at, summary, metadata, previous_state, resulting_state";
 
 #[async_trait::async_trait]
 impl OrgRepository for TursoSession {
@@ -319,10 +320,11 @@ impl OrgRepository for TursoSession {
         let sql = format!(
             "INSERT INTO org_events (
                  id, workspace_id, sequence, subject_kind, subject_id,
-                 actor_id, event_type, occurred_at, summary, metadata
+                 actor_id, attempt_id, event_type, occurred_at, summary, metadata,
+                 previous_state, resulting_state
              )
              SELECT ?1, workspace.id, workspace.last_event_sequence+1,
-                    ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                    ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
              FROM org_workspaces workspace
              WHERE workspace.id=?2
              RETURNING {EVENT_COLUMNS}"
@@ -337,10 +339,13 @@ impl OrgRepository for TursoSession {
                     event.subject_kind,
                     event.subject_id,
                     event.actor_id,
-                    event.event_type,
+                    event.attempt_id,
+                    event.event_type.as_str(),
                     event.occurred_at,
                     event.summary,
-                    metadata
+                    metadata,
+                    event.previous_state,
+                    event.resulting_state
                 ],
             )
             .await
@@ -472,7 +477,7 @@ fn validate_event_limit(limit: usize) -> StorageResult<()> {
 
 fn decode_event(row: &turso::Row) -> StorageResult<OrgEvent> {
     let metadata_text: String = row
-        .get(9)
+        .get(10)
         .map_err(|error| map_turso_error("decode Org event metadata", error))?;
     let metadata = serde_json::from_str(&metadata_text).map_err(|error| {
         StorageError::with_source(
@@ -501,16 +506,33 @@ fn decode_event(row: &turso::Row) -> StorageResult<OrgEvent> {
         actor_id: row
             .get(5)
             .map_err(|error| map_turso_error("decode Org event actor id", error))?,
-        event_type: row
+        attempt_id: row
             .get(6)
-            .map_err(|error| map_turso_error("decode Org event type", error))?,
+            .map_err(|error| map_turso_error("decode Org event attempt id", error))?,
+        event_type: row
+            .get::<String>(7)
+            .map_err(|error| map_turso_error("decode Org event type", error))?
+            .parse::<OrgEventType>()
+            .map_err(|error| {
+                StorageError::with_source(
+                    StorageErrorKind::Corrupt,
+                    "decode stored Org event type",
+                    error,
+                )
+            })?,
         occurred_at: row
-            .get(7)
+            .get(8)
             .map_err(|error| map_turso_error("decode Org event occurred at", error))?,
         summary: row
-            .get(8)
+            .get(9)
             .map_err(|error| map_turso_error("decode Org event summary", error))?,
         metadata,
+        previous_state: row
+            .get(11)
+            .map_err(|error| map_turso_error("decode Org event previous state", error))?,
+        resulting_state: row
+            .get(12)
+            .map_err(|error| map_turso_error("decode Org event resulting state", error))?,
     })
 }
 

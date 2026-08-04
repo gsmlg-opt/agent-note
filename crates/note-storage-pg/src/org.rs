@@ -3,8 +3,8 @@ use crate::PgSession;
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
     CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocument, OrgDocumentUpdate,
-    OrgEvent, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate, StorageError,
-    StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
+    OrgEvent, OrgEventType, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate,
+    StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
 };
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
@@ -316,22 +316,28 @@ impl OrgRepository for PgSession {
              )
              INSERT INTO org_events (
                  id, workspace_id, sequence, subject_kind, subject_id,
-                 actor_id, event_type, occurred_at, summary, metadata
+                 actor_id, attempt_id, event_type, occurred_at, summary, metadata,
+                 previous_state, resulting_state
              )
-             SELECT $2, $1, last_event_sequence, $3, $4, $5, $6, $7, $8, $9
+             SELECT $2, $1, last_event_sequence, $3, $4, $5, $6, $7, $8, $9,
+                    $10, $11, $12
              FROM next_sequence
              RETURNING id, workspace_id, sequence, subject_kind, subject_id,
-                       actor_id, event_type, occurred_at, summary, metadata",
+                       actor_id, attempt_id, event_type, occurred_at, summary, metadata,
+                       previous_state, resulting_state",
         )
         .bind(event.workspace_id.to_string())
         .bind(event.id)
         .bind(event.subject_kind)
         .bind(event.subject_id)
         .bind(event.actor_id)
-        .bind(event.event_type)
+        .bind(event.attempt_id)
+        .bind(event.event_type.as_str())
         .bind(event.occurred_at)
         .bind(event.summary)
         .bind(event.metadata)
+        .bind(event.previous_state)
+        .bind(event.resulting_state)
         .fetch_optional(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("append Org event", error))?;
@@ -353,7 +359,8 @@ impl OrgRepository for PgSession {
         let mut connection = self.connection().await?;
         sqlx::query_as::<_, EventRow>(
             "SELECT id, workspace_id, sequence, subject_kind, subject_id,
-                    actor_id, event_type, occurred_at, summary, metadata
+                    actor_id, attempt_id, event_type, occurred_at, summary, metadata,
+                    previous_state, resulting_state
              FROM org_events
              WHERE workspace_id=$1 AND sequence>$2
              ORDER BY sequence
@@ -427,10 +434,13 @@ struct EventRow {
     subject_kind: String,
     subject_id: String,
     actor_id: String,
+    attempt_id: Option<String>,
     event_type: String,
     occurred_at: i64,
     summary: String,
     metadata: Value,
+    previous_state: Option<String>,
+    resulting_state: Option<String>,
 }
 
 impl EventRow {
@@ -442,10 +452,19 @@ impl EventRow {
             subject_kind: self.subject_kind,
             subject_id: self.subject_id,
             actor_id: self.actor_id,
-            event_type: self.event_type,
+            attempt_id: self.attempt_id,
+            event_type: self.event_type.parse::<OrgEventType>().map_err(|error| {
+                StorageError::with_source(
+                    StorageErrorKind::Corrupt,
+                    "decode stored Org event type",
+                    error,
+                )
+            })?,
             occurred_at: self.occurred_at,
             summary: self.summary,
             metadata: self.metadata,
+            previous_state: self.previous_state,
+            resulting_state: self.resulting_state,
         })
     }
 }

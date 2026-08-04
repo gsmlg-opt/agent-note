@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::{convert::Infallible, fmt, str::FromStr};
 
 pub const EMBEDDING_DIMENSION: usize = 1024;
 
@@ -107,16 +108,233 @@ pub struct OrgProjectedWorkItem {
     pub note_links: Vec<note_org::NoteLink>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OrgEventType {
+    Creation,
+    Assignment,
+    Claim,
+    Heartbeat,
+    Release,
+    Start,
+    Progress,
+    Block,
+    Unblock,
+    ReviewRequest,
+    Approval,
+    Rejection,
+    Completion,
+    Failure,
+    Retry,
+    Cancellation,
+    LeaseExpiry,
+    DependencyChange,
+    ScheduleChange,
+    DocumentImport,
+    NoteLinkChange,
+    WorkspaceChange,
+    WorkspaceArchive,
+    DocumentMove,
+    ItemMove,
+    TitleChange,
+    PriorityChange,
+    DeadlineChange,
+    /// Preserves an event name written by schema v3 or a future producer.
+    /// Pipelines emit the known variants, while storage keeps audit rows
+    /// forward- and backward-readable.
+    Other(String),
+}
+
+impl OrgEventType {
+    pub const KNOWN: [Self; 28] = [
+        Self::Creation,
+        Self::Assignment,
+        Self::Claim,
+        Self::Heartbeat,
+        Self::Release,
+        Self::Start,
+        Self::Progress,
+        Self::Block,
+        Self::Unblock,
+        Self::ReviewRequest,
+        Self::Approval,
+        Self::Rejection,
+        Self::Completion,
+        Self::Failure,
+        Self::Retry,
+        Self::Cancellation,
+        Self::LeaseExpiry,
+        Self::DependencyChange,
+        Self::ScheduleChange,
+        Self::DocumentImport,
+        Self::NoteLinkChange,
+        Self::WorkspaceChange,
+        Self::WorkspaceArchive,
+        Self::DocumentMove,
+        Self::ItemMove,
+        Self::TitleChange,
+        Self::PriorityChange,
+        Self::DeadlineChange,
+    ];
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Creation => "creation",
+            Self::Assignment => "assignment",
+            Self::Claim => "claim",
+            Self::Heartbeat => "heartbeat",
+            Self::Release => "release",
+            Self::Start => "start",
+            Self::Progress => "progress",
+            Self::Block => "block",
+            Self::Unblock => "unblock",
+            Self::ReviewRequest => "review_request",
+            Self::Approval => "approval",
+            Self::Rejection => "rejection",
+            Self::Completion => "completion",
+            Self::Failure => "failure",
+            Self::Retry => "retry",
+            Self::Cancellation => "cancellation",
+            Self::LeaseExpiry => "lease_expiry",
+            Self::DependencyChange => "dependency_change",
+            Self::ScheduleChange => "schedule_change",
+            Self::DocumentImport => "document_import",
+            Self::NoteLinkChange => "note_link_change",
+            Self::WorkspaceChange => "workspace_change",
+            Self::WorkspaceArchive => "workspace_archive",
+            Self::DocumentMove => "document_move",
+            Self::ItemMove => "item_move",
+            Self::TitleChange => "title_change",
+            Self::PriorityChange => "priority_change",
+            Self::DeadlineChange => "deadline_change",
+            Self::Other(value) => value,
+        }
+    }
+
+    pub fn is_known(&self) -> bool {
+        !matches!(self, Self::Other(_))
+    }
+}
+
+impl fmt::Display for OrgEventType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for OrgEventType {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self::KNOWN
+            .into_iter()
+            .find(|event_type| event_type.as_str() == value)
+            .unwrap_or_else(|| Self::Other(value.to_owned())))
+    }
+}
+
+impl serde::Serialize for OrgEventType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OrgEventType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::from_str(&value).unwrap_or_else(|never| match never {}))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgAttemptStatus {
+    Running,
+    Submitted,
+    Completed,
+    Failed,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrgArtifactReference {
+    pub uri: String,
+    pub media_type: String,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrgAttemptNoteReference {
+    pub purpose: String,
+    pub note_id: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgAttempt {
+    pub id: String,
+    /// Workspace that owned the item when this attempt began.
+    pub workspace_id: note_org::WorkspaceId,
+    pub work_item_id: note_org::WorkItemId,
+    pub attempt_number: i64,
+    pub actor_id: String,
+    pub status: OrgAttemptStatus,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub error: Option<String>,
+    pub result_summary: Option<String>,
+    pub review_outcome: Option<String>,
+    pub note_refs: Vec<OrgAttemptNoteReference>,
+    pub artifacts: Vec<OrgArtifactReference>,
+    pub metadata: serde_json::Value,
+}
+
+pub struct NewOrgAttempt<'a> {
+    pub id: &'a str,
+    pub workspace_id: note_org::WorkspaceId,
+    pub work_item_id: note_org::WorkItemId,
+    pub attempt_number: i64,
+    pub actor_id: &'a str,
+    pub status: OrgAttemptStatus,
+    pub started_at: i64,
+    pub note_refs: &'a [OrgAttemptNoteReference],
+    pub artifacts: &'a [OrgArtifactReference],
+    pub metadata: &'a serde_json::Value,
+}
+
+pub struct OrgAttemptUpdate<'a> {
+    pub id: &'a str,
+    pub expected_status: OrgAttemptStatus,
+    pub status: OrgAttemptStatus,
+    pub ended_at: i64,
+    pub error: Option<&'a str>,
+    pub result_summary: Option<&'a str>,
+    pub review_outcome: Option<&'a str>,
+    pub note_refs: &'a [OrgAttemptNoteReference],
+    pub artifacts: &'a [OrgArtifactReference],
+    pub metadata: &'a serde_json::Value,
+}
+
 pub struct NewOrgEvent<'a> {
     pub id: &'a str,
     pub workspace_id: note_org::WorkspaceId,
     pub subject_kind: &'a str,
     pub subject_id: &'a str,
     pub actor_id: &'a str,
-    pub event_type: &'a str,
+    pub attempt_id: Option<&'a str>,
+    pub event_type: OrgEventType,
     pub occurred_at: i64,
     pub summary: &'a str,
     pub metadata: &'a serde_json::Value,
+    pub previous_state: Option<&'a str>,
+    pub resulting_state: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,10 +345,13 @@ pub struct OrgEvent {
     pub subject_kind: String,
     pub subject_id: String,
     pub actor_id: String,
-    pub event_type: String,
+    pub attempt_id: Option<String>,
+    pub event_type: OrgEventType,
     pub occurred_at: i64,
     pub summary: String,
     pub metadata: serde_json::Value,
+    pub previous_state: Option<String>,
+    pub resulting_state: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

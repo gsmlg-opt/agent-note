@@ -146,46 +146,18 @@ CREATE TABLE org_note_links (
 
 CREATE INDEX idx_org_note_links_note_id ON org_note_links(note_id, work_item_id);
 
-CREATE TABLE org_attempts (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES org_workspaces(id) ON DELETE RESTRICT,
-    work_item_id TEXT NOT NULL,
-    attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
-    actor_id TEXT NOT NULL CHECK (length(trim(actor_id)) > 0),
-    status TEXT NOT NULL CHECK (length(trim(status)) > 0),
-    started_at INTEGER NOT NULL,
-    ended_at INTEGER,
-    error TEXT,
-    result_summary TEXT,
-    review_outcome TEXT,
-    note_refs TEXT NOT NULL CHECK (json_valid(note_refs)),
-    artifacts TEXT NOT NULL CHECK (json_valid(artifacts)),
-    metadata TEXT NOT NULL CHECK (json_valid(metadata)),
-    CHECK (ended_at IS NULL OR ended_at >= started_at)
-);
-
-CREATE UNIQUE INDEX idx_org_attempts_item_number
-    ON org_attempts(work_item_id, attempt_number);
-
 CREATE TABLE org_events (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES org_workspaces(id) ON DELETE RESTRICT,
     sequence INTEGER NOT NULL CHECK (sequence >= 1),
-    subject_kind TEXT NOT NULL CHECK (validation_version = 3 OR length(trim(subject_kind)) > 0),
-    subject_id TEXT NOT NULL CHECK (validation_version = 3 OR length(trim(subject_id)) > 0),
-    actor_id TEXT NOT NULL CHECK (validation_version = 3 OR length(trim(actor_id)) > 0),
-    attempt_id TEXT REFERENCES org_attempts(id) ON DELETE RESTRICT,
-    event_type TEXT NOT NULL CHECK (validation_version = 3 OR length(trim(event_type)) > 0),
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
     occurred_at INTEGER NOT NULL,
-    summary TEXT NOT NULL CHECK (validation_version = 3 OR length(trim(summary)) > 0),
-    metadata TEXT NOT NULL CHECK (json_valid(metadata)),
-    previous_state TEXT,
-    resulting_state TEXT,
-    validation_version INTEGER NOT NULL DEFAULT 4 CHECK (validation_version >= 3),
-    UNIQUE (workspace_id, sequence),
-    CHECK (validation_version = 3 OR (previous_state IS NULL) = (resulting_state IS NULL)),
-    CHECK (validation_version = 3 OR previous_state IS NULL OR length(trim(previous_state)) > 0),
-    CHECK (validation_version = 3 OR resulting_state IS NULL OR length(trim(resulting_state)) > 0)
+    summary TEXT NOT NULL,
+    metadata TEXT NOT NULL,
+    UNIQUE (workspace_id, sequence)
 );
 
 CREATE TRIGGER org_events_advance_workspace_sequence
@@ -207,9 +179,6 @@ END;
 
 CREATE INDEX idx_org_events_subject
     ON org_events(workspace_id, subject_kind, subject_id, sequence);
-
-CREATE INDEX idx_org_events_attempt
-    ON org_events(attempt_id, workspace_id, sequence);
 
 CREATE TABLE org_operations (
     workspace_id TEXT NOT NULL REFERENCES org_workspaces(id) ON DELETE RESTRICT,

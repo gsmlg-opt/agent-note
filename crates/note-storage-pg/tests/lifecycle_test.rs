@@ -1,7 +1,9 @@
 mod support;
 
-use note_storage::{NotesRepository, StorageErrorKind};
+use note_org::WorkspaceId;
+use note_storage::{NewOrgEvent, NotesRepository, OrgEventType, OrgRepository, StorageErrorKind};
 use note_storage_pg::PgStorage;
+use std::str::FromStr as _;
 use support::{configured_url_or_skip, TestDatabase};
 
 #[tokio::test]
@@ -93,6 +95,7 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
         "notes",
         "org_dependencies",
         "org_documents",
+        "org_attempts",
         "org_events",
         "org_note_links",
         "org_operations",
@@ -122,6 +125,8 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
         ("idx_note_chunks_status", "btree"),
         ("idx_note_labels_key_value", "btree"),
         ("idx_notes_title_fts", "gin"),
+        ("idx_org_attempts_item_number", "btree"),
+        ("idx_org_events_attempt", "btree"),
     ] {
         assert!(
             indexes
@@ -155,15 +160,15 @@ async fn ordered_migrations_preserve_existing_notes() {
 
     let seed_pool = database.inspect_pool().await;
     sqlx::migrate!("./migrations")
-        .run_to(1, &seed_pool)
+        .run_to(2, &seed_pool)
         .await
-        .expect("provision PostgreSQL schema at migration 1");
+        .expect("provision PostgreSQL schema at migration 2");
     let seeded_versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&seed_pool)
             .await
             .expect("read seeded migration version");
-    assert_eq!(seeded_versions, vec![1]);
+    assert_eq!(seeded_versions, vec![1, 2]);
     sqlx::query(
         "INSERT INTO notes (
              id, title, content, attachments, created_at, updated_at, note_revision, deleted_at
@@ -177,19 +182,44 @@ async fn ordered_migrations_preserve_existing_notes() {
     .bind(1_i64)
     .execute(&seed_pool)
     .await
-    .expect("seed note before migration 2");
+    .expect("seed note before migration 3");
+    sqlx::query(
+        "INSERT INTO org_workspaces (
+             id, slug, display_name, description, timezone,
+             policy_schema_version, policy, revision, last_event_sequence,
+             created_at, updated_at, archived_at
+         ) VALUES ($1, 'migration', 'Migration', '', 'UTC', 1, '{}'::jsonb,
+                   1, 2, 1, 1, NULL)",
+    )
+    .bind("11111111-1111-4111-8111-111111111111")
+    .execute(&seed_pool)
+    .await
+    .expect("seed Org workspace before migration 3");
+    sqlx::query(
+        "INSERT INTO org_events (
+             id, workspace_id, sequence, subject_kind, subject_id, actor_id,
+             event_type, occurred_at, summary, metadata
+         ) VALUES
+             ('event-before-v3', $1, 1, 'workspace', $1, 'migration-test',
+              'legacy_custom_event', 1, 'created', '{}'::jsonb),
+             ('event-before-v3-blank', $1, 2, '', '   ', '', '', 2, ' ', '{}'::jsonb)",
+    )
+    .bind("11111111-1111-4111-8111-111111111111")
+    .execute(&seed_pool)
+    .await
+    .expect("seed schema-valid legacy Org events before migration 3");
     seed_pool.close().await;
 
     let migrated = PgStorage::connect(&database.url, 2)
         .await
-        .expect("apply pending PostgreSQL migration 2");
+        .expect("apply pending PostgreSQL migrations 2 and 3");
     let inspection = database.inspect_pool().await;
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&inspection)
             .await
             .expect("read ordered migration versions");
-    assert_eq!(versions, vec![1, 2]);
+    assert_eq!(versions, vec![1, 2, 3]);
     inspection.close().await;
 
     let session = migrated.connect_session().await.unwrap();
@@ -200,7 +230,90 @@ async fn ordered_migrations_preserve_existing_notes() {
             .unwrap(),
         Some("preserved".to_owned())
     );
+    let workspace_id = WorkspaceId::from_str("11111111-1111-4111-8111-111111111111").unwrap();
+    let events = session
+        .list_org_events(workspace_id, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0].event_type,
+        OrgEventType::Other("legacy_custom_event".into())
+    );
+    assert_eq!(events[1].subject_kind, "");
+    assert_eq!(events[1].subject_id, "   ");
+    assert_eq!(events[1].actor_id, "");
+    assert_eq!(events[1].event_type, OrgEventType::Other(String::new()));
+    assert_eq!(events[1].summary, " ");
+    assert_eq!(events[1].attempt_id, None);
+    assert_eq!(events[1].previous_state, None);
+    assert_eq!(events[1].resulting_state, None);
+
+    let metadata = serde_json::json!({"migrated": true});
+    let appended = session
+        .append_org_event(NewOrgEvent {
+            id: "event-after-v4",
+            workspace_id,
+            subject_kind: "workspace",
+            subject_id: "11111111-1111-4111-8111-111111111111",
+            actor_id: "migration-test",
+            attempt_id: None,
+            event_type: OrgEventType::WorkspaceChange,
+            occurred_at: 3,
+            summary: "migration completed",
+            metadata: &metadata,
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(appended.sequence, 3);
+
+    let invalid = session
+        .append_org_event(NewOrgEvent {
+            id: "invalid-v4-event",
+            workspace_id,
+            subject_kind: " ",
+            subject_id: "workspace",
+            actor_id: "migration-test",
+            attempt_id: None,
+            event_type: OrgEventType::Other(" ".into()),
+            occurred_at: 4,
+            summary: "invalid",
+            metadata: &metadata,
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .expect_err("new PostgreSQL v4 event fields must be nonblank");
+    assert_eq!(invalid.kind(), StorageErrorKind::Constraint);
     drop(session);
+
+    let inspection = database.inspect_pool().await;
+    let validation_versions: Vec<(String, i16)> = sqlx::query_as(
+        "SELECT id, validation_version FROM org_events
+         ORDER BY sequence",
+    )
+    .fetch_all(&inspection)
+    .await
+    .expect("read migrated Org event validation versions");
+    assert_eq!(
+        validation_versions,
+        vec![
+            ("event-before-v3".into(), 3),
+            ("event-before-v3-blank".into(), 3),
+            ("event-after-v4".into(), 4),
+        ]
+    );
+    let last_sequence: i64 = sqlx::query_scalar(
+        "SELECT last_event_sequence FROM org_workspaces
+         WHERE id = '11111111-1111-4111-8111-111111111111'",
+    )
+    .fetch_one(&inspection)
+    .await
+    .expect("read migrated Org workspace event sequence");
+    assert_eq!(last_sequence, 3);
+    inspection.close().await;
     database
         .cleanup(Some(&migrated))
         .await
