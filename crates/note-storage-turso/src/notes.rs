@@ -881,6 +881,7 @@ mod tests {
     use super::*;
     use crate::TursoStorage;
     use note_core::parse_label_selectors;
+    use note_storage::LabelRepository;
 
     #[test]
     fn resolved_predicates_precede_order_and_limit() {

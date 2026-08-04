@@ -7,10 +7,10 @@ use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
 
-pub type OrgMutationFuture<'a> =
+pub(crate) type OrgMutationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<OrgCommandResult, OrgError>> + Send + 'a>>;
 
-pub async fn execute_idempotent<R, F>(
+pub(crate) async fn execute_idempotent<R, F>(
     context: &OrgContext,
     command_kind: OrgCommandKind,
     envelope: &CommandEnvelope,
@@ -32,7 +32,7 @@ where
     .await
 }
 
-pub async fn execute_idempotent_create<R, F>(
+pub(crate) async fn execute_idempotent_create<R, F>(
     context: &OrgContext,
     command_kind: OrgCommandKind,
     envelope: &CommandEnvelope,
@@ -222,7 +222,10 @@ fn validate_command_kind(command_kind: OrgCommandKind) -> Result<(), OrgError> {
     Ok(())
 }
 
-pub fn resolve_cas<T>(value: CompareAndSwap<T>, resource: &'static str) -> Result<T, OrgError> {
+pub(crate) fn resolve_cas<T>(
+    value: CompareAndSwap<T>,
+    resource: &'static str,
+) -> Result<T, OrgError> {
     match value {
         CompareAndSwap::Applied(value) => Ok(value),
         CompareAndSwap::NotFound => Err(OrgError::new(

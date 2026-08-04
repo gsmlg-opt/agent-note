@@ -624,7 +624,7 @@ cargo fmt --all -- --check
 
 ```sh
 cargo test -p note-pipelines --test org_claims_test
-cargo test -p note-pipelines --test org_idempotency_audit_test
+cargo test -p note-pipelines org::mutation_test
 cargo test -p note-pipelines --test org_recovery_context_test
 ```
 

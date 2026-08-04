@@ -1,3 +1,6 @@
+#[cfg(test)]
+extern crate self as note_pipelines;
+
 pub mod context;
 pub use context::*;
 

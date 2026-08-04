@@ -41,6 +41,8 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
                    • save_note   — validate → atomically persist note/chunks/jobs/labels → return Note
                    • embedding worker — embed queued body chunks → atomically persist dense vectors only
                    • search_notes — title FTS + exact dense content → weighted RRF → hydrate top-k
+                   • org — transport-free, revision-safe workspace/document/item commands,
+                     append-only audit reads, and recovery-context assembly
    ▲
    ├── note-mcp     save_note / semantic_search tools over stdio AND Streamable HTTP (same server type)
    └── note-server  Axum REST (/api/notes, /api/labels) + /mcp; one binary, `--stdio` flag picks the door
@@ -49,15 +51,25 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
 ```
 
 **Org canonical persistence.** `note-org` supplies the pure Org domain and workspace-time behavior.
-Storage schema v3 persists canonical Org workspaces and documents alongside derived, rebuildable
-work-item projections. The embedded Turso adapter atomically upgrades marked v2 databases to v3;
-PostgreSQL applies the ordered `0002_org_canonical.sql` migration. Markdown notes and their storage
-remain unchanged.
+Storage schema v4 persists canonical Org workspaces and documents, durable execution-attempt
+records, richer append-only events, idempotent operation results, and derived, rebuildable work-item
+projections. The embedded Turso adapter atomically upgrades marked v2 or v3 databases to v4;
+PostgreSQL applies the ordered `0002_org_canonical.sql` and `0003_org_workflow_audit.sql`
+migrations. Markdown notes and their storage remain unchanged. Projection rebuilds preserve
+attempts, events, and operation results.
 
-Delivery Slice 2 does not include an Org pipeline service, leases, MCP, REST, CLI, or Web UI.
-Projection rows are derived and rebuildable, so direct projection deletion is recoverable. Org
-events and operation records are authoritative runtime data and projection recovery must not delete
-them.
+The transport-free `note_pipelines::org` boundary provides atomic, revision-safe commands for
+workspace and document management and for item creation, follow-ups, movement, reparenting,
+assignment, scheduling, dependencies, and Markdown-note links. It also provides workspace-sequenced
+audit pages and recovery context assembled from canonical document revisions, projections,
+dependencies, weak-note availability, attempts, artifacts, origins, and cross-workspace event
+lineage. Archived workspaces remain readable and auditable while rejecting new mutations.
+
+This is a Rust pipeline foundation only: Org operations are not registered with MCP, REST, CLI, or
+the Web UI yet. Lease ownership is intentionally absent, and no claim, progress, result, review,
+failure, completion, retry, or state-transition mutation is exposed. Delivery Slice 4 must add
+authoritative leases and mandatory fencing-token validation before those ownership-sensitive
+commands—and archive or existing-document import while work is actively leased—can be enabled.
 
 **One core, two front doors.** REST and both MCP transports call the exact same `note-pipelines`
 functions — no business logic is duplicated per transport (design.md §1–2). **Hybrid retrieval**

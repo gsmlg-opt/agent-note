@@ -1,10 +1,11 @@
+#[path = "../../tests/support/mod.rs"]
 mod support;
 
-use note_org::WorkspacePolicy;
-use note_pipelines::org::{
+use super::{
     execute_idempotent, execute_idempotent_create, resolve_cas, CommandEnvelope, FixedOrgClock,
     OrgCommandKind, OrgCommandResult, OrgContext, OrgError, OrgErrorCode,
 };
+use note_org::WorkspacePolicy;
 use note_storage::{
     CompareAndSwap, NewOrgEvent, NewOrgWorkspace, OrgEventType, OrgWorkspaceUpdate, StorageBackend,
 };

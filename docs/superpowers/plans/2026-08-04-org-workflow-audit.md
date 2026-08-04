@@ -341,7 +341,7 @@ foundation or the final delivery can be declared verified.
 - Create: `crates/note-pipelines/src/org/idempotency.rs`
 - Create: `crates/note-pipelines/src/org/mutation.rs`
 - Create: `crates/note-pipelines/tests/support/org.rs`
-- Create: `crates/note-pipelines/tests/org_idempotency_audit_test.rs`
+- Create: `crates/note-pipelines/src/org/mutation_test.rs`
 
 - [ ] Move `note-org` from dev-dependencies to dependencies and define a small
   `OrgContext` with shared storage plus an injected `OrgClock`; do not require
@@ -357,8 +357,8 @@ foundation or the final delivery can be declared verified.
 - [ ] Run:
 
 ```sh
-cargo test -p note-pipelines --test org_idempotency_audit_test
-cargo test -p note-pipelines --test save_note_transaction_test
+cargo test -p note-pipelines org::mutation_test
+cargo test -p note-pipelines --test save_note_test
 cargo fmt --all -- --check
 ```
 
@@ -420,7 +420,7 @@ cargo fmt --all -- --check
 
 ```sh
 cargo test -p note-pipelines --test org_workspace_document_test
-cargo test -p note-pipelines --test org_idempotency_audit_test
+cargo test -p note-pipelines org::mutation_test
 ```
 
 ## Task 6: Item Workflow Commands

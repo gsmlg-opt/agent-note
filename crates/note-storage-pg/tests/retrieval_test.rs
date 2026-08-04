@@ -96,6 +96,7 @@ async fn allowed_ids_are_applied_before_title_and_dense_limits() {
         allowed
     );
 
+    drop(session);
     database
         .cleanup(Some(&storage))
         .await

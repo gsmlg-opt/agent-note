@@ -7,6 +7,8 @@ mod error;
 mod idempotency;
 mod items;
 mod mutation;
+#[cfg(test)]
+mod mutation_test;
 mod projection;
 mod workspaces;
 
@@ -17,6 +19,6 @@ pub use documents::*;
 pub use dto::*;
 pub use error::*;
 pub use items::*;
-pub use mutation::*;
+pub(crate) use mutation::*;
 pub use projection::*;
 pub use workspaces::*;
