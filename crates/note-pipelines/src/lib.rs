@@ -1,6 +1,8 @@
 pub mod context;
 pub use context::*;
 
+pub mod org;
+
 pub mod note_attachments;
 pub use note_attachments::*;
 

@@ -1,8 +1,12 @@
 #[allow(dead_code)]
 mod events;
+#[allow(dead_code)]
+mod org;
 
 #[allow(unused_imports)]
 pub use events::*;
+#[allow(unused_imports)]
+pub use org::*;
 
 use note_attachments::FilesystemAttachmentStore;
 use note_embedding::StubEmbedder;
