@@ -9,6 +9,12 @@ pub enum PolicyError {
     TransitionStateMissing { state: String },
     #[error("{role} state {state} must be executable")]
     RecoveryStateNotExecutable { role: String, state: String },
+    #[error("required {role} transition {from} -> {to} is not configured")]
+    RequiredTransitionMissing {
+        role: String,
+        from: String,
+        to: String,
+    },
     #[error("successful state {state} must be terminal")]
     SuccessfulStateNotTerminal { state: String },
     #[error("concurrency limit must be greater than zero")]
@@ -120,6 +126,7 @@ impl WorkspacePolicy {
                 ("READY", "RUNNING"),
                 ("READY", "CANCELLED"),
                 ("RUNNING", "BLOCKED"),
+                ("RUNNING", "READY"),
                 ("RUNNING", "REVIEW"),
                 ("RUNNING", "DONE"),
                 ("RUNNING", "FAILED"),
@@ -130,6 +137,7 @@ impl WorkspacePolicy {
                 ("REVIEW", "READY"),
                 ("REVIEW", "CANCELLED"),
                 ("FAILED", "READY"),
+                ("FAILED", "RUNNING"),
                 ("FAILED", "CANCELLED"),
             ]
             .into_iter()
@@ -222,6 +230,31 @@ pub fn validate_policy(policy: &WorkspacePolicy) -> Result<(), PolicyError> {
         }
     }
 
+    for (role, from, to) in [
+        ("release", &policy.running_state, &policy.release_state),
+        (
+            "review_rejection",
+            &policy.review_state,
+            &policy.review_rejection_state,
+        ),
+        (
+            "lease_expiry",
+            &policy.running_state,
+            &policy.lease_expiry_recovery_state,
+        ),
+        ("retry", &policy.failed_state, &policy.running_state),
+        (
+            "lease_expiry_recovery",
+            &policy.lease_expiry_recovery_state,
+            &policy.running_state,
+        ),
+    ] {
+        require_transition(policy, role, from, to)?;
+    }
+    for state in &policy.executable_states {
+        require_transition(policy, "claim", state, &policy.running_state)?;
+    }
+
     for state in &policy.successful_terminal_states {
         if !policy.terminal_states.contains(state) {
             return Err(PolicyError::SuccessfulStateNotTerminal {
@@ -259,6 +292,25 @@ pub fn validate_policy(policy: &WorkspacePolicy) -> Result<(), PolicyError> {
         }
     }
 
+    Ok(())
+}
+
+fn require_transition(
+    policy: &WorkspacePolicy,
+    role: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), PolicyError> {
+    if !policy
+        .transitions
+        .contains(&(from.to_string(), to.to_string()))
+    {
+        return Err(PolicyError::RequiredTransitionMissing {
+            role: role.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+    }
     Ok(())
 }
 

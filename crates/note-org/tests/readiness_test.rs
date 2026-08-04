@@ -2,8 +2,8 @@ mod support;
 
 use chrono::NaiveDate;
 use note_org::{
-    evaluate_readiness, validate_dependencies, ClaimPolicy, OrgTimestamp, Readiness,
-    ReadinessBlocker, ReadinessContext, WorkspacePolicy,
+    evaluate_readiness, validate_dependencies, AttemptPhase, ClaimPolicy, ClaimQueue, LeaseKind,
+    LeaseStatus, OrgTimestamp, Readiness, ReadinessBlocker, ReadinessContext, WorkspacePolicy,
 };
 use std::collections::BTreeSet;
 use support::{id, item, ready_item};
@@ -28,11 +28,13 @@ fn reports_every_blocker_in_declaration_order() {
         now: 100,
         dependencies_satisfied: false,
         workspace_active: false,
-        active_lease: true,
+        lease: LeaseStatus::Active(LeaseKind::Execution),
         capacity_available: false,
         actor_id: Some("agent-b".to_string()),
         scheduled_at: Some(101),
-        lease_expired_running: false,
+        queue: ClaimQueue::Execution,
+        execution_attempt_count: 0,
+        current_attempt: None,
     };
 
     assert_eq!(
@@ -122,7 +124,7 @@ fn archived_workspace_is_blocked() {
 #[test]
 fn active_lease_is_blocked() {
     let context = ReadinessContext {
-        active_lease: true,
+        lease: LeaseStatus::Active(LeaseKind::Execution),
         ..ReadinessContext::ready_at(100)
     };
 
@@ -307,8 +309,9 @@ fn expired_running_item_is_recovery_candidate_despite_its_lease() {
     let mut item = ready_item();
     item.state = Some("RUNNING".to_string());
     let context = ReadinessContext {
-        active_lease: true,
-        lease_expired_running: true,
+        lease: LeaseStatus::Expired(LeaseKind::Execution),
+        execution_attempt_count: 1,
+        current_attempt: Some(AttemptPhase::Running),
         ..ReadinessContext::ready_at(100)
     };
 
@@ -324,8 +327,9 @@ fn expired_running_item_with_other_blockers_reports_only_those_blockers() {
     item.state = Some("RUNNING".to_string());
     let context = ReadinessContext {
         dependencies_satisfied: false,
-        active_lease: true,
-        lease_expired_running: true,
+        lease: LeaseStatus::Expired(LeaseKind::Execution),
+        execution_attempt_count: 1,
+        current_attempt: Some(AttemptPhase::Running),
         ..ReadinessContext::ready_at(100)
     };
 
@@ -336,20 +340,26 @@ fn expired_running_item_with_other_blockers_reports_only_those_blockers() {
 }
 
 #[test]
-fn expired_flag_does_not_make_other_states_recovery_candidates() {
-    let context = ReadinessContext {
-        lease_expired_running: true,
-        ..ReadinessContext::ready_at(100)
-    };
+fn expired_execution_lease_is_valid_only_for_running_recovery() {
+    let policy = WorkspacePolicy::engineering_default();
 
-    assert_eq!(
-        evaluate_readiness(
-            &ready_item(),
-            &WorkspacePolicy::engineering_default(),
-            &context,
-        ),
-        Readiness::Ready
-    );
+    for context in [
+        ReadinessContext {
+            lease: LeaseStatus::Expired(LeaseKind::Execution),
+            ..ReadinessContext::ready_at(100)
+        },
+        ReadinessContext {
+            lease: LeaseStatus::Expired(LeaseKind::Execution),
+            execution_attempt_count: 1,
+            current_attempt: Some(AttemptPhase::Terminal),
+            ..ReadinessContext::ready_at(100)
+        },
+    ] {
+        assert_eq!(
+            evaluate_readiness(&ready_item(), &policy, &context),
+            blocked(ReadinessBlocker::AttemptHistoryInconsistent)
+        );
+    }
 }
 
 #[test]
@@ -366,6 +376,225 @@ fn running_without_expiry_must_be_executable_to_be_ready() {
     policy.executable_states.insert("RUNNING".to_string());
     assert_eq!(
         evaluate_readiness(&item, &policy, &ReadinessContext::ready_at(100)),
+        Readiness::Ready
+    );
+}
+
+#[test]
+fn execution_and_review_queues_accept_only_their_own_states() {
+    let policy = WorkspacePolicy::engineering_default();
+    let execution = ready_item();
+    let mut review = ready_item();
+    review.state = Some(policy.review_state.clone());
+
+    assert_eq!(
+        evaluate_readiness(&execution, &policy, &ReadinessContext::ready_at(100),),
+        Readiness::Ready
+    );
+    assert_eq!(
+        evaluate_readiness(
+            &review,
+            &policy,
+            &ReadinessContext {
+                queue: ClaimQueue::Execution,
+                execution_attempt_count: 1,
+                current_attempt: Some(AttemptPhase::Submitted),
+                ..ReadinessContext::ready_at(100)
+            },
+        ),
+        blocked(ReadinessBlocker::NonExecutableState)
+    );
+    assert_eq!(
+        evaluate_readiness(
+            &execution,
+            &policy,
+            &ReadinessContext {
+                queue: ClaimQueue::Review,
+                ..ReadinessContext::ready_at(100)
+            },
+        ),
+        blocked(ReadinessBlocker::NonExecutableState)
+    );
+    assert_eq!(
+        evaluate_readiness(
+            &review,
+            &policy,
+            &ReadinessContext {
+                queue: ClaimQueue::Review,
+                execution_attempt_count: 1,
+                current_attempt: Some(AttemptPhase::Submitted),
+                ..ReadinessContext::ready_at(100)
+            },
+        ),
+        Readiness::Ready
+    );
+}
+
+#[test]
+fn review_claim_requires_the_current_submitted_attempt() {
+    let mut item = ready_item();
+    let policy = WorkspacePolicy::engineering_default();
+    item.state = Some(policy.review_state.clone());
+
+    for current_attempt in [
+        None,
+        Some(AttemptPhase::Running),
+        Some(AttemptPhase::Terminal),
+    ] {
+        assert_eq!(
+            evaluate_readiness(
+                &item,
+                &policy,
+                &ReadinessContext {
+                    queue: ClaimQueue::Review,
+                    execution_attempt_count: 1,
+                    current_attempt,
+                    ..ReadinessContext::ready_at(100)
+                },
+            ),
+            blocked(ReadinessBlocker::SubmittedAttemptRequired)
+        );
+    }
+}
+
+#[test]
+fn expired_review_lease_can_be_reclaimed_only_by_the_review_queue() {
+    let mut item = ready_item();
+    let policy = WorkspacePolicy::engineering_default();
+    item.state = Some(policy.review_state.clone());
+    let base = ReadinessContext {
+        lease: LeaseStatus::Expired(LeaseKind::Review),
+        execution_attempt_count: 1,
+        current_attempt: Some(AttemptPhase::Submitted),
+        ..ReadinessContext::ready_at(100)
+    };
+
+    assert_eq!(
+        evaluate_readiness(
+            &item,
+            &policy,
+            &ReadinessContext {
+                queue: ClaimQueue::Review,
+                ..base.clone()
+            },
+        ),
+        Readiness::Ready
+    );
+    assert_eq!(
+        evaluate_readiness(
+            &item,
+            &policy,
+            &ReadinessContext {
+                queue: ClaimQueue::Execution,
+                ..base
+            },
+        ),
+        Readiness::Blocked(vec![
+            ReadinessBlocker::NonExecutableState,
+            ReadinessBlocker::LeaseKindMismatch,
+        ])
+    );
+}
+
+#[test]
+fn running_recovery_requires_an_expired_execution_lease() {
+    let mut item = ready_item();
+    let policy = WorkspacePolicy::engineering_default();
+    item.state = Some(policy.running_state.clone());
+
+    for (lease, expected) in [
+        (
+            LeaseStatus::None,
+            vec![ReadinessBlocker::NonExecutableState],
+        ),
+        (
+            LeaseStatus::Active(LeaseKind::Execution),
+            vec![
+                ReadinessBlocker::NonExecutableState,
+                ReadinessBlocker::ActiveLease,
+            ],
+        ),
+        (
+            LeaseStatus::Active(LeaseKind::Review),
+            vec![
+                ReadinessBlocker::NonExecutableState,
+                ReadinessBlocker::ActiveLease,
+            ],
+        ),
+        (
+            LeaseStatus::Expired(LeaseKind::Review),
+            vec![
+                ReadinessBlocker::NonExecutableState,
+                ReadinessBlocker::LeaseKindMismatch,
+            ],
+        ),
+    ] {
+        assert_eq!(
+            evaluate_readiness(
+                &item,
+                &policy,
+                &ReadinessContext {
+                    lease,
+                    execution_attempt_count: 1,
+                    current_attempt: Some(AttemptPhase::Running),
+                    ..ReadinessContext::ready_at(100)
+                },
+            ),
+            Readiness::Blocked(expected)
+        );
+    }
+}
+
+#[test]
+fn execution_attempt_budget_blocks_claim_and_recovery_at_limit() {
+    let mut policy = WorkspacePolicy::engineering_default();
+    policy.retry_limit = 0;
+    let exhausted = ReadinessContext {
+        execution_attempt_count: 1,
+        current_attempt: Some(AttemptPhase::Terminal),
+        ..ReadinessContext::ready_at(100)
+    };
+
+    assert_eq!(
+        evaluate_readiness(&ready_item(), &policy, &exhausted),
+        blocked(ReadinessBlocker::RetryLimit)
+    );
+
+    let mut running = ready_item();
+    running.state = Some(policy.running_state.clone());
+    assert_eq!(
+        evaluate_readiness(
+            &running,
+            &policy,
+            &ReadinessContext {
+                lease: LeaseStatus::Expired(LeaseKind::Execution),
+                execution_attempt_count: 1,
+                current_attempt: Some(AttemptPhase::Running),
+                ..ReadinessContext::ready_at(100)
+            },
+        ),
+        blocked(ReadinessBlocker::RetryLimit)
+    );
+}
+
+#[test]
+fn review_claim_does_not_consume_the_execution_attempt_budget() {
+    let mut item = ready_item();
+    let mut policy = WorkspacePolicy::engineering_default();
+    policy.retry_limit = 0;
+    item.state = Some(policy.review_state.clone());
+
+    assert_eq!(
+        evaluate_readiness(
+            &item,
+            &policy,
+            &ReadinessContext {
+                queue: ClaimQueue::Review,
+                execution_attempt_count: 1,
+                current_attempt: Some(AttemptPhase::Submitted),
+                ..ReadinessContext::ready_at(100)
+            },
+        ),
         Readiness::Ready
     );
 }

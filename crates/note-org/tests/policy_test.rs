@@ -74,6 +74,7 @@ fn default_engineering_policy_has_exact_prd_configuration() {
             ("READY", "RUNNING"),
             ("READY", "CANCELLED"),
             ("RUNNING", "BLOCKED"),
+            ("RUNNING", "READY"),
             ("RUNNING", "REVIEW"),
             ("RUNNING", "DONE"),
             ("RUNNING", "FAILED"),
@@ -84,6 +85,7 @@ fn default_engineering_policy_has_exact_prd_configuration() {
             ("REVIEW", "READY"),
             ("REVIEW", "CANCELLED"),
             ("FAILED", "READY"),
+            ("FAILED", "RUNNING"),
             ("FAILED", "CANCELLED"),
         ]
         .into_iter()
@@ -600,4 +602,95 @@ fn approved_review_allows_configured_completion_edge() {
         ),
         Ok(())
     );
+}
+
+#[test]
+fn policy_requires_every_claim_and_recovery_transition() {
+    let cases = [
+        ("release", "RUNNING", "READY"),
+        ("review_rejection", "REVIEW", "READY"),
+        ("retry", "FAILED", "RUNNING"),
+    ];
+
+    for (role, from, to) in cases {
+        let mut policy = WorkspacePolicy::engineering_default();
+        policy
+            .transitions
+            .remove(&(from.to_string(), to.to_string()));
+
+        assert_eq!(
+            validate_policy(&policy),
+            Err(PolicyError::RequiredTransitionMissing {
+                role: role.to_string(),
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+        );
+    }
+}
+
+#[test]
+fn policy_requires_a_claim_transition_from_every_executable_state() {
+    let mut policy = WorkspacePolicy::engineering_default();
+    policy.states.insert("QUEUED".to_string());
+    policy.executable_states.insert("QUEUED".to_string());
+
+    assert_eq!(
+        validate_policy(&policy),
+        Err(PolicyError::RequiredTransitionMissing {
+            role: "claim".to_string(),
+            from: "QUEUED".to_string(),
+            to: "RUNNING".to_string(),
+        })
+    );
+}
+
+#[test]
+fn policy_still_requires_recovery_transitions_when_no_item_types_are_allowed() {
+    let mut policy = WorkspacePolicy::engineering_default();
+    policy.allowed_types.clear();
+    policy
+        .transitions
+        .remove(&("RUNNING".to_string(), "READY".to_string()));
+
+    assert_eq!(
+        validate_policy(&policy),
+        Err(PolicyError::RequiredTransitionMissing {
+            role: "release".to_string(),
+            from: "RUNNING".to_string(),
+            to: "READY".to_string(),
+        })
+    );
+}
+
+#[test]
+fn policy_requires_the_full_expiry_recovery_round_trip() {
+    for (role, include_entry, include_return, from, to) in [
+        ("lease_expiry", false, true, "RUNNING", "RECOVERY"),
+        ("lease_expiry_recovery", true, false, "RECOVERY", "RUNNING"),
+    ] {
+        let mut policy = WorkspacePolicy::engineering_default();
+        policy.states.insert("RECOVERY".to_string());
+        policy.executable_states.insert("RECOVERY".to_string());
+        policy.lease_expiry_recovery_state = "RECOVERY".to_string();
+        if include_entry {
+            policy
+                .transitions
+                .insert(("RUNNING".to_string(), "RECOVERY".to_string()));
+        }
+        if include_return {
+            policy
+                .transitions
+                .insert(("RECOVERY".to_string(), "RUNNING".to_string()));
+        }
+
+        assert_eq!(
+            validate_policy(&policy),
+            Err(PolicyError::RequiredTransitionMissing {
+                role: role.to_string(),
+                from: from.to_string(),
+                to: to.to_string(),
+            })
+        );
+    }
 }
