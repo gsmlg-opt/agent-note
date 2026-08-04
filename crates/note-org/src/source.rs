@@ -1,6 +1,7 @@
 use crate::{
-    EditedDocument, IndexedItem, MovedDocuments, NewWorkItem, NoteLink, OrgError, OrgTimestamp,
-    ParseOptions, PropertyKey, SemanticEdit, Span, WorkItem, WorkItemId, WorkItemType,
+    EditedDocument, IndexedItem, IndexedNoteLink, MovedDocuments, NewWorkItem, NoteLink, OrgError,
+    OrgTimestamp, ParseOptions, PropertyKey, SemanticEdit, Span, WorkItem, WorkItemId,
+    WorkItemType,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -82,7 +83,18 @@ impl OrgDocument {
             SemanticEdit::SetScheduled { item_id, value } => {
                 self.set_scheduled(item_id, value.as_deref())
             }
+            SemanticEdit::SetDeadline { item_id, value } => {
+                self.set_deadline(item_id, value.as_deref())
+            }
+            SemanticEdit::SetTitle { item_id, title } => self.set_title(item_id, &title),
+            SemanticEdit::SetPriority { item_id, priority } => self.set_priority(item_id, priority),
             SemanticEdit::SetTags { item_id, tags } => self.set_tags(item_id, &tags),
+            SemanticEdit::AddNoteLink { item_id, link } => self.add_note_link(item_id, link),
+            SemanticEdit::RemoveNoteLink {
+                item_id,
+                purpose,
+                note_id,
+            } => self.remove_note_link(item_id, &purpose, note_id),
             SemanticEdit::AppendItem { parent_id, item } => self.append_item(parent_id, item),
         }
     }
@@ -271,6 +283,23 @@ impl OrgDocument {
         item_id: WorkItemId,
         value: Option<&str>,
     ) -> Result<EditedDocument, OrgError> {
+        self.set_planning(item_id, "SCHEDULED", value)
+    }
+
+    fn set_deadline(
+        &self,
+        item_id: WorkItemId,
+        value: Option<&str>,
+    ) -> Result<EditedDocument, OrgError> {
+        self.set_planning(item_id, "DEADLINE", value)
+    }
+
+    fn set_planning(
+        &self,
+        item_id: WorkItemId,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<EditedDocument, OrgError> {
         let indexed = self
             .index
             .get(&item_id)
@@ -281,39 +310,302 @@ impl OrgDocument {
                 parse_error(
                     &self.source,
                     indexed.heading.start,
-                    format!("SCHEDULED: {message}"),
+                    format!("{key}: {message}"),
                 )
             })?;
         }
-        let source = match (indexed.planning.get("SCHEDULED").copied(), value) {
+        let source = match (indexed.planning.get(key).copied(), value) {
             (Some(span), Some(value)) => {
                 ensure_contained_span(&self.source, span, indexed.subtree, item_id)?;
-                let line_ending = span_line_ending(&self.source, span, item_id)?;
-                replace_span(
-                    &self.source,
-                    span,
-                    &format!("SCHEDULED: {value}{line_ending}"),
-                )
+                let value_span = planning_value_span(&self.source, span, key, item_id)?;
+                replace_span(&self.source, value_span, value)
             }
             (Some(span), None) => {
                 ensure_contained_span(&self.source, span, indexed.subtree, item_id)?;
                 replace_span(&self.source, span, "")
             }
             (None, Some(value)) => {
+                let offset = if key == "SCHEDULED" {
+                    indexed.heading.end
+                } else {
+                    planning_insertion_offset(&self.source, indexed, item_id)?
+                };
                 let span = Span {
-                    start: indexed.heading.end,
-                    end: indexed.heading.end,
+                    start: offset,
+                    end: offset,
                 };
                 ensure_editable_span(&self.source, span, item_id)?;
                 let line_ending = span_line_ending(&self.source, indexed.heading, item_id)?;
-                replace_span(
-                    &self.source,
-                    span,
-                    &format!("SCHEDULED: {value}{line_ending}"),
-                )
+                replace_span(&self.source, span, &format!("{key}: {value}{line_ending}"))
             }
             (None, None) => self.source.clone(),
         };
+        let reparsed =
+            parse_document(&source, &self.options).map_err(|_| OrgError::UnsafeEdit(item_id))?;
+        let mut expected = indexed.item.clone();
+        let parsed = value
+            .map(parse_planning_timestamp)
+            .transpose()
+            .map_err(|_| OrgError::UnsafeEdit(item_id))?;
+        if key == "SCHEDULED" {
+            expected.scheduled = parsed;
+        } else {
+            expected.deadline = parsed;
+        }
+        if reparsed.item(item_id) != Some(&expected) {
+            return Err(OrgError::UnsafeEdit(item_id));
+        }
+        Ok(EditedDocument {
+            source,
+            changed_items: BTreeSet::from([item_id]),
+        })
+    }
+
+    fn set_title(&self, item_id: WorkItemId, title: &str) -> Result<EditedDocument, OrgError> {
+        let indexed = self
+            .index
+            .get(&item_id)
+            .ok_or(OrgError::ItemNotFound(item_id))?;
+        validate_indexed_item(&self.source, indexed, item_id)?;
+        if title.trim().is_empty() || title != title.trim() || title.contains(['\r', '\n']) {
+            return Err(parse_error(
+                &self.source,
+                indexed.heading.start,
+                "work item title must be one nonempty trimmed line",
+            ));
+        }
+        ensure_contained_span(&self.source, indexed.title, indexed.heading, item_id)?;
+        let replacement = if indexed.title.start == indexed.title.end {
+            let before = self.source[..indexed.title.start].chars().next_back();
+            let after = self.source[indexed.title.end..].chars().next();
+            let mut replacement = String::with_capacity(title.len() + 2);
+            if !matches!(before, None | Some(' ' | '\t' | '\r' | '\n')) {
+                replacement.push(' ');
+            }
+            replacement.push_str(title);
+            if !matches!(after, None | Some(' ' | '\t' | '\r' | '\n')) {
+                replacement.push(' ');
+            }
+            replacement
+        } else {
+            title.to_string()
+        };
+        let source = replace_span(&self.source, indexed.title, &replacement);
+        let reparsed =
+            parse_document(&source, &self.options).map_err(|_| OrgError::UnsafeEdit(item_id))?;
+        let mut expected = indexed.item.clone();
+        expected.title = title.to_string();
+        if reparsed.item(item_id) != Some(&expected) {
+            return Err(OrgError::UnsafeEdit(item_id));
+        }
+        Ok(EditedDocument {
+            source,
+            changed_items: BTreeSet::from([item_id]),
+        })
+    }
+
+    fn set_priority(
+        &self,
+        item_id: WorkItemId,
+        priority: Option<char>,
+    ) -> Result<EditedDocument, OrgError> {
+        let indexed = self
+            .index
+            .get(&item_id)
+            .ok_or(OrgError::ItemNotFound(item_id))?;
+        validate_indexed_item(&self.source, indexed, item_id)?;
+        if priority.is_some_and(|value| !value.is_ascii_uppercase()) {
+            return Err(parse_error(
+                &self.source,
+                indexed.heading.start,
+                "work item priority must be an uppercase ASCII letter",
+            ));
+        }
+        let source = match (indexed.priority, priority) {
+            (Some(span), Some(priority)) => {
+                ensure_contained_span(&self.source, span, indexed.heading, item_id)?;
+                replace_span(&self.source, span, &format!("[#{priority}]"))
+            }
+            (Some(span), None) => {
+                ensure_contained_span(&self.source, span, indexed.heading, item_id)?;
+                let bytes = self.source.as_bytes();
+                let removal = if bytes
+                    .get(span.end)
+                    .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+                {
+                    Span {
+                        start: span.start,
+                        end: span.end + 1,
+                    }
+                } else {
+                    let marker_content_start = indexed
+                        .heading
+                        .start
+                        .checked_add(indexed.item.level)
+                        .and_then(|offset| offset.checked_add(1))
+                        .ok_or(OrgError::UnsafeEdit(item_id))?;
+                    let start = if span.start == marker_content_start {
+                        span.start
+                    } else {
+                        span.start
+                            .checked_sub(1)
+                            .filter(|offset| {
+                                bytes
+                                    .get(*offset)
+                                    .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+                            })
+                            .unwrap_or(span.start)
+                    };
+                    Span {
+                        start,
+                        end: span.end,
+                    }
+                };
+                ensure_contained_span(&self.source, removal, indexed.heading, item_id)?;
+                replace_span(&self.source, removal, "")
+            }
+            (None, Some(priority)) => {
+                ensure_contained_span(&self.source, indexed.title, indexed.heading, item_id)?;
+                let offset = indexed.title.start;
+                let preceding = offset
+                    .checked_sub(1)
+                    .and_then(|offset| self.source.as_bytes().get(offset))
+                    .copied();
+                let separator = if preceding == Some(b'\t') { '\t' } else { ' ' };
+                let has_leading_separator =
+                    preceding.is_some_and(|byte| matches!(byte, b' ' | b'\t'));
+                let heading = self
+                    .source
+                    .get(indexed.heading.start..indexed.heading.end)
+                    .ok_or(OrgError::UnsafeEdit(item_id))?;
+                let meaningful_end = indexed.heading.start
+                    + line_content(heading).trim_end_matches([' ', '\t']).len();
+                let trailing_separator = if offset < meaningful_end {
+                    separator.to_string()
+                } else {
+                    String::new()
+                };
+                let replacement = if has_leading_separator {
+                    format!("[#{priority}]{trailing_separator}")
+                } else {
+                    format!("{separator}[#{priority}]{trailing_separator}")
+                };
+                let insertion = Span {
+                    start: offset,
+                    end: offset,
+                };
+                ensure_contained_span(&self.source, insertion, indexed.heading, item_id)?;
+                replace_span(&self.source, insertion, &replacement)
+            }
+            (None, None) => self.source.clone(),
+        };
+        let reparsed =
+            parse_document(&source, &self.options).map_err(|_| OrgError::UnsafeEdit(item_id))?;
+        let mut expected = indexed.item.clone();
+        expected.priority = priority;
+        if reparsed.item(item_id) != Some(&expected) {
+            return Err(OrgError::UnsafeEdit(item_id));
+        }
+        Ok(EditedDocument {
+            source,
+            changed_items: BTreeSet::from([item_id]),
+        })
+    }
+
+    fn add_note_link(
+        &self,
+        item_id: WorkItemId,
+        link: NoteLink,
+    ) -> Result<EditedDocument, OrgError> {
+        let indexed = self
+            .index
+            .get(&item_id)
+            .ok_or(OrgError::ItemNotFound(item_id))?;
+        validate_indexed_item(&self.source, indexed, item_id)?;
+        validate_note_link(&self.source, indexed.heading.start, &link)?;
+        if indexed.note_links.iter().any(|existing| {
+            existing.link.purpose == link.purpose && existing.link.note_id == link.note_id
+        }) {
+            return Err(OrgError::UnsafeEdit(item_id));
+        }
+        let line_ending = local_section_line_ending(&self.source, indexed, item_id)?;
+        let rendered = render_note_link(&link, line_ending);
+        let insertion = insertion_with_boundaries(
+            &self.source,
+            indexed.section.end,
+            &rendered,
+            line_ending,
+            item_id,
+        )?;
+        let source = replace_span(
+            &self.source,
+            Span {
+                start: indexed.section.end,
+                end: indexed.section.end,
+            },
+            &insertion,
+        );
+        let reparsed =
+            parse_document(&source, &self.options).map_err(|_| OrgError::UnsafeEdit(item_id))?;
+        let mut expected = indexed.item.clone();
+        expected.note_links.push(link);
+        if reparsed.item(item_id) != Some(&expected) {
+            return Err(OrgError::UnsafeEdit(item_id));
+        }
+        Ok(EditedDocument {
+            source,
+            changed_items: BTreeSet::from([item_id]),
+        })
+    }
+
+    fn remove_note_link(
+        &self,
+        item_id: WorkItemId,
+        purpose: &str,
+        note_id: Uuid,
+    ) -> Result<EditedDocument, OrgError> {
+        let indexed = self
+            .index
+            .get(&item_id)
+            .ok_or(OrgError::ItemNotFound(item_id))?;
+        validate_indexed_item(&self.source, indexed, item_id)?;
+        let matches = indexed
+            .note_links
+            .iter()
+            .filter(|entry| entry.link.purpose == purpose && entry.link.note_id == note_id)
+            .collect::<Vec<_>>();
+        let [matched] = matches.as_slice() else {
+            return Err(OrgError::UnsafeEdit(item_id));
+        };
+        ensure_contained_span(&self.source, matched.span, indexed.section, item_id)?;
+        let line = whole_line_span(&self.source, matched.span, item_id)?;
+        let link_source = self
+            .source
+            .get(matched.span.start..matched.span.end)
+            .ok_or(OrgError::UnsafeEdit(item_id))?;
+        let line_source = self
+            .source
+            .get(line.start..line.end)
+            .ok_or(OrgError::UnsafeEdit(item_id))?;
+        let removal = if line_content(line_source).trim() == link_source {
+            line
+        } else {
+            matched.span
+        };
+        ensure_contained_span(&self.source, removal, indexed.section, item_id)?;
+        let source = replace_span(&self.source, removal, "");
+        let reparsed =
+            parse_document(&source, &self.options).map_err(|_| OrgError::UnsafeEdit(item_id))?;
+        let mut expected = indexed.item.clone();
+        let position = expected
+            .note_links
+            .iter()
+            .position(|link| link.purpose == purpose && link.note_id == note_id)
+            .ok_or(OrgError::UnsafeEdit(item_id))?;
+        expected.note_links.remove(position);
+        if reparsed.item(item_id) != Some(&expected) {
+            return Err(OrgError::UnsafeEdit(item_id));
+        }
         Ok(EditedDocument {
             source,
             changed_items: BTreeSet::from([item_id]),
@@ -617,6 +909,27 @@ fn preferred_line_ending(source: &str) -> &'static str {
     }
 }
 
+fn local_section_line_ending(
+    source: &str,
+    indexed: &IndexedItem,
+    item_id: WorkItemId,
+) -> Result<&'static str, OrgError> {
+    ensure_contained_span(source, indexed.section, indexed.subtree, item_id)?;
+    let section = source
+        .get(indexed.section.start..indexed.section.end)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    if let Some(newline) = section.rfind('\n') {
+        return Ok(
+            if newline > 0 && section.as_bytes().get(newline - 1) == Some(&b'\r') {
+                "\r\n"
+            } else {
+                "\n"
+            },
+        );
+    }
+    span_line_ending(source, indexed.heading, item_id)
+}
+
 fn span_line_ending(
     source: &str,
     span: Span,
@@ -720,9 +1033,14 @@ fn validate_indexed_item(
         .into_iter()
         .find(|heading| heading.heading.start == indexed.heading.start)
         .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let section = Span {
+        start: scanned.heading.end,
+        end: scanned.section_end,
+    };
     if indexed.item.id != item_id
         || scanned.heading != indexed.heading
         || scanned.subtree != indexed.subtree
+        || indexed.section != section
     {
         return Err(OrgError::UnsafeEdit(item_id));
     }
@@ -1145,7 +1463,12 @@ fn project_document(
             }
         };
         let depends_on = parse_dependencies(&source, &properties, id)?;
-        let note_links = parse_note_links(&source, heading.heading.end, heading.section_end);
+        let indexed_note_links =
+            parse_note_links(&source, heading.heading.end, heading.section_end);
+        let note_links = indexed_note_links
+            .iter()
+            .map(|entry| entry.link.clone())
+            .collect();
 
         let parent_id = projected_ancestors.last().map(|(_, id)| *id);
 
@@ -1170,10 +1493,17 @@ fn project_document(
             item: item.clone(),
             heading: heading.heading,
             subtree: heading.subtree,
+            section: Span {
+                start: heading.heading.end,
+                end: heading.section_end,
+            },
             state: parsed_heading.state_span,
+            title: parsed_heading.title_span,
+            priority: parsed_heading.priority_span,
             properties: property_spans(&properties),
             planning,
             tags: parsed_heading.tags_span,
+            note_links: indexed_note_links,
         };
         items.push(item);
         index.insert(id, indexed);
@@ -1196,6 +1526,8 @@ struct ParsedHeading {
     priority: Option<char>,
     tags: BTreeSet<String>,
     state_span: Option<Span>,
+    title_span: Span,
+    priority_span: Option<Span>,
     tags_span: Option<Span>,
 }
 
@@ -1205,6 +1537,7 @@ fn parse_heading(source: &str, heading: &ScannedHeading, options: &ParseOptions)
     let mut state = None;
     let mut priority = None;
     let mut state_span = None;
+    let mut priority_span = None;
 
     if let Some((token_start, token_end)) = next_token(line, cursor) {
         let token = &line[token_start..token_end];
@@ -1215,20 +1548,29 @@ fn parse_heading(source: &str, heading: &ScannedHeading, options: &ParseOptions)
                 end: heading.heading.start + token_end,
             });
             cursor = token_end;
-            cursor = skip_ascii_spaces(line, cursor);
-            let bytes = line.as_bytes();
-            if bytes[cursor..].starts_with(b"[#")
-                && bytes.get(cursor + 3) == Some(&b']')
-                && bytes.get(cursor + 2).is_some_and(u8::is_ascii_uppercase)
-            {
-                priority = Some(bytes[cursor + 2] as char);
-                cursor += 4;
-            }
         }
     }
 
-    cursor = skip_ascii_spaces(line, cursor);
-    let content_end = line.trim_end_matches([' ', '\t']).len();
+    cursor = skip_horizontal_whitespace(line, cursor);
+    let bytes = line.as_bytes();
+    if bytes[cursor..].starts_with(b"[#")
+        && bytes.get(cursor + 3) == Some(&b']')
+        && bytes.get(cursor + 2).is_some_and(u8::is_ascii_uppercase)
+        && matches!(bytes.get(cursor + 4), None | Some(b' ' | b'\t'))
+    {
+        priority = Some(bytes[cursor + 2] as char);
+        priority_span = Some(Span {
+            start: heading.heading.start + cursor,
+            end: heading.heading.start + cursor + 4,
+        });
+        cursor += 4;
+    }
+    cursor = skip_horizontal_whitespace(line, cursor);
+    let content_end = line
+        .trim_end_matches([' ', '\t'])
+        .len()
+        .max(heading.level + 1);
+    cursor = cursor.min(content_end);
     let tags_span = trailing_tags(line, cursor, content_end).map(|(start, end)| Span {
         start: heading.heading.start + start,
         end: heading.heading.start + end,
@@ -1236,7 +1578,14 @@ fn parse_heading(source: &str, heading: &ScannedHeading, options: &ParseOptions)
     let title_end = tags_span
         .map(|span| span.start - heading.heading.start)
         .unwrap_or(content_end);
-    let title = line[cursor..title_end].trim().to_string();
+    let raw_title = &line[cursor..title_end];
+    let title_start = cursor + raw_title.len() - raw_title.trim_start().len();
+    let title_end = cursor + raw_title.trim_end().len();
+    let title_span = Span {
+        start: heading.heading.start + title_start,
+        end: heading.heading.start + title_end,
+    };
+    let title = line[title_start..title_end].to_string();
     let tags = tags_span
         .map(|span| {
             line[span.start - heading.heading.start..span.end - heading.heading.start]
@@ -1253,6 +1602,8 @@ fn parse_heading(source: &str, heading: &ScannedHeading, options: &ParseOptions)
         priority,
         tags,
         state_span,
+        title_span,
+        priority_span,
         tags_span,
     }
 }
@@ -1366,10 +1717,11 @@ fn parse_planning_timestamp(raw: &str) -> Result<OrgTimestamp, String> {
     })
 }
 
-fn parse_note_links(source: &str, start: usize, end: usize) -> Vec<NoteLink> {
+fn parse_note_links(source: &str, start: usize, end: usize) -> Vec<IndexedNoteLink> {
     let mut links = Vec::new();
     let mut block_stack = Vec::<String>::new();
     let mut drawer = false;
+    let mut offset = start;
 
     for line in source[start..end].split_inclusive('\n') {
         let content = line_content(line);
@@ -1385,38 +1737,46 @@ fn parse_note_links(source: &str, start: usize, end: usize) -> Vec<NoteLink> {
                     block_stack.pop();
                 }
             }
+            offset += line.len();
             continue;
         }
         if drawer {
             if is_drawer_end(content) {
                 drawer = false;
             }
+            offset += line.len();
             continue;
         }
         if let Some(kind) = block_begin(trimmed) {
             block_stack.push(kind.to_string());
+            offset += line.len();
             continue;
         }
         if drawer_start(trimmed).is_some_and(|name| !name.eq_ignore_ascii_case("END")) {
             drawer = true;
+            offset += line.len();
             continue;
         }
         if trimmed.starts_with('#') {
+            offset += line.len();
             continue;
         }
-        parse_note_links_in_line(content, &mut links);
+        parse_note_links_in_line(content, offset, &mut links);
+        offset += line.len();
     }
 
     links
 }
 
-fn parse_note_links_in_line(line: &str, links: &mut Vec<NoteLink>) {
+fn parse_note_links_in_line(line: &str, base_offset: usize, links: &mut Vec<IndexedNoteLink>) {
     enum State {
         Searching,
         Target {
+            outer_start: usize,
             start: usize,
         },
         Description {
+            outer_start: usize,
             target_start: usize,
             target_end: usize,
             description_start: usize,
@@ -1433,23 +1793,33 @@ fn parse_note_links_in_line(line: &str, links: &mut Vec<NoteLink>) {
         match &mut state {
             State::Searching => {
                 if bytes[cursor] == b'[' && next == Some(b'[') {
-                    state = State::Target { start: cursor + 2 };
+                    state = State::Target {
+                        outer_start: cursor,
+                        start: cursor + 2,
+                    };
                     cursor += 2;
                 } else {
                     cursor += 1;
                 }
             }
-            State::Target { start } => {
+            State::Target { outer_start, start } => {
                 if bytes[cursor] == b'[' && next == Some(b'[') {
+                    *outer_start = cursor;
                     *start = cursor + 2;
                     cursor += 2;
                 } else if bytes[cursor] == b']' && next == Some(b']') {
                     if let Some((purpose, note_id)) = parse_note_link_target(&line[*start..cursor])
                     {
-                        links.push(NoteLink {
-                            purpose: purpose.to_string(),
-                            note_id,
-                            description: String::new(),
+                        links.push(IndexedNoteLink {
+                            link: NoteLink {
+                                purpose: purpose.to_string(),
+                                note_id,
+                                description: String::new(),
+                            },
+                            span: Span {
+                                start: base_offset + *outer_start,
+                                end: base_offset + cursor + 2,
+                            },
                         });
                     }
                     state = State::Searching;
@@ -1457,6 +1827,7 @@ fn parse_note_links_in_line(line: &str, links: &mut Vec<NoteLink>) {
                 } else if bytes[cursor] == b']' && next == Some(b'[') {
                     if parse_note_link_target(&line[*start..cursor]).is_some() {
                         state = State::Description {
+                            outer_start: *outer_start,
                             target_start: *start,
                             target_end: cursor,
                             description_start: cursor + 2,
@@ -1471,6 +1842,7 @@ fn parse_note_links_in_line(line: &str, links: &mut Vec<NoteLink>) {
                 }
             }
             State::Description {
+                outer_start,
                 target_start,
                 target_end,
                 description_start,
@@ -1488,10 +1860,16 @@ fn parse_note_links_in_line(line: &str, links: &mut Vec<NoteLink>) {
                     if let Some((purpose, note_id)) =
                         parse_note_link_target(&line[*target_start..*target_end])
                     {
-                        links.push(NoteLink {
-                            purpose: purpose.to_string(),
-                            note_id,
-                            description: line[*description_start..cursor].to_string(),
+                        links.push(IndexedNoteLink {
+                            link: NoteLink {
+                                purpose: purpose.to_string(),
+                                note_id,
+                                description: line[*description_start..cursor].to_string(),
+                            },
+                            span: Span {
+                                start: base_offset + *outer_start,
+                                end: base_offset + cursor + 2,
+                            },
                         });
                     }
                     state = State::Searching;
@@ -1505,7 +1883,10 @@ fn parse_note_links_in_line(line: &str, links: &mut Vec<NoteLink>) {
             },
             State::Discarding => {
                 if bytes[cursor] == b'[' && next == Some(b'[') {
-                    state = State::Target { start: cursor + 2 };
+                    state = State::Target {
+                        outer_start: cursor,
+                        start: cursor + 2,
+                    };
                     cursor += 2;
                 } else if bytes[cursor] == b']' && next == Some(b']') {
                     state = State::Searching;
@@ -1534,6 +1915,57 @@ fn parse_note_link_target(target: &str) -> Option<(&str, Uuid)> {
     }
     let note_id = Uuid::parse_str(note_id).ok()?;
     Some((purpose, note_id))
+}
+
+fn validate_note_link(source: &str, offset: usize, link: &NoteLink) -> Result<(), OrgError> {
+    if link.purpose.is_empty()
+        || link.purpose.contains([':', '[', ']', '\r', '\n'])
+        || link.purpose.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(parse_error(
+            source,
+            offset,
+            "agent-note link purpose is invalid",
+        ));
+    }
+    if link.description.contains(['\r', '\n']) {
+        return Err(parse_error(
+            source,
+            offset,
+            "agent-note link description must be one line",
+        ));
+    }
+    let mut depth = 0usize;
+    for byte in link.description.bytes() {
+        if byte == b'[' {
+            depth += 1;
+        } else if byte == b']' {
+            depth = depth.checked_sub(1).ok_or_else(|| {
+                parse_error(
+                    source,
+                    offset,
+                    "agent-note link description has unbalanced brackets",
+                )
+            })?;
+        }
+    }
+    if depth != 0 {
+        return Err(parse_error(
+            source,
+            offset,
+            "agent-note link description has unbalanced brackets",
+        ));
+    }
+    Ok(())
+}
+
+fn render_note_link(link: &NoteLink, line_ending: &str) -> String {
+    let target = format!("agent-note:{}:{}", link.purpose, link.note_id);
+    if link.description.is_empty() {
+        format!("[[{target}]]{line_ending}")
+    } else {
+        format!("[[{target}][{}]]{line_ending}", link.description)
+    }
 }
 
 fn parse_properties<'a>(source: &'a str, start: usize, end: usize) -> Vec<PropertyOccurrence<'a>> {
@@ -1694,6 +2126,43 @@ fn planning_spans(
     Ok(spans)
 }
 
+fn planning_value_span(
+    source: &str,
+    line_span: Span,
+    key: &str,
+    item_id: WorkItemId,
+) -> Result<Span, OrgError> {
+    ensure_editable_span(source, line_span, item_id)?;
+    let line = source
+        .get(line_span.start..line_span.end)
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    let content = line_content(line);
+    let trimmed = content.trim_start();
+    let key_start = content.len() - trimmed.len();
+    let value_region_start = key_start
+        .checked_add(key.len())
+        .and_then(|offset| offset.checked_add(1))
+        .ok_or(OrgError::UnsafeEdit(item_id))?;
+    if !trimmed.starts_with(key)
+        || trimmed.as_bytes().get(key.len()) != Some(&b':')
+        || value_region_start > content.len()
+    {
+        return Err(OrgError::UnsafeEdit(item_id));
+    }
+    let value_region = &content[value_region_start..];
+    let value_start = value_region_start + value_region.len() - value_region.trim_start().len();
+    let value_end = value_region_start + value_region.trim_end().len();
+    if value_start >= value_end {
+        return Err(OrgError::UnsafeEdit(item_id));
+    }
+    let span = Span {
+        start: line_span.start + value_start,
+        end: line_span.start + value_end,
+    };
+    ensure_contained_span(source, span, line_span, item_id)?;
+    Ok(span)
+}
+
 fn line_content(line: &str) -> &str {
     line.strip_suffix('\n')
         .unwrap_or(line)
@@ -1744,7 +2213,7 @@ fn heading_level(line: &str) -> Option<usize> {
 }
 
 fn next_token(line: &str, start: usize) -> Option<(usize, usize)> {
-    let start = skip_ascii_spaces(line, start);
+    let start = skip_horizontal_whitespace(line, start);
     if start == line.len() {
         return None;
     }
@@ -1754,8 +2223,12 @@ fn next_token(line: &str, start: usize) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-fn skip_ascii_spaces(line: &str, mut offset: usize) -> usize {
-    while line.as_bytes().get(offset) == Some(&b' ') {
+fn skip_horizontal_whitespace(line: &str, mut offset: usize) -> usize {
+    while line
+        .as_bytes()
+        .get(offset)
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
         offset += 1;
     }
     offset

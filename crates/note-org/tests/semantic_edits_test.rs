@@ -1,8 +1,9 @@
 use note_org::{
-    move_item, parse_document, reparent_item, NewWorkItem, OrgError, ParseOptions, PropertyKey,
-    SemanticEdit, WorkItemId, WorkItemType,
+    move_item, parse_document, reparent_item, NewWorkItem, NoteLink, OrgError, ParseOptions,
+    PropertyKey, SemanticEdit, WorkItemId, WorkItemType,
 };
 use std::{collections::BTreeSet, str::FromStr};
+use uuid::Uuid;
 
 fn id(value: &str) -> WorkItemId {
     WorkItemId::from_str(value).unwrap()
@@ -68,23 +69,177 @@ fn transition_inserts_a_missing_configured_state_after_the_heading_marker() {
 }
 
 #[test]
-fn state_insertion_rejects_reinterpreting_a_priority_like_title() {
+fn priority_without_todo_projects_and_edits_independently() {
     let item_id = id("11111111-1111-4111-8111-111111111111");
     let source = "* [#A] Ship\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n";
     let document = parse_document(source, &options()).unwrap();
     let item = document.item(item_id).unwrap();
     assert_eq!(item.state, None);
-    assert_eq!(item.priority, None);
-    assert_eq!(item.title, "[#A] Ship");
+    assert_eq!(item.priority, Some('A'));
+    assert_eq!(item.title, "Ship");
 
-    assert_eq!(
-        document.apply(SemanticEdit::SetState {
+    let transitioned = document
+        .apply(SemanticEdit::SetState {
             item_id,
             state: "READY".to_string(),
-        }),
-        Err(OrgError::UnsafeEdit(item_id))
+        })
+        .unwrap();
+    assert_eq!(transitioned.source, source.replacen("* ", "* READY ", 1));
+
+    let reprioritized = document
+        .apply(SemanticEdit::SetPriority {
+            item_id,
+            priority: Some('B'),
+        })
+        .unwrap();
+    assert_eq!(reprioritized.source, source.replacen("[#A]", "[#B]", 1));
+
+    let cleared = document
+        .apply(SemanticEdit::SetPriority {
+            item_id,
+            priority: None,
+        })
+        .unwrap();
+    assert_eq!(cleared.source, source.replacen(" [#A]", "", 1));
+
+    let without_priority = source.replace(" [#A]", "");
+    let inserted = parse_document(&without_priority, &options())
+        .unwrap()
+        .apply(SemanticEdit::SetPriority {
+            item_id,
+            priority: Some('C'),
+        })
+        .unwrap();
+    assert_eq!(
+        inserted.source,
+        without_priority.replacen("* ", "* [#C] ", 1)
     );
-    assert_eq!(document.source(), source);
+}
+
+#[test]
+fn tab_separated_priority_cookies_project_with_and_without_todo() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    for (source, expected_state) in [
+        (
+            "* READY\t[#A]\tShip\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n",
+            Some("READY"),
+        ),
+        (
+            "* \t[#A]\tShip\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n",
+            None,
+        ),
+    ] {
+        let document = parse_document(source, &options()).unwrap();
+        let item = document.item(item_id).unwrap();
+        assert_eq!(item.state.as_deref(), expected_state);
+        assert_eq!(item.priority, Some('A'));
+        assert_eq!(item.title, "Ship");
+    }
+}
+
+#[test]
+fn priority_cookie_requires_a_horizontal_boundary_after_it() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* [#A]Ship\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n";
+    let document = parse_document(source, &options()).unwrap();
+    let item = document.item(item_id).unwrap();
+
+    assert_eq!(item.state, None);
+    assert_eq!(item.priority, None);
+    assert_eq!(item.title, "[#A]Ship");
+}
+
+#[test]
+fn priority_cookie_accepts_end_of_line_after_the_cookie() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    for heading in ["* [#A]\n", "* [#A]\t\n"] {
+        let source = format!(
+            "{heading}:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n"
+        );
+        let document = parse_document(source, &options()).unwrap();
+        let item = document.item(item_id).unwrap();
+
+        assert_eq!(item.state, None);
+        assert_eq!(item.priority, Some('A'));
+        assert_eq!(item.title, "");
+    }
+}
+
+#[test]
+fn clearing_and_readding_priority_keeps_an_empty_title_heading_valid() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    for line_ending in ["\n", "\r\n"] {
+        let source = format!(
+            "* [#A]{line_ending}:PROPERTIES:{line_ending}:ID: 11111111-1111-4111-8111-111111111111{line_ending}:AGENT_NOTE_TYPE: task{line_ending}:END:{line_ending}"
+        );
+        let expected_cleared = source.replacen("* [#A]", "* ", 1);
+        let cleared = parse_document(&source, &options())
+            .unwrap()
+            .apply(SemanticEdit::SetPriority {
+                item_id,
+                priority: None,
+            })
+            .unwrap();
+        assert_eq!(cleared.source, expected_cleared);
+        let cleared_document = parse_document(&cleared.source, &options()).unwrap();
+        let cleared_item = cleared_document.item(item_id).unwrap();
+        assert_eq!(cleared_item.priority, None);
+        assert_eq!(cleared_item.title, "");
+
+        let restored = cleared_document
+            .apply(SemanticEdit::SetPriority {
+                item_id,
+                priority: Some('A'),
+            })
+            .unwrap();
+        assert_eq!(restored.source, source);
+        assert_eq!(
+            parse_document(&restored.source, &options())
+                .unwrap()
+                .item(item_id)
+                .unwrap()
+                .priority,
+            Some('A')
+        );
+    }
+}
+
+#[test]
+fn priority_edits_preserve_tab_separators_without_duplicating_cookies() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    for source in [
+        "* READY\t[#A]\tShip\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n",
+        "* \t[#A]\tShip\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n",
+    ] {
+        let document = parse_document(source, &options()).unwrap();
+        let replaced = document
+            .apply(SemanticEdit::SetPriority {
+                item_id,
+                priority: Some('B'),
+            })
+            .unwrap();
+        assert_eq!(replaced.source, source.replacen("[#A]", "[#B]", 1));
+        assert_eq!(replaced.source.matches("[#").count(), 1);
+
+        let cleared = document
+            .apply(SemanticEdit::SetPriority {
+                item_id,
+                priority: None,
+            })
+            .unwrap();
+        let expected_cleared = source.replacen("[#A]\t", "", 1);
+        assert_eq!(cleared.source, expected_cleared);
+
+        let restored = parse_document(&cleared.source, &options())
+            .unwrap()
+            .apply(SemanticEdit::SetPriority {
+                item_id,
+                priority: Some('A'),
+            })
+            .unwrap();
+        assert_eq!(restored.source, source);
+        assert_eq!(restored.source.matches("[#").count(), 1);
+    }
 }
 
 #[test]
@@ -693,6 +848,356 @@ fn scheduled_edits_replace_insert_and_remove_only_the_planning_line() {
             .map(|timestamp| timestamp.raw.as_str()),
         Some("<2026-08-04 Tue>")
     );
+
+    let formatted_crlf = crlf.replacen(
+        "SCHEDULED: <2026-08-01 Sat 09:30>\r\n",
+        "  SCHEDULED: <2026-08-01 Sat 09:30> \t \r\n",
+        1,
+    );
+    let edited = parse_document(&formatted_crlf, &options())
+        .unwrap()
+        .apply(SemanticEdit::SetScheduled {
+            item_id,
+            value: Some("<2026-08-05 Wed 11:15>".to_string()),
+        })
+        .unwrap();
+    assert_eq!(
+        edited.source,
+        formatted_crlf.replacen("<2026-08-01 Sat 09:30>", "<2026-08-05 Wed 11:15>", 1,)
+    );
+}
+
+#[test]
+fn deadline_edits_replace_insert_and_clear_only_the_planning_line() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* READY Deadline\r\nSCHEDULED: <2026-08-01 Sat 09:30>\r\nDEADLINE: <2026-08-02 Sun>\r\n:PROPERTIES:\r\n:ID: 11111111-1111-4111-8111-111111111111\r\n:AGENT_NOTE_TYPE: task\r\n:CUSTOM: keep\r\n:END:\r\nBody.\r\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    let replaced = document
+        .apply(SemanticEdit::SetDeadline {
+            item_id,
+            value: Some("<2026-08-03 Mon 10:45>".to_string()),
+        })
+        .unwrap();
+    assert_eq!(
+        replaced.source,
+        source.replacen(
+            "DEADLINE: <2026-08-02 Sun>\r\n",
+            "DEADLINE: <2026-08-03 Mon 10:45>\r\n",
+            1,
+        )
+    );
+    assert_eq!(replaced.changed_items, BTreeSet::from([item_id]));
+    assert_eq!(
+        parse_document(&replaced.source, &options())
+            .unwrap()
+            .item(item_id)
+            .unwrap()
+            .deadline
+            .as_ref()
+            .map(|timestamp| timestamp.raw.as_str()),
+        Some("<2026-08-03 Mon 10:45>")
+    );
+
+    let without_deadline = source.replace("DEADLINE: <2026-08-02 Sun>\r\n", "");
+    let inserted = parse_document(&without_deadline, &options())
+        .unwrap()
+        .apply(SemanticEdit::SetDeadline {
+            item_id,
+            value: Some("<2026-08-04 Tue>".to_string()),
+        })
+        .unwrap();
+    assert_eq!(
+        inserted.source,
+        without_deadline.replacen(
+            "SCHEDULED: <2026-08-01 Sat 09:30>\r\n",
+            "SCHEDULED: <2026-08-01 Sat 09:30>\r\nDEADLINE: <2026-08-04 Tue>\r\n",
+            1,
+        )
+    );
+
+    let cleared = document
+        .apply(SemanticEdit::SetDeadline {
+            item_id,
+            value: None,
+        })
+        .unwrap();
+    assert_eq!(cleared.source, without_deadline);
+    assert!(parse_document(&cleared.source, &options())
+        .unwrap()
+        .item(item_id)
+        .unwrap()
+        .deadline
+        .is_none());
+
+    let formatted_crlf = source.replacen(
+        "DEADLINE: <2026-08-02 Sun>\r\n",
+        " \tDEADLINE: <2026-08-02 Sun>   \r\n",
+        1,
+    );
+    let edited = parse_document(&formatted_crlf, &options())
+        .unwrap()
+        .apply(SemanticEdit::SetDeadline {
+            item_id,
+            value: Some("<2026-08-06 Thu 12:30>".to_string()),
+        })
+        .unwrap();
+    assert_eq!(
+        edited.source,
+        formatted_crlf.replacen("<2026-08-02 Sun>", "<2026-08-06 Thu 12:30>", 1,)
+    );
+}
+
+#[test]
+fn title_and_priority_edits_touch_only_their_heading_tokens() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* READY [#A] Old title :keep:\r\n:PROPERTIES:\r\n:ID: 11111111-1111-4111-8111-111111111111\r\n:AGENT_NOTE_TYPE: task\r\n:END:\r\nBody bytes stay.\r\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    let titled = document
+        .apply(SemanticEdit::SetTitle {
+            item_id,
+            title: "New title".to_string(),
+        })
+        .unwrap();
+    assert_eq!(titled.source, source.replacen("Old title", "New title", 1));
+    let titled_item = parse_document(&titled.source, &options())
+        .unwrap()
+        .item(item_id)
+        .unwrap()
+        .clone();
+    assert_eq!(titled_item.title, "New title");
+    assert_eq!(titled_item.priority, Some('A'));
+    assert_eq!(titled_item.tags, BTreeSet::from(["keep".to_string()]));
+
+    let reprioritized = document
+        .apply(SemanticEdit::SetPriority {
+            item_id,
+            priority: Some('B'),
+        })
+        .unwrap();
+    assert_eq!(reprioritized.source, source.replacen("[#A]", "[#B]", 1));
+
+    let cleared = document
+        .apply(SemanticEdit::SetPriority {
+            item_id,
+            priority: None,
+        })
+        .unwrap();
+    assert_eq!(cleared.source, source.replacen(" [#A]", "", 1));
+
+    let without_priority = source.replace(" [#A]", "");
+    let inserted = parse_document(&without_priority, &options())
+        .unwrap()
+        .apply(SemanticEdit::SetPriority {
+            item_id,
+            priority: Some('C'),
+        })
+        .unwrap();
+    assert_eq!(
+        inserted.source,
+        without_priority.replacen("* READY", "* READY [#C]", 1)
+    );
+    assert_eq!(
+        parse_document(&inserted.source, &options())
+            .unwrap()
+            .item(item_id)
+            .unwrap()
+            .priority,
+        Some('C')
+    );
+}
+
+#[test]
+fn title_insertion_preserves_empty_heading_token_boundaries() {
+    let cases = [
+        ("* READY\n", "* READY New title\n"),
+        ("* [#A]\r\n", "* [#A] New title\r\n"),
+        ("* READY [#B]\n", "* READY [#B] New title\n"),
+        ("* READY :keep:\r\n", "* READY New title :keep:\r\n"),
+    ];
+    for (heading, expected_heading) in cases {
+        let item_id = id("11111111-1111-4111-8111-111111111111");
+        let line_ending = if heading.ends_with("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let source = format!(
+            "{heading}:PROPERTIES:{line_ending}:ID: 11111111-1111-4111-8111-111111111111{line_ending}:AGENT_NOTE_TYPE: task{line_ending}:END:{line_ending}"
+        );
+        let document = parse_document(&source, &options()).unwrap();
+        assert_eq!(document.item(item_id).unwrap().title, "");
+
+        let edited = document
+            .apply(SemanticEdit::SetTitle {
+                item_id,
+                title: "New title".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            edited.source,
+            source.replacen(heading, expected_heading, 1),
+            "failed heading {heading:?}"
+        );
+        let item = parse_document(&edited.source, &options())
+            .unwrap()
+            .item(item_id)
+            .unwrap()
+            .clone();
+        assert_eq!(item.title, "New title");
+        assert_eq!(
+            item.priority,
+            document.item(item_id).unwrap().priority,
+            "priority changed for {heading:?}"
+        );
+        assert_eq!(
+            item.tags,
+            document.item(item_id).unwrap().tags,
+            "tags changed for {heading:?}"
+        );
+    }
+}
+
+#[test]
+fn heading_edits_reject_values_that_reparse_as_other_heading_syntax() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let source = "* READY Safe\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    assert!(matches!(
+        document.apply(SemanticEdit::SetTitle {
+            item_id,
+            title: "Ship :secret:".to_string(),
+        }),
+        Err(OrgError::UnsafeEdit(id)) if id == item_id
+    ));
+    assert!(matches!(
+        document.apply(SemanticEdit::SetTitle {
+            item_id,
+            title: "\nInjected".to_string(),
+        }),
+        Err(OrgError::Parse { .. })
+    ));
+    assert!(matches!(
+        document.apply(SemanticEdit::SetPriority {
+            item_id,
+            priority: Some('1'),
+        }),
+        Err(OrgError::Parse { .. })
+    ));
+}
+
+#[test]
+fn typed_agent_note_link_edits_preserve_opaque_and_unrelated_bytes() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let note_id = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+    let source = "* READY Links\r\n:PROPERTIES:\r\n:ID: 11111111-1111-4111-8111-111111111111\r\n:AGENT_NOTE_TYPE: task\r\n:END:\r\n#+BEGIN_SRC org\r\n[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][opaque]]\r\n#+END_SRC\r\nBody stays.\r\n";
+    let document = parse_document(source, &options()).unwrap();
+    let link = NoteLink {
+        purpose: "design".to_string(),
+        note_id,
+        description: "Design note".to_string(),
+    };
+
+    let added = document
+        .apply(SemanticEdit::AddNoteLink {
+            item_id,
+            link: link.clone(),
+        })
+        .unwrap();
+    let rendered = "[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][Design note]]\r\n";
+    assert_eq!(added.source, format!("{source}{rendered}"));
+    assert_eq!(added.changed_items, BTreeSet::from([item_id]));
+    assert_eq!(
+        parse_document(&added.source, &options())
+            .unwrap()
+            .item(item_id)
+            .unwrap()
+            .note_links,
+        vec![link]
+    );
+
+    let removed = parse_document(&added.source, &options())
+        .unwrap()
+        .apply(SemanticEdit::RemoveNoteLink {
+            item_id,
+            purpose: "design".to_string(),
+            note_id,
+        })
+        .unwrap();
+    assert_eq!(removed.source, source);
+    assert!(removed.source.contains("[opaque]"));
+    assert!(parse_document(&removed.source, &options())
+        .unwrap()
+        .item(item_id)
+        .unwrap()
+        .note_links
+        .is_empty());
+}
+
+#[test]
+fn added_agent_note_link_uses_the_target_sections_local_line_ending() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let note_id = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+    let source = "Mixed preamble.\r\n* READY Local LF\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\nBody stays.\n";
+    let edited = parse_document(source, &options())
+        .unwrap()
+        .apply(SemanticEdit::AddNoteLink {
+            item_id,
+            link: NoteLink {
+                purpose: "design".to_string(),
+                note_id,
+                description: "Design note".to_string(),
+            },
+        })
+        .unwrap();
+
+    assert_eq!(
+        edited.source,
+        format!(
+            "{source}[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][Design note]]\n"
+        )
+    );
+}
+
+#[test]
+fn typed_agent_note_link_edits_reject_invalid_or_ambiguous_targets() {
+    let item_id = id("11111111-1111-4111-8111-111111111111");
+    let note_id = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+    let source = "* READY Links\n:PROPERTIES:\n:ID: 11111111-1111-4111-8111-111111111111\n:AGENT_NOTE_TYPE: task\n:END:\n[[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][one]] and [[agent-note:design:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa][two]]\n";
+    let document = parse_document(source, &options()).unwrap();
+
+    assert_eq!(
+        document.apply(SemanticEdit::RemoveNoteLink {
+            item_id,
+            purpose: "design".to_string(),
+            note_id,
+        }),
+        Err(OrgError::UnsafeEdit(item_id))
+    );
+    for link in [
+        NoteLink {
+            purpose: "bad:purpose".to_string(),
+            note_id,
+            description: "safe".to_string(),
+        },
+        NoteLink {
+            purpose: "design".to_string(),
+            note_id,
+            description: "unsafe\nline".to_string(),
+        },
+        NoteLink {
+            purpose: "design".to_string(),
+            note_id,
+            description: "unbalanced ] bracket".to_string(),
+        },
+    ] {
+        assert!(matches!(
+            document.apply(SemanticEdit::AddNoteLink { item_id, link }),
+            Err(OrgError::Parse { .. })
+        ));
+    }
 }
 
 #[test]

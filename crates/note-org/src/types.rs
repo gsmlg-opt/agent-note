@@ -20,10 +20,20 @@ pub(crate) struct IndexedItem {
     pub item: WorkItem,
     pub heading: Span,
     pub subtree: Span,
+    pub section: Span,
     pub state: Option<Span>,
+    pub title: Span,
+    pub priority: Option<Span>,
     pub properties: BTreeMap<String, Span>,
     pub planning: BTreeMap<String, Span>,
     pub tags: Option<Span>,
+    pub note_links: Vec<IndexedNoteLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexedNoteLink {
+    pub link: NoteLink,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -193,9 +203,30 @@ pub enum SemanticEdit {
         item_id: WorkItemId,
         value: Option<String>,
     },
+    SetDeadline {
+        item_id: WorkItemId,
+        value: Option<String>,
+    },
+    SetTitle {
+        item_id: WorkItemId,
+        title: String,
+    },
+    SetPriority {
+        item_id: WorkItemId,
+        priority: Option<char>,
+    },
     SetTags {
         item_id: WorkItemId,
         tags: BTreeSet<String>,
+    },
+    AddNoteLink {
+        item_id: WorkItemId,
+        link: NoteLink,
+    },
+    RemoveNoteLink {
+        item_id: WorkItemId,
+        purpose: String,
+        note_id: Uuid,
     },
     AppendItem {
         parent_id: Option<WorkItemId>,
