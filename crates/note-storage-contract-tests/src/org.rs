@@ -1,12 +1,15 @@
-use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
+use note_org::{
+    ClaimPolicy, DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy,
+};
 use note_storage::{
     CompareAndSwap, ConditionalUpdate, ExpiredOrgLeaseClosure, NewOrgAttempt,
     NewOrgAttemptAllocation, NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace,
     OrgArtifactReference, OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate,
     OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
     OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind, OrgLeaseOwnershipMove,
-    OrgLeaseProof, OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind,
-    StoredOrgOperation, StoredOrgTimestamp, TransactionMode,
+    OrgLeaseProof, OrgOperationalQuery, OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker,
+    OrgReviewLeaseMarker, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StoredOrgOperation,
+    StoredOrgTimestamp, TransactionMode,
 };
 use serde_json::json;
 use std::str::FromStr as _;
@@ -59,6 +62,32 @@ fn projected_item(
         tags: Vec::new(),
         dependencies: Vec::new(),
         note_links: Vec::new(),
+    }
+}
+
+fn operational_query<'a>(
+    view: OrgOperationalView,
+    workspace_ids: &'a [WorkspaceId],
+    now: i64,
+) -> OrgOperationalQuery<'a> {
+    OrgOperationalQuery {
+        view,
+        workspace_ids,
+        item_type: None,
+        state: None,
+        priority: None,
+        tags: &[],
+        assignee: None,
+        scheduled_from: None,
+        scheduled_to: None,
+        deadline_from: None,
+        deadline_to: None,
+        completed_from: None,
+        completed_to: None,
+        include_archived: false,
+        now,
+        after: None,
+        limit: 50,
     }
 }
 
@@ -1656,7 +1685,921 @@ async fn run_workflow_audit_contracts(storage: Arc<dyn StorageBackend>) {
         vec![target_projection[1].clone()]
     );
 
-    run_lease_and_attempt_contracts(storage).await;
+    run_lease_and_attempt_contracts(storage.clone()).await;
+    run_operational_ready_contract(storage).await;
+}
+
+async fn run_operational_ready_contract(storage: Arc<dyn StorageBackend>) {
+    let workspace = workspace_id("1a000000-0000-0000-0000-000000000001");
+    let document = document_id("1b000000-0000-0000-0000-000000000001");
+    let ready_id = work_item_id("1c000000-0000-0000-0000-000000000001");
+    let assigned_id = work_item_id("1c000000-0000-0000-0000-000000000002");
+    let running_id = work_item_id("1c000000-0000-0000-0000-000000000003");
+    let blocked_id = work_item_id("1c000000-0000-0000-0000-000000000004");
+    let review_id = work_item_id("1c000000-0000-0000-0000-000000000005");
+    let scheduled_due_id = work_item_id("1c000000-0000-0000-0000-000000000006");
+    let scheduled_future_id = work_item_id("1c000000-0000-0000-0000-000000000007");
+    let deadline_id = work_item_id("1c000000-0000-0000-0000-000000000008");
+    let failed_id = work_item_id("1c000000-0000-0000-0000-000000000009");
+    let recovery_id = work_item_id("1c000000-0000-0000-0000-00000000000a");
+    let completed_id = work_item_id("1c000000-0000-0000-0000-00000000000b");
+    let cancelled_id = work_item_id("1c000000-0000-0000-0000-00000000000c");
+    let dependency_done_id = work_item_id("1c000000-0000-0000-0000-00000000000d");
+    let dependent_ready_id = work_item_id("1c000000-0000-0000-0000-00000000000e");
+    let dependent_blocked_id = work_item_id("1c000000-0000-0000-0000-00000000000f");
+    let tagged_id = work_item_id("1c000000-0000-0000-0000-000000000010");
+    let review_expired_id = work_item_id("1c000000-0000-0000-0000-000000000011");
+    let review_active_id = work_item_id("1c000000-0000-0000-0000-000000000012");
+    let tie_id = work_item_id("1c000000-0000-0000-0000-000000000013");
+    let tie_later_id = work_item_id("1c000000-0000-0000-0000-000000000014");
+    let stateless_assigned_id = work_item_id("1c000000-0000-0000-0000-000000000015");
+    let stateless_dependency_id = work_item_id("1c000000-0000-0000-0000-000000000016");
+    let dependent_on_stateless_id = work_item_id("1c000000-0000-0000-0000-000000000017");
+    let dispatch_workspace = workspace_id("1d000000-0000-0000-0000-000000000001");
+    let dispatch_document = document_id("1e000000-0000-0000-0000-000000000001");
+    let dispatch_assigned_id = work_item_id("1f000000-0000-0000-0000-000000000001");
+    let dispatch_unassigned_id = work_item_id("1f000000-0000-0000-0000-000000000002");
+    let moved_completed_id = work_item_id("1f000000-0000-0000-0000-000000000003");
+    let archived_workspace = workspace_id("20000000-0000-0000-0000-000000000001");
+    let archived_document = document_id("21000000-0000-0000-0000-000000000001");
+    let archived_assigned_id = work_item_id("22000000-0000-0000-0000-000000000001");
+    let mut policy = WorkspacePolicy::engineering_default();
+    policy.allow_cross_workspace_agenda = true;
+    let session = storage.session().await.unwrap();
+    session
+        .insert_org_workspace(NewOrgWorkspace {
+            id: workspace,
+            slug: "operational-ready",
+            display_name: "Operational ready",
+            description: "first operational query tracer bullet",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            now: 1_000,
+        })
+        .await
+        .unwrap();
+    session
+        .insert_org_document(NewOrgDocument {
+            id: document,
+            workspace_id: workspace,
+            path: "operational-ready.org",
+            source: "* READY Ready item",
+            content_hash: "operational-ready-hash",
+            now: 1_000,
+        })
+        .await
+        .unwrap();
+    let mut ready = projected_item(ready_id, workspace, document, None, 0, "Ready item");
+    ready.state = Some("READY".into());
+    ready.assignee = None;
+    ready.priority = None;
+    ready.created_at = 1_000;
+    let mut assigned = projected_item(
+        assigned_id,
+        workspace,
+        document,
+        None,
+        1,
+        "Assigned backlog",
+    );
+    assigned.state = Some("BACKLOG".into());
+    assigned.assignee = Some("agent-assigned".into());
+    assigned.created_at = 1_001;
+    let make_item = |id, order, title: &str, state: &str| {
+        let mut item = projected_item(id, workspace, document, None, order, title);
+        item.state = Some(state.into());
+        item.assignee = None;
+        item.created_at = 1_000 + order;
+        item
+    };
+    let running = make_item(running_id, 2, "Running active", "RUNNING");
+    let blocked = make_item(blocked_id, 3, "Blocked", "BLOCKED");
+    let review = make_item(review_id, 4, "Review unleased", "REVIEW");
+    let mut scheduled_due = make_item(scheduled_due_id, 5, "Scheduled due", "BACKLOG");
+    scheduled_due.scheduled = Some(scheduled("<due>", "due", 1_000));
+    let mut scheduled_future = make_item(scheduled_future_id, 6, "Scheduled future", "BACKLOG");
+    scheduled_future.scheduled = Some(scheduled("<future>", "future", 1_100));
+    let mut deadline = make_item(deadline_id, 7, "Deadline boundary", "BACKLOG");
+    deadline.deadline = Some(scheduled("<deadline>", "deadline", 1_000));
+    let failed = make_item(failed_id, 8, "Failed exhausted", "FAILED");
+    let mut recovery = make_item(recovery_id, 9, "Running recovery", "RUNNING");
+    recovery.priority = None;
+    let completed = make_item(completed_id, 10, "Completed", "DONE");
+    let mut cancelled = make_item(cancelled_id, 11, "Cancelled", "CANCELLED");
+    cancelled.scheduled = Some(scheduled("<cancelled>", "cancelled", 1_000));
+    cancelled.deadline = Some(scheduled("<cancelled-deadline>", "cancelled", 1_100));
+    let dependency_done = make_item(dependency_done_id, 12, "Dependency done", "DONE");
+    let mut dependent_ready = make_item(dependent_ready_id, 13, "Dependency ready", "READY");
+    dependent_ready.priority = None;
+    dependent_ready.dependencies = vec![dependency_done_id];
+    let mut dependent_blocked =
+        make_item(dependent_blocked_id, 14, "Dependency incomplete", "READY");
+    dependent_blocked.dependencies = vec![blocked_id];
+    let mut tagged = make_item(tagged_id, 15, "Tagged incident", "READY");
+    tagged.item_type = WorkItemType::Incident;
+    tagged.priority = Some('C');
+    tagged.tags = vec!["Backend".into(), "ops".into()];
+    let review_expired = make_item(review_expired_id, 16, "Review expired", "REVIEW");
+    let review_active = make_item(review_active_id, 17, "Review active", "REVIEW");
+    let mut tie = make_item(tie_id, 18, "Stable ordering tie", "READY");
+    tie.priority = Some('B');
+    tie.created_at = 1_050;
+    tie.tags = vec!["ordering-tie".into()];
+    tie.note_links = vec![NoteLink {
+        purpose: "context".into(),
+        note_id: "23000000-0000-0000-0000-000000000001".parse().unwrap(),
+        description: "single-statement relation fixture".into(),
+    }];
+    let mut tie_later = make_item(tie_later_id, 19, "Stable item ordering tie", "READY");
+    tie_later.priority = Some('B');
+    tie_later.created_at = 1_050;
+    tie_later.tags = vec!["ordering-tie".into()];
+    let mut stateless_assigned =
+        make_item(stateless_assigned_id, 20, "Stateless assigned", "READY");
+    stateless_assigned.state = None;
+    stateless_assigned.assignee = Some("stateless-agent".into());
+    let mut stateless_dependency =
+        make_item(stateless_dependency_id, 21, "Stateless dependency", "READY");
+    stateless_dependency.state = None;
+    let mut dependent_on_stateless = make_item(
+        dependent_on_stateless_id,
+        22,
+        "Blocked by stateless dependency",
+        "READY",
+    );
+    dependent_on_stateless.dependencies = vec![stateless_dependency_id];
+    session
+        .replace_org_document_projection(
+            document,
+            &[
+                ready,
+                assigned,
+                running,
+                blocked,
+                review,
+                scheduled_due,
+                scheduled_future,
+                deadline,
+                failed,
+                recovery,
+                completed,
+                cancelled,
+                dependency_done,
+                dependent_ready,
+                dependent_blocked,
+                tagged,
+                review_expired,
+                review_active,
+                tie,
+                tie_later,
+                stateless_assigned,
+                stateless_dependency,
+                dependent_on_stateless,
+            ],
+        )
+        .await
+        .unwrap();
+
+    let mut dispatch_policy = policy.clone();
+    dispatch_policy.claim_policy = ClaimPolicy::ExplicitlyDispatched;
+    session
+        .insert_org_workspace(NewOrgWorkspace {
+            id: dispatch_workspace,
+            slug: "operational-dispatch",
+            display_name: "Operational dispatch",
+            description: "explicit dispatch readiness",
+            timezone: "America/New_York",
+            policy_schema_version: 1,
+            policy: &dispatch_policy,
+            now: 1_000,
+        })
+        .await
+        .unwrap();
+    session
+        .insert_org_document(NewOrgDocument {
+            id: dispatch_document,
+            workspace_id: dispatch_workspace,
+            path: "operational-dispatch.org",
+            source: "* READY Dispatch items",
+            content_hash: "operational-dispatch-hash",
+            now: 1_000,
+        })
+        .await
+        .unwrap();
+    let mut dispatch_assigned = projected_item(
+        dispatch_assigned_id,
+        dispatch_workspace,
+        dispatch_document,
+        None,
+        0,
+        "Assigned dispatch",
+    );
+    dispatch_assigned.state = Some("READY".into());
+    dispatch_assigned.assignee = Some("dispatch-agent".into());
+    dispatch_assigned.priority = Some('B');
+    dispatch_assigned.created_at = 1_050;
+    dispatch_assigned.tags = vec!["ordering-tie".into()];
+    let mut dispatch_unassigned = projected_item(
+        dispatch_unassigned_id,
+        dispatch_workspace,
+        dispatch_document,
+        None,
+        1,
+        "Unassigned dispatch",
+    );
+    dispatch_unassigned.state = Some("READY".into());
+    dispatch_unassigned.assignee = None;
+    let mut moved_completed = projected_item(
+        moved_completed_id,
+        dispatch_workspace,
+        dispatch_document,
+        None,
+        2,
+        "Moved completed",
+    );
+    moved_completed.state = Some("DONE".into());
+    session
+        .replace_org_document_projection(
+            dispatch_document,
+            &[dispatch_assigned, dispatch_unassigned, moved_completed],
+        )
+        .await
+        .unwrap();
+
+    let archived_policy = WorkspacePolicy::engineering_default();
+    session
+        .insert_org_workspace(NewOrgWorkspace {
+            id: archived_workspace,
+            slug: "operational-archived",
+            display_name: "Operational archived",
+            description: "archive filtering",
+            timezone: "Asia/Shanghai",
+            policy_schema_version: 1,
+            policy: &archived_policy,
+            now: 1_000,
+        })
+        .await
+        .unwrap();
+    session
+        .insert_org_document(NewOrgDocument {
+            id: archived_document,
+            workspace_id: archived_workspace,
+            path: "operational-archived.org",
+            source: "* BACKLOG Archived assigned",
+            content_hash: "operational-archived-hash",
+            now: 1_000,
+        })
+        .await
+        .unwrap();
+    let mut archived_assigned = projected_item(
+        archived_assigned_id,
+        archived_workspace,
+        archived_document,
+        None,
+        0,
+        "Archived assigned",
+    );
+    archived_assigned.state = Some("BACKLOG".into());
+    archived_assigned.assignee = Some("archived-agent".into());
+    session
+        .replace_org_document_projection(archived_document, &[archived_assigned])
+        .await
+        .unwrap();
+    assert!(matches!(
+        session
+            .compare_and_swap_org_workspace(OrgWorkspaceUpdate {
+                id: archived_workspace,
+                expected_revision: 1,
+                slug: "operational-archived",
+                display_name: "Operational archived",
+                description: "archive filtering",
+                timezone: "Asia/Shanghai",
+                policy_schema_version: 1,
+                policy: &archived_policy,
+                archived_at: Some(1_000),
+                updated_at: 1_001,
+            })
+            .await
+            .unwrap(),
+        CompareAndSwap::Applied(_)
+    ));
+
+    let seed = storage.begin(TransactionMode::Immediate).await.unwrap();
+    for (id, item_id, actor, status, number) in [
+        (
+            "operational-running-attempt",
+            running_id,
+            "runner",
+            OrgAttemptStatus::Running,
+            1,
+        ),
+        (
+            "operational-review-attempt",
+            review_id,
+            "author",
+            OrgAttemptStatus::Submitted,
+            1,
+        ),
+        (
+            "operational-recovery-attempt",
+            recovery_id,
+            "recover",
+            OrgAttemptStatus::Running,
+            1,
+        ),
+        (
+            "operational-failed-attempt-1",
+            failed_id,
+            "failed",
+            OrgAttemptStatus::Failed,
+            1,
+        ),
+        (
+            "operational-failed-attempt-2",
+            failed_id,
+            "failed",
+            OrgAttemptStatus::Failed,
+            2,
+        ),
+        (
+            "operational-failed-attempt-3",
+            failed_id,
+            "failed",
+            OrgAttemptStatus::Failed,
+            3,
+        ),
+        (
+            "operational-review-expired-attempt",
+            review_expired_id,
+            "author",
+            OrgAttemptStatus::Submitted,
+            1,
+        ),
+        (
+            "operational-review-active-attempt",
+            review_active_id,
+            "author",
+            OrgAttemptStatus::Submitted,
+            1,
+        ),
+    ] {
+        seed.insert_org_attempt(NewOrgAttempt {
+            id,
+            workspace_id: workspace,
+            work_item_id: item_id,
+            attempt_number: number,
+            actor_id: actor,
+            status,
+            started_at: 900 + number,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &json!({}),
+        })
+        .await
+        .unwrap();
+    }
+    for (id, item_id, attempt_id, kind, actor, hash, expires_at, insert_now) in [
+        (
+            "operational-running-lease",
+            running_id,
+            "operational-running-attempt",
+            OrgLeaseKind::Execution,
+            "runner",
+            "1010101010101010101010101010101010101010101010101010101010101010",
+            1_100,
+            1_000,
+        ),
+        (
+            "operational-recovery-lease",
+            recovery_id,
+            "operational-recovery-attempt",
+            OrgLeaseKind::Execution,
+            "recover",
+            "2020202020202020202020202020202020202020202020202020202020202020",
+            1_000,
+            900,
+        ),
+        (
+            "operational-review-expired-lease",
+            review_expired_id,
+            "operational-review-expired-attempt",
+            OrgLeaseKind::Review,
+            "reviewer-expired",
+            "3030303030303030303030303030303030303030303030303030303030303030",
+            1_000,
+            900,
+        ),
+        (
+            "operational-review-active-lease",
+            review_active_id,
+            "operational-review-active-attempt",
+            OrgLeaseKind::Review,
+            "reviewer-active",
+            "4040404040404040404040404040404040404040404040404040404040404040",
+            1_100,
+            1_000,
+        ),
+    ] {
+        assert!(matches!(
+            seed.insert_org_lease_if_capacity(
+                NewOrgLease {
+                    id,
+                    workspace_id: workspace,
+                    work_item_id: item_id,
+                    attempt_id,
+                    kind,
+                    actor_id: actor,
+                    fencing_token_hash: hash,
+                    acquired_at: insert_now,
+                    last_heartbeat_at: insert_now,
+                    expires_at,
+                },
+                4,
+                insert_now,
+            )
+            .await
+            .unwrap(),
+            ConditionalUpdate::Applied(_)
+        ));
+    }
+    seed.commit().await.unwrap();
+    for (id, event_workspace, item_id, occurred_at) in [
+        (
+            "operational-completion-event",
+            workspace,
+            completed_id,
+            1_000,
+        ),
+        (
+            "operational-dependency-completion-event",
+            workspace,
+            dependency_done_id,
+            900,
+        ),
+        (
+            "operational-moved-completion-event",
+            workspace,
+            moved_completed_id,
+            1_200,
+        ),
+    ] {
+        let subject_id = item_id.to_string();
+        session
+            .append_org_event(NewOrgEvent {
+                id,
+                workspace_id: event_workspace,
+                subject_kind: "work_item",
+                subject_id: &subject_id,
+                actor_id: "operator",
+                attempt_id: None,
+                event_type: OrgEventType::Completion,
+                occurred_at,
+                summary: "Completed",
+                metadata: &json!({}),
+                previous_state: Some("RUNNING"),
+                resulting_state: Some("DONE"),
+            })
+            .await
+            .unwrap();
+    }
+    let moved_subject_id = moved_completed_id.to_string();
+    session
+        .append_org_event(NewOrgEvent {
+            id: "operational-moved-target-event",
+            workspace_id: dispatch_workspace,
+            subject_kind: "work_item",
+            subject_id: &moved_subject_id,
+            actor_id: "operator",
+            attempt_id: None,
+            event_type: OrgEventType::DocumentMove,
+            occurred_at: 1_201,
+            summary: "Moved after completion",
+            metadata: &json!({
+                "lineage_previous_event_id": "operational-moved-completion-event"
+            }),
+            previous_state: Some("DONE"),
+            resulting_state: Some("DONE"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .list_org_global_subject_events("work_item", &moved_subject_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>(),
+        vec![
+            "operational-moved-completion-event",
+            "operational-moved-target-event"
+        ]
+    );
+
+    let rows = session
+        .query_org_operational(operational_query(
+            OrgOperationalView::Ready,
+            &[workspace],
+            1_000,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.item.id).collect::<Vec<_>>(),
+        vec![
+            tie_id,
+            tie_later_id,
+            tagged_id,
+            ready_id,
+            recovery_id,
+            dependent_ready_id,
+        ]
+    );
+    assert!(rows.iter().any(|row| row.item.id == ready_id));
+    assert!(rows.iter().any(|row| {
+        row.item.id == recovery_id
+            && row.ready_marker == Some(OrgReadyMarker::RecoveryCandidate)
+            && row
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.expires_at == 1_000)
+    }));
+    assert!(!rows.iter().any(|row| row.item.id == dependent_blocked_id));
+    assert!(!rows
+        .iter()
+        .any(|row| row.item.id == dependent_on_stateless_id));
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.item.id == dependent_ready_id)
+            .unwrap()
+            .item
+            .dependencies,
+        vec![dependency_done_id]
+    );
+
+    let workspace_ids = [workspace];
+    let assigned_rows = session
+        .query_org_operational({
+            let mut query = operational_query(OrgOperationalView::Assigned, &workspace_ids, 1_000);
+            query.assignee = Some("agent-assigned");
+            query
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        assigned_rows
+            .iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![assigned_id]
+    );
+    assert_eq!(
+        session
+            .query_org_operational(operational_query(
+                OrgOperationalView::Assigned,
+                &workspace_ids,
+                1_000,
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![assigned_id, stateless_assigned_id]
+    );
+
+    let tagged_filters = [" Backend ", "ops", "Backend"];
+    let tagged_rows = session
+        .query_org_operational({
+            let mut query = operational_query(OrgOperationalView::Ready, &workspace_ids, 1_000);
+            query.item_type = Some(WorkItemType::Incident);
+            query.state = Some("READY");
+            query.priority = Some('C');
+            query.tags = &tagged_filters;
+            query
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        tagged_rows
+            .iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![tagged_id]
+    );
+    let lowercase_tag = ["backend"];
+    let mut lowercase_tag_query =
+        operational_query(OrgOperationalView::Ready, &workspace_ids, 1_000);
+    lowercase_tag_query.tags = &lowercase_tag;
+    assert!(session
+        .query_org_operational(lowercase_tag_query)
+        .await
+        .unwrap()
+        .is_empty());
+    let blank_tag = ["  "];
+    let mut blank_tag_query = operational_query(OrgOperationalView::Ready, &workspace_ids, 1_000);
+    blank_tag_query.tags = &blank_tag;
+    assert_eq!(
+        session
+            .query_org_operational(blank_tag_query)
+            .await
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::Operation
+    );
+
+    let dispatch_workspace_ids = [dispatch_workspace];
+    assert_eq!(
+        session
+            .query_org_operational(operational_query(
+                OrgOperationalView::Ready,
+                &dispatch_workspace_ids,
+                1_000,
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![dispatch_assigned_id]
+    );
+
+    let tie_tags = ["ordering-tie"];
+    let tied_workspaces = [workspace, dispatch_workspace];
+    let mut tie_query = operational_query(OrgOperationalView::Ready, &tied_workspaces, 1_000);
+    tie_query.tags = &tie_tags;
+    let tied_rows = session.query_org_operational(tie_query).await.unwrap();
+    assert!(tied_rows
+        .iter()
+        .all(|row| row.item.tags == vec!["ordering-tie"]));
+    assert_eq!(
+        tied_rows
+            .iter()
+            .find(|row| row.item.id == tie_id)
+            .unwrap()
+            .item
+            .note_links,
+        vec![NoteLink {
+            purpose: "context".into(),
+            note_id: "23000000-0000-0000-0000-000000000001".parse().unwrap(),
+            description: "single-statement relation fixture".into(),
+        }]
+    );
+    assert_eq!(
+        tied_rows.iter().map(|row| row.item.id).collect::<Vec<_>>(),
+        vec![tie_id, tie_later_id, dispatch_assigned_id]
+    );
+    let cursor = tied_rows[0].cursor(OrgOperationalView::Ready);
+    let mut resumed_tie_query =
+        operational_query(OrgOperationalView::Ready, &tied_workspaces, 1_000);
+    resumed_tie_query.tags = &tie_tags;
+    resumed_tie_query.after = Some(&cursor);
+    assert_eq!(
+        session
+            .query_org_operational(resumed_tie_query)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![tie_later_id, dispatch_assigned_id]
+    );
+
+    let archived_workspace_ids = [archived_workspace];
+    assert!(session
+        .query_org_operational(operational_query(
+            OrgOperationalView::Assigned,
+            &archived_workspace_ids,
+            1_000,
+        ))
+        .await
+        .unwrap()
+        .is_empty());
+    let mut archived_query =
+        operational_query(OrgOperationalView::Assigned, &archived_workspace_ids, 1_000);
+    archived_query.include_archived = true;
+    assert_eq!(
+        session
+            .query_org_operational(archived_query)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![archived_assigned_id]
+    );
+
+    for (view, expected) in [
+        (OrgOperationalView::Running, vec![running_id, recovery_id]),
+        (OrgOperationalView::Blocked, vec![blocked_id]),
+        (
+            OrgOperationalView::Review,
+            vec![review_id, review_expired_id, review_active_id],
+        ),
+        (
+            OrgOperationalView::Scheduled,
+            vec![scheduled_due_id, scheduled_future_id],
+        ),
+        (OrgOperationalView::UpcomingDeadline, vec![deadline_id]),
+        (OrgOperationalView::Failed, vec![failed_id]),
+        (
+            OrgOperationalView::ExpiredLease,
+            vec![recovery_id, review_expired_id],
+        ),
+        (
+            OrgOperationalView::Completed,
+            vec![completed_id, dependency_done_id],
+        ),
+    ] {
+        let actual = session
+            .query_org_operational(operational_query(view, &[workspace], 1_000))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual,
+            expected.into_iter().collect(),
+            "unexpected {view:?} rows"
+        );
+    }
+    for (view, expected) in [
+        (
+            OrgOperationalView::Scheduled,
+            vec![scheduled_due_id, scheduled_future_id],
+        ),
+        (
+            OrgOperationalView::ExpiredLease,
+            vec![review_expired_id, recovery_id],
+        ),
+        (
+            OrgOperationalView::Completed,
+            vec![completed_id, dependency_done_id],
+        ),
+    ] {
+        assert_eq!(
+            session
+                .query_org_operational(operational_query(view, &workspace_ids, 1_000))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.item.id)
+                .collect::<Vec<_>>(),
+            expected,
+            "unexpected {view:?} ordering"
+        );
+    }
+    let expired_rows = session
+        .query_org_operational(operational_query(
+            OrgOperationalView::ExpiredLease,
+            &workspace_ids,
+            1_000,
+        ))
+        .await
+        .unwrap();
+    let expired_cursor = expired_rows[0].cursor(OrgOperationalView::ExpiredLease);
+    let mut expired_resume =
+        operational_query(OrgOperationalView::ExpiredLease, &workspace_ids, 1_000);
+    expired_resume.after = Some(&expired_cursor);
+    assert_eq!(
+        session
+            .query_org_operational(expired_resume)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![recovery_id]
+    );
+
+    let mut scheduled_boundary =
+        operational_query(OrgOperationalView::Scheduled, &workspace_ids, 1_000);
+    scheduled_boundary.scheduled_from = Some(1_000);
+    scheduled_boundary.scheduled_to = Some(1_000);
+    assert_eq!(
+        session
+            .query_org_operational(scheduled_boundary)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![scheduled_due_id]
+    );
+    let mut deadline_boundary =
+        operational_query(OrgOperationalView::UpcomingDeadline, &workspace_ids, 1_000);
+    deadline_boundary.deadline_from = Some(1_000);
+    deadline_boundary.deadline_to = Some(1_000);
+    assert_eq!(
+        session
+            .query_org_operational(deadline_boundary)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![deadline_id]
+    );
+    let mut completed_boundary =
+        operational_query(OrgOperationalView::Completed, &workspace_ids, 1_000);
+    completed_boundary.completed_from = Some(1_000);
+    completed_boundary.completed_to = Some(1_000);
+    assert_eq!(
+        session
+            .query_org_operational(completed_boundary)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![completed_id]
+    );
+    let mut moved_completion_window = operational_query(
+        OrgOperationalView::Completed,
+        &dispatch_workspace_ids,
+        1_000,
+    );
+    moved_completion_window.completed_from = Some(1_200);
+    moved_completion_window.completed_to = Some(1_200);
+    let moved_completion_rows = session
+        .query_org_operational(moved_completion_window)
+        .await
+        .unwrap();
+    assert_eq!(moved_completion_rows.len(), 1);
+    assert_eq!(moved_completion_rows[0].item.id, moved_completed_id);
+    assert_eq!(moved_completion_rows[0].completion_at, Some(1_200));
+    let review_rows = session
+        .query_org_operational(operational_query(
+            OrgOperationalView::Review,
+            &[workspace],
+            1_000,
+        ))
+        .await
+        .unwrap();
+    assert!(review_rows.iter().any(|row| {
+        row.item.id == review_id && row.review_lease_marker == Some(OrgReviewLeaseMarker::Unleased)
+    }));
+    assert!(review_rows.iter().any(|row| {
+        row.item.id == review_expired_id
+            && row.review_lease_marker == Some(OrgReviewLeaseMarker::Expired)
+    }));
+    assert!(review_rows.iter().any(|row| {
+        row.item.id == review_active_id
+            && row.review_lease_marker == Some(OrgReviewLeaseMarker::Active)
+    }));
+    let failed_row = session
+        .query_org_operational(operational_query(
+            OrgOperationalView::Failed,
+            &[workspace],
+            1_000,
+        ))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(failed_row.attempt_count, 3);
+    assert!(failed_row.retry_exhausted);
+
+    let summary = session
+        .get_org_workspace_operational_summary(workspace, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.workspace_id, workspace);
+    assert_eq!(summary.timezone, "UTC");
+    assert_eq!(summary.archived_at, None);
+    assert_eq!(summary.workspace_revision, 1);
+    assert_eq!(summary.evaluated_at, 1_000);
+    assert_eq!(summary.counts.ready, 6);
+    assert_eq!(summary.counts.assigned, 2);
+    assert_eq!(summary.counts.running, 2);
+    assert_eq!(summary.counts.blocked, 1);
+    assert_eq!(summary.counts.review, 3);
+    assert_eq!(summary.counts.scheduled, 2);
+    assert_eq!(summary.counts.upcoming_deadline, 1);
+    assert_eq!(summary.counts.failed, 1);
+    assert_eq!(summary.counts.expired_lease, 2);
+    assert_eq!(summary.counts.completed, 2);
+    let archived_summary = session
+        .get_org_workspace_operational_summary(archived_workspace, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(archived_summary.timezone, "Asia/Shanghai");
+    assert_eq!(archived_summary.archived_at, Some(1_000));
+    assert_eq!(archived_summary.workspace_revision, 2);
+    assert_eq!(archived_summary.counts.ready, 0);
+    assert_eq!(archived_summary.counts.assigned, 1);
+    assert!(session
+        .get_org_workspace_operational_summary(
+            workspace_id("1a000000-0000-0000-0000-000000000099"),
+            1_000,
+        )
+        .await
+        .unwrap()
+        .is_none());
 }
 
 async fn run_lease_and_attempt_contracts(storage: Arc<dyn StorageBackend>) {

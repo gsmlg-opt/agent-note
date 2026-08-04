@@ -8,9 +8,10 @@ use note_storage::{
     OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument,
     OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
     OrgEventType, OrgLease, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind,
-    OrgLeaseOwnershipMove, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate,
-    SanitizedOrgLease, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
-    StoredOrgTimestamp,
+    OrgLeaseOwnershipMove, OrgOperationalCounts, OrgOperationalQuery, OrgOperationalRow,
+    OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker, OrgRepository, OrgReviewLeaseMarker,
+    OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, SanitizedOrgLease,
+    StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
@@ -25,6 +26,37 @@ const WORK_ITEM_COLUMNS: &str =
      scheduled_raw, scheduled_local, scheduled_timezone, scheduled_utc,
      deadline_raw, deadline_local, deadline_timezone, deadline_utc,
      assignee, requires_review, created_at";
+const OPERATIONAL_ITEM_COLUMNS: &str =
+    "item.id, item.workspace_id, item.document_id, item.parent_id, item.source_order,
+     item.item_type, item.title, item.state, item.priority,
+     item.scheduled_raw, item.scheduled_local, item.scheduled_timezone, item.scheduled_utc,
+     item.deadline_raw, item.deadline_local, item.deadline_timezone, item.deadline_utc,
+     item.assignee, item.requires_review, item.created_at";
+const OPERATIONAL_RELATION_COLUMNS: &str = "COALESCE((
+         SELECT json_group_array(ordered_tag.tag)
+         FROM (
+             SELECT tag FROM org_work_item_tags
+             WHERE work_item_id=item.id ORDER BY tag
+         ) ordered_tag
+     ), '[]'),
+     COALESCE((
+         SELECT json_group_array(ordered_dependency.depends_on_id)
+         FROM (
+             SELECT depends_on_id FROM org_dependencies
+             WHERE work_item_id=item.id ORDER BY depends_on_id
+         ) ordered_dependency
+     ), '[]'),
+     COALESCE((
+         SELECT json_group_array(json_object(
+             'purpose', ordered_link.purpose,
+             'note_id', ordered_link.note_id,
+             'description', ordered_link.description
+         ))
+         FROM (
+             SELECT purpose, note_id, description FROM org_note_links
+             WHERE work_item_id=item.id ORDER BY ordinal
+         ) ordered_link
+     ), '[]')";
 // The widest projection statement binds 20 values per row, so 64 rows remain
 // comfortably below both embedded and PostgreSQL driver parameter limits.
 const PROJECTION_BATCH_SIZE: usize = 64;
@@ -972,6 +1004,244 @@ impl OrgRepository for TursoSession {
         .await
     }
 
+    async fn query_org_operational(
+        &self,
+        query: OrgOperationalQuery<'_>,
+    ) -> StorageResult<Vec<OrgOperationalRow>> {
+        let _operation_guard = self.operation_guard().await;
+        validate_operational_query(&query)?;
+        let tags = normalized_operational_tags(query.tags)?;
+        let mut params = Vec::<turso::Value>::new();
+        let now = push_turso_param(&mut params, query.now);
+        let workspace_placeholders = query
+            .workspace_ids
+            .iter()
+            .map(|id| push_turso_param(&mut params, id.to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ready_marker = if query.view == OrgOperationalView::Ready {
+            format!(
+                "CASE WHEN item.state=json_extract(workspace.policy, '$.running_state')
+                       AND lease.kind='execution' AND lease.expires_at<={now}
+                      THEN 'recovery' ELSE 'ready' END"
+            )
+        } else {
+            "NULL".into()
+        };
+        let review_marker = if query.view == OrgOperationalView::Review {
+            format!(
+                "CASE WHEN lease.kind='review' AND lease.expires_at<={now} THEN 'expired'
+                      WHEN lease.kind='review' AND lease.expires_at>{now} THEN 'active'
+                      ELSE 'unleased' END"
+            )
+        } else {
+            "NULL".into()
+        };
+        let mut sql = format!(
+            "WITH attempt_stats AS (
+                 SELECT work_item_id, COUNT(*) AS attempt_count
+                 FROM org_attempts GROUP BY work_item_id
+             ), current_attempt AS (
+                 SELECT attempt.* FROM org_attempts attempt
+                 WHERE attempt.attempt_number = (
+                     SELECT MAX(candidate.attempt_number) FROM org_attempts candidate
+                     WHERE candidate.work_item_id=attempt.work_item_id
+                 )
+             ), active_counts AS (
+                 SELECT workspace_id, COUNT(*) AS active_count
+                 FROM org_leases
+                 WHERE ended_at IS NULL AND expires_at>{now}
+                 GROUP BY workspace_id
+             ), completion_events AS (
+                 SELECT subject_id, MAX(occurred_at) AS completion_at
+                 FROM org_events
+                 WHERE subject_kind='work_item' AND event_type='completion'
+                 GROUP BY subject_id
+             )
+             SELECT {OPERATIONAL_ITEM_COLUMNS},
+                    COALESCE(attempt_stats.attempt_count, 0), current_attempt.status,
+                    COALESCE(attempt_stats.attempt_count, 0)
+                        >= CAST(json_extract(workspace.policy, '$.retry_limit') AS INTEGER) + 1,
+                    {ready_marker}, {review_marker},
+                    lease.id, lease.workspace_id, lease.work_item_id, lease.attempt_id,
+                    lease.kind, lease.actor_id, lease.acquired_at, lease.last_heartbeat_at,
+                    lease.expires_at, lease.ended_at, lease.end_reason, lease.expiry_event_id,
+                    completion_events.completion_at, {OPERATIONAL_RELATION_COLUMNS}
+             FROM org_work_items item
+             JOIN org_workspaces workspace ON workspace.id=item.workspace_id
+             LEFT JOIN attempt_stats ON attempt_stats.work_item_id=item.id
+             LEFT JOIN current_attempt ON current_attempt.work_item_id=item.id
+             LEFT JOIN org_leases lease ON lease.work_item_id=item.id AND lease.ended_at IS NULL
+             LEFT JOIN active_counts ON active_counts.workspace_id=item.workspace_id
+             LEFT JOIN completion_events ON completion_events.subject_id=item.id
+             WHERE item.workspace_id IN ({workspace_placeholders})
+               AND {}",
+            turso_view_predicate(query.view, &now)
+        );
+        if !query.include_archived {
+            sql.push_str(" AND workspace.archived_at IS NULL");
+        }
+        push_turso_operational_filters(&mut sql, &mut params, &query, &tags)?;
+        push_turso_operational_cursor(&mut sql, &mut params, query.view, query.after)?;
+        sql.push_str(" ORDER BY ");
+        sql.push_str(turso_operational_order(query.view));
+        sql.push_str(" LIMIT ");
+        sql.push_str(&push_turso_param(&mut params, query.limit as i64));
+        let mut raw_rows = self
+            .connection
+            .query(&sql, turso::params_from_iter(params))
+            .await
+            .map_err(|error| map_turso_error("query Org operational view", error))?;
+        let mut rows = Vec::new();
+        while let Some(row) = raw_rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read Org operational view", error))?
+        {
+            rows.push(decode_operational_row(&row)?);
+        }
+        Ok(rows)
+    }
+
+    async fn get_org_workspace_operational_summary(
+        &self,
+        workspace_id: WorkspaceId,
+        now: i64,
+    ) -> StorageResult<Option<OrgWorkspaceOperationalSummary>> {
+        if now <= 0 {
+            return Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "Org operational summary evaluation time must be positive",
+            ));
+        }
+        let _operation_guard = self.operation_guard().await;
+        let view_counts = OrgOperationalView::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, view)| {
+                format!(
+                    "SELECT {index} AS view_index, COUNT(*) AS view_count
+                 FROM candidates candidate WHERE {}",
+                    turso_summary_view_predicate(view)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let sql = format!(
+            "WITH attempt_stats AS (
+                 SELECT work_item_id, COUNT(*) AS attempt_count
+                 FROM org_attempts GROUP BY work_item_id
+             ), current_attempt AS (
+                 SELECT attempt.* FROM org_attempts attempt
+                 WHERE attempt.attempt_number = (
+                     SELECT MAX(candidate.attempt_number) FROM org_attempts candidate
+                     WHERE candidate.work_item_id=attempt.work_item_id
+                 )
+             ), active_counts AS (
+                 SELECT workspace_id, COUNT(*) AS active_count
+                 FROM org_leases
+                 WHERE ended_at IS NULL AND expires_at>?1
+                 GROUP BY workspace_id
+             ), candidates AS MATERIALIZED (
+                 SELECT item.id, item.state, item.scheduled_utc, item.deadline_utc,
+                        item.assignee, workspace.policy, workspace.archived_at,
+                        COALESCE(attempt_stats.attempt_count, 0) AS attempt_count,
+                        current_attempt.id AS current_attempt_id,
+                        current_attempt.status AS current_attempt_status,
+                        COALESCE(active_counts.active_count, 0) AS active_count,
+                        lease.id AS lease_id, lease.kind AS lease_kind,
+                        lease.expires_at AS lease_expires_at
+                 FROM org_workspaces workspace
+                 JOIN org_work_items item ON item.workspace_id=workspace.id
+                 LEFT JOIN attempt_stats ON attempt_stats.work_item_id=item.id
+                 LEFT JOIN current_attempt ON current_attempt.work_item_id=item.id
+                 LEFT JOIN org_leases lease
+                        ON lease.work_item_id=item.id AND lease.ended_at IS NULL
+                 LEFT JOIN active_counts ON active_counts.workspace_id=workspace.id
+                 WHERE workspace.id=?2
+             ), view_counts AS (
+                 {view_counts}
+             )
+             SELECT workspace.id, workspace.timezone, workspace.archived_at,
+                    workspace.revision,
+                    MAX(CASE WHEN view_counts.view_index=0 THEN view_count END),
+                    MAX(CASE WHEN view_counts.view_index=1 THEN view_count END),
+                    MAX(CASE WHEN view_counts.view_index=2 THEN view_count END),
+                    MAX(CASE WHEN view_counts.view_index=3 THEN view_count END),
+                    MAX(CASE WHEN view_counts.view_index=4 THEN view_count END),
+                    MAX(CASE WHEN view_counts.view_index=5 THEN view_count END),
+                    MAX(CASE WHEN view_counts.view_index=6 THEN view_count END),
+                    MAX(CASE WHEN view_counts.view_index=7 THEN view_count END),
+                    MAX(CASE WHEN view_counts.view_index=8 THEN view_count END),
+                    MAX(CASE WHEN view_counts.view_index=9 THEN view_count END)
+             FROM org_workspaces workspace
+             LEFT JOIN view_counts ON TRUE
+             WHERE workspace.id=?2
+             GROUP BY workspace.id, workspace.timezone, workspace.archived_at,
+                      workspace.revision"
+        );
+        let mut rows = self
+            .connection
+            .query(&sql, turso::params![now, workspace_id.to_string()])
+            .await
+            .map_err(|error| map_turso_error("query Org operational summary", error))?;
+        let summary = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read Org operational summary", error))?
+            .map(|row| {
+                Ok(OrgWorkspaceOperationalSummary {
+                    workspace_id: decode_workspace_id(row.get(0).map_err(|error| {
+                        map_turso_error("decode Org operational summary workspace", error)
+                    })?)?,
+                    timezone: row.get(1).map_err(|error| {
+                        map_turso_error("decode Org operational summary timezone", error)
+                    })?,
+                    archived_at: row.get(2).map_err(|error| {
+                        map_turso_error("decode Org operational summary archive", error)
+                    })?,
+                    workspace_revision: row.get(3).map_err(|error| {
+                        map_turso_error("decode Org operational summary revision", error)
+                    })?,
+                    evaluated_at: now,
+                    counts: OrgOperationalCounts {
+                        ready: row
+                            .get(4)
+                            .map_err(|error| map_turso_error("decode Org ready count", error))?,
+                        assigned: row
+                            .get(5)
+                            .map_err(|error| map_turso_error("decode Org assigned count", error))?,
+                        running: row
+                            .get(6)
+                            .map_err(|error| map_turso_error("decode Org running count", error))?,
+                        blocked: row
+                            .get(7)
+                            .map_err(|error| map_turso_error("decode Org blocked count", error))?,
+                        review: row
+                            .get(8)
+                            .map_err(|error| map_turso_error("decode Org review count", error))?,
+                        scheduled: row.get(9).map_err(|error| {
+                            map_turso_error("decode Org scheduled count", error)
+                        })?,
+                        upcoming_deadline: row
+                            .get(10)
+                            .map_err(|error| map_turso_error("decode Org deadline count", error))?,
+                        failed: row
+                            .get(11)
+                            .map_err(|error| map_turso_error("decode Org failed count", error))?,
+                        expired_lease: row.get(12).map_err(|error| {
+                            map_turso_error("decode Org expired lease count", error)
+                        })?,
+                        completed: row.get(13).map_err(|error| {
+                            map_turso_error("decode Org completed count", error)
+                        })?,
+                    },
+                })
+            })
+            .transpose()?;
+        Ok(summary)
+    }
+
     async fn insert_org_operation(&self, operation: &StoredOrgOperation) -> StorageResult<()> {
         let _operation_guard = self.operation_guard().await;
         let result = serde_json::to_string(&operation.result).map_err(|error| {
@@ -1582,6 +1852,379 @@ fn validate_new_lease(lease: &NewOrgLease<'_>, capacity: i64, now: i64) -> Stora
     Ok(())
 }
 
+fn validate_operational_query(query: &OrgOperationalQuery<'_>) -> StorageResult<()> {
+    if query.workspace_ids.is_empty() || query.now <= 0 || !(1..=200).contains(&query.limit) {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "invalid Org operational query scope, time, or limit",
+        ));
+    }
+    for (from, to) in [
+        (query.scheduled_from, query.scheduled_to),
+        (query.deadline_from, query.deadline_to),
+        (query.completed_from, query.completed_to),
+    ] {
+        if from.zip(to).is_some_and(|(from, to)| from > to) {
+            return Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "invalid Org operational query time bounds",
+            ));
+        }
+    }
+    if query.tags.iter().any(|tag| tag.trim().is_empty()) {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org operational query tags must not be blank",
+        ));
+    }
+    Ok(())
+}
+
+fn normalized_operational_tags(tags: &[&str]) -> StorageResult<Vec<String>> {
+    let mut normalized = tags
+        .iter()
+        .map(|tag| tag.trim())
+        .map(|tag| {
+            if tag.is_empty() {
+                Err(StorageError::new(
+                    StorageErrorKind::Operation,
+                    "Org operational query tags must not be blank",
+                ))
+            } else {
+                Ok(tag.to_owned())
+            }
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn work_item_type_name(value: WorkItemType) -> &'static str {
+    match value {
+        WorkItemType::Project => "project",
+        WorkItemType::Epic => "epic",
+        WorkItemType::Issue => "issue",
+        WorkItemType::Task => "task",
+        WorkItemType::Subtask => "subtask",
+        WorkItemType::Review => "review",
+        WorkItemType::Approval => "approval",
+        WorkItemType::Incident => "incident",
+        WorkItemType::Milestone => "milestone",
+    }
+}
+
+fn push_turso_param(params: &mut Vec<turso::Value>, value: impl Into<turso::Value>) -> String {
+    params.push(value.into());
+    format!("?{}", params.len())
+}
+
+fn turso_view_predicate(view: OrgOperationalView, now: &str) -> String {
+    let non_terminal = "NOT EXISTS (
+        SELECT 1 FROM json_each(workspace.policy, '$.terminal_states') terminal
+        WHERE terminal.value=item.state
+    )";
+    match view {
+        OrgOperationalView::Ready => format!(
+            "workspace.archived_at IS NULL
+             AND (item.scheduled_utc IS NULL OR item.scheduled_utc<={now})
+             AND COALESCE(active_counts.active_count, 0)
+                   < CAST(json_extract(workspace.policy, '$.concurrency_limit') AS INTEGER)
+             AND COALESCE(attempt_stats.attempt_count, 0)
+                   < CAST(json_extract(workspace.policy, '$.retry_limit') AS INTEGER) + 1
+             AND (json_extract(workspace.policy, '$.claim_policy') <> 'explicitly_dispatched'
+                  OR item.assignee IS NOT NULL)
+             AND NOT EXISTS (
+                 SELECT 1 FROM org_dependencies dependency
+                 JOIN org_work_items target ON target.id=dependency.depends_on_id
+                 WHERE dependency.work_item_id=item.id
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM json_each(workspace.policy, '$.successful_terminal_states') success
+                       WHERE success.value=target.state
+                   )
+             )
+             AND ((
+                   EXISTS (
+                       SELECT 1 FROM json_each(workspace.policy, '$.executable_states') executable
+                       WHERE executable.value=item.state
+                   )
+                   AND lease.id IS NULL
+                   AND ((COALESCE(attempt_stats.attempt_count, 0)=0
+                         AND current_attempt.id IS NULL)
+                        OR (COALESCE(attempt_stats.attempt_count, 0)>0
+                            AND current_attempt.status IN
+                                ('completed', 'failed', 'cancelled', 'expired')))
+                 ) OR (
+                   item.state=json_extract(workspace.policy, '$.running_state')
+                   AND lease.kind='execution' AND lease.expires_at<={now}
+                   AND COALESCE(attempt_stats.attempt_count, 0)>0
+                   AND current_attempt.status='running'
+                 ))"
+        ),
+        OrgOperationalView::Assigned => format!("item.assignee IS NOT NULL AND {non_terminal}"),
+        OrgOperationalView::Running => {
+            "item.state=json_extract(workspace.policy, '$.running_state')".into()
+        }
+        OrgOperationalView::Blocked => "item.state='BLOCKED' AND EXISTS (
+            SELECT 1 FROM json_each(workspace.policy, '$.states') configured
+            WHERE configured.value='BLOCKED'
+        )"
+        .into(),
+        OrgOperationalView::Review => {
+            "item.state=json_extract(workspace.policy, '$.review_state')".into()
+        }
+        OrgOperationalView::Scheduled => {
+            format!("item.scheduled_utc IS NOT NULL AND {non_terminal}")
+        }
+        OrgOperationalView::UpcomingDeadline => {
+            format!("item.deadline_utc>={now} AND {non_terminal}")
+        }
+        OrgOperationalView::Failed => {
+            "item.state=json_extract(workspace.policy, '$.failed_state')".into()
+        }
+        OrgOperationalView::ExpiredLease => {
+            format!("lease.id IS NOT NULL AND lease.expires_at<={now}")
+        }
+        OrgOperationalView::Completed => "EXISTS (
+            SELECT 1 FROM json_each(workspace.policy, '$.successful_terminal_states') successful
+            WHERE successful.value=item.state
+        )"
+        .into(),
+    }
+}
+
+fn turso_summary_view_predicate(view: OrgOperationalView) -> String {
+    let non_terminal = "NOT EXISTS (
+        SELECT 1 FROM json_each(candidate.policy, '$.terminal_states') terminal
+        WHERE terminal.value=candidate.state
+    )";
+    match view {
+        OrgOperationalView::Ready => "candidate.archived_at IS NULL
+             AND (candidate.scheduled_utc IS NULL OR candidate.scheduled_utc<=?1)
+             AND candidate.active_count
+                   < CAST(json_extract(candidate.policy, '$.concurrency_limit') AS INTEGER)
+             AND candidate.attempt_count
+                   < CAST(json_extract(candidate.policy, '$.retry_limit') AS INTEGER) + 1
+             AND (json_extract(candidate.policy, '$.claim_policy') <> 'explicitly_dispatched'
+                  OR candidate.assignee IS NOT NULL)
+             AND NOT EXISTS (
+                 SELECT 1 FROM org_dependencies dependency
+                 JOIN org_work_items target ON target.id=dependency.depends_on_id
+                 WHERE dependency.work_item_id=candidate.id
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM json_each(candidate.policy, '$.successful_terminal_states') success
+                       WHERE success.value=target.state
+                   )
+             )
+             AND ((
+                   EXISTS (
+                       SELECT 1 FROM json_each(candidate.policy, '$.executable_states') executable
+                       WHERE executable.value=candidate.state
+                   )
+                   AND candidate.lease_id IS NULL
+                   AND ((candidate.attempt_count=0 AND candidate.current_attempt_id IS NULL)
+                        OR (candidate.attempt_count>0 AND candidate.current_attempt_status IN
+                            ('completed', 'failed', 'cancelled', 'expired')))
+                 ) OR (
+                   candidate.state=json_extract(candidate.policy, '$.running_state')
+                   AND candidate.lease_kind='execution' AND candidate.lease_expires_at<=?1
+                   AND candidate.attempt_count>0
+                   AND candidate.current_attempt_status='running'
+                 ))"
+        .into(),
+        OrgOperationalView::Assigned => {
+            format!("candidate.assignee IS NOT NULL AND {non_terminal}")
+        }
+        OrgOperationalView::Running => {
+            "candidate.state=json_extract(candidate.policy, '$.running_state')".into()
+        }
+        OrgOperationalView::Blocked => "candidate.state='BLOCKED' AND EXISTS (
+            SELECT 1 FROM json_each(candidate.policy, '$.states') configured
+            WHERE configured.value='BLOCKED'
+        )"
+        .into(),
+        OrgOperationalView::Review => {
+            "candidate.state=json_extract(candidate.policy, '$.review_state')".into()
+        }
+        OrgOperationalView::Scheduled => {
+            format!("candidate.scheduled_utc IS NOT NULL AND {non_terminal}")
+        }
+        OrgOperationalView::UpcomingDeadline => {
+            format!("candidate.deadline_utc>=?1 AND {non_terminal}")
+        }
+        OrgOperationalView::Failed => {
+            "candidate.state=json_extract(candidate.policy, '$.failed_state')".into()
+        }
+        OrgOperationalView::ExpiredLease => {
+            "candidate.lease_id IS NOT NULL AND candidate.lease_expires_at<=?1".into()
+        }
+        OrgOperationalView::Completed => "EXISTS (
+            SELECT 1 FROM json_each(candidate.policy, '$.successful_terminal_states') successful
+            WHERE successful.value=candidate.state
+        )"
+        .into(),
+    }
+}
+
+fn push_turso_operational_filters(
+    sql: &mut String,
+    params: &mut Vec<turso::Value>,
+    query: &OrgOperationalQuery<'_>,
+    tags: &[String],
+) -> StorageResult<()> {
+    if let Some(item_type) = query.item_type {
+        let value = push_turso_param(params, work_item_type_name(item_type));
+        sql.push_str(&format!(" AND item.item_type={value}"));
+    }
+    if let Some(state) = query.state {
+        let value = push_turso_param(params, state.to_owned());
+        sql.push_str(&format!(" AND item.state={value}"));
+    }
+    if let Some(priority) = query.priority {
+        let value = push_turso_param(params, priority.to_string());
+        sql.push_str(&format!(" AND item.priority={value}"));
+    }
+    if let Some(assignee) = query.assignee {
+        let value = push_turso_param(params, assignee.to_owned());
+        sql.push_str(&format!(" AND item.assignee={value}"));
+    }
+    for (column, bound, operator) in [
+        ("item.scheduled_utc", query.scheduled_from, ">="),
+        ("item.scheduled_utc", query.scheduled_to, "<="),
+        ("item.deadline_utc", query.deadline_from, ">="),
+        ("item.deadline_utc", query.deadline_to, "<="),
+        (
+            "completion_events.completion_at",
+            query.completed_from,
+            ">=",
+        ),
+        ("completion_events.completion_at", query.completed_to, "<="),
+    ] {
+        if let Some(bound) = bound {
+            let value = push_turso_param(params, bound);
+            sql.push_str(&format!(" AND {column}{operator}{value}"));
+        }
+    }
+    if !tags.is_empty() {
+        let placeholders = tags
+            .iter()
+            .map(|tag| push_turso_param(params, tag.clone()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let count = push_turso_param(params, tags.len() as i64);
+        sql.push_str(&format!(
+            " AND (SELECT COUNT(*) FROM org_work_item_tags filtered_tag
+                    WHERE filtered_tag.work_item_id=item.id
+                      AND filtered_tag.tag IN ({placeholders}))={count}"
+        ));
+    }
+    Ok(())
+}
+
+fn push_turso_operational_cursor(
+    sql: &mut String,
+    params: &mut Vec<turso::Value>,
+    view: OrgOperationalView,
+    cursor: Option<&note_storage::OrgOperationalCursor>,
+) -> StorageResult<()> {
+    let Some(cursor) = cursor else {
+        return Ok(());
+    };
+    let primary_column = match view {
+        OrgOperationalView::Scheduled => Some("item.scheduled_utc"),
+        OrgOperationalView::UpcomingDeadline => Some("item.deadline_utc"),
+        OrgOperationalView::ExpiredLease => Some("lease.expires_at"),
+        _ => None,
+    };
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    if let Some(column) = primary_column {
+        columns.push(column.to_owned());
+        values.push(push_turso_param(
+            params,
+            cursor.primary_at.ok_or_else(|| {
+                StorageError::new(
+                    StorageErrorKind::Operation,
+                    "Org operational cursor is missing its primary time",
+                )
+            })?,
+        ));
+    } else if cursor.primary_at.is_some() {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org operational cursor has an unexpected primary time",
+        ));
+    }
+    columns.extend([
+        "item.priority IS NULL".into(),
+        "COALESCE(item.priority, '')".into(),
+        "item.deadline_utc IS NULL".into(),
+        "COALESCE(item.deadline_utc, 0)".into(),
+        "item.scheduled_utc IS NULL".into(),
+        "COALESCE(item.scheduled_utc, 0)".into(),
+        "item.created_at".into(),
+        "item.workspace_id".into(),
+        "item.id".into(),
+    ]);
+    values.extend([
+        push_turso_param(params, i64::from(cursor.priority.is_none())),
+        push_turso_param(
+            params,
+            cursor
+                .priority
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        push_turso_param(params, i64::from(cursor.deadline_at.is_none())),
+        push_turso_param(params, cursor.deadline_at.unwrap_or_default()),
+        push_turso_param(params, i64::from(cursor.scheduled_at.is_none())),
+        push_turso_param(params, cursor.scheduled_at.unwrap_or_default()),
+        push_turso_param(params, cursor.created_at),
+        push_turso_param(params, cursor.workspace_id.to_string()),
+        push_turso_param(params, cursor.work_item_id.to_string()),
+    ]);
+    sql.push_str(&format!(
+        " AND ({}) > ({})",
+        columns.join(", "),
+        values.join(", ")
+    ));
+    Ok(())
+}
+
+fn turso_operational_order(view: OrgOperationalView) -> &'static str {
+    match view {
+        OrgOperationalView::Scheduled => {
+            "item.scheduled_utc,
+            item.priority IS NULL, item.priority,
+            item.deadline_utc IS NULL, item.deadline_utc,
+            item.scheduled_utc IS NULL, item.scheduled_utc,
+            item.created_at, item.workspace_id, item.id"
+        }
+        OrgOperationalView::UpcomingDeadline => {
+            "item.deadline_utc,
+            item.priority IS NULL, item.priority,
+            item.deadline_utc IS NULL, item.deadline_utc,
+            item.scheduled_utc IS NULL, item.scheduled_utc,
+            item.created_at, item.workspace_id, item.id"
+        }
+        OrgOperationalView::ExpiredLease => {
+            "lease.expires_at,
+            item.priority IS NULL, item.priority,
+            item.deadline_utc IS NULL, item.deadline_utc,
+            item.scheduled_utc IS NULL, item.scheduled_utc,
+            item.created_at, item.workspace_id, item.id"
+        }
+        _ => {
+            "item.priority IS NULL, item.priority,
+            item.deadline_utc IS NULL, item.deadline_utc,
+            item.scheduled_utc IS NULL, item.scheduled_utc,
+            item.created_at, item.workspace_id, item.id"
+        }
+    }
+}
+
 fn validate_lease_heartbeat(update: &OrgLeaseHeartbeat<'_>) -> StorageResult<()> {
     validate_lease_proof(&update.proof)?;
     if update.last_heartbeat_at < update.proof.now || update.expires_at < update.last_heartbeat_at {
@@ -1875,6 +2518,146 @@ async fn query_optional_lease(
         .as_ref()
         .map(decode_lease)
         .transpose()
+}
+
+fn decode_operational_row(row: &turso::Row) -> StorageResult<OrgOperationalRow> {
+    let mut item = decode_projected_item(row)?;
+    let current_attempt_status = row
+        .get::<Option<String>>(21)
+        .map_err(|error| map_turso_error("decode Org operational current attempt", error))?
+        .as_deref()
+        .map(decode_attempt_status)
+        .transpose()?;
+    let ready_marker = match row
+        .get::<Option<String>>(23)
+        .map_err(|error| map_turso_error("decode Org operational ready marker", error))?
+        .as_deref()
+    {
+        Some("ready") => Some(OrgReadyMarker::Ready),
+        Some("recovery") => Some(OrgReadyMarker::RecoveryCandidate),
+        None => None,
+        Some(value) => {
+            return Err(StorageError::new(
+                StorageErrorKind::Corrupt,
+                format!("stored Org operational row has unknown ready marker {value:?}"),
+            ));
+        }
+    };
+    let review_lease_marker = match row
+        .get::<Option<String>>(24)
+        .map_err(|error| map_turso_error("decode Org operational review lease marker", error))?
+        .as_deref()
+    {
+        Some("unleased") => Some(OrgReviewLeaseMarker::Unleased),
+        Some("active") => Some(OrgReviewLeaseMarker::Active),
+        Some("expired") => Some(OrgReviewLeaseMarker::Expired),
+        None => None,
+        Some(value) => {
+            return Err(StorageError::new(
+                StorageErrorKind::Corrupt,
+                format!("stored Org operational row has unknown review marker {value:?}"),
+            ));
+        }
+    };
+    let lease_id = row
+        .get::<Option<String>>(25)
+        .map_err(|error| map_turso_error("decode Org operational lease id", error))?;
+    let lease = lease_id
+        .map(|id| {
+            Ok(SanitizedOrgLease {
+                id,
+                workspace_id: decode_workspace_id(row.get(26).map_err(|error| {
+                    map_turso_error("decode Org operational lease workspace", error)
+                })?)?,
+                work_item_id: decode_work_item_id(row.get(27).map_err(|error| {
+                    map_turso_error("decode Org operational lease work item", error)
+                })?)?,
+                attempt_id: row.get(28).map_err(|error| {
+                    map_turso_error("decode Org operational lease attempt", error)
+                })?,
+                kind: decode_lease_kind(&row.get::<String>(29).map_err(|error| {
+                    map_turso_error("decode Org operational lease kind", error)
+                })?)?,
+                actor_id: row.get(30).map_err(|error| {
+                    map_turso_error("decode Org operational lease actor", error)
+                })?,
+                acquired_at: row.get(31).map_err(|error| {
+                    map_turso_error("decode Org operational lease acquired time", error)
+                })?,
+                last_heartbeat_at: row.get(32).map_err(|error| {
+                    map_turso_error("decode Org operational lease heartbeat", error)
+                })?,
+                expires_at: row.get(33).map_err(|error| {
+                    map_turso_error("decode Org operational lease expiry", error)
+                })?,
+                ended_at: row.get(34).map_err(|error| {
+                    map_turso_error("decode Org operational lease end time", error)
+                })?,
+                end_reason: row
+                    .get::<Option<String>>(35)
+                    .map_err(|error| {
+                        map_turso_error("decode Org operational lease end reason", error)
+                    })?
+                    .as_deref()
+                    .map(decode_lease_end_reason)
+                    .transpose()?,
+                expiry_event_id: row.get(36).map_err(|error| {
+                    map_turso_error("decode Org operational lease expiry event", error)
+                })?,
+            })
+        })
+        .transpose()?;
+    let tags_json: String = row
+        .get(38)
+        .map_err(|error| map_turso_error("decode Org operational tags JSON", error))?;
+    item.tags = serde_json::from_str(&tags_json).map_err(|error| {
+        StorageError::with_source(
+            StorageErrorKind::Corrupt,
+            "decode Org operational tags",
+            error,
+        )
+    })?;
+    let dependencies_json: String = row
+        .get(39)
+        .map_err(|error| map_turso_error("decode Org operational dependencies JSON", error))?;
+    item.dependencies = serde_json::from_str::<Vec<String>>(&dependencies_json)
+        .map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Corrupt,
+                "decode Org operational dependencies",
+                error,
+            )
+        })?
+        .into_iter()
+        .map(decode_work_item_id)
+        .collect::<StorageResult<Vec<_>>>()?;
+    let note_links_json: String = row
+        .get(40)
+        .map_err(|error| map_turso_error("decode Org operational note links JSON", error))?;
+    item.note_links = serde_json::from_str(&note_links_json).map_err(|error| {
+        StorageError::with_source(
+            StorageErrorKind::Corrupt,
+            "decode Org operational note links",
+            error,
+        )
+    })?;
+    Ok(OrgOperationalRow {
+        item,
+        attempt_count: row
+            .get(20)
+            .map_err(|error| map_turso_error("decode Org operational attempt count", error))?,
+        current_attempt_status,
+        retry_exhausted: decode_bool(
+            row.get(22)
+                .map_err(|error| map_turso_error("decode Org operational retry marker", error))?,
+        )?,
+        ready_marker,
+        review_lease_marker,
+        lease,
+        completion_at: row
+            .get(37)
+            .map_err(|error| map_turso_error("decode Org operational completion time", error))?,
+    })
 }
 
 fn decode_lease(row: &turso::Row) -> StorageResult<OrgLease> {
@@ -3150,5 +3933,18 @@ mod projection_tests {
 
         assert_eq!(sizes, vec![64, 64, 64, 64, 1]);
         assert!(sizes.iter().all(|size| *size <= PROJECTION_BATCH_SIZE));
+    }
+
+    #[test]
+    fn operational_page_relations_are_correlated_in_the_main_statement() {
+        assert!(OPERATIONAL_RELATION_COLUMNS.contains("FROM org_work_item_tags"));
+        assert!(OPERATIONAL_RELATION_COLUMNS.contains("FROM org_dependencies"));
+        assert!(OPERATIONAL_RELATION_COLUMNS.contains("FROM org_note_links"));
+        assert_eq!(
+            OPERATIONAL_RELATION_COLUMNS
+                .matches("work_item_id=item.id")
+                .count(),
+            3
+        );
     }
 }

@@ -384,6 +384,145 @@ pub struct OrgLeaseUpdate<'a> {
     pub expiry_event_id: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OrgOperationalView {
+    Ready,
+    Assigned,
+    Running,
+    Blocked,
+    Review,
+    Scheduled,
+    UpcomingDeadline,
+    Failed,
+    ExpiredLease,
+    Completed,
+}
+
+impl OrgOperationalView {
+    pub const ALL: [Self; 10] = [
+        Self::Ready,
+        Self::Assigned,
+        Self::Running,
+        Self::Blocked,
+        Self::Review,
+        Self::Scheduled,
+        Self::UpcomingDeadline,
+        Self::Failed,
+        Self::ExpiredLease,
+        Self::Completed,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgReadyMarker {
+    Ready,
+    RecoveryCandidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgReviewLeaseMarker {
+    Unleased,
+    Active,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgOperationalCursor {
+    pub primary_at: Option<i64>,
+    pub priority: Option<char>,
+    pub deadline_at: Option<i64>,
+    pub scheduled_at: Option<i64>,
+    pub created_at: i64,
+    pub workspace_id: note_org::WorkspaceId,
+    pub work_item_id: note_org::WorkItemId,
+}
+
+pub struct OrgOperationalQuery<'a> {
+    pub view: OrgOperationalView,
+    pub workspace_ids: &'a [note_org::WorkspaceId],
+    pub item_type: Option<note_org::WorkItemType>,
+    pub state: Option<&'a str>,
+    pub priority: Option<char>,
+    pub tags: &'a [&'a str],
+    pub assignee: Option<&'a str>,
+    pub scheduled_from: Option<i64>,
+    pub scheduled_to: Option<i64>,
+    pub deadline_from: Option<i64>,
+    pub deadline_to: Option<i64>,
+    pub completed_from: Option<i64>,
+    pub completed_to: Option<i64>,
+    pub include_archived: bool,
+    pub now: i64,
+    pub after: Option<&'a OrgOperationalCursor>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgOperationalRow {
+    pub item: OrgProjectedWorkItem,
+    pub attempt_count: i64,
+    pub current_attempt_status: Option<OrgAttemptStatus>,
+    pub retry_exhausted: bool,
+    pub ready_marker: Option<OrgReadyMarker>,
+    pub review_lease_marker: Option<OrgReviewLeaseMarker>,
+    pub lease: Option<crate::SanitizedOrgLease>,
+    pub completion_at: Option<i64>,
+}
+
+impl OrgOperationalRow {
+    pub fn cursor(&self, view: OrgOperationalView) -> OrgOperationalCursor {
+        let primary_at = match view {
+            OrgOperationalView::Scheduled => self
+                .item
+                .scheduled
+                .as_ref()
+                .map(|value| value.utc_timestamp),
+            OrgOperationalView::UpcomingDeadline => {
+                self.item.deadline.as_ref().map(|value| value.utc_timestamp)
+            }
+            OrgOperationalView::ExpiredLease => self.lease.as_ref().map(|value| value.expires_at),
+            _ => None,
+        };
+        OrgOperationalCursor {
+            primary_at,
+            priority: self.item.priority,
+            deadline_at: self.item.deadline.as_ref().map(|value| value.utc_timestamp),
+            scheduled_at: self
+                .item
+                .scheduled
+                .as_ref()
+                .map(|value| value.utc_timestamp),
+            created_at: self.item.created_at,
+            workspace_id: self.item.workspace_id,
+            work_item_id: self.item.id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgOperationalCounts {
+    pub ready: i64,
+    pub assigned: i64,
+    pub running: i64,
+    pub blocked: i64,
+    pub review: i64,
+    pub scheduled: i64,
+    pub upcoming_deadline: i64,
+    pub failed: i64,
+    pub expired_lease: i64,
+    pub completed: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgWorkspaceOperationalSummary {
+    pub workspace_id: note_org::WorkspaceId,
+    pub timezone: String,
+    pub archived_at: Option<i64>,
+    pub workspace_revision: i64,
+    pub evaluated_at: i64,
+    pub counts: OrgOperationalCounts,
+}
+
 pub struct NewOrgEvent<'a> {
     pub id: &'a str,
     pub workspace_id: note_org::WorkspaceId,

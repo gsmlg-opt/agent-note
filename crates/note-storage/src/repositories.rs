@@ -3,9 +3,9 @@ use crate::{
     EmbeddingDashboardStatus, EmbeddingJob, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent,
     NewOrgLease, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteUpdate, OrgArtifactReference,
     OrgAttempt, OrgAttemptNoteReference, OrgAttemptUpdate, OrgDocument, OrgDocumentUpdate,
-    OrgEvent, OrgLease, OrgLeaseEndReason, OrgLeaseKind, OrgProjectedWorkItem, OrgWorkspace,
-    OrgWorkspaceUpdate, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
-    UpsertNoteChunk,
+    OrgEvent, OrgLease, OrgLeaseEndReason, OrgLeaseKind, OrgOperationalQuery, OrgOperationalRow,
+    OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate,
+    StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, UpsertNoteChunk,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -852,6 +852,29 @@ pub trait OrgRepository: Send + Sync {
         update: OrgLeaseOwnershipMove<'_>,
     ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
         let _ = update;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn query_org_operational(
+        &self,
+        query: OrgOperationalQuery<'_>,
+    ) -> StorageResult<Vec<OrgOperationalRow>> {
+        let _ = query;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn get_org_workspace_operational_summary(
+        &self,
+        workspace_id: note_org::WorkspaceId,
+        now: i64,
+    ) -> StorageResult<Option<OrgWorkspaceOperationalSummary>> {
+        let _ = (workspace_id, now);
         Err(StorageError::new(
             StorageErrorKind::UnsupportedSchema,
             "Org persistence is not implemented by this storage session",
