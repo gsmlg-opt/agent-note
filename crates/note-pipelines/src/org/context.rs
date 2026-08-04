@@ -73,6 +73,7 @@ pub trait OrgClaimTestHook: Send + Sync {
 pub enum OrgWorkflowPhase {
     Proof,
     SourceEdit,
+    ProjectionUpdate,
     AttemptUpdate,
     LeaseUpdate,
     Events,

@@ -1,20 +1,24 @@
 mod support;
 
-use note_org::{DocumentId, WorkItemId, WorkspaceId, WorkspacePolicy};
+use note_org::{ClaimPolicy, DocumentId, WorkItemId, WorkspaceId, WorkspacePolicy};
 use note_pipelines::org::{
-    create_workspace, import_documents, move_document, put_document, update_workspace,
-    CommandEnvelope, CreateWorkspaceRequest, DocumentImport, ImportDocumentsRequest,
-    MoveDocumentRequest, OrgContext, OrgErrorCode, PutDocumentRequest, UpdateWorkspaceRequest,
+    claim_item, create_workspace, import_documents, move_document, put_document, release_claim,
+    schedule_item, update_workspace, CommandEnvelope, CreateWorkspaceRequest, DocumentImport,
+    ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest, OrgClaimKind, OrgContext,
+    OrgErrorCode, OrgFieldPatch, OrgWorkflowPhase, PutDocumentRequest, ReleaseClaimRequest,
+    ScheduleItemRequest, StartClaimRequest, UpdateWorkspaceRequest,
 };
 use note_storage::{
-    NewNote, OrgDocument, OrgEvent, OrgEventType, OrgProjectedWorkItem, OrgWorkspace,
-    OrgWorkspaceUpdate, StorageBackend,
+    NewNote, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument, OrgEvent, OrgEventType,
+    OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceUpdate, StorageBackend,
 };
 use note_storage_turso::TursoStorage;
 use std::collections::BTreeMap;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use support::{event_log, EventStorageBackend};
+use support::{
+    event_log, DeterministicTokenSource, EventStorageBackend, FailAtWorkflowPhaseOccurrence,
+};
 
 const NOW: i64 = 1_800_000_000;
 
@@ -267,6 +271,7 @@ async fn policy_update_rejects_existing_items_it_would_invalidate_without_side_e
             path: "tasks.org".into(),
             source: source(item, "DONE", "Body.\r\n"),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -283,6 +288,7 @@ async fn policy_update_rejects_existing_items_it_would_invalidate_without_side_e
                 "Cancelled policy role.\r\n",
             ),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -299,6 +305,7 @@ async fn policy_update_rejects_existing_items_it_would_invalidate_without_side_e
                 "Recovery policy roles.\r\n",
             ),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -435,6 +442,7 @@ async fn document_import_preserves_bytes_created_at_and_resolves_workspace_time(
             path: "time.org".into(),
             source: raw.clone(),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -473,6 +481,7 @@ async fn document_import_preserves_bytes_created_at_and_resolves_workspace_time(
             path: "time.org".into(),
             source: opaque_only,
             expected_revision: Some(1),
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -558,6 +567,7 @@ async fn ambiguous_and_nonexistent_dst_timestamps_reject_the_entire_import() {
                     "",
                 ),
                 expected_revision: None,
+                lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
@@ -575,7 +585,7 @@ async fn ambiguous_and_nonexistent_dst_timestamps_reject_the_entire_import() {
 }
 
 #[tokio::test]
-async fn raw_replacement_rejects_semantic_change_omission_and_running_items() {
+async fn raw_replacement_rejects_invalid_changes_but_allows_opaque_active_state_bytes() {
     let (context, backend, _dir) = empty_context(NOW).await;
     let workspace = workspace_id("10000000-0000-4000-8000-000000000040");
     create_test_workspace(&context, workspace, "create-guard-workspace", "UTC").await;
@@ -590,6 +600,7 @@ async fn raw_replacement_rejects_semantic_change_omission_and_running_items() {
             path: "guard.org".into(),
             source: original.clone(),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -599,7 +610,6 @@ async fn raw_replacement_rejects_semantic_change_omission_and_running_items() {
     for (operation, candidate) in [
         ("state-change", source(item, "DONE", "Keep.\r\n")),
         ("omission", "No work items.\r\n".into()),
-        ("running", source(item, "RUNNING", "Keep.\r\n")),
     ] {
         let error = put_document(
             &context,
@@ -609,6 +619,7 @@ async fn raw_replacement_rejects_semantic_change_omission_and_running_items() {
                 path: "guard.org".into(),
                 source: candidate,
                 expected_revision: Some(1),
+                lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
@@ -639,6 +650,7 @@ async fn raw_replacement_rejects_semantic_change_omission_and_running_items() {
             path: "guard.org".into(),
             source: original.replace("Keep.", "Keep opaque change."),
             expected_revision: Some(99),
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -692,11 +704,12 @@ async fn raw_replacement_rejects_semantic_change_omission_and_running_items() {
                 path: format!("active-{index}.org"),
                 source: initial.clone(),
                 expected_revision: None,
+                lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
         .unwrap();
-        let rejected = put_document(
+        put_document(
             &context,
             &envelope(workspace, &format!("replace-active-{index}")),
             &PutDocumentRequest {
@@ -704,11 +717,19 @@ async fn raw_replacement_rejects_semantic_change_omission_and_running_items() {
                 path: format!("active-{index}.org"),
                 source: initial.replace("Existing active state.", "Opaque active change."),
                 expected_revision: Some(1),
+                lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
-        .unwrap_err();
-        assert_eq!(rejected.code, OrgErrorCode::InvalidTransition);
+        .unwrap();
+        assert!(backend
+            .session()
+            .await
+            .unwrap()
+            .get_open_org_lease_internal(new_item)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
 
@@ -737,6 +758,7 @@ async fn multi_document_import_requires_complete_revisions_and_moves_ids_atomica
                 },
             ],
             expected_revisions: BTreeMap::new(),
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -756,6 +778,7 @@ async fn multi_document_import_requires_complete_revisions_and_moves_ids_atomica
             },
         ],
         expected_revisions: BTreeMap::from([(source_document, 1)]),
+        lease_proofs: std::collections::BTreeMap::new(),
     };
     let error = import_documents(
         &context,
@@ -852,6 +875,7 @@ async fn complete_dependency_graph_and_new_note_targets_are_validated_before_wri
                 path: "invalid.org".into(),
                 source: candidate,
                 expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
@@ -917,6 +941,7 @@ async fn raw_import_keeps_existing_weak_links_but_rejects_new_links_to_soft_dele
             path: "existing-link.org".into(),
             source: linked_source.clone(),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -937,6 +962,7 @@ async fn raw_import_keeps_existing_weak_links_but_rejects_new_links_to_soft_dele
             path: "existing-link.org".into(),
             source: linked_source.replace("Context]]", "Context]]\r\nOpaque change."),
             expected_revision: Some(1),
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -969,6 +995,7 @@ async fn raw_import_keeps_existing_weak_links_but_rejects_new_links_to_soft_dele
                 &format!("[[agent-note:design:{note_id}][Deleted]]\r\n"),
             ),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -991,25 +1018,99 @@ async fn raw_import_keeps_existing_weak_links_but_rejects_new_links_to_soft_dele
 #[tokio::test]
 async fn cross_workspace_document_move_rebuilds_both_workspaces_and_pairs_events_atomically() {
     let (context, backend, _dir) = empty_context(NOW).await;
+    let context = context.with_token_source(Arc::new(DeterministicTokenSource::new([
+        "closed-before-move-token",
+        "move-document-token",
+        "move-document-second-token",
+    ])));
     let source_workspace = workspace_id("10000000-0000-4000-8000-000000000070");
     let target_workspace = workspace_id("10000000-0000-4000-8000-000000000071");
     create_test_workspace(&context, source_workspace, "create-source-workspace", "UTC").await;
     create_test_workspace(&context, target_workspace, "create-target-workspace", "UTC").await;
     let document = document_id("20000000-0000-4000-8000-000000000070");
     let item = work_item_id("30000000-0000-4000-8000-000000000070");
+    let second_item = work_item_id("30000000-0000-4000-8000-000000000079");
     put_document(
         &context,
         &envelope(source_workspace, "seed-move-document"),
         &PutDocumentRequest {
             document_id: document,
             path: "move.org".into(),
-            source: source(item, "READY", "Move intact.\r\n"),
+            source: format!(
+                "{}{}",
+                source(item, "READY", "Move intact.\r\n"),
+                source(second_item, "READY", "Move together.\r\n")
+            ),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let closed_claim = claim_item(
+        &context,
+        &envelope(source_workspace, "claim-to-close-before-document-move"),
+        &StartClaimRequest {
+            work_item_id: item,
+            document_id: document,
+            expected_document_revision: 1,
+            kind: OrgClaimKind::Execution,
+        },
+    )
+    .await
+    .unwrap();
+    release_claim(
+        &context,
+        &envelope(source_workspace, "close-before-document-move"),
+        &ReleaseClaimRequest {
+            schema_version: 1,
+            work_item_id: item,
+            document_id: document,
+            expected_document_revision: 2,
+            lease_id: closed_claim.lease_id.clone(),
+            kind: OrgClaimKind::Execution,
+            fencing_token: closed_claim.fencing_token.clone(),
+            target_state: Some("READY".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let claim = claim_item(
+        &context,
+        &envelope(source_workspace, "claim-before-document-move"),
+        &StartClaimRequest {
+            work_item_id: item,
+            document_id: document,
+            expected_document_revision: 3,
+            kind: OrgClaimKind::Execution,
+        },
+    )
+    .await
+    .unwrap();
+    let second_claim = claim_item(
+        &context,
+        &envelope(source_workspace, "claim-second-before-document-move"),
+        &StartClaimRequest {
+            work_item_id: second_item,
+            document_id: document,
+            expected_document_revision: 4,
+            kind: OrgClaimKind::Execution,
         },
     )
     .await
     .unwrap();
     let session = backend.session().await.unwrap();
+    let lease_before = session
+        .get_open_org_lease_internal(item)
+        .await
+        .unwrap()
+        .unwrap();
+    let attempt_before = session
+        .list_org_attempts(item)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
     let source_revision = session
         .get_org_workspace(source_workspace)
         .await
@@ -1025,14 +1126,42 @@ async fn cross_workspace_document_move_rebuilds_both_workspaces_and_pairs_events
     let request = MoveDocumentRequest {
         document_id: document,
         target_workspace_id: target_workspace,
-        expected_document_revision: 1,
+        expected_document_revision: 5,
         expected_source_workspace_revision: source_revision,
         expected_target_workspace_revision: target_revision,
+        lease_proofs: BTreeMap::from([
+            (
+                item,
+                LeaseProofInput {
+                    lease_id: claim.lease_id.clone(),
+                    kind: OrgClaimKind::Execution,
+                    fencing_token: claim.fencing_token.clone(),
+                },
+            ),
+            (
+                second_item,
+                LeaseProofInput {
+                    lease_id: second_claim.lease_id.clone(),
+                    kind: OrgClaimKind::Execution,
+                    fencing_token: second_claim.fencing_token.clone(),
+                },
+            ),
+        ]),
     };
     let later_context = OrgContext::new(
         backend.clone(),
-        Arc::new(note_pipelines::org::FixedOrgClock::new(NOW + 100)),
+        Arc::new(note_pipelines::org::FixedOrgClock::new(NOW + 1)),
     );
+    let mut incomplete = request.clone();
+    incomplete.lease_proofs.remove(&second_item);
+    let missing = move_document(
+        &later_context,
+        &envelope(source_workspace, "move-document-missing-contained-proof"),
+        &incomplete,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(missing.code, OrgErrorCode::StaleLease);
     let moved = move_document(
         &later_context,
         &envelope(source_workspace, "move-document"),
@@ -1065,6 +1194,43 @@ async fn cross_workspace_document_move_rebuilds_both_workspaces_and_pairs_events
     let moved_item = session.get_org_work_item(item).await.unwrap().unwrap();
     assert_eq!(moved_item.workspace_id, target_workspace);
     assert_eq!(moved_item.created_at, NOW);
+    assert_eq!(
+        session
+            .get_org_work_item(second_item)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace_id,
+        target_workspace
+    );
+    let lease_after = session
+        .get_open_org_lease_internal(item)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease_after.workspace_id, target_workspace);
+    assert_eq!(lease_after.id, lease_before.id);
+    assert_eq!(lease_after.attempt_id, lease_before.attempt_id);
+    assert_eq!(lease_after.actor_id, lease_before.actor_id);
+    assert_eq!(lease_after.kind, lease_before.kind);
+    assert_eq!(lease_after.expires_at, lease_before.expires_at);
+    let attempt_after = session
+        .list_org_attempts(item)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(attempt_after, attempt_before);
+    assert_eq!(attempt_after.workspace_id, source_workspace);
+    assert_eq!(
+        session
+            .get_open_org_lease_internal(second_item)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace_id,
+        target_workspace
+    );
 
     let source_events = session
         .list_org_events(source_workspace, None, 50)
@@ -1114,6 +1280,687 @@ async fn cross_workspace_document_move_rebuilds_both_workspaces_and_pairs_events
         target_item_move.summary,
         "Moved Org work item into workspace"
     );
+    assert_eq!(
+        source_item_move.attempt_id.as_deref(),
+        Some(attempt_after.id.as_str())
+    );
+    assert_eq!(target_item_move.attempt_id, None);
+
+    drop(session);
+    let stale = schedule_item(
+        &later_context,
+        &envelope(
+            target_workspace,
+            "prove-closed-token-stays-stale-after-move",
+        ),
+        &ScheduleItemRequest {
+            item_id: item,
+            document_id: document,
+            scheduled: OrgFieldPatch::Set("<2029-01-01 Mon 09:00>".into()),
+            deadline: OrgFieldPatch::Unchanged,
+            expected_revisions: BTreeMap::from([(document, 6)]),
+            lease: Some(LeaseProofInput {
+                lease_id: closed_claim.lease_id,
+                kind: OrgClaimKind::Execution,
+                fencing_token: closed_claim.fencing_token,
+            }),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.code, OrgErrorCode::StaleLease);
+    schedule_item(
+        &later_context,
+        &envelope(target_workspace, "prove-moved-token-current"),
+        &ScheduleItemRequest {
+            item_id: item,
+            document_id: document,
+            scheduled: OrgFieldPatch::Set("<2030-01-01 Tue 09:00>".into()),
+            deadline: OrgFieldPatch::Unchanged,
+            expected_revisions: BTreeMap::from([(document, 6)]),
+            lease: Some(LeaseProofInput {
+                lease_id: claim.lease_id,
+                kind: OrgClaimKind::Execution,
+                fencing_token: claim.fencing_token,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cross_workspace_active_move_rejects_incompatible_target_role_and_dispatch_policy() {
+    for (suffix, mutate_policy) in [
+        (
+            "role",
+            (|policy: &mut WorkspacePolicy| {
+                policy.states.insert("ACTIVE".into());
+                policy.running_state = "ACTIVE".into();
+                policy.transitions.extend([
+                    ("READY".into(), "ACTIVE".into()),
+                    ("ACTIVE".into(), "READY".into()),
+                    ("FAILED".into(), "ACTIVE".into()),
+                ]);
+            }) as fn(&mut WorkspacePolicy),
+        ),
+        (
+            "dispatch",
+            (|policy: &mut WorkspacePolicy| {
+                policy.claim_policy = ClaimPolicy::ExplicitlyDispatched;
+            }) as fn(&mut WorkspacePolicy),
+        ),
+    ] {
+        let (context, backend, _dir) = empty_context(NOW).await;
+        let context =
+            context.with_token_source(Arc::new(DeterministicTokenSource::new([format!(
+                "target-policy-{suffix}-token"
+            )])));
+        let source_workspace = workspace_id(if suffix == "role" {
+            "10000000-0000-4000-8000-000000000074"
+        } else {
+            "10000000-0000-4000-8000-000000000076"
+        });
+        let target_workspace = workspace_id(if suffix == "role" {
+            "10000000-0000-4000-8000-000000000075"
+        } else {
+            "10000000-0000-4000-8000-000000000077"
+        });
+        create_test_workspace(
+            &context,
+            source_workspace,
+            &format!("create-policy-source-{suffix}"),
+            "UTC",
+        )
+        .await;
+        create_test_workspace(
+            &context,
+            target_workspace,
+            &format!("create-policy-target-{suffix}"),
+            "UTC",
+        )
+        .await;
+        let mut policy = WorkspacePolicy::engineering_default();
+        mutate_policy(&mut policy);
+        update_workspace(
+            &context,
+            &envelope(target_workspace, &format!("update-policy-target-{suffix}")),
+            &UpdateWorkspaceRequest {
+                expected_revision: 1,
+                slug: format!("workspace-{target_workspace}"),
+                display_name: "Policy target".into(),
+                description: "Incompatible active lease target".into(),
+                timezone: "UTC".into(),
+                policy_schema_version: 1,
+                policy,
+            },
+        )
+        .await
+        .unwrap();
+        let document = document_id(if suffix == "role" {
+            "20000000-0000-4000-8000-000000000074"
+        } else {
+            "20000000-0000-4000-8000-000000000076"
+        });
+        let item = work_item_id(if suffix == "role" {
+            "30000000-0000-4000-8000-000000000074"
+        } else {
+            "30000000-0000-4000-8000-000000000076"
+        });
+        put_document(
+            &context,
+            &envelope(source_workspace, &format!("seed-policy-move-{suffix}")),
+            &PutDocumentRequest {
+                document_id: document,
+                path: format!("policy-{suffix}.org"),
+                source: source(item, "READY", ""),
+                expected_revision: None,
+                lease_proofs: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let claim = claim_item(
+            &context,
+            &envelope(source_workspace, &format!("claim-policy-move-{suffix}")),
+            &StartClaimRequest {
+                work_item_id: item,
+                document_id: document,
+                expected_document_revision: 1,
+                kind: OrgClaimKind::Execution,
+            },
+        )
+        .await
+        .unwrap();
+        let before_source = workspace_snapshot(backend.as_ref(), source_workspace).await;
+        let before_target = workspace_snapshot(backend.as_ref(), target_workspace).await;
+        let error = move_document(
+            &context,
+            &envelope(source_workspace, &format!("move-policy-{suffix}")),
+            &MoveDocumentRequest {
+                document_id: document,
+                target_workspace_id: target_workspace,
+                expected_document_revision: 2,
+                expected_source_workspace_revision: before_source.workspace.revision,
+                expected_target_workspace_revision: before_target.workspace.revision,
+                lease_proofs: BTreeMap::from([(
+                    item,
+                    LeaseProofInput {
+                        lease_id: claim.lease_id,
+                        kind: OrgClaimKind::Execution,
+                        fencing_token: claim.fencing_token,
+                    },
+                )]),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, OrgErrorCode::InvalidInput, "{suffix}");
+        assert_eq!(
+            workspace_snapshot(backend.as_ref(), source_workspace).await,
+            before_source,
+            "{suffix}"
+        );
+        assert_eq!(
+            workspace_snapshot(backend.as_ref(), target_workspace).await,
+            before_target,
+            "{suffix}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cross_workspace_second_projection_failure_rolls_back_both_workspaces_and_retries() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let source_workspace = workspace_id("10000000-0000-4000-8000-000000000098");
+    let target_workspace = workspace_id("10000000-0000-4000-8000-000000000099");
+    create_test_workspace(
+        &context,
+        source_workspace,
+        "create-second-projection-source",
+        "UTC",
+    )
+    .await;
+    create_test_workspace(
+        &context,
+        target_workspace,
+        "create-second-projection-target",
+        "UTC",
+    )
+    .await;
+    let document = document_id("20000000-0000-4000-8000-000000000098");
+    let item = work_item_id("30000000-0000-4000-8000-000000000098");
+    put_document(
+        &context,
+        &envelope(source_workspace, "seed-second-projection-move"),
+        &PutDocumentRequest {
+            document_id: document,
+            path: "second-projection.org".into(),
+            source: source(item, "READY", ""),
+            expected_revision: None,
+            lease_proofs: BTreeMap::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let source_before = workspace_snapshot(backend.as_ref(), source_workspace).await;
+    let target_before = workspace_snapshot(backend.as_ref(), target_workspace).await;
+    let operation_id = "move-fail-second-projection";
+    let request = MoveDocumentRequest {
+        document_id: document,
+        target_workspace_id: target_workspace,
+        expected_document_revision: 1,
+        expected_source_workspace_revision: source_before.workspace.revision,
+        expected_target_workspace_revision: target_before.workspace.revision,
+        lease_proofs: BTreeMap::new(),
+    };
+    let fault_context =
+        context
+            .clone()
+            .with_workflow_test_hook(Arc::new(FailAtWorkflowPhaseOccurrence::new(
+                OrgWorkflowPhase::ProjectionUpdate,
+                2,
+            )));
+    let error = move_document(
+        &fault_context,
+        &envelope(source_workspace, operation_id),
+        &request,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, OrgErrorCode::StorageFailure);
+    assert_eq!(
+        workspace_snapshot(backend.as_ref(), source_workspace).await,
+        source_before
+    );
+    assert_eq!(
+        workspace_snapshot(backend.as_ref(), target_workspace).await,
+        target_before
+    );
+    let session = backend.session().await.unwrap();
+    assert_eq!(
+        session
+            .get_org_document(document)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace_id,
+        source_workspace
+    );
+    assert!(session
+        .get_org_operation(source_workspace, operation_id)
+        .await
+        .unwrap()
+        .is_none());
+    drop(session);
+    move_document(
+        &context,
+        &envelope(source_workspace, operation_id),
+        &request,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cross_workspace_active_move_rejects_target_retry_and_attempt_incompatibility() {
+    for case in ["retry", "attempt"] {
+        let (context, backend, _dir) = empty_context(NOW).await;
+        let context = context.with_token_source(Arc::new(DeterministicTokenSource::new([
+            format!("{case}-first-token"),
+            format!("{case}-second-token"),
+        ])));
+        let source_workspace = workspace_id(if case == "retry" {
+            "10000000-0000-4000-8000-000000000094"
+        } else {
+            "10000000-0000-4000-8000-000000000096"
+        });
+        let target_workspace = workspace_id(if case == "retry" {
+            "10000000-0000-4000-8000-000000000095"
+        } else {
+            "10000000-0000-4000-8000-000000000097"
+        });
+        create_test_workspace(
+            &context,
+            source_workspace,
+            &format!("create-{case}-source"),
+            "UTC",
+        )
+        .await;
+        create_test_workspace(
+            &context,
+            target_workspace,
+            &format!("create-{case}-target"),
+            "UTC",
+        )
+        .await;
+        if case == "retry" {
+            let mut policy = WorkspacePolicy::engineering_default();
+            policy.retry_limit = 0;
+            update_workspace(
+                &context,
+                &envelope(target_workspace, "limit-target-retries"),
+                &UpdateWorkspaceRequest {
+                    expected_revision: 1,
+                    slug: format!("workspace-{target_workspace}"),
+                    display_name: "Retry target".into(),
+                    description: "No retries".into(),
+                    timezone: "UTC".into(),
+                    policy_schema_version: 1,
+                    policy,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let document = document_id(if case == "retry" {
+            "20000000-0000-4000-8000-000000000094"
+        } else {
+            "20000000-0000-4000-8000-000000000096"
+        });
+        let item = work_item_id(if case == "retry" {
+            "30000000-0000-4000-8000-000000000094"
+        } else {
+            "30000000-0000-4000-8000-000000000096"
+        });
+        put_document(
+            &context,
+            &envelope(source_workspace, &format!("seed-{case}-move")),
+            &PutDocumentRequest {
+                document_id: document,
+                path: format!("{case}-move.org"),
+                source: source(item, "READY", ""),
+                expected_revision: None,
+                lease_proofs: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let first = claim_item(
+            &context,
+            &envelope(source_workspace, &format!("claim-{case}-first")),
+            &StartClaimRequest {
+                work_item_id: item,
+                document_id: document,
+                expected_document_revision: 1,
+                kind: OrgClaimKind::Execution,
+            },
+        )
+        .await
+        .unwrap();
+        let (claim, revision) = if case == "retry" {
+            release_claim(
+                &context,
+                &envelope(source_workspace, "release-before-retry-move"),
+                &ReleaseClaimRequest {
+                    schema_version: 1,
+                    work_item_id: item,
+                    document_id: document,
+                    expected_document_revision: 2,
+                    lease_id: first.lease_id,
+                    kind: OrgClaimKind::Execution,
+                    fencing_token: first.fencing_token,
+                    target_state: Some("READY".into()),
+                },
+            )
+            .await
+            .unwrap();
+            (
+                claim_item(
+                    &context,
+                    &envelope(source_workspace, "claim-before-retry-move"),
+                    &StartClaimRequest {
+                        work_item_id: item,
+                        document_id: document,
+                        expected_document_revision: 3,
+                        kind: OrgClaimKind::Execution,
+                    },
+                )
+                .await
+                .unwrap(),
+                4,
+            )
+        } else {
+            let attempt = backend
+                .session()
+                .await
+                .unwrap()
+                .list_org_attempts(item)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            backend
+                .session()
+                .await
+                .unwrap()
+                .update_org_attempt(OrgAttemptUpdate {
+                    id: &attempt.id,
+                    expected_status: OrgAttemptStatus::Running,
+                    status: OrgAttemptStatus::Failed,
+                    ended_at: NOW,
+                    error: Some("injected inconsistency"),
+                    result_summary: None,
+                    review_outcome: None,
+                    note_refs: &attempt.note_refs,
+                    artifacts: &attempt.artifacts,
+                    metadata: &attempt.metadata,
+                })
+                .await
+                .unwrap();
+            (first, 2)
+        };
+        let before_source = workspace_snapshot(backend.as_ref(), source_workspace).await;
+        let before_target = workspace_snapshot(backend.as_ref(), target_workspace).await;
+        let error = move_document(
+            &context,
+            &envelope(source_workspace, &format!("reject-{case}-move")),
+            &MoveDocumentRequest {
+                document_id: document,
+                target_workspace_id: target_workspace,
+                expected_document_revision: revision,
+                expected_source_workspace_revision: before_source.workspace.revision,
+                expected_target_workspace_revision: before_target.workspace.revision,
+                lease_proofs: BTreeMap::from([(
+                    item,
+                    LeaseProofInput {
+                        lease_id: claim.lease_id,
+                        kind: OrgClaimKind::Execution,
+                        fencing_token: claim.fencing_token,
+                    },
+                )]),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            if case == "retry" {
+                OrgErrorCode::RetryLimit
+            } else {
+                OrgErrorCode::InvalidTransition
+            },
+            "{case}"
+        );
+        assert_eq!(
+            workspace_snapshot(backend.as_ref(), source_workspace).await,
+            before_source,
+            "{case}"
+        );
+        assert_eq!(
+            workspace_snapshot(backend.as_ref(), target_workspace).await,
+            before_target,
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cross_workspace_move_and_target_claim_share_one_capacity_boundary() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let context = context.with_token_source(Arc::new(DeterministicTokenSource::new([
+        "capacity-source-token",
+        "capacity-target-token",
+    ])));
+    let source_workspace = workspace_id("10000000-0000-4000-8000-000000000072");
+    let target_workspace = workspace_id("10000000-0000-4000-8000-000000000073");
+    create_test_workspace(
+        &context,
+        source_workspace,
+        "capacity-source-workspace",
+        "UTC",
+    )
+    .await;
+    create_test_workspace(
+        &context,
+        target_workspace,
+        "capacity-target-workspace",
+        "UTC",
+    )
+    .await;
+    let mut target_policy = WorkspacePolicy::engineering_default();
+    target_policy.concurrency_limit = 1;
+    update_workspace(
+        &context,
+        &envelope(target_workspace, "limit-target-capacity"),
+        &UpdateWorkspaceRequest {
+            slug: format!("workspace-{target_workspace}"),
+            display_name: "Capacity target".into(),
+            description: "One active lease".into(),
+            timezone: "UTC".into(),
+            policy_schema_version: 1,
+            policy: target_policy,
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let source_document = document_id("20000000-0000-4000-8000-000000000072");
+    let source_item = work_item_id("30000000-0000-4000-8000-000000000072");
+    let target_document = document_id("20000000-0000-4000-8000-000000000073");
+    let target_item = work_item_id("30000000-0000-4000-8000-000000000073");
+    for (workspace, document, item, path, operation) in [
+        (
+            source_workspace,
+            source_document,
+            source_item,
+            "capacity-source.org",
+            "seed-capacity-source",
+        ),
+        (
+            target_workspace,
+            target_document,
+            target_item,
+            "capacity-target.org",
+            "seed-capacity-target",
+        ),
+    ] {
+        put_document(
+            &context,
+            &envelope(workspace, operation),
+            &PutDocumentRequest {
+                document_id: document,
+                path: path.into(),
+                source: source(item, "READY", ""),
+                expected_revision: None,
+                lease_proofs: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let source_claim = claim_item(
+        &context,
+        &envelope(source_workspace, "claim-capacity-source"),
+        &StartClaimRequest {
+            work_item_id: source_item,
+            document_id: source_document,
+            expected_document_revision: 1,
+            kind: OrgClaimKind::Execution,
+        },
+    )
+    .await
+    .unwrap();
+    let session = backend.session().await.unwrap();
+    let source_revision = session
+        .get_org_workspace(source_workspace)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let target_revision = session
+        .get_org_workspace(target_workspace)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    drop(session);
+    let move_request = MoveDocumentRequest {
+        document_id: source_document,
+        target_workspace_id: target_workspace,
+        expected_document_revision: 2,
+        expected_source_workspace_revision: source_revision,
+        expected_target_workspace_revision: target_revision,
+        lease_proofs: BTreeMap::from([(
+            source_item,
+            LeaseProofInput {
+                lease_id: source_claim.lease_id,
+                kind: OrgClaimKind::Execution,
+                fencing_token: source_claim.fencing_token,
+            },
+        )]),
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let move_task = {
+        let context = context.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            move_document(
+                &context,
+                &envelope(source_workspace, "race-capacity-move"),
+                &move_request,
+            )
+            .await
+        })
+    };
+    let claim_task = {
+        let context = context.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            claim_item(
+                &context,
+                &envelope(target_workspace, "race-capacity-claim"),
+                &StartClaimRequest {
+                    work_item_id: target_item,
+                    document_id: target_document,
+                    expected_document_revision: 1,
+                    kind: OrgClaimKind::Execution,
+                },
+            )
+            .await
+        })
+    };
+    barrier.wait().await;
+    let moved = move_task.await.unwrap();
+    let claimed = claim_task.await.unwrap();
+    assert_eq!(usize::from(moved.is_ok()) + usize::from(claimed.is_ok()), 1);
+    let loser = moved
+        .as_ref()
+        .err()
+        .or_else(|| claimed.as_ref().err())
+        .unwrap();
+    assert_eq!(loser.code, OrgErrorCode::ConcurrencyLimit);
+
+    let session = backend.session().await.unwrap();
+    assert_eq!(
+        session
+            .count_active_org_leases(target_workspace, NOW)
+            .await
+            .unwrap(),
+        1
+    );
+    let stored_document = session
+        .get_org_document(source_document)
+        .await
+        .unwrap()
+        .unwrap();
+    let source_lease = session
+        .get_open_org_lease_internal(source_item)
+        .await
+        .unwrap()
+        .unwrap();
+    if moved.is_ok() {
+        assert_eq!(stored_document.workspace_id, target_workspace);
+        assert_eq!(source_lease.workspace_id, target_workspace);
+        assert!(session
+            .get_org_operation(target_workspace, "race-capacity-claim")
+            .await
+            .unwrap()
+            .is_none());
+    } else {
+        assert_eq!(stored_document.workspace_id, source_workspace);
+        assert_eq!(source_lease.workspace_id, source_workspace);
+        assert!(session
+            .get_org_operation(source_workspace, "race-capacity-move")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(session
+            .list_org_workspace_projection(source_workspace)
+            .await
+            .unwrap()
+            .iter()
+            .any(|item| item.id == source_item));
+        assert!(session
+            .list_org_workspace_projection(target_workspace)
+            .await
+            .unwrap()
+            .iter()
+            .all(|item| item.id != source_item));
+    }
 }
 
 #[tokio::test]
@@ -1143,6 +1990,7 @@ async fn archived_rejection_and_commit_failure_leave_document_state_unchanged() 
             path: "failed.org".into(),
             source: source(item, "READY", "No partial data.\r\n"),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -1169,6 +2017,7 @@ async fn archived_rejection_and_commit_failure_leave_document_state_unchanged() 
         path: "replay.org".into(),
         source: source(replay_item, "READY", "Replay after archive.\r\n"),
         expected_revision: None,
+        lease_proofs: std::collections::BTreeMap::new(),
     };
     let first = put_document(
         &context,
@@ -1213,6 +2062,7 @@ async fn archived_rejection_and_commit_failure_leave_document_state_unchanged() 
                 "Rejected.\r\n",
             ),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -1246,6 +2096,7 @@ async fn repository_failpoints_rollback_source_projection_event_and_operation_bo
             path: "failpoints.org".into(),
             source: initial.clone(),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -1271,6 +2122,7 @@ async fn repository_failpoints_rollback_source_projection_event_and_operation_bo
                 path: "failpoints.org".into(),
                 source: initial.replace("Original opaque body.", "Changed opaque body."),
                 expected_revision: Some(1),
+                lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
@@ -1318,6 +2170,7 @@ async fn failure_after_ownership_cas_rolls_back_both_workspaces_completely() {
             path: "ownership.org".into(),
             source: source(item, "READY", "Ownership rollback.\r\n"),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -1337,6 +2190,7 @@ async fn failure_after_ownership_cas_rolls_back_both_workspaces_completely() {
             expected_document_revision: 1,
             expected_source_workspace_revision: source_revision,
             expected_target_workspace_revision: target_revision,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await

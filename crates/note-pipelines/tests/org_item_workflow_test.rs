@@ -2,11 +2,12 @@ mod support;
 
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_pipelines::org::{
-    add_dependency, assign_item, create_follow_up, create_item, link_note, move_item, put_document,
-    remove_dependency, reparent_item, schedule_item, unlink_note, validate_item_transition,
-    AssignItemRequest, CommandEnvelope, CreateFollowUpRequest, CreateItemRequest,
-    DependencyRequest, FixedOrgClock, FollowUpOrigin, MoveItemRequest, NoteLinkRequest, OrgContext,
-    OrgErrorCode, OrgFieldPatch, PutDocumentRequest, ReparentItemRequest, ScheduleItemRequest,
+    add_dependency, assign_item, claim_item, create_follow_up, create_item, link_note, move_item,
+    put_document, remove_dependency, reparent_item, schedule_item, unlink_note,
+    validate_item_transition, AssignItemRequest, CommandEnvelope, CreateFollowUpRequest,
+    CreateItemRequest, DependencyRequest, FixedOrgClock, FollowUpOrigin, LeaseProofInput,
+    MoveItemRequest, NoteLinkRequest, OrgClaimKind, OrgContext, OrgErrorCode, OrgFieldPatch,
+    PutDocumentRequest, ReparentItemRequest, ScheduleItemRequest, StartClaimRequest,
     UnlinkNoteRequest,
 };
 use note_storage::{
@@ -16,7 +17,7 @@ use note_storage::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
 use std::sync::Arc;
-use support::{event_log, org_test_context, EventStorageBackend};
+use support::{event_log, org_test_context, DeterministicTokenSource, EventStorageBackend};
 
 const NOW: i64 = 1_810_000_000;
 
@@ -94,6 +95,7 @@ async fn seed_document(
             path: path.into(),
             source,
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -444,6 +446,7 @@ async fn moves_between_documents_and_reparents_with_complete_revision_maps() {
             target_document_id: target_document,
             target_parent_id: Some(parent),
             expected_revisions: BTreeMap::from([(source_document, 1), (target_document, 1)]),
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -488,6 +491,7 @@ async fn moves_between_documents_and_reparents_with_complete_revision_maps() {
             document_id: target_document,
             target_parent_id: None,
             expected_revisions: expected(target_document, 2),
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -514,6 +518,7 @@ async fn moves_between_documents_and_reparents_with_complete_revision_maps() {
                 document_id: target_document,
                 target_parent_id: target_parent,
                 expected_revisions: expected(target_document, 3),
+                lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
@@ -536,6 +541,7 @@ async fn moves_between_documents_and_reparents_with_complete_revision_maps() {
                 document_id: target_document,
                 target_parent_id: Some(parent),
                 expected_revisions: expected(target_document, 2),
+                lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
@@ -553,6 +559,7 @@ async fn moves_between_documents_and_reparents_with_complete_revision_maps() {
             target_document_id: source_document,
             target_parent_id: None,
             expected_revisions: expected(target_document, 3),
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -578,6 +585,7 @@ async fn moves_between_documents_and_reparents_with_complete_revision_maps() {
                     document_id: target_document,
                     target_parent_id: Some(parent),
                     expected_revisions,
+                    lease_proofs: std::collections::BTreeMap::new(),
                 },
             )
             .await
@@ -620,6 +628,7 @@ async fn assignment_and_schedule_mutations_are_minimal_and_audited() {
                 document_id: document,
                 assignee: assignee.map(str::to_string),
                 expected_revisions: expected(document, i64::try_from(index).unwrap() + 1),
+                lease: None,
             },
         )
         .await
@@ -634,6 +643,7 @@ async fn assignment_and_schedule_mutations_are_minimal_and_audited() {
                 document_id: document,
                 assignee: None,
                 expected_revisions: expected(document, 4),
+                lease: None,
             },
         )
         .await
@@ -646,6 +656,7 @@ async fn assignment_and_schedule_mutations_are_minimal_and_audited() {
         document_id: document,
         assignee: Some(" agent-invalid".into()),
         expected_revisions: expected(document, 4),
+        lease: None,
     };
     assert_eq!(
         assign_item(
@@ -679,6 +690,7 @@ async fn assignment_and_schedule_mutations_are_minimal_and_audited() {
             scheduled: OrgFieldPatch::Set("<2027-05-15 Sat 09:30>".into()),
             deadline: OrgFieldPatch::Set("<2027-05-16 Sun 18:00>".into()),
             expected_revisions: expected(document, 4),
+            lease: None,
         },
     )
     .await
@@ -726,6 +738,7 @@ async fn assignment_and_schedule_mutations_are_minimal_and_audited() {
             scheduled: OrgFieldPatch::Unchanged,
             deadline: OrgFieldPatch::Clear,
             expected_revisions: expected(document, 5),
+            lease: None,
         },
     )
     .await
@@ -746,6 +759,7 @@ async fn assignment_and_schedule_mutations_are_minimal_and_audited() {
                 scheduled: OrgFieldPatch::Unchanged,
                 deadline: OrgFieldPatch::Unchanged,
                 expected_revisions: expected(document, 6),
+                lease: None,
             },
         )
         .await
@@ -774,8 +788,11 @@ async fn assignment_and_schedule_mutations_are_minimal_and_audited() {
 }
 
 #[tokio::test]
-async fn active_descendants_block_moves_and_assignments_but_not_schedule_edits() {
+async fn active_descendants_require_current_proofs_for_every_semantic_edit() {
     let (context, backend, _dir, _db_path, workspace_id) = org_test_context(NOW).await;
+    let context = context.with_token_source(Arc::new(DeterministicTokenSource::new([
+        "active-descendant-token",
+    ])));
     let source_document = document_id("51000000-0000-4000-8000-000000000025");
     let target_document = document_id("51000000-0000-4000-8000-000000000026");
     let parent = item_id("52000000-0000-4000-8000-000000000025");
@@ -787,7 +804,7 @@ async fn active_descendants_block_moves_and_assignments_but_not_schedule_edits()
         "seed-active-subtree",
         "active.org",
         format!(
-            "{}** RUNNING Active child\r\n:PROPERTIES:\r\n:ID: {child}\r\n:AGENT_NOTE_TYPE: subtask\r\n:END:\r\n",
+            "{}** READY Active child\r\n:PROPERTIES:\r\n:ID: {child}\r\n:AGENT_NOTE_TYPE: subtask\r\n:END:\r\n",
             source(parent, "BACKLOG", "Parent", "")
         ),
     )
@@ -801,6 +818,18 @@ async fn active_descendants_block_moves_and_assignments_but_not_schedule_edits()
         "Target opaque.\r\n".into(),
     )
     .await;
+    let claim = claim_item(
+        &context,
+        &envelope(workspace_id, "claim-active-child"),
+        &StartClaimRequest {
+            work_item_id: child,
+            document_id: source_document,
+            expected_document_revision: 1,
+            kind: OrgClaimKind::Execution,
+        },
+    )
+    .await
+    .unwrap();
     let baseline = item_workspace_snapshot(backend.as_ref(), workspace_id).await;
 
     assert_eq!(
@@ -812,13 +841,14 @@ async fn active_descendants_block_moves_and_assignments_but_not_schedule_edits()
                 source_document_id: source_document,
                 target_document_id: target_document,
                 target_parent_id: None,
-                expected_revisions: BTreeMap::from([(source_document, 1), (target_document, 1),]),
+                expected_revisions: BTreeMap::from([(source_document, 2), (target_document, 1),]),
+                lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
         .unwrap_err()
         .code,
-        OrgErrorCode::InvalidTransition
+        OrgErrorCode::StaleLease
     );
     assert_eq!(
         assign_item(
@@ -828,19 +858,149 @@ async fn active_descendants_block_moves_and_assignments_but_not_schedule_edits()
                 item_id: child,
                 document_id: source_document,
                 assignee: Some("agent-active".into()),
-                expected_revisions: expected(source_document, 1),
+                expected_revisions: expected(source_document, 2),
+                lease: None,
             },
         )
         .await
         .unwrap_err()
         .code,
-        OrgErrorCode::InvalidTransition
+        OrgErrorCode::StaleLease
     );
     assert_eq!(
         item_workspace_snapshot(backend.as_ref(), workspace_id).await,
         baseline
     );
+    let stale_proof = LeaseProofInput {
+        lease_id: claim.lease_id.clone(),
+        kind: OrgClaimKind::Execution,
+        fencing_token: "stale-semantic-token".into(),
+    };
+    assert_eq!(
+        move_item(
+            &context,
+            &envelope(workspace_id, "move-active-subtree-stale"),
+            &MoveItemRequest {
+                item_id: parent,
+                source_document_id: source_document,
+                target_document_id: target_document,
+                target_parent_id: None,
+                expected_revisions: BTreeMap::from([(source_document, 2), (target_document, 1)]),
+                lease_proofs: BTreeMap::from([(child, stale_proof.clone())]),
+            },
+        )
+        .await
+        .unwrap_err()
+        .code,
+        OrgErrorCode::StaleLease
+    );
+    assert_eq!(
+        assign_item(
+            &context,
+            &envelope(workspace_id, "assign-active-child-stale"),
+            &AssignItemRequest {
+                item_id: child,
+                document_id: source_document,
+                assignee: Some("agent-active".into()),
+                expected_revisions: expected(source_document, 2),
+                lease: Some(stale_proof.clone()),
+            },
+        )
+        .await
+        .unwrap_err()
+        .code,
+        OrgErrorCode::StaleLease
+    );
+    assert_eq!(
+        schedule_item(
+            &context,
+            &envelope(workspace_id, "schedule-active-child-stale"),
+            &ScheduleItemRequest {
+                item_id: child,
+                document_id: source_document,
+                scheduled: OrgFieldPatch::Unchanged,
+                deadline: OrgFieldPatch::Set("<2027-06-02 Wed 10:00>".into()),
+                expected_revisions: expected(source_document, 2),
+                lease: Some(stale_proof),
+            },
+        )
+        .await
+        .unwrap_err()
+        .code,
+        OrgErrorCode::StaleLease
+    );
 
+    for (operation, lease_proofs) in [
+        ("reparent-active-child-missing", BTreeMap::new()),
+        (
+            "reparent-active-child-stale",
+            BTreeMap::from([(
+                child,
+                LeaseProofInput {
+                    lease_id: claim.lease_id.clone(),
+                    kind: OrgClaimKind::Execution,
+                    fencing_token: "stale-reparent-token".into(),
+                },
+            )]),
+        ),
+    ] {
+        assert_eq!(
+            reparent_item(
+                &context,
+                &envelope(workspace_id, operation),
+                &ReparentItemRequest {
+                    item_id: child,
+                    document_id: source_document,
+                    target_parent_id: None,
+                    expected_revisions: expected(source_document, 2),
+                    lease_proofs,
+                },
+            )
+            .await
+            .unwrap_err()
+            .code,
+            OrgErrorCode::StaleLease
+        );
+    }
+    reparent_item(
+        &context,
+        &envelope(workspace_id, "reparent-active-child-current"),
+        &ReparentItemRequest {
+            item_id: child,
+            document_id: source_document,
+            target_parent_id: None,
+            expected_revisions: expected(source_document, 2),
+            lease_proofs: BTreeMap::from([(
+                child,
+                LeaseProofInput {
+                    lease_id: claim.lease_id.clone(),
+                    kind: OrgClaimKind::Execution,
+                    fencing_token: claim.fencing_token.clone(),
+                },
+            )]),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        schedule_item(
+            &context,
+            &envelope(workspace_id, "schedule-active-child-missing"),
+            &ScheduleItemRequest {
+                item_id: child,
+                document_id: source_document,
+                scheduled: OrgFieldPatch::Set("<2027-06-01 Tue 10:00>".into()),
+                deadline: OrgFieldPatch::Unchanged,
+                expected_revisions: expected(source_document, 3),
+                lease: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .code,
+        OrgErrorCode::StaleLease
+    );
     schedule_item(
         &context,
         &envelope(workspace_id, "schedule-active-child"),
@@ -849,7 +1009,12 @@ async fn active_descendants_block_moves_and_assignments_but_not_schedule_edits()
             document_id: source_document,
             scheduled: OrgFieldPatch::Set("<2027-06-01 Tue 10:00>".into()),
             deadline: OrgFieldPatch::Unchanged,
-            expected_revisions: expected(source_document, 1),
+            expected_revisions: expected(source_document, 3),
+            lease: Some(LeaseProofInput {
+                lease_id: claim.lease_id,
+                kind: OrgClaimKind::Execution,
+                fencing_token: claim.fencing_token,
+            }),
         },
     )
     .await
@@ -919,6 +1084,7 @@ async fn schedule_rejects_ambiguous_and_nonexistent_workspace_local_times_atomic
                 scheduled: OrgFieldPatch::Set(timestamp.into()),
                 deadline: OrgFieldPatch::Unchanged,
                 expected_revisions: expected(document, 1),
+                lease: None,
             },
         )
         .await
@@ -964,6 +1130,7 @@ async fn dependencies_reject_invalid_graphs_and_transition_validation_uses_succe
             dependency_id: prerequisite,
             document_id: document,
             expected_revisions: expected(document, 1),
+            lease: None,
         },
     )
     .await
@@ -1008,6 +1175,7 @@ async fn dependencies_reject_invalid_graphs_and_transition_validation_uses_succe
             dependency_id: dependent,
             document_id: document,
             expected_revisions: expected(document, 2),
+            lease: None,
         },
     )
     .await
@@ -1021,6 +1189,7 @@ async fn dependencies_reject_invalid_graphs_and_transition_validation_uses_succe
             dependency_id: item_id("52000000-0000-4000-8000-000000000039"),
             document_id: document,
             expected_revisions: expected(document, 2),
+            lease: None,
         },
     )
     .await
@@ -1061,6 +1230,7 @@ async fn dependencies_reject_invalid_graphs_and_transition_validation_uses_succe
             dependency_id: dependent,
             document_id: document,
             expected_revisions: expected(document, 2),
+            lease: None,
         },
     )
     .await
@@ -1088,6 +1258,7 @@ async fn dependencies_reject_invalid_graphs_and_transition_validation_uses_succe
             dependency_id: prerequisite,
             document_id: document,
             expected_revisions: expected(document, 2),
+            lease: None,
         },
     )
     .await
@@ -1116,6 +1287,7 @@ async fn dependencies_reject_invalid_graphs_and_transition_validation_uses_succe
                 dependency_id: prerequisite,
                 document_id: document,
                 expected_revisions: expected(document, 3),
+                lease: None,
             },
         )
         .await
@@ -1177,6 +1349,7 @@ async fn cross_workspace_origins_dependencies_and_document_ownership_are_rejecte
                 dependency_id: foreign_item,
                 document_id: local_document,
                 expected_revisions: expected(local_document, 1),
+                lease: None,
             },
         )
         .await
@@ -1208,6 +1381,7 @@ async fn cross_workspace_origins_dependencies_and_document_ownership_are_rejecte
                 document_id: foreign_document,
                 assignee: Some("wrong-workspace".into()),
                 expected_revisions: expected(foreign_document, 1),
+                lease: None,
             },
         )
         .await
@@ -1258,6 +1432,7 @@ async fn note_links_require_active_targets_but_remain_weak_after_deletion() {
             note_id: note_id.parse().unwrap(),
             description: "Design context".into(),
             expected_revisions: expected(document, 1),
+            lease: None,
         },
     )
     .await
@@ -1272,6 +1447,7 @@ async fn note_links_require_active_targets_but_remain_weak_after_deletion() {
             note_id: note_id.parse().unwrap(),
             description: "Design context".into(),
             expected_revisions: expected(document, 1),
+            lease: None,
         },
     )
     .await
@@ -1288,6 +1464,7 @@ async fn note_links_require_active_targets_but_remain_weak_after_deletion() {
                 note_id: note_id.parse().unwrap(),
                 description: "Design context".into(),
                 expected_revisions: expected(document, 2),
+                lease: None,
             },
         )
         .await
@@ -1322,6 +1499,7 @@ async fn note_links_require_active_targets_but_remain_weak_after_deletion() {
             note_id: note_id.parse().unwrap(),
             description: "Deleted target".into(),
             expected_revisions: expected(document, 2),
+            lease: None,
         },
     )
     .await
@@ -1338,6 +1516,7 @@ async fn note_links_require_active_targets_but_remain_weak_after_deletion() {
             note_id: "53000000-0000-4000-8000-000000000041".parse().unwrap(),
             description: "Missing".into(),
             expected_revisions: expected(document, 2),
+            lease: None,
         },
     )
     .await
@@ -1352,6 +1531,7 @@ async fn note_links_require_active_targets_but_remain_weak_after_deletion() {
             purpose: "design".into(),
             note_id: note_id.parse().unwrap(),
             expected_revisions: expected(document, 2),
+            lease: None,
         },
     )
     .await

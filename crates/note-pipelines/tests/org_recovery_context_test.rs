@@ -88,6 +88,7 @@ async fn context_maps_canonical_relations_attempts_history_and_note_availability
             path: "recovery.org".into(),
             source,
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -284,6 +285,7 @@ async fn context_hydrates_work_item_and_event_follow_up_origins() {
             path: "origins.org".into(),
             source: "Origin prelude.\r\n".into(),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -387,6 +389,7 @@ async fn context_orders_a_to_b_to_a_history_by_lineage_and_keeps_attempt_ownersh
                 "* READY Lineage\r\n:PROPERTIES:\r\n:ID: {item}\r\n:AGENT_NOTE_TYPE: task\r\n:END:\r\n"
             ),
             expected_revision: None,
+        lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -416,6 +419,7 @@ async fn context_orders_a_to_b_to_a_history_by_lineage_and_keeps_attempt_ownersh
             expected_document_revision: 1,
             expected_source_workspace_revision: 1,
             expected_target_workspace_revision: 1,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -456,6 +460,7 @@ async fn context_orders_a_to_b_to_a_history_by_lineage_and_keeps_attempt_ownersh
             expected_document_revision: document_after_first.revision,
             expected_source_workspace_revision: workspace_b_current.revision,
             expected_target_workspace_revision: workspace_a_current.revision,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -503,6 +508,7 @@ async fn empty_relations_and_read_failures_are_mapped_without_partial_context() 
                 "* BACKLOG Empty\r\n:PROPERTIES:\r\n:ID: {item}\r\n:AGENT_NOTE_TYPE: task\r\n:END:\r\n"
             ),
             expected_revision: None,
+        lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await

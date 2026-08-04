@@ -25,6 +25,6 @@ pub use error::*;
 pub use execution::*;
 pub use items::*;
 pub(crate) use mutation::*;
-pub use projection::*;
+pub(crate) use projection::*;
 pub use reviews::*;
 pub use workspaces::*;

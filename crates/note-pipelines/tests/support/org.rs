@@ -88,6 +88,42 @@ impl OrgWorkflowTestHook for FailOnceAtWorkflowPhase {
     }
 }
 
+pub struct FailAtWorkflowPhaseOccurrence {
+    phase: OrgWorkflowPhase,
+    occurrence: usize,
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+impl FailAtWorkflowPhaseOccurrence {
+    pub fn new(phase: OrgWorkflowPhase, occurrence: usize) -> Self {
+        assert!(occurrence > 0);
+        Self {
+            phase,
+            occurrence,
+            seen: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl OrgWorkflowTestHook for FailAtWorkflowPhaseOccurrence {
+    fn after_phase(&self, phase: OrgWorkflowPhase) -> Result<(), OrgError> {
+        if phase == self.phase
+            && self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.occurrence
+        {
+            return Err(OrgError::new(
+                note_pipelines::org::OrgErrorCode::StorageFailure,
+                "injected workflow occurrence failure",
+                serde_json::json!({
+                    "phase": format!("{phase:?}"),
+                    "occurrence": self.occurrence,
+                }),
+                true,
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub async fn org_test_context(
     now: i64,
 ) -> (

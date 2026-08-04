@@ -3,8 +3,8 @@ use super::{
     execute_idempotent, get_item_context_in_transaction, project_document, projected_to_domain,
     resolve_cas, validate_item_transition, validate_projected_items_for_policy, CommandEnvelope,
     HeartbeatClaimRequest, OrgClaimKind, OrgClaimPhase, OrgClaimResult, OrgCommandKind,
-    OrgCommandResult, OrgContext, OrgError, OrgErrorCode, ReleaseClaimRequest, StartClaimRequest,
-    ORG_COMMAND_SCHEMA_VERSION,
+    OrgCommandResult, OrgContext, OrgError, OrgErrorCode, OrgWorkflowPhase, ReleaseClaimRequest,
+    StartClaimRequest, ORG_COMMAND_SCHEMA_VERSION,
 };
 use note_org::{
     AttemptPhase, ClaimDecisionError, ClaimKind, ClaimQueue, ClaimRequest, LeaseKind, LeaseStatus,
@@ -654,6 +654,20 @@ pub(crate) async fn bookkeep_expired_lease(
     lease: &OrgLease,
     now: i64,
 ) -> Result<String, OrgError> {
+    bookkeep_expired_lease_with_phases(transaction, workspace, item, lease, now, |_| Ok(())).await
+}
+
+pub(crate) async fn bookkeep_expired_lease_with_phases<F>(
+    transaction: &dyn StorageTransaction,
+    workspace: &OrgWorkspace,
+    item: &OrgProjectedWorkItem,
+    lease: &OrgLease,
+    now: i64,
+    mut after_phase: F,
+) -> Result<String, OrgError>
+where
+    F: FnMut(OrgWorkflowPhase) -> Result<(), OrgError>,
+{
     let expiry_event_id = uuid::Uuid::new_v4().to_string();
     let closed = transaction
         .close_expired_org_lease(ExpiredOrgLeaseClosure {
@@ -668,6 +682,7 @@ pub(crate) async fn bookkeep_expired_lease(
     if !matches!(closed, ConditionalUpdate::Applied(_)) {
         return Err(stale_lease());
     }
+    after_phase(OrgWorkflowPhase::LeaseUpdate)?;
     if lease.kind == OrgLeaseKind::Execution {
         let attempt = transaction
             .get_org_attempt(&lease.attempt_id)
@@ -692,8 +707,9 @@ pub(crate) async fn bookkeep_expired_lease(
                 .map_err(OrgError::storage)?,
             "attempt",
         )?;
+        after_phase(OrgWorkflowPhase::AttemptUpdate)?;
     }
-    append_event(
+    let event_id = append_event(
         transaction,
         &expiry_event_id,
         workspace,
@@ -707,7 +723,9 @@ pub(crate) async fn bookkeep_expired_lease(
         item.state.as_deref(),
         item.state.as_deref(),
     )
-    .await
+    .await?;
+    after_phase(OrgWorkflowPhase::Events)?;
+    Ok(event_id)
 }
 
 async fn finish_release_error(

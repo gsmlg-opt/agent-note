@@ -1,5 +1,7 @@
 use super::{
-    execute_idempotent, CommandEnvelope, ConservativeLeaseGuard, LeaseGuard, LeaseGuardOperation,
+    bookkeep_expired_lease_with_phases, execute_idempotent, inspect_touched_lease_proofs_except,
+    resolve_lease_update, resolve_update, stale_lease, storage_kind, token_hash,
+    validate_lease_input, validate_touched_lease_proofs, CommandEnvelope, LeaseProofInput,
     OrgCommandKind, OrgCommandResult, OrgContext, OrgError, OrgErrorCode,
     ORG_COMMAND_SCHEMA_VERSION,
 };
@@ -8,7 +10,8 @@ use note_org::{
     WorkItemType, WorkspaceId, WorkspacePolicy,
 };
 use note_storage::{
-    NewOrgEvent, OrgDocument, OrgDocumentUpdate, OrgEventType, OrgProjectedWorkItem, OrgWorkspace,
+    NewOrgEvent, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument, OrgDocumentUpdate, OrgEventType,
+    OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseProof, OrgProjectedWorkItem, OrgWorkspace,
     StorageTransaction,
 };
 use serde::{Deserialize, Serialize};
@@ -26,6 +29,12 @@ const ADD_DEPENDENCY: OrgCommandKind = OrgCommandKind::new("add_dependency", 1);
 const REMOVE_DEPENDENCY: OrgCommandKind = OrgCommandKind::new("remove_dependency", 1);
 const LINK_NOTE: OrgCommandKind = OrgCommandKind::new("link_note", 1);
 const UNLINK_NOTE: OrgCommandKind = OrgCommandKind::new("unlink_note", 1);
+
+#[derive(Clone, Copy)]
+enum OwnershipAction {
+    Preserve,
+    Reassign,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateItemRequest {
@@ -61,6 +70,7 @@ pub struct MoveItemRequest {
     pub target_document_id: DocumentId,
     pub target_parent_id: Option<WorkItemId>,
     pub expected_revisions: BTreeMap<DocumentId, i64>,
+    pub lease_proofs: BTreeMap<WorkItemId, LeaseProofInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +79,7 @@ pub struct ReparentItemRequest {
     pub document_id: DocumentId,
     pub target_parent_id: Option<WorkItemId>,
     pub expected_revisions: BTreeMap<DocumentId, i64>,
+    pub lease_proofs: BTreeMap<WorkItemId, LeaseProofInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +88,7 @@ pub struct AssignItemRequest {
     pub document_id: DocumentId,
     pub assignee: Option<String>,
     pub expected_revisions: BTreeMap<DocumentId, i64>,
+    pub lease: Option<LeaseProofInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +98,7 @@ pub struct ScheduleItemRequest {
     pub scheduled: OrgFieldPatch<String>,
     pub deadline: OrgFieldPatch<String>,
     pub expected_revisions: BTreeMap<DocumentId, i64>,
+    pub lease: Option<LeaseProofInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +115,7 @@ pub struct DependencyRequest {
     pub dependency_id: WorkItemId,
     pub document_id: DocumentId,
     pub expected_revisions: BTreeMap<DocumentId, i64>,
+    pub lease: Option<LeaseProofInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +126,7 @@ pub struct NoteLinkRequest {
     pub note_id: uuid::Uuid,
     pub description: String,
     pub expected_revisions: BTreeMap<DocumentId, i64>,
+    pub lease: Option<LeaseProofInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +136,7 @@ pub struct UnlinkNoteRequest {
     pub purpose: String,
     pub note_id: uuid::Uuid,
     pub expected_revisions: BTreeMap<DocumentId, i64>,
+    pub lease: Option<LeaseProofInput>,
 }
 
 pub async fn create_item(
@@ -158,6 +174,7 @@ async fn execute_create(
     let request = request.clone();
     let origin = origin.clone();
     let command = envelope.clone();
+    let workflow_context = context.clone();
     execute_idempotent(
         context,
         kind,
@@ -190,7 +207,6 @@ async fn execute_create(
                 let loaded = load_documents(
                     transaction,
                     &workspace,
-                    &request.expected_revisions,
                     BTreeSet::from([request.document_id]),
                 )
                 .await?;
@@ -268,12 +284,15 @@ async fn execute_create(
                 }
                 commit_sources(
                     transaction,
+                    &workflow_context,
                     &workspace,
                     &command,
                     loaded,
                     BTreeMap::from([(request.document_id, source)]),
+                    request.expected_revisions.clone(),
                     BTreeSet::new(),
-                    None,
+                    BTreeMap::new(),
+                    OwnershipAction::Preserve,
                     events,
                     now,
                 )
@@ -307,6 +326,7 @@ pub async fn reparent_item(
             target_document_id: request.document_id,
             target_parent_id: request.target_parent_id,
             expected_revisions: request.expected_revisions.clone(),
+            lease_proofs: request.lease_proofs.clone(),
         },
     )
     .await
@@ -320,8 +340,16 @@ async fn execute_move(
 ) -> Result<OrgCommandResult, OrgError> {
     let required = BTreeSet::from([request.source_document_id, request.target_document_id]);
     validate_expected_keys(&request.expected_revisions, &required)?;
-    let fingerprint = request.clone();
+    let fingerprint = json!({
+        "item_id": request.item_id,
+        "source_document_id": request.source_document_id,
+        "target_document_id": request.target_document_id,
+        "target_parent_id": request.target_parent_id,
+        "expected_revisions": request.expected_revisions,
+        "lease_proofs": proof_map_fingerprint(&request.lease_proofs),
+    });
     let command = envelope.clone();
+    let workflow_context = context.clone();
     execute_idempotent(
         context,
         kind,
@@ -330,13 +358,7 @@ async fn execute_move(
         move |transaction, now| {
             Box::pin(async move {
                 let workspace = require_workspace(transaction, command.workspace_id).await?;
-                let loaded = load_documents(
-                    transaction,
-                    &workspace,
-                    &request.expected_revisions,
-                    required,
-                )
-                .await?;
+                let loaded = load_documents(transaction, &workspace, required).await?;
                 let source_document = &loaded[&request.source_document_id];
                 let root = source_document
                     .parsed
@@ -382,12 +404,15 @@ async fn execute_move(
                 });
                 commit_sources(
                     transaction,
+                    &workflow_context,
                     &workspace,
                     &command,
                     loaded,
                     sources,
+                    request.expected_revisions.clone(),
                     moved_ids,
-                    Some(LeaseGuardOperation::ItemMove),
+                    request.lease_proofs.clone(),
+                    OwnershipAction::Preserve,
                     vec![PendingEvent {
                         subject_id: request.item_id,
                         event_type: OrgEventType::ItemMove,
@@ -417,8 +442,14 @@ pub async fn assign_item(
             "Org assignee must be one trimmed nonblank line",
         ));
     }
+    let fingerprint = json!({
+        "item_id": request.item_id,
+        "document_id": request.document_id,
+        "assignee": request.assignee,
+        "expected_revisions": request.expected_revisions,
+        "lease": request.lease.as_ref().map(lease_fingerprint),
+    });
     let request = request.clone();
-    let fingerprint = request.clone();
     execute_single_item_edit(
         context,
         envelope,
@@ -427,15 +458,31 @@ pub async fn assign_item(
         request.document_id,
         request.item_id,
         request.expected_revisions.clone(),
-        Some(LeaseGuardOperation::Assignment),
+        request.lease.clone(),
+        OwnershipAction::Reassign,
         move |item, document, policy| {
             if item.assignee == request.assignee {
                 return Err(OrgError::invalid_input(
                     "Org assignment mutation does not change the assignee",
                 ));
             }
+            let recovery_state = request.lease.as_ref().map(|proof| match proof.kind {
+                super::OrgClaimKind::Execution => policy.release_state.clone(),
+                super::OrgClaimKind::Review => policy.review_rejection_state.clone(),
+            });
+            let mut source = document.source().to_string();
+            if let Some(state) = &recovery_state {
+                source = apply_edit(
+                    &source,
+                    policy,
+                    SemanticEdit::SetState {
+                        item_id: request.item_id,
+                        state: state.clone(),
+                    },
+                )?;
+            }
             let source = apply_edit(
-                document.source(),
+                &source,
                 policy,
                 SemanticEdit::SetProperty {
                     item_id: request.item_id,
@@ -454,7 +501,7 @@ pub async fn assign_item(
                         "resulting_assignee": request.assignee,
                     }),
                     previous_state: item.state.clone(),
-                    resulting_state: item.state.clone(),
+                    resulting_state: recovery_state.or_else(|| item.state.clone()),
                 }],
             ))
         },
@@ -467,8 +514,15 @@ pub async fn schedule_item(
     envelope: &CommandEnvelope,
     request: &ScheduleItemRequest,
 ) -> Result<OrgCommandResult, OrgError> {
+    let fingerprint = json!({
+        "item_id": request.item_id,
+        "document_id": request.document_id,
+        "scheduled": request.scheduled,
+        "deadline": request.deadline,
+        "expected_revisions": request.expected_revisions,
+        "lease": request.lease.as_ref().map(lease_fingerprint),
+    });
     let request = request.clone();
-    let fingerprint = request.clone();
     execute_single_item_edit(
         context,
         envelope,
@@ -477,7 +531,8 @@ pub async fn schedule_item(
         request.document_id,
         request.item_id,
         request.expected_revisions.clone(),
-        None,
+        request.lease.clone(),
+        OwnershipAction::Preserve,
         move |item, document, policy| {
             let mut source = document.source().to_string();
             let mut events = Vec::new();
@@ -564,8 +619,15 @@ async fn change_dependency(
     if add && request.item_id == request.dependency_id {
         return Err(OrgError::invalid_input("Work item cannot depend on itself"));
     }
+    let fingerprint = json!({
+        "item_id": request.item_id,
+        "dependency_id": request.dependency_id,
+        "document_id": request.document_id,
+        "expected_revisions": request.expected_revisions,
+        "lease": request.lease.as_ref().map(lease_fingerprint),
+        "add": add,
+    });
     let request = request.clone();
-    let fingerprint = request.clone();
     execute_single_item_edit(
         context,
         envelope,
@@ -574,7 +636,8 @@ async fn change_dependency(
         request.document_id,
         request.item_id,
         request.expected_revisions.clone(),
-        None,
+        request.lease.clone(),
+        OwnershipAction::Preserve,
         move |item, document, policy| {
             let previous_dependencies = item.dependencies.clone();
             let mut dependencies = item.dependencies.iter().copied().collect::<BTreeSet<_>>();
@@ -634,8 +697,16 @@ pub async fn link_note(
     envelope: &CommandEnvelope,
     request: &NoteLinkRequest,
 ) -> Result<OrgCommandResult, OrgError> {
+    let fingerprint = json!({
+        "item_id": request.item_id,
+        "document_id": request.document_id,
+        "purpose": request.purpose,
+        "note_id": request.note_id,
+        "description": request.description,
+        "expected_revisions": request.expected_revisions,
+        "lease": request.lease.as_ref().map(lease_fingerprint),
+    });
     let request = request.clone();
-    let fingerprint = request.clone();
     execute_single_item_edit(
         context,
         envelope,
@@ -644,7 +715,8 @@ pub async fn link_note(
         request.document_id,
         request.item_id,
         request.expected_revisions.clone(),
-        None,
+        request.lease.clone(),
+        OwnershipAction::Preserve,
         move |item, document, policy| {
             let source = apply_edit(
                 document.source(),
@@ -683,8 +755,15 @@ pub async fn unlink_note(
     envelope: &CommandEnvelope,
     request: &UnlinkNoteRequest,
 ) -> Result<OrgCommandResult, OrgError> {
+    let fingerprint = json!({
+        "item_id": request.item_id,
+        "document_id": request.document_id,
+        "purpose": request.purpose,
+        "note_id": request.note_id,
+        "expected_revisions": request.expected_revisions,
+        "lease": request.lease.as_ref().map(lease_fingerprint),
+    });
     let request = request.clone();
-    let fingerprint = request.clone();
     execute_single_item_edit(
         context,
         envelope,
@@ -693,7 +772,8 @@ pub async fn unlink_note(
         request.document_id,
         request.item_id,
         request.expected_revisions.clone(),
-        None,
+        request.lease.clone(),
+        OwnershipAction::Preserve,
         move |item, document, policy| {
             let source = apply_edit(
                 document.source(),
@@ -789,7 +869,8 @@ async fn execute_single_item_edit<R, F>(
     document_id: DocumentId,
     item_id: WorkItemId,
     expected_revisions: BTreeMap<DocumentId, i64>,
-    guard_operation: Option<LeaseGuardOperation>,
+    lease: Option<LeaseProofInput>,
+    ownership_action: OwnershipAction,
     edit: F,
 ) -> Result<OrgCommandResult, OrgError>
 where
@@ -806,6 +887,7 @@ where
     let fingerprint = serde_json::to_value(fingerprint)
         .map_err(|_| OrgError::invalid_input("Org item request cannot be serialized"))?;
     let command = envelope.clone();
+    let workflow_context = context.clone();
     execute_idempotent(
         context,
         kind,
@@ -814,13 +896,8 @@ where
         move |transaction, now| {
             Box::pin(async move {
                 let workspace = require_workspace(transaction, command.workspace_id).await?;
-                let loaded = load_documents(
-                    transaction,
-                    &workspace,
-                    &expected_revisions,
-                    BTreeSet::from([document_id]),
-                )
-                .await?;
+                let loaded =
+                    load_documents(transaction, &workspace, BTreeSet::from([document_id])).await?;
                 let projected = transaction
                     .get_org_work_item(item_id)
                     .await
@@ -831,14 +908,20 @@ where
                 }
                 let (source, events) =
                     edit(&projected, &loaded[&document_id].parsed, &workspace.policy)?;
+                let lease_proofs = lease
+                    .map(|proof| BTreeMap::from([(item_id, proof)]))
+                    .unwrap_or_default();
                 commit_sources(
                     transaction,
+                    &workflow_context,
                     &workspace,
                     &command,
                     loaded,
                     BTreeMap::from([(document_id, source)]),
+                    expected_revisions.clone(),
                     BTreeSet::from([item_id]),
-                    guard_operation,
+                    lease_proofs,
+                    ownership_action,
                     events,
                     now,
                 )
@@ -866,10 +949,8 @@ struct PendingEvent {
 async fn load_documents(
     transaction: &dyn StorageTransaction,
     workspace: &OrgWorkspace,
-    expected_revisions: &BTreeMap<DocumentId, i64>,
     required: BTreeSet<DocumentId>,
 ) -> Result<BTreeMap<DocumentId, LoadedDocument>, OrgError> {
-    validate_expected_keys(expected_revisions, &required)?;
     let mut loaded = BTreeMap::new();
     for document_id in required {
         let stored = transaction
@@ -879,15 +960,6 @@ async fn load_documents(
             .ok_or_else(|| not_found("document"))?;
         if stored.workspace_id != workspace.id {
             return Err(not_found("document"));
-        }
-        let expected = expected_revisions[&document_id];
-        if stored.revision != expected {
-            return Err(OrgError::new(
-                OrgErrorCode::StaleRevision,
-                "Org document revision is stale",
-                json!({"document_id": document_id, "current_revision": stored.revision}),
-                true,
-            ));
         }
         let parsed = parse_document(stored.source.clone(), &workspace.policy.parse_options())
             .map_err(parse_error)?;
@@ -899,12 +971,15 @@ async fn load_documents(
 #[allow(clippy::too_many_arguments)]
 async fn commit_sources(
     transaction: &dyn StorageTransaction,
+    context: &OrgContext,
     workspace: &OrgWorkspace,
     command: &CommandEnvelope,
     loaded: BTreeMap<DocumentId, LoadedDocument>,
     sources: BTreeMap<DocumentId, String>,
+    expected_revisions: BTreeMap<DocumentId, i64>,
     guard_item_ids: BTreeSet<WorkItemId>,
-    guard_operation: Option<LeaseGuardOperation>,
+    lease_proofs: BTreeMap<WorkItemId, LeaseProofInput>,
+    ownership_action: OwnershipAction,
     events: Vec<PendingEvent>,
     now: i64,
 ) -> Result<OrgCommandResult, OrgError> {
@@ -957,10 +1032,61 @@ async fn commit_sources(
             .iter()
             .filter_map(|id| candidate_by_id.get(id).copied().cloned()),
     );
-    if let Some(operation) = guard_operation {
-        ConservativeLeaseGuard.validate(operation, &workspace.policy, &guarded)?;
-    }
-
+    let deferred = match ownership_action {
+        OwnershipAction::Preserve => BTreeSet::new(),
+        OwnershipAction::Reassign => guard_item_ids.clone(),
+    };
+    inspect_touched_lease_proofs_except(
+        transaction,
+        workspace,
+        &command.actor_id,
+        &guarded,
+        &lease_proofs,
+        &deferred,
+        now,
+    )
+    .await?;
+    context.after_workflow_phase(super::OrgWorkflowPhase::Proof)?;
+    validate_loaded_revisions(&loaded, &expected_revisions)?;
+    let event_attempts = match ownership_action {
+        OwnershipAction::Preserve => {
+            let guard = validate_touched_lease_proofs(
+                transaction,
+                workspace,
+                &command.actor_id,
+                &guarded,
+                &lease_proofs,
+                now,
+            )
+            .await?;
+            let mut attempts = BTreeMap::new();
+            for (item_id, lease) in guard.active {
+                let attempt = transaction
+                    .get_org_attempt(&lease.attempt_id)
+                    .await
+                    .map_err(OrgError::storage)?
+                    .ok_or_else(|| not_found("attempt"))?;
+                if attempt.workspace_id == workspace.id {
+                    attempts.insert(item_id, lease.attempt_id);
+                }
+            }
+            attempts
+        }
+        OwnershipAction::Reassign => {
+            close_reassigned_ownership(
+                transaction,
+                context,
+                workspace,
+                command,
+                &old_projection,
+                &candidate,
+                &guarded,
+                &lease_proofs,
+                now,
+            )
+            .await?
+        }
+    };
     let mut revisions = BTreeMap::new();
     for (document_id, source) in &sources {
         let stored = &loaded[document_id].stored;
@@ -979,11 +1105,13 @@ async fn commit_sources(
             "document",
         )?;
         revisions.insert(document_id.to_string(), updated.revision);
+        context.after_workflow_phase(super::OrgWorkflowPhase::SourceEdit)?;
     }
     transaction
         .rebuild_org_workspace_projection(workspace.id, &candidate)
         .await
         .map_err(OrgError::storage)?;
+    context.after_workflow_phase(super::OrgWorkflowPhase::ProjectionUpdate)?;
     let result_data = command_result_data(&candidate, &events, sources.len());
     let mut event_ids = Vec::new();
     for event in events {
@@ -994,7 +1122,7 @@ async fn commit_sources(
                 subject_kind: "work_item",
                 subject_id: &event.subject_id.to_string(),
                 actor_id: &command.actor_id,
-                attempt_id: None,
+                attempt_id: event_attempts.get(&event.subject_id).map(String::as_str),
                 event_type: event.event_type,
                 occurred_at: now,
                 summary: event.summary,
@@ -1005,6 +1133,7 @@ async fn commit_sources(
             .await
             .map_err(OrgError::storage)?;
         event_ids.push(appended.id);
+        context.after_workflow_phase(super::OrgWorkflowPhase::Events)?;
     }
     Ok(OrgCommandResult {
         schema_version: ORG_COMMAND_SCHEMA_VERSION,
@@ -1015,6 +1144,146 @@ async fn commit_sources(
         document_revisions: revisions,
         data: result_data,
     })
+}
+
+fn validate_loaded_revisions(
+    loaded: &BTreeMap<DocumentId, LoadedDocument>,
+    expected_revisions: &BTreeMap<DocumentId, i64>,
+) -> Result<(), OrgError> {
+    for (document_id, document) in loaded {
+        if document.stored.revision != expected_revisions[document_id] {
+            return Err(OrgError::new(
+                OrgErrorCode::StaleRevision,
+                "Org document revision is stale",
+                json!({
+                    "document_id": document_id,
+                    "current_revision": document.stored.revision,
+                }),
+                true,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn close_reassigned_ownership(
+    transaction: &dyn StorageTransaction,
+    context: &OrgContext,
+    workspace: &OrgWorkspace,
+    command: &CommandEnvelope,
+    old_projection: &[OrgProjectedWorkItem],
+    candidate: &[OrgProjectedWorkItem],
+    touched: &[OrgProjectedWorkItem],
+    proofs: &BTreeMap<WorkItemId, LeaseProofInput>,
+    now: i64,
+) -> Result<BTreeMap<WorkItemId, String>, OrgError> {
+    let touched_by_id = touched
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    let candidate_by_id = candidate
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    let old_by_id = old_projection
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    let mut active = BTreeMap::new();
+    let mut expired = Vec::new();
+    for item in touched_by_id.values() {
+        let Some(lease) = transaction
+            .get_open_org_lease_internal(item.id)
+            .await
+            .map_err(OrgError::storage)?
+        else {
+            continue;
+        };
+        if lease.expires_at <= now {
+            expired.push(((*item).clone(), lease));
+        } else {
+            active.insert(item.id, lease);
+        }
+    }
+    if proofs.keys().copied().collect::<BTreeSet<_>>()
+        != active.keys().copied().collect::<BTreeSet<_>>()
+    {
+        return Err(stale_lease());
+    }
+    for (item_id, lease) in &active {
+        let current = old_by_id[item_id];
+        let target = candidate_by_id[item_id]
+            .state
+            .as_deref()
+            .ok_or_else(|| OrgError::invalid_input("Org work item has no workflow state"))?;
+        validate_item_transition(&workspace.policy, current, old_projection, target, false)?;
+        let proof = &proofs[item_id];
+        validate_lease_input(&proof.lease_id, &proof.fencing_token)?;
+        let digest = token_hash(&proof.fencing_token);
+        let closed = resolve_lease_update(
+            transaction
+                .close_org_lease(OrgLeaseClosure {
+                    proof: OrgLeaseProof {
+                        lease_id: &proof.lease_id,
+                        workspace_id: workspace.id,
+                        work_item_id: *item_id,
+                        fencing_token_hash: &digest,
+                        kind: storage_kind(proof.kind),
+                        actor_id: &command.actor_id,
+                        now,
+                    },
+                    ended_at: now,
+                    end_reason: OrgLeaseEndReason::Reassignment,
+                })
+                .await
+                .map_err(OrgError::storage)?,
+        )?;
+        if closed.id != lease.id {
+            return Err(stale_lease());
+        }
+        context.after_workflow_phase(super::OrgWorkflowPhase::LeaseUpdate)?;
+    }
+    for (item, lease) in &expired {
+        bookkeep_expired_lease_with_phases(transaction, workspace, item, lease, now, |phase| {
+            context.after_workflow_phase(phase)
+        })
+        .await?;
+    }
+
+    let mut attempt_ids = BTreeMap::new();
+    for (item_id, lease) in active {
+        let attempt = transaction
+            .get_org_attempt(&lease.attempt_id)
+            .await
+            .map_err(OrgError::storage)?
+            .ok_or_else(|| not_found("attempt"))?;
+        resolve_update(
+            transaction
+                .update_org_attempt(OrgAttemptUpdate {
+                    id: &attempt.id,
+                    expected_status: match lease.kind {
+                        note_storage::OrgLeaseKind::Execution => OrgAttemptStatus::Running,
+                        note_storage::OrgLeaseKind::Review => OrgAttemptStatus::Submitted,
+                    },
+                    status: OrgAttemptStatus::Cancelled,
+                    ended_at: now,
+                    error: attempt.error.as_deref(),
+                    result_summary: attempt.result_summary.as_deref(),
+                    review_outcome: (lease.kind == note_storage::OrgLeaseKind::Review)
+                        .then_some("reassigned"),
+                    note_refs: &attempt.note_refs,
+                    artifacts: &attempt.artifacts,
+                    metadata: &attempt.metadata,
+                })
+                .await
+                .map_err(OrgError::storage)?,
+            "attempt",
+        )?;
+        context.after_workflow_phase(super::OrgWorkflowPhase::AttemptUpdate)?;
+        attempt_ids.insert(item_id, attempt.id);
+    }
+    Ok(attempt_ids)
 }
 
 async fn validate_follow_up_origin(
@@ -1276,6 +1545,23 @@ async fn require_workspace(
 
 fn content_hash(source: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(source.as_bytes()))
+}
+
+fn lease_fingerprint(proof: &LeaseProofInput) -> serde_json::Value {
+    json!({
+        "lease_id": proof.lease_id,
+        "kind": proof.kind,
+        "fencing_token_digest": super::token_hash(&proof.fencing_token),
+    })
+}
+
+fn proof_map_fingerprint(
+    proofs: &BTreeMap<WorkItemId, LeaseProofInput>,
+) -> BTreeMap<String, serde_json::Value> {
+    proofs
+        .iter()
+        .map(|(item_id, proof)| (item_id.to_string(), lease_fingerprint(proof)))
+        .collect()
 }
 
 fn parse_error(error: note_org::OrgError) -> OrgError {

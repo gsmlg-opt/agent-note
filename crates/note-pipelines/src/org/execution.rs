@@ -23,7 +23,7 @@ const TRANSITION_ITEM: OrgCommandKind = OrgCommandKind::new("transition_item", 1
 const RETRY_ITEM: OrgCommandKind = OrgCommandKind::new("retry_item", 1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransitionLifecycle {
+pub(crate) enum TransitionLifecycle {
     Approval,
     Rejection,
     Cancellation,
@@ -847,7 +847,7 @@ fn decode_retry_result(value: serde_json::Value) -> Result<OrgClaimResult, OrgEr
     })
 }
 
-fn classify_transition(
+pub(crate) fn classify_transition(
     policy: &note_org::WorkspacePolicy,
     from: &str,
     target: &str,
@@ -873,7 +873,7 @@ fn classify_transition(
     }
 }
 
-fn closes_lease(lifecycle: TransitionLifecycle) -> bool {
+pub(crate) fn closes_lease(lifecycle: TransitionLifecycle) -> bool {
     matches!(
         lifecycle,
         TransitionLifecycle::Approval
@@ -886,7 +886,7 @@ fn closes_lease(lifecycle: TransitionLifecycle) -> bool {
     )
 }
 
-fn lifecycle_end_reason(lifecycle: TransitionLifecycle) -> OrgLeaseEndReason {
+pub(crate) fn lifecycle_end_reason(lifecycle: TransitionLifecycle) -> OrgLeaseEndReason {
     match lifecycle {
         TransitionLifecycle::Approval => OrgLeaseEndReason::Approval,
         TransitionLifecycle::Rejection => OrgLeaseEndReason::Rejection,
@@ -901,7 +901,7 @@ fn lifecycle_end_reason(lifecycle: TransitionLifecycle) -> OrgLeaseEndReason {
     }
 }
 
-fn lifecycle_attempt(
+pub(crate) fn lifecycle_attempt(
     lifecycle: TransitionLifecycle,
     from_review: bool,
 ) -> (OrgAttemptStatus, OrgAttemptStatus, Option<&'static str>) {
@@ -941,7 +941,7 @@ fn lifecycle_attempt(
     }
 }
 
-fn lifecycle_events(lifecycle: TransitionLifecycle) -> &'static [OrgEventType] {
+pub(crate) fn lifecycle_events(lifecycle: TransitionLifecycle) -> &'static [OrgEventType] {
     match lifecycle {
         TransitionLifecycle::Approval => &[OrgEventType::Approval, OrgEventType::Completion],
         TransitionLifecycle::Rejection => &[OrgEventType::Rejection],
@@ -955,7 +955,7 @@ fn lifecycle_events(lifecycle: TransitionLifecycle) -> &'static [OrgEventType] {
     }
 }
 
-fn lifecycle_summary(event_type: &OrgEventType) -> &'static str {
+pub(crate) fn lifecycle_summary(event_type: &OrgEventType) -> &'static str {
     match event_type {
         OrgEventType::Approval => "Approved Org work item",
         OrgEventType::Rejection => "Rejected Org work item",

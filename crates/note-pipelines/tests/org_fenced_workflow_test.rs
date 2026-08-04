@@ -47,6 +47,7 @@ async fn claimed_review() -> (
                 item_id()
             ),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -107,6 +108,7 @@ async fn submitted_review_claim() -> (
                 item_id()
             ),
             expected_revision: None,
+        lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -388,6 +390,7 @@ async fn claimed_execution_fixture(
                 if requires_review { ":REQUIRES_REVIEW: true\r\n" } else { "" }
             ),
             expected_revision: None,
+        lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -593,6 +596,7 @@ async fn superseded_and_released_owners_cannot_mutate_workflow_state() {
                 item_id()
             ),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -1612,6 +1616,7 @@ async fn unleased_unblock_and_policy_transition_change_only_source_and_audit() {
                     item_id()
                 ),
                 expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
@@ -1677,6 +1682,7 @@ async fn every_default_unleased_cancellation_updates_only_source_projection_and_
                     item_id()
                 ),
                 expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
@@ -1744,6 +1750,7 @@ async fn unleased_transitions_never_ignore_a_supplied_invalid_proof() {
                     item_id()
                 ),
                 expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await
@@ -2080,6 +2087,7 @@ async fn retry_revalidates_assignment_schedule_dependencies_and_capacity() {
                 item_id()
             ),
             expected_revision: None,
+        lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -2122,6 +2130,7 @@ async fn retry_revalidates_assignment_schedule_dependencies_and_capacity() {
                 item_id()
             ),
             expected_revision: None,
+        lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -2159,6 +2168,7 @@ async fn retry_revalidates_assignment_schedule_dependencies_and_capacity() {
                 item_id()
             ),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -2199,6 +2209,7 @@ async fn retry_preserves_prior_progress_result_error_notes_artifacts_and_metadat
                 item_id()
             ),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -2621,6 +2632,7 @@ async fn workflow_phase_failures_roll_back_every_command_class_and_allow_same_op
                     item_id()
                 ),
                 expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
             },
         )
         .await

@@ -3465,6 +3465,7 @@ dependencies = [
  "note-embedding",
  "note-org",
  "note-storage",
+ "note-storage-pg",
  "note-storage-turso",
  "serde",
  "serde_json",

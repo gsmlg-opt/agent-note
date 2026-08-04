@@ -441,22 +441,24 @@ impl std::fmt::Debug for RejectItemRequest {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransitionLeaseProof {
+pub struct LeaseProofInput {
     pub lease_id: String,
     pub kind: OrgClaimKind,
     pub fencing_token: String,
 }
 
-impl std::fmt::Debug for TransitionLeaseProof {
+impl std::fmt::Debug for LeaseProofInput {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("TransitionLeaseProof")
+            .debug_struct("LeaseProofInput")
             .field("lease_id", &self.lease_id)
             .field("kind", &self.kind)
             .field("fencing_token", &"[REDACTED]")
             .finish()
     }
 }
+
+pub type TransitionLeaseProof = LeaseProofInput;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransitionItemRequest {

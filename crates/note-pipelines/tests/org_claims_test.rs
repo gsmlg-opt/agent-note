@@ -62,6 +62,7 @@ async fn seed_document(
             path: format!("{document}.org"),
             source: source(item, state, properties, planning),
             expected_revision: None,
+            lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -1228,6 +1229,7 @@ async fn claim_enforces_dependencies_archival_and_capacity() {
                 "* BACKLOG Dependency\r\n:PROPERTIES:\r\n:ID: {dependency}\r\n:AGENT_NOTE_TYPE: task\r\n:END:\r\n* READY Dependent\r\n:PROPERTIES:\r\n:ID: {dependent}\r\n:AGENT_NOTE_TYPE: task\r\n:DEPENDS_ON: {dependency}\r\n:END:\r\n"
             ),
             expected_revision: None,
+        lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await
@@ -1454,6 +1456,7 @@ async fn execution_release_revalidates_dependencies_before_entering_ready() {
                 "* BACKLOG Dependency\r\n:PROPERTIES:\r\n:ID: {dependency}\r\n:AGENT_NOTE_TYPE: task\r\n:END:\r\n* RUNNING Work\r\n:PROPERTIES:\r\n:ID: {item}\r\n:AGENT_NOTE_TYPE: task\r\n:DEPENDS_ON: {dependency}\r\n:END:\r\n"
             ),
             expected_revision: None,
+        lease_proofs: std::collections::BTreeMap::new(),
         },
     )
     .await

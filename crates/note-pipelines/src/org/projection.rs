@@ -1,60 +1,148 @@
-use super::{OrgError, OrgErrorCode};
+use super::{
+    bookkeep_expired_lease, resolve_lease, stale_lease, storage_kind, token_hash,
+    validate_lease_input, LeaseProofInput, OrgError, OrgErrorCode,
+};
 use note_org::{
     resolve_org_timestamp, validate_dependencies, validate_item, OrgDocument as ParsedDocument,
     WorkItem, WorkspacePolicy,
 };
-use note_storage::{OrgProjectedWorkItem, StorageTransaction, StoredOrgTimestamp};
+use note_storage::{
+    OrgLeaseProof, OrgProjectedWorkItem, OrgWorkspace, SanitizedOrgLease, StorageTransaction,
+    StoredOrgTimestamp,
+};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LeaseGuardOperation {
-    Archive,
-    RawImport,
-    DocumentMove,
-    ItemMove,
-    Assignment,
+pub(crate) struct LeaseGuardResult {
+    pub active: BTreeMap<note_org::WorkItemId, SanitizedOrgLease>,
+    pub expired: Vec<(OrgProjectedWorkItem, note_storage::OrgLease)>,
 }
 
-/// Fail-closed Slice 3 seam. Slice 4 replaces this state-based check with
-/// authoritative lease lookup and per-item fencing-token validation.
-pub trait LeaseGuard: Send + Sync {
-    fn validate(
-        &self,
-        operation: LeaseGuardOperation,
-        policy: &WorkspacePolicy,
-        items: &[OrgProjectedWorkItem],
-    ) -> Result<(), OrgError>;
+/// Validates the exact proof set for all actively leased touched items.
+/// Expired open leases are bookkept only after the full proof shape is valid.
+pub(crate) async fn validate_touched_lease_proofs(
+    transaction: &dyn StorageTransaction,
+    workspace: &OrgWorkspace,
+    actor_id: &str,
+    touched: &[OrgProjectedWorkItem],
+    proofs: &BTreeMap<note_org::WorkItemId, LeaseProofInput>,
+    now: i64,
+) -> Result<LeaseGuardResult, OrgError> {
+    validate_touched_lease_proofs_except(
+        transaction,
+        workspace,
+        actor_id,
+        touched,
+        proofs,
+        &BTreeSet::new(),
+        now,
+    )
+    .await
 }
 
-#[derive(Debug, Default)]
-pub struct ConservativeLeaseGuard;
-
-impl LeaseGuard for ConservativeLeaseGuard {
-    fn validate(
-        &self,
-        operation: LeaseGuardOperation,
-        policy: &WorkspacePolicy,
-        items: &[OrgProjectedWorkItem],
-    ) -> Result<(), OrgError> {
-        let unsafe_item = items.iter().find(|item| {
-            item.state.as_ref().is_some_and(|state| {
-                state == &policy.running_state || state == &policy.review_state
-            })
-        });
-        if let Some(item) = unsafe_item {
-            return Err(OrgError::new(
-                OrgErrorCode::InvalidTransition,
-                "Org mutation is unavailable until active lease fencing is validated",
-                json!({
-                    "work_item_id": item.id,
-                    "operation": format!("{operation:?}"),
-                }),
-                false,
-            ));
-        }
-        Ok(())
+/// Validates the exact proof set while deferring the conditional proof operation
+/// for items whose lease will be closed by the caller in this transaction.
+pub(crate) async fn validate_touched_lease_proofs_except(
+    transaction: &dyn StorageTransaction,
+    workspace: &OrgWorkspace,
+    actor_id: &str,
+    touched: &[OrgProjectedWorkItem],
+    proofs: &BTreeMap<note_org::WorkItemId, LeaseProofInput>,
+    deferred: &BTreeSet<note_org::WorkItemId>,
+    now: i64,
+) -> Result<LeaseGuardResult, OrgError> {
+    let mut result = inspect_touched_lease_proofs_except(
+        transaction,
+        workspace,
+        actor_id,
+        touched,
+        proofs,
+        deferred,
+        now,
+    )
+    .await?;
+    for (item, lease) in &result.expired {
+        bookkeep_expired_lease(transaction, workspace, item, lease, now).await?;
     }
+    result.expired.clear();
+    Ok(result)
+}
+
+/// Performs exact proof discovery and validation without mutation. Callers that
+/// need to validate revisions before expiry bookkeeping can defer all writes.
+pub(crate) async fn inspect_touched_lease_proofs_except(
+    transaction: &dyn StorageTransaction,
+    workspace: &OrgWorkspace,
+    actor_id: &str,
+    touched: &[OrgProjectedWorkItem],
+    proofs: &BTreeMap<note_org::WorkItemId, LeaseProofInput>,
+    deferred: &BTreeSet<note_org::WorkItemId>,
+    now: i64,
+) -> Result<LeaseGuardResult, OrgError> {
+    let touched_by_id = touched
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    let mut active = BTreeMap::new();
+    let mut expired = Vec::new();
+    for item in touched_by_id.values() {
+        let Some(lease) = transaction
+            .get_open_org_lease_internal(item.id)
+            .await
+            .map_err(OrgError::storage)?
+        else {
+            continue;
+        };
+        if lease.expires_at <= now {
+            expired.push(((*item).clone(), lease));
+        } else {
+            active.insert(item.id, lease);
+        }
+    }
+    if proofs.keys().copied().collect::<BTreeSet<_>>()
+        != active.keys().copied().collect::<BTreeSet<_>>()
+    {
+        return Err(stale_lease());
+    }
+
+    for (item_id, lease) in &active {
+        let proof = &proofs[item_id];
+        validate_lease_input(&proof.lease_id, &proof.fencing_token)?;
+        let digest = token_hash(&proof.fencing_token);
+        if lease.id != proof.lease_id
+            || lease.workspace_id != workspace.id
+            || lease.work_item_id != *item_id
+            || lease.fencing_token_hash != digest
+            || lease.kind != storage_kind(proof.kind)
+            || lease.actor_id != actor_id
+        {
+            return Err(stale_lease());
+        }
+        if !deferred.contains(item_id) {
+            resolve_lease(
+                transaction
+                    .validate_org_lease_proof(OrgLeaseProof {
+                        lease_id: &proof.lease_id,
+                        workspace_id: workspace.id,
+                        work_item_id: *item_id,
+                        fencing_token_hash: &digest,
+                        kind: storage_kind(proof.kind),
+                        actor_id,
+                        now,
+                    })
+                    .await
+                    .map_err(OrgError::storage)?,
+            )?;
+        }
+    }
+
+    Ok(LeaseGuardResult {
+        active: active
+            .into_iter()
+            .map(|(id, lease)| (id, lease.into()))
+            .collect(),
+        expired,
+    })
 }
 
 pub(crate) fn project_document(
