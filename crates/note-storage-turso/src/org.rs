@@ -3,11 +3,14 @@ use crate::TursoSession;
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
     order_org_event_segments_by_lineage, AppliedOrgDocumentOwnershipMove, CompareAndSwap,
-    ConditionalUpdate, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
-    OrgArtifactReference, OrgAttempt, OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate,
-    OrgDocument, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate,
-    OrgEvent, OrgEventType, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate,
-    StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
+    ConditionalUpdate, ExpiredOrgLeaseClosure, NewOrgAttempt, NewOrgAttemptAllocation,
+    NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace, OrgArtifactReference, OrgAttempt,
+    OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument,
+    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
+    OrgEventType, OrgLease, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind,
+    OrgLeaseOwnershipMove, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate,
+    SanitizedOrgLease, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
+    StoredOrgTimestamp,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
@@ -31,6 +34,9 @@ const EVENT_COLUMNS: &str =
 const ATTEMPT_COLUMNS: &str =
     "id, workspace_id, work_item_id, attempt_number, actor_id, status, started_at, ended_at,
      error, result_summary, review_outcome, note_refs, artifacts, metadata";
+const LEASE_COLUMNS: &str =
+    "id, workspace_id, work_item_id, attempt_id, kind, actor_id, fencing_token_hash,
+     acquired_at, last_heartbeat_at, expires_at, ended_at, end_reason, expiry_event_id";
 const OWNERSHIP_MOVE_SAVEPOINT: &str = "org_document_ownership_move";
 
 #[async_trait::async_trait]
@@ -550,6 +556,45 @@ impl OrgRepository for TursoSession {
         .await
     }
 
+    async fn allocate_next_org_attempt(
+        &self,
+        attempt: NewOrgAttemptAllocation<'_>,
+    ) -> StorageResult<OrgAttempt> {
+        let _operation_guard = self.operation_guard().await;
+        validate_attempt_allocation(&attempt)?;
+        let note_refs = serialize_json(attempt.note_refs, "serialize Org attempt note refs")?;
+        let artifacts = serialize_json(attempt.artifacts, "serialize Org attempt artifacts")?;
+        let metadata = serialize_json(attempt.metadata, "serialize Org attempt metadata")?;
+        let sql = format!(
+            "INSERT INTO org_attempts (
+                 id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                 started_at, ended_at, error, result_summary, review_outcome,
+                 note_refs, artifacts, metadata
+             ) SELECT ?1, ?2, ?3,
+                      COALESCE(MAX(attempt_number), 0) + 1,
+                      ?4, 'running', ?5, NULL, NULL, NULL, NULL, ?6, ?7, ?8
+               FROM org_attempts
+               WHERE work_item_id=?3
+             RETURNING {ATTEMPT_COLUMNS}"
+        );
+        query_one_attempt(
+            self,
+            &sql,
+            turso::params![
+                attempt.id,
+                attempt.workspace_id.to_string(),
+                attempt.work_item_id.to_string(),
+                attempt.actor_id,
+                attempt.started_at,
+                note_refs,
+                artifacts,
+                metadata
+            ],
+            "allocate next Org attempt",
+        )
+        .await
+    }
+
     async fn get_org_attempt(&self, id: &str) -> StorageResult<Option<OrgAttempt>> {
         let _operation_guard = self.operation_guard().await;
         get_org_attempt_unlocked(self, id).await
@@ -579,6 +624,25 @@ impl OrgRepository for TursoSession {
         Ok(attempts)
     }
 
+    async fn count_org_attempts(&self, work_item_id: WorkItemId) -> StorageResult<i64> {
+        let _operation_guard = self.operation_guard().await;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT COUNT(*) FROM org_attempts WHERE work_item_id=?1",
+                turso::params![work_item_id.to_string()],
+            )
+            .await
+            .map_err(|error| map_turso_error("count Org attempts", error))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read Org attempt count", error))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::Operation, "missing count row"))?;
+        row.get(0)
+            .map_err(|error| map_turso_error("decode Org attempt count", error))
+    }
+
     async fn update_org_attempt(
         &self,
         update: OrgAttemptUpdate<'_>,
@@ -592,7 +656,7 @@ impl OrgRepository for TursoSession {
             "UPDATE org_attempts
              SET status=?2, ended_at=?3, error=?4, result_summary=?5, review_outcome=?6,
                  note_refs=?7, artifacts=?8, metadata=?9
-             WHERE id=?1 AND status=?10 AND ended_at IS NULL
+             WHERE id=?1 AND status=?10
              RETURNING {ATTEMPT_COLUMNS}"
         );
         let updated = query_optional_attempt(
@@ -623,6 +687,289 @@ impl OrgRepository for TursoSession {
                 ConditionalUpdate::NotFound
             },
         )
+    }
+
+    async fn insert_org_lease_if_capacity(
+        &self,
+        lease: NewOrgLease<'_>,
+        capacity: i64,
+        now: i64,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _operation_guard = self.operation_guard().await;
+        validate_new_lease(&lease, capacity, now)?;
+        let sql = format!(
+            "INSERT INTO org_leases (
+                 id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                 fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                 ended_at, end_reason, expiry_event_id
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, NULL
+             WHERE NOT EXISTS (SELECT 1 FROM org_leases WHERE id=?1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM org_leases WHERE work_item_id=?3 AND ended_at IS NULL
+               )
+               AND (SELECT COUNT(*) FROM org_leases
+                    WHERE workspace_id=?2 AND ended_at IS NULL AND expires_at>?11) < ?12
+               AND EXISTS (
+                   SELECT 1 FROM org_attempts
+                   WHERE id=?4 AND work_item_id=?3
+                     AND ((?5='execution' AND status='running')
+                       OR (?5='review' AND status='submitted'))
+               )
+             RETURNING {LEASE_COLUMNS}"
+        );
+        let lease = query_optional_lease(
+            self,
+            &sql,
+            turso::params![
+                lease.id,
+                lease.workspace_id.to_string(),
+                lease.work_item_id.to_string(),
+                lease.attempt_id,
+                lease_kind_name(lease.kind),
+                lease.actor_id,
+                lease.fencing_token_hash,
+                lease.acquired_at,
+                lease.last_heartbeat_at,
+                lease.expires_at,
+                now,
+                capacity
+            ],
+            "insert Org lease within capacity",
+        )
+        .await?;
+        Ok(match lease {
+            Some(lease) => ConditionalUpdate::Applied(lease.into()),
+            None => ConditionalUpdate::Conflict,
+        })
+    }
+
+    async fn get_open_org_lease_internal(
+        &self,
+        work_item_id: WorkItemId,
+    ) -> StorageResult<Option<OrgLease>> {
+        let _operation_guard = self.operation_guard().await;
+        let sql = format!(
+            "SELECT {LEASE_COLUMNS} FROM org_leases
+             WHERE work_item_id=?1 AND ended_at IS NULL"
+        );
+        query_optional_lease(
+            self,
+            &sql,
+            turso::params![work_item_id.to_string()],
+            "query open Org lease",
+        )
+        .await
+    }
+
+    async fn get_active_org_lease(
+        &self,
+        work_item_id: WorkItemId,
+        now: i64,
+    ) -> StorageResult<Option<SanitizedOrgLease>> {
+        let _operation_guard = self.operation_guard().await;
+        let sql = format!(
+            "SELECT {LEASE_COLUMNS} FROM org_leases
+             WHERE work_item_id=?1 AND ended_at IS NULL AND expires_at>?2"
+        );
+        query_optional_lease(
+            self,
+            &sql,
+            turso::params![work_item_id.to_string(), now],
+            "query active Org lease",
+        )
+        .await
+        .map(|lease| lease.map(Into::into))
+    }
+
+    async fn list_org_lease_history(
+        &self,
+        work_item_id: WorkItemId,
+    ) -> StorageResult<Vec<SanitizedOrgLease>> {
+        let _operation_guard = self.operation_guard().await;
+        let sql = format!(
+            "SELECT {LEASE_COLUMNS} FROM org_leases
+             WHERE work_item_id=?1 ORDER BY acquired_at, id"
+        );
+        let mut rows = self
+            .connection
+            .query(&sql, turso::params![work_item_id.to_string()])
+            .await
+            .map_err(|error| map_turso_error("list Org lease history", error))?;
+        let mut leases = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read Org lease history", error))?
+        {
+            leases.push(decode_lease(&row)?.into());
+        }
+        Ok(leases)
+    }
+
+    async fn count_active_org_leases(
+        &self,
+        workspace_id: WorkspaceId,
+        now: i64,
+    ) -> StorageResult<i64> {
+        let _operation_guard = self.operation_guard().await;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT COUNT(*) FROM org_leases
+                 WHERE workspace_id=?1 AND ended_at IS NULL AND expires_at>?2",
+                turso::params![workspace_id.to_string(), now],
+            )
+            .await
+            .map_err(|error| map_turso_error("count active Org leases", error))?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read active Org lease count", error))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::Operation, "missing count row"))?;
+        row.get(0)
+            .map_err(|error| map_turso_error("decode active Org lease count", error))
+    }
+
+    async fn heartbeat_org_lease(
+        &self,
+        update: OrgLeaseHeartbeat<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _operation_guard = self.operation_guard().await;
+        validate_lease_heartbeat(&update)?;
+        let sql = format!(
+            "UPDATE org_leases
+             SET last_heartbeat_at=?8, expires_at=?9
+             WHERE id=?1 AND workspace_id=?2 AND work_item_id=?3
+               AND fencing_token_hash=?4 AND kind=?5 AND actor_id=?6
+               AND ended_at IS NULL AND expires_at>?7
+               AND last_heartbeat_at<=?8 AND expires_at<=?9
+             RETURNING {LEASE_COLUMNS}"
+        );
+        conditional_lease_write(
+            self,
+            &sql,
+            turso::params![
+                update.proof.lease_id,
+                update.proof.workspace_id.to_string(),
+                update.proof.work_item_id.to_string(),
+                update.proof.fencing_token_hash,
+                lease_kind_name(update.proof.kind),
+                update.proof.actor_id,
+                update.proof.now,
+                update.last_heartbeat_at,
+                update.expires_at
+            ],
+            update.proof.lease_id,
+            "heartbeat Org lease",
+        )
+        .await
+    }
+
+    async fn close_org_lease(
+        &self,
+        update: OrgLeaseClosure<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _operation_guard = self.operation_guard().await;
+        validate_lease_closure(&update)?;
+        let sql = format!(
+            "UPDATE org_leases
+             SET ended_at=?8, end_reason=?9, expiry_event_id=NULL
+             WHERE id=?1 AND workspace_id=?2 AND work_item_id=?3
+               AND fencing_token_hash=?4 AND kind=?5 AND actor_id=?6
+               AND ended_at IS NULL AND expires_at>?7
+             RETURNING {LEASE_COLUMNS}"
+        );
+        conditional_lease_write(
+            self,
+            &sql,
+            turso::params![
+                update.proof.lease_id,
+                update.proof.workspace_id.to_string(),
+                update.proof.work_item_id.to_string(),
+                update.proof.fencing_token_hash,
+                lease_kind_name(update.proof.kind),
+                update.proof.actor_id,
+                update.proof.now,
+                update.ended_at,
+                lease_end_reason_name(update.end_reason)
+            ],
+            update.proof.lease_id,
+            "close Org lease",
+        )
+        .await
+    }
+
+    async fn close_expired_org_lease(
+        &self,
+        update: ExpiredOrgLeaseClosure<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _operation_guard = self.operation_guard().await;
+        if update.lease_id.trim().is_empty()
+            || update.expiry_event_id.trim().is_empty()
+            || update.ended_at < update.now
+        {
+            return Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "invalid expired Org lease closure",
+            ));
+        }
+        let sql = format!(
+            "UPDATE org_leases
+             SET ended_at=?4, end_reason='lease_expiry', expiry_event_id=?5
+             WHERE id=?1 AND work_item_id=?2 AND ended_at IS NULL AND expires_at<=?3
+             RETURNING {LEASE_COLUMNS}"
+        );
+        conditional_lease_write(
+            self,
+            &sql,
+            turso::params![
+                update.lease_id,
+                update.work_item_id.to_string(),
+                update.now,
+                update.ended_at,
+                update.expiry_event_id
+            ],
+            update.lease_id,
+            "close expired Org lease",
+        )
+        .await
+    }
+
+    async fn move_org_lease_ownership(
+        &self,
+        update: OrgLeaseOwnershipMove<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _operation_guard = self.operation_guard().await;
+        validate_lease_move(&update)?;
+        let sql = format!(
+            "UPDATE org_leases
+             SET workspace_id=?8
+             WHERE id=?1 AND workspace_id=?2 AND work_item_id=?3
+               AND fencing_token_hash=?4 AND kind=?5 AND actor_id=?6
+               AND ended_at IS NULL AND expires_at>?7
+               AND (SELECT COUNT(*) FROM org_leases
+                    WHERE workspace_id=?8 AND ended_at IS NULL AND expires_at>?7) < ?9
+             RETURNING {LEASE_COLUMNS}"
+        );
+        conditional_lease_write(
+            self,
+            &sql,
+            turso::params![
+                update.proof.lease_id,
+                update.proof.workspace_id.to_string(),
+                update.proof.work_item_id.to_string(),
+                update.proof.fencing_token_hash,
+                lease_kind_name(update.proof.kind),
+                update.proof.actor_id,
+                update.proof.now,
+                update.target_workspace_id.to_string(),
+                update.target_capacity
+            ],
+            update.proof.lease_id,
+            "move Org lease ownership",
+        )
+        .await
     }
 
     async fn insert_org_operation(&self, operation: &StoredOrgOperation) -> StorageResult<()> {
@@ -1160,6 +1507,22 @@ fn validate_new_attempt(attempt: &NewOrgAttempt<'_>) -> StorageResult<()> {
     Ok(())
 }
 
+fn validate_attempt_allocation(attempt: &NewOrgAttemptAllocation<'_>) -> StorageResult<()> {
+    if attempt.id.trim().is_empty() || attempt.actor_id.trim().is_empty() {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org attempt id and actor id must not be empty",
+        ));
+    }
+    if attempt.started_at <= 0 {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "Org attempt start must be positive",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_attempt_update(update: &OrgAttemptUpdate<'_>) -> StorageResult<()> {
     if update.id.trim().is_empty() {
         return Err(StorageError::new(
@@ -1167,7 +1530,159 @@ fn validate_attempt_update(update: &OrgAttemptUpdate<'_>) -> StorageResult<()> {
             "Org attempt id must not be empty",
         ));
     }
+    let allowed = matches!(
+        (update.expected_status, update.status),
+        (
+            OrgAttemptStatus::Running,
+            OrgAttemptStatus::Submitted
+                | OrgAttemptStatus::Completed
+                | OrgAttemptStatus::Failed
+                | OrgAttemptStatus::Cancelled
+                | OrgAttemptStatus::Expired
+        ) | (
+            OrgAttemptStatus::Submitted,
+            OrgAttemptStatus::Completed | OrgAttemptStatus::Failed | OrgAttemptStatus::Cancelled
+        )
+    );
+    if !allowed {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid Org attempt status transition",
+        ));
+    }
     Ok(())
+}
+
+fn validate_new_lease(lease: &NewOrgLease<'_>, capacity: i64, now: i64) -> StorageResult<()> {
+    if lease.id.trim().is_empty()
+        || lease.actor_id.trim().is_empty()
+        || lease.attempt_id.trim().is_empty()
+        || lease.fencing_token_hash.len() != 64
+        || !lease
+            .fencing_token_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "invalid Org lease identity or fencing hash",
+        ));
+    }
+    if capacity < 1
+        || now <= 0
+        || lease.acquired_at <= 0
+        || lease.last_heartbeat_at < lease.acquired_at
+        || lease.expires_at < lease.last_heartbeat_at
+    {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid Org lease capacity or timestamps",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lease_heartbeat(update: &OrgLeaseHeartbeat<'_>) -> StorageResult<()> {
+    validate_lease_proof(&update.proof)?;
+    if update.last_heartbeat_at < update.proof.now || update.expires_at < update.last_heartbeat_at {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid Org lease heartbeat timestamps",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lease_closure(update: &OrgLeaseClosure<'_>) -> StorageResult<()> {
+    validate_lease_proof(&update.proof)?;
+    if update.end_reason == OrgLeaseEndReason::LeaseExpiry || update.ended_at < update.proof.now {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid active Org lease closure",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lease_move(update: &OrgLeaseOwnershipMove<'_>) -> StorageResult<()> {
+    validate_lease_proof(&update.proof)?;
+    if update.target_capacity < 1 || update.target_workspace_id == update.proof.workspace_id {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid Org lease ownership move",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lease_proof(proof: &note_storage::OrgLeaseProof<'_>) -> StorageResult<()> {
+    if proof.lease_id.trim().is_empty()
+        || proof.actor_id.trim().is_empty()
+        || proof.fencing_token_hash.len() != 64
+        || !proof
+            .fencing_token_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || proof.now <= 0
+    {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "invalid Org lease proof",
+        ));
+    }
+    Ok(())
+}
+
+fn lease_kind_name(kind: OrgLeaseKind) -> &'static str {
+    match kind {
+        OrgLeaseKind::Execution => "execution",
+        OrgLeaseKind::Review => "review",
+    }
+}
+
+fn decode_lease_kind(value: &str) -> StorageResult<OrgLeaseKind> {
+    match value {
+        "execution" => Ok(OrgLeaseKind::Execution),
+        "review" => Ok(OrgLeaseKind::Review),
+        _ => Err(StorageError::new(
+            StorageErrorKind::Corrupt,
+            format!("stored Org lease has unknown kind {value:?}"),
+        )),
+    }
+}
+
+fn lease_end_reason_name(reason: OrgLeaseEndReason) -> &'static str {
+    match reason {
+        OrgLeaseEndReason::Release => "release",
+        OrgLeaseEndReason::Completion => "completion",
+        OrgLeaseEndReason::Failure => "failure",
+        OrgLeaseEndReason::Block => "block",
+        OrgLeaseEndReason::Cancellation => "cancellation",
+        OrgLeaseEndReason::LeaseExpiry => "lease_expiry",
+        OrgLeaseEndReason::ReviewRequest => "review_request",
+        OrgLeaseEndReason::Approval => "approval",
+        OrgLeaseEndReason::Rejection => "rejection",
+        OrgLeaseEndReason::Reassignment => "reassignment",
+    }
+}
+
+fn decode_lease_end_reason(value: &str) -> StorageResult<OrgLeaseEndReason> {
+    match value {
+        "release" => Ok(OrgLeaseEndReason::Release),
+        "completion" => Ok(OrgLeaseEndReason::Completion),
+        "failure" => Ok(OrgLeaseEndReason::Failure),
+        "block" => Ok(OrgLeaseEndReason::Block),
+        "cancellation" => Ok(OrgLeaseEndReason::Cancellation),
+        "lease_expiry" => Ok(OrgLeaseEndReason::LeaseExpiry),
+        "review_request" => Ok(OrgLeaseEndReason::ReviewRequest),
+        "approval" => Ok(OrgLeaseEndReason::Approval),
+        "rejection" => Ok(OrgLeaseEndReason::Rejection),
+        "reassignment" => Ok(OrgLeaseEndReason::Reassignment),
+        _ => Err(StorageError::new(
+            StorageErrorKind::Corrupt,
+            format!("stored Org lease has unknown end reason {value:?}"),
+        )),
+    }
 }
 
 fn attempt_status_name(status: OrgAttemptStatus) -> &'static str {
@@ -1308,6 +1823,108 @@ fn decode_attempt(row: &turso::Row) -> StorageResult<OrgAttempt> {
                 error,
             )
         })?,
+    })
+}
+
+async fn conditional_lease_write(
+    session: &TursoSession,
+    sql: &str,
+    params: impl turso::IntoParams,
+    lease_id: &str,
+    context: &str,
+) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+    if let Some(lease) = query_optional_lease(session, sql, params, context).await? {
+        return Ok(ConditionalUpdate::Applied(lease.into()));
+    }
+    let mut rows = session
+        .connection
+        .query(
+            "SELECT EXISTS(SELECT 1 FROM org_leases WHERE id=?1)",
+            turso::params![lease_id],
+        )
+        .await
+        .map_err(|error| map_turso_error("check Org lease conditional conflict", error))?;
+    let exists: i64 = rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read Org lease conditional conflict", error))?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::Operation, "missing exists row"))?
+        .get(0)
+        .map_err(|error| map_turso_error("decode Org lease conditional conflict", error))?;
+    Ok(if exists == 0 {
+        ConditionalUpdate::NotFound
+    } else {
+        ConditionalUpdate::Conflict
+    })
+}
+
+async fn query_optional_lease(
+    session: &TursoSession,
+    sql: &str,
+    params: impl turso::IntoParams,
+    context: &str,
+) -> StorageResult<Option<OrgLease>> {
+    let mut rows = session
+        .connection
+        .query(sql, params)
+        .await
+        .map_err(|error| map_turso_error(context, error))?;
+    rows.next()
+        .await
+        .map_err(|error| map_turso_error(context, error))?
+        .as_ref()
+        .map(decode_lease)
+        .transpose()
+}
+
+fn decode_lease(row: &turso::Row) -> StorageResult<OrgLease> {
+    let end_reason = row
+        .get::<Option<String>>(11)
+        .map_err(|error| map_turso_error("decode Org lease end reason", error))?
+        .as_deref()
+        .map(decode_lease_end_reason)
+        .transpose()?;
+    Ok(OrgLease {
+        id: row
+            .get(0)
+            .map_err(|error| map_turso_error("decode Org lease id", error))?,
+        workspace_id: decode_workspace_id(
+            row.get(1)
+                .map_err(|error| map_turso_error("decode Org lease workspace", error))?,
+        )?,
+        work_item_id: decode_work_item_id(
+            row.get(2)
+                .map_err(|error| map_turso_error("decode Org lease work item", error))?,
+        )?,
+        attempt_id: row
+            .get(3)
+            .map_err(|error| map_turso_error("decode Org lease attempt", error))?,
+        kind: decode_lease_kind(
+            &row.get::<String>(4)
+                .map_err(|error| map_turso_error("decode Org lease kind", error))?,
+        )?,
+        actor_id: row
+            .get(5)
+            .map_err(|error| map_turso_error("decode Org lease actor", error))?,
+        fencing_token_hash: row
+            .get(6)
+            .map_err(|error| map_turso_error("decode Org lease fencing hash", error))?,
+        acquired_at: row
+            .get(7)
+            .map_err(|error| map_turso_error("decode Org lease acquired time", error))?,
+        last_heartbeat_at: row
+            .get(8)
+            .map_err(|error| map_turso_error("decode Org lease heartbeat", error))?,
+        expires_at: row
+            .get(9)
+            .map_err(|error| map_turso_error("decode Org lease expiry", error))?,
+        ended_at: row
+            .get(10)
+            .map_err(|error| map_turso_error("decode Org lease end time", error))?,
+        end_reason,
+        expiry_event_id: row
+            .get(12)
+            .map_err(|error| map_turso_error("decode Org lease expiry event", error))?,
     })
 }
 

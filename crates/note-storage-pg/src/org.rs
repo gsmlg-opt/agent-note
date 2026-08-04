@@ -3,11 +3,14 @@ use crate::PgSession;
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
     order_org_event_segments_by_lineage, AppliedOrgDocumentOwnershipMove, CompareAndSwap,
-    ConditionalUpdate, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
-    OrgArtifactReference, OrgAttempt, OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate,
-    OrgDocument, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate,
-    OrgEvent, OrgEventType, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate,
-    StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
+    ConditionalUpdate, ExpiredOrgLeaseClosure, NewOrgAttempt, NewOrgAttemptAllocation,
+    NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace, OrgArtifactReference, OrgAttempt,
+    OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument,
+    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
+    OrgEventType, OrgLease, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind,
+    OrgLeaseOwnershipMove, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate,
+    SanitizedOrgLease, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
+    StoredOrgTimestamp,
 };
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
@@ -657,6 +660,52 @@ impl OrgRepository for PgSession {
         .into_attempt()
     }
 
+    async fn allocate_next_org_attempt(
+        &self,
+        attempt: NewOrgAttemptAllocation<'_>,
+    ) -> StorageResult<OrgAttempt> {
+        validate_attempt_allocation(&attempt)?;
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, AttemptRow>(
+            "INSERT INTO org_attempts (
+                 id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                 started_at, ended_at, error, result_summary, review_outcome,
+                 note_refs, artifacts, metadata
+             ) SELECT $1, $2, $3,
+                      COALESCE(MAX(attempt_number), 0) + 1,
+                      $4, 'running', $5, NULL, NULL, NULL, NULL, $6, $7, $8
+               FROM org_attempts
+               WHERE work_item_id=$3
+             RETURNING id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                       started_at, ended_at, error, result_summary, review_outcome,
+                       note_refs, artifacts, metadata",
+        )
+        .bind(attempt.id)
+        .bind(attempt.workspace_id.to_string())
+        .bind(attempt.work_item_id.to_string())
+        .bind(attempt.actor_id)
+        .bind(attempt.started_at)
+        .bind(serde_json::to_value(attempt.note_refs).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize Org attempt note refs",
+                error,
+            )
+        })?)
+        .bind(serde_json::to_value(attempt.artifacts).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize Org attempt artifacts",
+                error,
+            )
+        })?)
+        .bind(attempt.metadata)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("allocate next Org attempt", error))?
+        .into_attempt()
+    }
+
     async fn get_org_attempt(&self, id: &str) -> StorageResult<Option<OrgAttempt>> {
         let mut connection = self.connection().await?;
         sqlx::query_as::<_, AttemptRow>(
@@ -692,6 +741,17 @@ impl OrgRepository for PgSession {
         .collect()
     }
 
+    async fn count_org_attempts(&self, work_item_id: WorkItemId) -> StorageResult<i64> {
+        let mut connection = self.connection().await?;
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM org_attempts WHERE work_item_id=$1",
+        )
+        .bind(work_item_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("count Org attempts", error))
+    }
+
     async fn update_org_attempt(
         &self,
         update: OrgAttemptUpdate<'_>,
@@ -702,7 +762,7 @@ impl OrgRepository for PgSession {
             "UPDATE org_attempts
              SET status=$2, ended_at=$3, error=$4, result_summary=$5, review_outcome=$6,
                  note_refs=$7, artifacts=$8, metadata=$9
-             WHERE id=$1 AND status=$10 AND ended_at IS NULL
+             WHERE id=$1 AND status=$10
              RETURNING id, workspace_id, work_item_id, attempt_number, actor_id, status,
                        started_at, ended_at, error, result_summary, review_outcome,
                        note_refs, artifacts, metadata",
@@ -746,6 +806,267 @@ impl OrgRepository for PgSession {
         } else {
             ConditionalUpdate::NotFound
         })
+    }
+
+    async fn insert_org_lease_if_capacity(
+        &self,
+        lease: NewOrgLease<'_>,
+        capacity: i64,
+        now: i64,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        validate_new_lease(&lease, capacity, now)?;
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, LeaseRow>(
+            "INSERT INTO org_leases (
+                 id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                 fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                 ended_at, end_reason, expiry_event_id
+             )
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL
+             WHERE NOT EXISTS (SELECT 1 FROM org_leases WHERE id=$1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM org_leases WHERE work_item_id=$3 AND ended_at IS NULL
+               )
+               AND (SELECT COUNT(*) FROM org_leases
+                    WHERE workspace_id=$2 AND ended_at IS NULL AND expires_at>$11) < $12
+               AND EXISTS (
+                   SELECT 1 FROM org_attempts
+                   WHERE id=$4 AND work_item_id=$3
+                     AND (($5='execution' AND status='running')
+                       OR ($5='review' AND status='submitted'))
+               )
+             RETURNING id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                       fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                       ended_at, end_reason, expiry_event_id",
+        )
+        .bind(lease.id)
+        .bind(lease.workspace_id.to_string())
+        .bind(lease.work_item_id.to_string())
+        .bind(lease.attempt_id)
+        .bind(lease_kind_name(lease.kind))
+        .bind(lease.actor_id)
+        .bind(lease.fencing_token_hash)
+        .bind(lease.acquired_at)
+        .bind(lease.last_heartbeat_at)
+        .bind(lease.expires_at)
+        .bind(now)
+        .bind(capacity)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("insert Org lease within capacity", error))?;
+        Ok(match row {
+            Some(row) => ConditionalUpdate::Applied(row.into_lease()?.into()),
+            None => ConditionalUpdate::Conflict,
+        })
+    }
+
+    async fn get_open_org_lease_internal(
+        &self,
+        work_item_id: WorkItemId,
+    ) -> StorageResult<Option<OrgLease>> {
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, LeaseRow>(
+            "SELECT id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                    fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                    ended_at, end_reason, expiry_event_id
+             FROM org_leases WHERE work_item_id=$1 AND ended_at IS NULL",
+        )
+        .bind(work_item_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query open Org lease", error))?
+        .map(LeaseRow::into_lease)
+        .transpose()
+    }
+
+    async fn get_active_org_lease(
+        &self,
+        work_item_id: WorkItemId,
+        now: i64,
+    ) -> StorageResult<Option<SanitizedOrgLease>> {
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, LeaseRow>(
+            "SELECT id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                    fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                    ended_at, end_reason, expiry_event_id
+             FROM org_leases
+             WHERE work_item_id=$1 AND ended_at IS NULL AND expires_at>$2",
+        )
+        .bind(work_item_id.to_string())
+        .bind(now)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query active Org lease", error))?
+        .map(LeaseRow::into_lease)
+        .transpose()
+        .map(|lease| lease.map(Into::into))
+    }
+
+    async fn list_org_lease_history(
+        &self,
+        work_item_id: WorkItemId,
+    ) -> StorageResult<Vec<SanitizedOrgLease>> {
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, LeaseRow>(
+            "SELECT id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                    fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                    ended_at, end_reason, expiry_event_id
+             FROM org_leases WHERE work_item_id=$1 ORDER BY acquired_at, id",
+        )
+        .bind(work_item_id.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("list Org lease history", error))?
+        .into_iter()
+        .map(LeaseRow::into_lease)
+        .map(|result| result.map(Into::into))
+        .collect()
+    }
+
+    async fn count_active_org_leases(
+        &self,
+        workspace_id: WorkspaceId,
+        now: i64,
+    ) -> StorageResult<i64> {
+        let mut connection = self.connection().await?;
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM org_leases
+             WHERE workspace_id=$1 AND ended_at IS NULL AND expires_at>$2",
+        )
+        .bind(workspace_id.to_string())
+        .bind(now)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("count active Org leases", error))
+    }
+
+    async fn heartbeat_org_lease(
+        &self,
+        update: OrgLeaseHeartbeat<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        validate_lease_heartbeat(&update)?;
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, LeaseRow>(
+            "UPDATE org_leases
+             SET last_heartbeat_at=$8, expires_at=$9
+             WHERE id=$1 AND workspace_id=$2 AND work_item_id=$3
+               AND fencing_token_hash=$4 AND kind=$5 AND actor_id=$6
+               AND ended_at IS NULL AND expires_at>$7
+               AND last_heartbeat_at<=$8 AND expires_at<=$9
+             RETURNING id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                       fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                       ended_at, end_reason, expiry_event_id",
+        )
+        .bind(update.proof.lease_id)
+        .bind(update.proof.workspace_id.to_string())
+        .bind(update.proof.work_item_id.to_string())
+        .bind(update.proof.fencing_token_hash)
+        .bind(lease_kind_name(update.proof.kind))
+        .bind(update.proof.actor_id)
+        .bind(update.proof.now)
+        .bind(update.last_heartbeat_at)
+        .bind(update.expires_at)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("heartbeat Org lease", error))?;
+        conditional_lease_result(&mut connection, row, update.proof.lease_id).await
+    }
+
+    async fn close_org_lease(
+        &self,
+        update: OrgLeaseClosure<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        validate_lease_closure(&update)?;
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, LeaseRow>(
+            "UPDATE org_leases
+             SET ended_at=$8, end_reason=$9, expiry_event_id=NULL
+             WHERE id=$1 AND workspace_id=$2 AND work_item_id=$3
+               AND fencing_token_hash=$4 AND kind=$5 AND actor_id=$6
+               AND ended_at IS NULL AND expires_at>$7
+             RETURNING id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                       fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                       ended_at, end_reason, expiry_event_id",
+        )
+        .bind(update.proof.lease_id)
+        .bind(update.proof.workspace_id.to_string())
+        .bind(update.proof.work_item_id.to_string())
+        .bind(update.proof.fencing_token_hash)
+        .bind(lease_kind_name(update.proof.kind))
+        .bind(update.proof.actor_id)
+        .bind(update.proof.now)
+        .bind(update.ended_at)
+        .bind(lease_end_reason_name(update.end_reason))
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("close Org lease", error))?;
+        conditional_lease_result(&mut connection, row, update.proof.lease_id).await
+    }
+
+    async fn close_expired_org_lease(
+        &self,
+        update: ExpiredOrgLeaseClosure<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        if update.lease_id.trim().is_empty()
+            || update.expiry_event_id.trim().is_empty()
+            || update.ended_at < update.now
+        {
+            return Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "invalid expired Org lease closure",
+            ));
+        }
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, LeaseRow>(
+            "UPDATE org_leases
+             SET ended_at=$4, end_reason='lease_expiry', expiry_event_id=$5
+             WHERE id=$1 AND work_item_id=$2 AND ended_at IS NULL AND expires_at<=$3
+             RETURNING id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                       fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                       ended_at, end_reason, expiry_event_id",
+        )
+        .bind(update.lease_id)
+        .bind(update.work_item_id.to_string())
+        .bind(update.now)
+        .bind(update.ended_at)
+        .bind(update.expiry_event_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("close expired Org lease", error))?;
+        conditional_lease_result(&mut connection, row, update.lease_id).await
+    }
+
+    async fn move_org_lease_ownership(
+        &self,
+        update: OrgLeaseOwnershipMove<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        validate_lease_move(&update)?;
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, LeaseRow>(
+            "UPDATE org_leases
+             SET workspace_id=$8
+             WHERE id=$1 AND workspace_id=$2 AND work_item_id=$3
+               AND fencing_token_hash=$4 AND kind=$5 AND actor_id=$6
+               AND ended_at IS NULL AND expires_at>$7
+               AND (SELECT COUNT(*) FROM org_leases
+                    WHERE workspace_id=$8 AND ended_at IS NULL AND expires_at>$7) < $9
+             RETURNING id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                       fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                       ended_at, end_reason, expiry_event_id",
+        )
+        .bind(update.proof.lease_id)
+        .bind(update.proof.workspace_id.to_string())
+        .bind(update.proof.work_item_id.to_string())
+        .bind(update.proof.fencing_token_hash)
+        .bind(lease_kind_name(update.proof.kind))
+        .bind(update.proof.actor_id)
+        .bind(update.proof.now)
+        .bind(update.target_workspace_id.to_string())
+        .bind(update.target_capacity)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("move Org lease ownership", error))?;
+        conditional_lease_result(&mut connection, row, update.proof.lease_id).await
     }
 
     async fn insert_org_operation(&self, operation: &StoredOrgOperation) -> StorageResult<()> {
@@ -963,6 +1284,22 @@ fn validate_new_attempt(attempt: &NewOrgAttempt<'_>) -> StorageResult<()> {
     Ok(())
 }
 
+fn validate_attempt_allocation(attempt: &NewOrgAttemptAllocation<'_>) -> StorageResult<()> {
+    if attempt.id.trim().is_empty() || attempt.actor_id.trim().is_empty() {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org attempt id and actor id must not be empty",
+        ));
+    }
+    if attempt.started_at <= 0 {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "Org attempt start must be positive",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_attempt_update(update: &OrgAttemptUpdate<'_>) -> StorageResult<()> {
     if update.id.trim().is_empty() {
         return Err(StorageError::new(
@@ -970,7 +1307,159 @@ fn validate_attempt_update(update: &OrgAttemptUpdate<'_>) -> StorageResult<()> {
             "Org attempt id must not be empty",
         ));
     }
+    let allowed = matches!(
+        (update.expected_status, update.status),
+        (
+            OrgAttemptStatus::Running,
+            OrgAttemptStatus::Submitted
+                | OrgAttemptStatus::Completed
+                | OrgAttemptStatus::Failed
+                | OrgAttemptStatus::Cancelled
+                | OrgAttemptStatus::Expired
+        ) | (
+            OrgAttemptStatus::Submitted,
+            OrgAttemptStatus::Completed | OrgAttemptStatus::Failed | OrgAttemptStatus::Cancelled
+        )
+    );
+    if !allowed {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid Org attempt status transition",
+        ));
+    }
     Ok(())
+}
+
+fn validate_new_lease(lease: &NewOrgLease<'_>, capacity: i64, now: i64) -> StorageResult<()> {
+    if lease.id.trim().is_empty()
+        || lease.actor_id.trim().is_empty()
+        || lease.attempt_id.trim().is_empty()
+        || lease.fencing_token_hash.len() != 64
+        || !lease
+            .fencing_token_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "invalid Org lease identity or fencing hash",
+        ));
+    }
+    if capacity < 1
+        || now <= 0
+        || lease.acquired_at <= 0
+        || lease.last_heartbeat_at < lease.acquired_at
+        || lease.expires_at < lease.last_heartbeat_at
+    {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid Org lease capacity or timestamps",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lease_heartbeat(update: &OrgLeaseHeartbeat<'_>) -> StorageResult<()> {
+    validate_lease_proof(&update.proof)?;
+    if update.last_heartbeat_at < update.proof.now || update.expires_at < update.last_heartbeat_at {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid Org lease heartbeat timestamps",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lease_closure(update: &OrgLeaseClosure<'_>) -> StorageResult<()> {
+    validate_lease_proof(&update.proof)?;
+    if update.end_reason == OrgLeaseEndReason::LeaseExpiry || update.ended_at < update.proof.now {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid active Org lease closure",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lease_move(update: &OrgLeaseOwnershipMove<'_>) -> StorageResult<()> {
+    validate_lease_proof(&update.proof)?;
+    if update.target_capacity < 1 || update.target_workspace_id == update.proof.workspace_id {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "invalid Org lease ownership move",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lease_proof(proof: &note_storage::OrgLeaseProof<'_>) -> StorageResult<()> {
+    if proof.lease_id.trim().is_empty()
+        || proof.actor_id.trim().is_empty()
+        || proof.fencing_token_hash.len() != 64
+        || !proof
+            .fencing_token_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || proof.now <= 0
+    {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "invalid Org lease proof",
+        ));
+    }
+    Ok(())
+}
+
+fn lease_kind_name(kind: OrgLeaseKind) -> &'static str {
+    match kind {
+        OrgLeaseKind::Execution => "execution",
+        OrgLeaseKind::Review => "review",
+    }
+}
+
+fn decode_lease_kind(value: &str) -> StorageResult<OrgLeaseKind> {
+    match value {
+        "execution" => Ok(OrgLeaseKind::Execution),
+        "review" => Ok(OrgLeaseKind::Review),
+        _ => Err(StorageError::new(
+            StorageErrorKind::Corrupt,
+            format!("stored Org lease has unknown kind {value:?}"),
+        )),
+    }
+}
+
+fn lease_end_reason_name(reason: OrgLeaseEndReason) -> &'static str {
+    match reason {
+        OrgLeaseEndReason::Release => "release",
+        OrgLeaseEndReason::Completion => "completion",
+        OrgLeaseEndReason::Failure => "failure",
+        OrgLeaseEndReason::Block => "block",
+        OrgLeaseEndReason::Cancellation => "cancellation",
+        OrgLeaseEndReason::LeaseExpiry => "lease_expiry",
+        OrgLeaseEndReason::ReviewRequest => "review_request",
+        OrgLeaseEndReason::Approval => "approval",
+        OrgLeaseEndReason::Rejection => "rejection",
+        OrgLeaseEndReason::Reassignment => "reassignment",
+    }
+}
+
+fn decode_lease_end_reason(value: &str) -> StorageResult<OrgLeaseEndReason> {
+    match value {
+        "release" => Ok(OrgLeaseEndReason::Release),
+        "completion" => Ok(OrgLeaseEndReason::Completion),
+        "failure" => Ok(OrgLeaseEndReason::Failure),
+        "block" => Ok(OrgLeaseEndReason::Block),
+        "cancellation" => Ok(OrgLeaseEndReason::Cancellation),
+        "lease_expiry" => Ok(OrgLeaseEndReason::LeaseExpiry),
+        "review_request" => Ok(OrgLeaseEndReason::ReviewRequest),
+        "approval" => Ok(OrgLeaseEndReason::Approval),
+        "rejection" => Ok(OrgLeaseEndReason::Rejection),
+        "reassignment" => Ok(OrgLeaseEndReason::Reassignment),
+        _ => Err(StorageError::new(
+            StorageErrorKind::Corrupt,
+            format!("stored Org lease has unknown end reason {value:?}"),
+        )),
+    }
 }
 
 fn attempt_status_name(status: OrgAttemptStatus) -> &'static str {
@@ -996,6 +1485,67 @@ fn decode_attempt_status(value: &str) -> StorageResult<OrgAttemptStatus> {
             StorageErrorKind::Corrupt,
             format!("stored Org attempt has unknown status {value:?}"),
         )),
+    }
+}
+
+async fn conditional_lease_result(
+    connection: &mut PgConnection,
+    row: Option<LeaseRow>,
+    lease_id: &str,
+) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+    if let Some(row) = row {
+        return Ok(ConditionalUpdate::Applied(row.into_lease()?.into()));
+    }
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM org_leases WHERE id=$1)")
+        .bind(lease_id)
+        .fetch_one(connection)
+        .await
+        .map_err(|error| map_sqlx_error("check Org lease conditional conflict", error))?;
+    Ok(if exists {
+        ConditionalUpdate::Conflict
+    } else {
+        ConditionalUpdate::NotFound
+    })
+}
+
+#[derive(sqlx::FromRow)]
+struct LeaseRow {
+    id: String,
+    workspace_id: String,
+    work_item_id: String,
+    attempt_id: String,
+    kind: String,
+    actor_id: String,
+    fencing_token_hash: String,
+    acquired_at: i64,
+    last_heartbeat_at: i64,
+    expires_at: i64,
+    ended_at: Option<i64>,
+    end_reason: Option<String>,
+    expiry_event_id: Option<String>,
+}
+
+impl LeaseRow {
+    fn into_lease(self) -> StorageResult<OrgLease> {
+        Ok(OrgLease {
+            id: self.id,
+            workspace_id: decode_workspace_id(self.workspace_id)?,
+            work_item_id: decode_work_item_id(self.work_item_id)?,
+            attempt_id: self.attempt_id,
+            kind: decode_lease_kind(&self.kind)?,
+            actor_id: self.actor_id,
+            fencing_token_hash: self.fencing_token_hash,
+            acquired_at: self.acquired_at,
+            last_heartbeat_at: self.last_heartbeat_at,
+            expires_at: self.expires_at,
+            ended_at: self.ended_at,
+            end_reason: self
+                .end_reason
+                .as_deref()
+                .map(decode_lease_end_reason)
+                .transpose()?,
+            expiry_event_id: self.expiry_event_id,
+        })
     }
 }
 

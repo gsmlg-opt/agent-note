@@ -1,8 +1,9 @@
 use crate::{
     ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, CompareAndSwap,
     EmbeddingDashboardStatus, EmbeddingJob, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent,
-    NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteUpdate, OrgAttempt, OrgAttemptUpdate,
-    OrgDocument, OrgDocumentUpdate, OrgEvent, OrgProjectedWorkItem, OrgWorkspace,
+    NewOrgLease, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteUpdate, OrgArtifactReference,
+    OrgAttempt, OrgAttemptNoteReference, OrgAttemptUpdate, OrgDocument, OrgDocumentUpdate,
+    OrgEvent, OrgLease, OrgLeaseEndReason, OrgLeaseKind, OrgProjectedWorkItem, OrgWorkspace,
     OrgWorkspaceUpdate, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
     UpsertNoteChunk,
 };
@@ -142,6 +143,91 @@ pub enum ConditionalUpdate<T> {
     Applied(T),
     NotFound,
     Conflict,
+}
+
+/// Lease metadata safe for general reads. Fencing-token hashes are deliberately
+/// absent so neither a raw token nor its verifier can escape through read APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedOrgLease {
+    pub id: String,
+    pub workspace_id: note_org::WorkspaceId,
+    pub work_item_id: note_org::WorkItemId,
+    pub attempt_id: String,
+    pub kind: OrgLeaseKind,
+    pub actor_id: String,
+    pub acquired_at: i64,
+    pub last_heartbeat_at: i64,
+    pub expires_at: i64,
+    pub ended_at: Option<i64>,
+    pub end_reason: Option<OrgLeaseEndReason>,
+    pub expiry_event_id: Option<String>,
+}
+
+impl From<OrgLease> for SanitizedOrgLease {
+    fn from(lease: OrgLease) -> Self {
+        Self {
+            id: lease.id,
+            workspace_id: lease.workspace_id,
+            work_item_id: lease.work_item_id,
+            attempt_id: lease.attempt_id,
+            kind: lease.kind,
+            actor_id: lease.actor_id,
+            acquired_at: lease.acquired_at,
+            last_heartbeat_at: lease.last_heartbeat_at,
+            expires_at: lease.expires_at,
+            ended_at: lease.ended_at,
+            end_reason: lease.end_reason,
+            expiry_event_id: lease.expiry_event_id,
+        }
+    }
+}
+
+pub struct NewOrgAttemptAllocation<'a> {
+    pub id: &'a str,
+    pub workspace_id: note_org::WorkspaceId,
+    pub work_item_id: note_org::WorkItemId,
+    pub actor_id: &'a str,
+    pub started_at: i64,
+    pub note_refs: &'a [OrgAttemptNoteReference],
+    pub artifacts: &'a [OrgArtifactReference],
+    pub metadata: &'a serde_json::Value,
+}
+
+#[derive(Clone, Copy)]
+pub struct OrgLeaseProof<'a> {
+    pub lease_id: &'a str,
+    pub workspace_id: note_org::WorkspaceId,
+    pub work_item_id: note_org::WorkItemId,
+    pub fencing_token_hash: &'a str,
+    pub kind: OrgLeaseKind,
+    pub actor_id: &'a str,
+    pub now: i64,
+}
+
+pub struct OrgLeaseHeartbeat<'a> {
+    pub proof: OrgLeaseProof<'a>,
+    pub last_heartbeat_at: i64,
+    pub expires_at: i64,
+}
+
+pub struct OrgLeaseClosure<'a> {
+    pub proof: OrgLeaseProof<'a>,
+    pub ended_at: i64,
+    pub end_reason: OrgLeaseEndReason,
+}
+
+pub struct ExpiredOrgLeaseClosure<'a> {
+    pub lease_id: &'a str,
+    pub work_item_id: note_org::WorkItemId,
+    pub now: i64,
+    pub ended_at: i64,
+    pub expiry_event_id: &'a str,
+}
+
+pub struct OrgLeaseOwnershipMove<'a> {
+    pub proof: OrgLeaseProof<'a>,
+    pub target_workspace_id: note_org::WorkspaceId,
+    pub target_capacity: i64,
 }
 
 pub struct OrgDocumentOwnershipMove {
@@ -612,6 +698,19 @@ pub trait OrgRepository: Send + Sync {
         ))
     }
 
+    /// Allocates the next stable work-item attempt number. Callers must invoke
+    /// this inside the immediate transaction that owns the surrounding claim.
+    async fn allocate_next_org_attempt(
+        &self,
+        attempt: NewOrgAttemptAllocation<'_>,
+    ) -> StorageResult<OrgAttempt> {
+        let _ = attempt;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
     async fn get_org_attempt(&self, id: &str) -> StorageResult<Option<OrgAttempt>> {
         let _ = id;
         Err(StorageError::new(
@@ -631,10 +730,127 @@ pub trait OrgRepository: Send + Sync {
         ))
     }
 
+    async fn count_org_attempts(&self, work_item_id: note_org::WorkItemId) -> StorageResult<i64> {
+        let _ = work_item_id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
     async fn update_org_attempt(
         &self,
         update: OrgAttemptUpdate<'_>,
     ) -> StorageResult<ConditionalUpdate<OrgAttempt>> {
+        let _ = update;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    /// Atomically enforces both one-open-per-item and workspace capacity.
+    /// The surrounding claim transaction must use `TransactionMode::Immediate`.
+    async fn insert_org_lease_if_capacity(
+        &self,
+        lease: NewOrgLease<'_>,
+        capacity: i64,
+        now: i64,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _ = (lease, capacity, now);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    /// Internal fencing lookup. General read paths must use sanitized methods.
+    async fn get_open_org_lease_internal(
+        &self,
+        work_item_id: note_org::WorkItemId,
+    ) -> StorageResult<Option<OrgLease>> {
+        let _ = work_item_id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn get_active_org_lease(
+        &self,
+        work_item_id: note_org::WorkItemId,
+        now: i64,
+    ) -> StorageResult<Option<SanitizedOrgLease>> {
+        let _ = (work_item_id, now);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_lease_history(
+        &self,
+        work_item_id: note_org::WorkItemId,
+    ) -> StorageResult<Vec<SanitizedOrgLease>> {
+        let _ = work_item_id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn count_active_org_leases(
+        &self,
+        workspace_id: note_org::WorkspaceId,
+        now: i64,
+    ) -> StorageResult<i64> {
+        let _ = (workspace_id, now);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn heartbeat_org_lease(
+        &self,
+        update: OrgLeaseHeartbeat<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _ = update;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn close_org_lease(
+        &self,
+        update: OrgLeaseClosure<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _ = update;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn close_expired_org_lease(
+        &self,
+        update: ExpiredOrgLeaseClosure<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _ = update;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    /// Moves current lease ownership without rotating or closing its fence.
+    /// The target-capacity check shares the immediate transaction serialization
+    /// domain with lease insertion.
+    async fn move_org_lease_ownership(
+        &self,
+        update: OrgLeaseOwnershipMove<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
         let _ = update;
         Err(StorageError::new(
             StorageErrorKind::UnsupportedSchema,

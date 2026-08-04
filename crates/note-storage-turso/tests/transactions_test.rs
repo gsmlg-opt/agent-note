@@ -1,8 +1,9 @@
-use note_org::{DocumentId, WorkspaceId, WorkspacePolicy};
+use note_org::{DocumentId, WorkItemId, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    NewNote, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocumentOwnershipMove,
-    OrgDocumentOwnershipMoveResult, OrgEventType, OrgRepository, StorageBackend, StorageErrorKind,
-    StorageTransaction, TransactionMode, UpsertNoteChunk, EMBEDDING_DIMENSION,
+    NewNote, NewOrgAttemptAllocation, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
+    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgEventType, OrgRepository,
+    StorageBackend, StorageErrorKind, StorageTransaction, TransactionMode, UpsertNoteChunk,
+    EMBEDDING_DIMENSION,
 };
 use note_storage_turso::TursoStorage;
 use serde_json::json;
@@ -35,6 +36,74 @@ async fn insert_note(transaction: &dyn StorageTransaction, id: &str) {
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn org_claim_races_preserve_uniqueness_capacity_and_rollback() {
+    let (_dir, storage) = storage().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(storage);
+    note_storage_contract_tests::run_org_claim_races(backend).await;
+}
+
+#[tokio::test]
+async fn dropping_pending_immediate_claim_waiter_does_not_consume_attempt_number() {
+    let (_dir, storage) = storage().await;
+    let workspace_id = WorkspaceId::from_str("7a000000-0000-0000-0000-000000000001").unwrap();
+    let work_item_id = WorkItemId::from_str("7b000000-0000-0000-0000-000000000001").unwrap();
+    seed_event_workspace(&storage, workspace_id, "cancelled-claim-waiter").await;
+
+    let blocker = StorageBackend::begin(&storage, TransactionMode::Immediate)
+        .await
+        .unwrap();
+    let mut waiter = Box::pin(async {
+        let transaction = StorageBackend::begin(&storage, TransactionMode::Immediate)
+            .await
+            .unwrap();
+        transaction
+            .allocate_next_org_attempt(NewOrgAttemptAllocation {
+                id: "cancelled-claim-waiter-attempt",
+                workspace_id,
+                work_item_id,
+                actor_id: "cancelled-waiter",
+                started_at: 1,
+                note_refs: &[],
+                artifacts: &[],
+                metadata: &json!({}),
+            })
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+    });
+    assert_pending(
+        waiter.as_mut(),
+        "claim waiter was not observably pending behind the immediate writer",
+    );
+    drop(waiter);
+    blocker.rollback().await.unwrap();
+
+    let retry = StorageBackend::begin(&storage, TransactionMode::Immediate)
+        .await
+        .unwrap();
+    let attempt = retry
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "cancelled-claim-waiter-attempt",
+            workspace_id,
+            work_item_id,
+            actor_id: "cancelled-waiter",
+            started_at: 2,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &json!({}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(attempt.attempt_number, 1);
+    assert!(retry
+        .get_open_org_lease_internal(work_item_id)
+        .await
+        .unwrap()
+        .is_none());
+    retry.rollback().await.unwrap();
 }
 
 async fn seed_event_workspace(storage: &TursoStorage, id: WorkspaceId, slug: &str) {

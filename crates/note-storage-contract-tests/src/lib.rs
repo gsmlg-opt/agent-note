@@ -21,6 +21,12 @@ pub async fn run_storage_contracts(storage: Arc<dyn StorageBackend>) {
     transactions::run(storage).await;
 }
 
+/// Runs barrier-driven lease uniqueness and workspace-capacity races against a
+/// fresh backend database.
+pub async fn run_org_claim_races(storage: Arc<dyn StorageBackend>) {
+    transactions::run_org_claim_races(storage).await;
+}
+
 pub(crate) fn unit(axis: usize) -> Vec<f32> {
     let mut vector = vec![0.0; note_storage::EMBEDDING_DIMENSION];
     vector[axis] = 1.0;

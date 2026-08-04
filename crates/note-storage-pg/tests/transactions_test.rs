@@ -1,11 +1,16 @@
 mod support;
 
+use note_org::{WorkItemId, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    NewNote, StorageBackend, StorageErrorKind, StorageTransaction, TransactionMode,
-    UpsertNoteChunk, EMBEDDING_DIMENSION,
+    NewNote, NewOrgAttemptAllocation, NewOrgWorkspace, OrgRepository, StorageBackend,
+    StorageErrorKind, StorageTransaction, TransactionMode, UpsertNoteChunk, EMBEDDING_DIMENSION,
 };
 use note_storage_pg::PgStorage;
+use std::future::Future;
+use std::pin::Pin;
+use std::str::FromStr as _;
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 async fn storage(test_name: &str) -> Option<(support::TestDatabase, Arc<PgStorage>)> {
@@ -28,6 +33,106 @@ async fn insert_note(transaction: &dyn StorageTransaction, id: &str) {
         })
         .await
         .unwrap();
+}
+
+fn assert_pending<F: Future>(mut future: Pin<&mut F>, message: &str) {
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(future.as_mut().poll(&mut context), Poll::Pending),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn org_claim_races_preserve_uniqueness_capacity_and_rollback() {
+    let Some((database, storage)) =
+        storage("org_claim_races_preserve_uniqueness_capacity_and_rollback").await
+    else {
+        return;
+    };
+    let backend: Arc<dyn StorageBackend> = storage.clone();
+    note_storage_contract_tests::run_org_claim_races(backend).await;
+    database.cleanup(Some(&storage)).await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_pending_immediate_claim_waiter_does_not_consume_attempt_number() {
+    let Some((database, storage)) =
+        storage("dropping_pending_immediate_claim_waiter_does_not_consume_attempt_number").await
+    else {
+        return;
+    };
+    let workspace_id = WorkspaceId::from_str("7a000000-0000-0000-0000-000000000001").unwrap();
+    let work_item_id = WorkItemId::from_str("7b000000-0000-0000-0000-000000000001").unwrap();
+    let session = storage.connect_session().await.unwrap();
+    session
+        .insert_org_workspace(NewOrgWorkspace {
+            id: workspace_id,
+            slug: "cancelled-claim-waiter",
+            display_name: "Cancelled claim waiter",
+            description: "observable pending acquisition contract",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &WorkspacePolicy::engineering_default(),
+            now: 1,
+        })
+        .await
+        .unwrap();
+    drop(session);
+
+    let blocker = StorageBackend::begin(storage.as_ref(), TransactionMode::Immediate)
+        .await
+        .unwrap();
+    let mut waiter = Box::pin(async {
+        let transaction = StorageBackend::begin(storage.as_ref(), TransactionMode::Immediate)
+            .await
+            .unwrap();
+        transaction
+            .allocate_next_org_attempt(NewOrgAttemptAllocation {
+                id: "cancelled-claim-waiter-attempt",
+                workspace_id,
+                work_item_id,
+                actor_id: "cancelled-waiter",
+                started_at: 1,
+                note_refs: &[],
+                artifacts: &[],
+                metadata: &serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+    });
+    assert_pending(
+        waiter.as_mut(),
+        "claim waiter was not observably pending behind the immediate writer",
+    );
+    drop(waiter);
+    blocker.rollback().await.unwrap();
+
+    let retry = StorageBackend::begin(storage.as_ref(), TransactionMode::Immediate)
+        .await
+        .unwrap();
+    let attempt = retry
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "cancelled-claim-waiter-attempt",
+            workspace_id,
+            work_item_id,
+            actor_id: "cancelled-waiter",
+            started_at: 2,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+    assert_eq!(attempt.attempt_number, 1);
+    assert!(retry
+        .get_open_org_lease_internal(work_item_id)
+        .await
+        .unwrap()
+        .is_none());
+    retry.rollback().await.unwrap();
+    database.cleanup(Some(&storage)).await.unwrap();
 }
 
 #[tokio::test]

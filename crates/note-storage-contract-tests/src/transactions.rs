@@ -1,10 +1,12 @@
 use crate::unit;
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
-    OrgAttemptStatus, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate,
-    OrgEventType, OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind,
-    StorageTransaction, StoredOrgOperation, TransactionMode, UpsertNoteChunk,
+    CompareAndSwap, ConditionalUpdate, NewNote, NewOrgAttempt, NewOrgAttemptAllocation,
+    NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace, OrgAttemptStatus,
+    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
+    OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof, OrgProjectedWorkItem, OrgWorkspaceUpdate,
+    StorageBackend, StorageErrorKind, StorageTransaction, StoredOrgOperation, TransactionMode,
+    UpsertNoteChunk,
 };
 use serde_json::json;
 use std::str::FromStr as _;
@@ -361,6 +363,29 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         })
         .await
         .unwrap();
+    assert!(matches!(
+        org_atomic
+            .insert_org_lease_if_capacity(
+                NewOrgLease {
+                    id: "rolled-back-lease",
+                    workspace_id,
+                    work_item_id: original_item_id,
+                    attempt_id: "rolled-back-attempt",
+                    kind: OrgLeaseKind::Execution,
+                    actor_id: "contract-rollback",
+                    fencing_token_hash:
+                        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    acquired_at: 511,
+                    last_heartbeat_at: 511,
+                    expires_at: 611,
+                },
+                1,
+                511,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
     assert_eq!(
         org_atomic
             .append_org_event(NewOrgEvent {
@@ -425,6 +450,11 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap()
         .is_none());
+    assert!(org_observer
+        .get_open_org_lease_internal(original_item_id)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         org_observer
             .list_org_document_projection(document_id)
@@ -475,4 +505,289 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .expect("second immediate transaction did not proceed after commit");
     second.rollback().await.unwrap();
+}
+
+pub(crate) async fn run_org_claim_races(storage: Arc<dyn StorageBackend>) {
+    let same_workspace = WorkspaceId::from_str("68000000-0000-0000-0000-000000000001").unwrap();
+    let capacity_workspace = WorkspaceId::from_str("68000000-0000-0000-0000-000000000002").unwrap();
+    let move_source = WorkspaceId::from_str("68000000-0000-0000-0000-000000000003").unwrap();
+    let move_target = WorkspaceId::from_str("68000000-0000-0000-0000-000000000004").unwrap();
+    let policy = WorkspacePolicy::engineering_default();
+    let seed = storage.session().await.unwrap();
+    for (id, slug) in [
+        (same_workspace, "race-same-item"),
+        (capacity_workspace, "race-capacity"),
+        (move_source, "race-move-source"),
+        (move_target, "race-move-target"),
+    ] {
+        seed.insert_org_workspace(NewOrgWorkspace {
+            id,
+            slug,
+            display_name: slug,
+            description: "barrier-driven lease race",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            now: 1_000,
+        })
+        .await
+        .unwrap();
+    }
+    drop(seed);
+
+    let same_item = WorkItemId::from_str("69000000-0000-0000-0000-000000000001").unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first = tokio::spawn(race_claim(
+        storage.clone(),
+        barrier.clone(),
+        same_workspace,
+        same_item,
+        "race-same-attempt-a",
+        "race-same-lease-a",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        10,
+    ));
+    let second = tokio::spawn(race_claim(
+        storage.clone(),
+        barrier,
+        same_workspace,
+        same_item,
+        "race-same-attempt-b",
+        "race-same-lease-b",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        10,
+    ));
+    let results = [first.await.unwrap(), second.await.unwrap()];
+    assert_eq!(results.into_iter().filter(|won| *won).count(), 1);
+    let observer = storage.session().await.unwrap();
+    assert_eq!(observer.count_org_attempts(same_item).await.unwrap(), 1);
+    assert_eq!(
+        observer
+            .list_org_lease_history(same_item)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(observer);
+
+    let capacity_item_a = WorkItemId::from_str("69000000-0000-0000-0000-000000000002").unwrap();
+    let capacity_item_b = WorkItemId::from_str("69000000-0000-0000-0000-000000000003").unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first = tokio::spawn(race_claim(
+        storage.clone(),
+        barrier.clone(),
+        capacity_workspace,
+        capacity_item_a,
+        "race-capacity-attempt-a",
+        "race-capacity-lease-a",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+        1,
+    ));
+    let second = tokio::spawn(race_claim(
+        storage.clone(),
+        barrier,
+        capacity_workspace,
+        capacity_item_b,
+        "race-capacity-attempt-b",
+        "race-capacity-lease-b",
+        "4444444444444444444444444444444444444444444444444444444444444444",
+        1,
+    ));
+    let results = [first.await.unwrap(), second.await.unwrap()];
+    assert_eq!(results.into_iter().filter(|won| *won).count(), 1);
+    let observer = storage.session().await.unwrap();
+    assert_eq!(
+        observer
+            .count_active_org_leases(capacity_workspace, 1_000)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        observer.count_org_attempts(capacity_item_a).await.unwrap()
+            + observer.count_org_attempts(capacity_item_b).await.unwrap(),
+        1,
+        "capacity loser must roll back its attempt allocation"
+    );
+    drop(observer);
+
+    let moving_item = WorkItemId::from_str("69000000-0000-0000-0000-000000000004").unwrap();
+    let target_claim_item = WorkItemId::from_str("69000000-0000-0000-0000-000000000005").unwrap();
+    let setup = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let moving_attempt = setup
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "race-move-attempt",
+            workspace_id: move_source,
+            work_item_id: moving_item,
+            actor_id: "race-mover",
+            started_at: 1_000,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &json!({}),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        setup
+            .insert_org_lease_if_capacity(
+                NewOrgLease {
+                    id: "race-move-lease",
+                    workspace_id: move_source,
+                    work_item_id: moving_item,
+                    attempt_id: &moving_attempt.id,
+                    kind: OrgLeaseKind::Execution,
+                    actor_id: "race-mover",
+                    fencing_token_hash:
+                        "5555555555555555555555555555555555555555555555555555555555555555",
+                    acquired_at: 1_000,
+                    last_heartbeat_at: 1_000,
+                    expires_at: 1_100,
+                },
+                1,
+                1_000,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    setup.commit().await.unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let move_storage = storage.clone();
+    let move_barrier = barrier.clone();
+    let mover = tokio::spawn(async move {
+        move_barrier.wait().await;
+        let transaction = move_storage
+            .begin(TransactionMode::Immediate)
+            .await
+            .unwrap();
+        let result = transaction
+            .move_org_lease_ownership(OrgLeaseOwnershipMove {
+                proof: OrgLeaseProof {
+                    lease_id: "race-move-lease",
+                    workspace_id: move_source,
+                    work_item_id: moving_item,
+                    fencing_token_hash:
+                        "5555555555555555555555555555555555555555555555555555555555555555",
+                    kind: OrgLeaseKind::Execution,
+                    actor_id: "race-mover",
+                    now: 1_000,
+                },
+                target_workspace_id: move_target,
+                target_capacity: 1,
+            })
+            .await
+            .unwrap();
+        let won = matches!(result, ConditionalUpdate::Applied(_));
+        if won {
+            transaction.commit().await.unwrap();
+        } else {
+            transaction.rollback().await.unwrap();
+        }
+        won
+    });
+    let claimer = tokio::spawn(race_claim(
+        storage.clone(),
+        barrier,
+        move_target,
+        target_claim_item,
+        "race-target-attempt",
+        "race-target-lease",
+        "6666666666666666666666666666666666666666666666666666666666666666",
+        1,
+    ));
+    let move_won = mover.await.unwrap();
+    let claim_won = claimer.await.unwrap();
+    assert_ne!(
+        move_won, claim_won,
+        "exactly one target capacity action wins"
+    );
+    let observer = storage.session().await.unwrap();
+    assert_eq!(
+        observer
+            .count_active_org_leases(move_target, 1_000)
+            .await
+            .unwrap(),
+        1
+    );
+    let moving_lease = observer
+        .get_open_org_lease_internal(moving_item)
+        .await
+        .unwrap()
+        .unwrap();
+    if move_won {
+        assert_eq!(moving_lease.workspace_id, move_target);
+        assert_eq!(
+            observer
+                .count_org_attempts(target_claim_item)
+                .await
+                .unwrap(),
+            0
+        );
+    } else {
+        assert_eq!(moving_lease.workspace_id, move_source);
+        assert_eq!(
+            observer
+                .count_org_attempts(target_claim_item)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+}
+
+async fn race_claim(
+    storage: Arc<dyn StorageBackend>,
+    barrier: Arc<tokio::sync::Barrier>,
+    workspace_id: WorkspaceId,
+    work_item_id: WorkItemId,
+    attempt_id: &'static str,
+    lease_id: &'static str,
+    fencing_token_hash: &'static str,
+    capacity: i64,
+) -> bool {
+    barrier.wait().await;
+    let transaction = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let attempt = transaction
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: attempt_id,
+            workspace_id,
+            work_item_id,
+            actor_id: "race-claimer",
+            started_at: 1_000,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &json!({}),
+        })
+        .await
+        .unwrap();
+    let won = matches!(
+        transaction
+            .insert_org_lease_if_capacity(
+                NewOrgLease {
+                    id: lease_id,
+                    workspace_id,
+                    work_item_id,
+                    attempt_id: &attempt.id,
+                    kind: OrgLeaseKind::Execution,
+                    actor_id: "race-claimer",
+                    fencing_token_hash,
+                    acquired_at: 1_000,
+                    last_heartbeat_at: 1_000,
+                    expires_at: 1_100,
+                },
+                capacity,
+                1_000,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    );
+    if won {
+        transaction.commit().await.unwrap();
+    } else {
+        transaction.rollback().await.unwrap();
+    }
+    won
 }

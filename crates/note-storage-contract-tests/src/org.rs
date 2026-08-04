@@ -1,10 +1,12 @@
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, ConditionalUpdate, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
+    CompareAndSwap, ConditionalUpdate, ExpiredOrgLeaseClosure, NewOrgAttempt,
+    NewOrgAttemptAllocation, NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace,
     OrgArtifactReference, OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate,
     OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
-    OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StoredOrgOperation,
-    StoredOrgTimestamp, TransactionMode,
+    OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind, OrgLeaseOwnershipMove,
+    OrgLeaseProof, OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind,
+    StoredOrgOperation, StoredOrgTimestamp, TransactionMode,
 };
 use serde_json::json;
 use std::str::FromStr as _;
@@ -1652,5 +1654,686 @@ async fn run_workflow_audit_contracts(storage: Arc<dyn StorageBackend>) {
             .await
             .unwrap(),
         vec![target_projection[1].clone()]
+    );
+
+    run_lease_and_attempt_contracts(storage).await;
+}
+
+async fn run_lease_and_attempt_contracts(storage: Arc<dyn StorageBackend>) {
+    let source_workspace = workspace_id("18000000-0000-0000-0000-000000000001");
+    let target_workspace = workspace_id("18000000-0000-0000-0000-000000000002");
+    let execution_item = work_item_id("19000000-0000-0000-0000-000000000001");
+    let review_item = work_item_id("19000000-0000-0000-0000-000000000002");
+    let expired_item = work_item_id("19000000-0000-0000-0000-000000000003");
+    let policy = WorkspacePolicy::engineering_default();
+    let session = storage.session().await.unwrap();
+    for (id, slug) in [
+        (source_workspace, "claims-source"),
+        (target_workspace, "claims-target"),
+    ] {
+        session
+            .insert_org_workspace(NewOrgWorkspace {
+                id,
+                slug,
+                display_name: slug,
+                description: "lease and attempt storage contracts",
+                timezone: "UTC",
+                policy_schema_version: 1,
+                policy: &policy,
+                now: 100,
+            })
+            .await
+            .unwrap();
+    }
+
+    let metadata = json!({"contract": "lease-attempt"});
+    let execution = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let first_attempt = execution
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "claim-attempt-1",
+            workspace_id: source_workspace,
+            work_item_id: execution_item,
+            actor_id: "agent-execution",
+            started_at: 100,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &metadata,
+        })
+        .await
+        .unwrap();
+    assert_eq!(first_attempt.attempt_number, 1);
+    let ConditionalUpdate::Applied(inserted) = execution
+        .insert_org_lease_if_capacity(
+            NewOrgLease {
+                id: "claim-lease-1",
+                workspace_id: source_workspace,
+                work_item_id: execution_item,
+                attempt_id: &first_attempt.id,
+                kind: OrgLeaseKind::Execution,
+                actor_id: "agent-execution",
+                fencing_token_hash:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                acquired_at: 100,
+                last_heartbeat_at: 100,
+                expires_at: 200,
+            },
+            2,
+            100,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("first execution lease should fit workspace capacity");
+    };
+    assert_eq!(inserted.kind, OrgLeaseKind::Execution);
+    execution.commit().await.unwrap();
+
+    let internal = session
+        .get_open_org_lease_internal(execution_item)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        internal.fencing_token_hash,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    let active = session
+        .get_active_org_lease(execution_item, 199)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.id, "claim-lease-1");
+    assert!(session
+        .get_active_org_lease(execution_item, 200)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        session
+            .count_active_org_leases(source_workspace, 199)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        session
+            .count_active_org_leases(source_workspace, 200)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let proof = |hash: &'static str, now| OrgLeaseProof {
+        lease_id: "claim-lease-1",
+        workspace_id: source_workspace,
+        work_item_id: execution_item,
+        fencing_token_hash: hash,
+        kind: OrgLeaseKind::Execution,
+        actor_id: "agent-execution",
+        now,
+    };
+    for invalid_proof in [
+        proof(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            150,
+        ),
+        OrgLeaseProof {
+            actor_id: "wrong-actor",
+            ..proof(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                150,
+            )
+        },
+        OrgLeaseProof {
+            kind: OrgLeaseKind::Review,
+            ..proof(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                150,
+            )
+        },
+        OrgLeaseProof {
+            workspace_id: target_workspace,
+            ..proof(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                150,
+            )
+        },
+        OrgLeaseProof {
+            work_item_id: expired_item,
+            ..proof(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                150,
+            )
+        },
+        proof(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            200,
+        ),
+    ] {
+        assert_eq!(
+            session
+                .heartbeat_org_lease(OrgLeaseHeartbeat {
+                    proof: invalid_proof,
+                    last_heartbeat_at: invalid_proof.now,
+                    expires_at: invalid_proof.now + 100,
+                })
+                .await
+                .unwrap(),
+            ConditionalUpdate::Conflict,
+            "every well-formed stale proof must have one generic result"
+        );
+    }
+    let ConditionalUpdate::Applied(heartbeat) = session
+        .heartbeat_org_lease(OrgLeaseHeartbeat {
+            proof: proof(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                150,
+            ),
+            last_heartbeat_at: 150,
+            expires_at: 250,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("current lease proof should heartbeat");
+    };
+    assert_eq!(heartbeat.last_heartbeat_at, 150);
+    assert_eq!(heartbeat.expires_at, 250);
+    assert_eq!(
+        session
+            .heartbeat_org_lease(OrgLeaseHeartbeat {
+                proof: proof(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    151,
+                ),
+                last_heartbeat_at: 151,
+                expires_at: 249,
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Conflict,
+        "heartbeat must never shorten the stored lease expiry"
+    );
+    assert_eq!(
+        session
+            .get_active_org_lease(execution_item, 249)
+            .await
+            .unwrap()
+            .unwrap()
+            .expires_at,
+        250
+    );
+
+    let close = || OrgLeaseClosure {
+        proof: proof(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            160,
+        ),
+        ended_at: 160,
+        end_reason: OrgLeaseEndReason::Release,
+    };
+    assert!(matches!(
+        session.close_org_lease(close()).await.unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    assert_eq!(
+        session.close_org_lease(close()).await.unwrap(),
+        ConditionalUpdate::Conflict
+    );
+    let history = session
+        .list_org_lease_history(execution_item)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].end_reason, Some(OrgLeaseEndReason::Release));
+
+    let review_tx = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let review_attempt = review_tx
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "review-attempt-1",
+            workspace_id: source_workspace,
+            work_item_id: review_item,
+            actor_id: "agent-author",
+            started_at: 300,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &metadata,
+        })
+        .await
+        .unwrap();
+    let ConditionalUpdate::Applied(submitted) = review_tx
+        .update_org_attempt(OrgAttemptUpdate {
+            id: &review_attempt.id,
+            expected_status: OrgAttemptStatus::Running,
+            status: OrgAttemptStatus::Submitted,
+            ended_at: 310,
+            error: None,
+            result_summary: Some("ready for review"),
+            review_outcome: None,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &metadata,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("running attempt should become submitted");
+    };
+    assert_eq!(submitted.status, OrgAttemptStatus::Submitted);
+    let ConditionalUpdate::Applied(review_lease) = review_tx
+        .insert_org_lease_if_capacity(
+            NewOrgLease {
+                id: "review-lease-1",
+                workspace_id: source_workspace,
+                work_item_id: review_item,
+                attempt_id: &review_attempt.id,
+                kind: OrgLeaseKind::Review,
+                actor_id: "agent-reviewer",
+                fencing_token_hash:
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                acquired_at: 320,
+                last_heartbeat_at: 320,
+                expires_at: 420,
+            },
+            2,
+            320,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("submitted attempt should accept a review lease");
+    };
+    assert_eq!(review_lease.kind, OrgLeaseKind::Review);
+    review_tx.commit().await.unwrap();
+
+    session
+        .rebuild_org_workspace_projection(source_workspace, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .get_active_org_lease(review_item, 350)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "review-lease-1"
+    );
+
+    let move_tx = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let ConditionalUpdate::Applied(moved) = move_tx
+        .move_org_lease_ownership(OrgLeaseOwnershipMove {
+            proof: OrgLeaseProof {
+                lease_id: "review-lease-1",
+                workspace_id: source_workspace,
+                work_item_id: review_item,
+                fencing_token_hash:
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                kind: OrgLeaseKind::Review,
+                actor_id: "agent-reviewer",
+                now: 350,
+            },
+            target_workspace_id: target_workspace,
+            target_capacity: 1,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("active review lease should move into available capacity");
+    };
+    assert_eq!(moved.workspace_id, target_workspace);
+    move_tx.commit().await.unwrap();
+    assert_eq!(
+        session
+            .get_org_attempt(&review_attempt.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .workspace_id,
+        source_workspace,
+        "attempt workspace is the workspace at execution start"
+    );
+
+    let moved_proof = OrgLeaseProof {
+        lease_id: "review-lease-1",
+        workspace_id: target_workspace,
+        work_item_id: review_item,
+        fencing_token_hash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        kind: OrgLeaseKind::Review,
+        actor_id: "agent-reviewer",
+        now: 360,
+    };
+    assert!(matches!(
+        session
+            .close_org_lease(OrgLeaseClosure {
+                proof: moved_proof,
+                ended_at: 360,
+                end_reason: OrgLeaseEndReason::Approval,
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    assert!(matches!(
+        session
+            .update_org_attempt(OrgAttemptUpdate {
+                id: &review_attempt.id,
+                expected_status: OrgAttemptStatus::Submitted,
+                status: OrgAttemptStatus::Completed,
+                ended_at: 360,
+                error: None,
+                result_summary: Some("approved"),
+                review_outcome: Some("approved"),
+                note_refs: &[],
+                artifacts: &[],
+                metadata: &metadata,
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    assert_eq!(
+        session
+            .update_org_attempt(OrgAttemptUpdate {
+                id: &review_attempt.id,
+                expected_status: OrgAttemptStatus::Submitted,
+                status: OrgAttemptStatus::Failed,
+                ended_at: 361,
+                error: Some("must not close twice"),
+                result_summary: None,
+                review_outcome: Some("rejected"),
+                note_refs: &[],
+                artifacts: &[],
+                metadata: &metadata,
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Conflict
+    );
+
+    assert_submitted_terminal(
+        session.as_ref(),
+        source_workspace,
+        work_item_id("19000000-0000-0000-0000-000000000004"),
+        "failed-lifecycle-attempt",
+        OrgAttemptStatus::Failed,
+    )
+    .await;
+    assert_submitted_terminal(
+        session.as_ref(),
+        source_workspace,
+        work_item_id("19000000-0000-0000-0000-000000000005"),
+        "cancelled-lifecycle-attempt",
+        OrgAttemptStatus::Cancelled,
+    )
+    .await;
+
+    let expiry_tx = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let expired_attempt = expiry_tx
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "expired-attempt-1",
+            workspace_id: source_workspace,
+            work_item_id: expired_item,
+            actor_id: "agent-expired",
+            started_at: 400,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &metadata,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        expiry_tx
+            .insert_org_lease_if_capacity(
+                NewOrgLease {
+                    id: "expired-lease-1",
+                    workspace_id: source_workspace,
+                    work_item_id: expired_item,
+                    attempt_id: &expired_attempt.id,
+                    kind: OrgLeaseKind::Execution,
+                    actor_id: "agent-expired",
+                    fencing_token_hash:
+                        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    acquired_at: 400,
+                    last_heartbeat_at: 400,
+                    expires_at: 450,
+                },
+                1,
+                400,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    expiry_tx.commit().await.unwrap();
+    let expiry_event = session
+        .append_internal_org_event(NewOrgEvent {
+            id: "event-expired-lease-contract",
+            workspace_id: source_workspace,
+            subject_kind: "work_item",
+            subject_id: &expired_item.to_string(),
+            actor_id: "system",
+            attempt_id: Some(&expired_attempt.id),
+            event_type: OrgEventType::LeaseExpiry,
+            occurred_at: 450,
+            summary: "Lease expired",
+            metadata: &json!({}),
+            previous_state: Some("ACTIVE"),
+            resulting_state: Some("TODO"),
+        })
+        .await
+        .unwrap();
+    let blocked_retry = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let retry_attempt = blocked_retry
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "expired-attempt-blocked-retry",
+            workspace_id: source_workspace,
+            work_item_id: expired_item,
+            actor_id: "agent-retry",
+            started_at: 450,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &metadata,
+        })
+        .await
+        .unwrap();
+    assert_eq!(retry_attempt.attempt_number, 2);
+    assert_eq!(
+        blocked_retry
+            .insert_org_lease_if_capacity(
+                NewOrgLease {
+                    id: "expired-lease-blocked-retry",
+                    workspace_id: source_workspace,
+                    work_item_id: expired_item,
+                    attempt_id: &retry_attempt.id,
+                    kind: OrgLeaseKind::Execution,
+                    actor_id: "agent-retry",
+                    fencing_token_hash:
+                        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    acquired_at: 450,
+                    last_heartbeat_at: 450,
+                    expires_at: 550,
+                },
+                1,
+                450,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpdate::Conflict,
+        "expired-but-unclosed lease still owns the unique open slot"
+    );
+    blocked_retry.rollback().await.unwrap();
+    let ConditionalUpdate::Applied(expired) = session
+        .close_expired_org_lease(ExpiredOrgLeaseClosure {
+            lease_id: "expired-lease-1",
+            work_item_id: expired_item,
+            now: 450,
+            ended_at: 450,
+            expiry_event_id: &expiry_event.id,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("lease is expired at the exact boundary");
+    };
+    assert_eq!(expired.end_reason, Some(OrgLeaseEndReason::LeaseExpiry));
+    assert_eq!(
+        expired.expiry_event_id.as_deref(),
+        Some("event-expired-lease-contract")
+    );
+    let reusable_slot = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let replacement_attempt = reusable_slot
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "expired-attempt-replacement",
+            workspace_id: source_workspace,
+            work_item_id: expired_item,
+            actor_id: "agent-replacement",
+            started_at: 451,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &metadata,
+        })
+        .await
+        .unwrap();
+    assert_eq!(replacement_attempt.attempt_number, 2);
+    assert!(matches!(
+        reusable_slot
+            .insert_org_lease_if_capacity(
+                NewOrgLease {
+                    id: "expired-lease-replacement",
+                    workspace_id: source_workspace,
+                    work_item_id: expired_item,
+                    attempt_id: &replacement_attempt.id,
+                    kind: OrgLeaseKind::Execution,
+                    actor_id: "agent-replacement",
+                    fencing_token_hash:
+                        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    acquired_at: 451,
+                    last_heartbeat_at: 451,
+                    expires_at: 551,
+                },
+                1,
+                451,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    reusable_slot.rollback().await.unwrap();
+
+    let allocation = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let retry = allocation
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "review-attempt-2",
+            workspace_id: target_workspace,
+            work_item_id: review_item,
+            actor_id: "agent-retry",
+            started_at: 500,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &metadata,
+        })
+        .await
+        .unwrap();
+    assert_eq!(retry.attempt_number, 2);
+    allocation.rollback().await.unwrap();
+    assert_eq!(session.count_org_attempts(review_item).await.unwrap(), 1);
+}
+
+async fn assert_submitted_terminal(
+    session: &dyn note_storage::StorageSession,
+    workspace_id: WorkspaceId,
+    work_item_id: WorkItemId,
+    attempt_id: &str,
+    terminal_status: OrgAttemptStatus,
+) {
+    let metadata = json!({"lifecycle": attempt_id});
+    session
+        .insert_org_attempt(NewOrgAttempt {
+            id: attempt_id,
+            workspace_id,
+            work_item_id,
+            attempt_number: 1,
+            actor_id: "lifecycle-agent",
+            status: OrgAttemptStatus::Running,
+            started_at: 600,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &metadata,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        session
+            .update_org_attempt(OrgAttemptUpdate {
+                id: attempt_id,
+                expected_status: OrgAttemptStatus::Running,
+                status: OrgAttemptStatus::Submitted,
+                ended_at: 610,
+                error: None,
+                result_summary: Some("submitted"),
+                review_outcome: None,
+                note_refs: &[],
+                artifacts: &[],
+                metadata: &metadata,
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    assert_eq!(
+        session
+            .update_org_attempt(OrgAttemptUpdate {
+                id: attempt_id,
+                expected_status: OrgAttemptStatus::Submitted,
+                status: OrgAttemptStatus::Expired,
+                ended_at: 619,
+                error: Some("review attempts do not expire"),
+                result_summary: None,
+                review_outcome: None,
+                note_refs: &[],
+                artifacts: &[],
+                metadata: &metadata,
+            })
+            .await
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::Constraint
+    );
+    assert!(matches!(
+        session
+            .update_org_attempt(OrgAttemptUpdate {
+                id: attempt_id,
+                expected_status: OrgAttemptStatus::Submitted,
+                status: terminal_status,
+                ended_at: 620,
+                error: (terminal_status == OrgAttemptStatus::Failed).then_some("failed"),
+                result_summary: None,
+                review_outcome: Some("reviewed"),
+                note_refs: &[],
+                artifacts: &[],
+                metadata: &metadata,
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    assert_eq!(
+        session
+            .update_org_attempt(OrgAttemptUpdate {
+                id: attempt_id,
+                expected_status: OrgAttemptStatus::Submitted,
+                status: terminal_status,
+                ended_at: 621,
+                error: None,
+                result_summary: None,
+                review_outcome: Some("must not overwrite"),
+                note_refs: &[],
+                artifacts: &[],
+                metadata: &metadata,
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Conflict
     );
 }
