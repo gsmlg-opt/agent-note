@@ -1,10 +1,11 @@
 use crate::connection::map_turso_error;
+use crate::labels::labels_for_note_unlocked;
 use crate::TursoSession;
 use note_core::{LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
-    resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, LabelRepository, NewNote,
-    NoteFieldsUpdate, NoteUpdate, NotesRepository, ResolvedLabelSelector, StorageError,
-    StorageErrorKind, StorageResult,
+    resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate,
+    NoteUpdate, NotesRepository, ResolvedLabelSelector, StorageError, StorageErrorKind,
+    StorageResult,
 };
 
 impl TursoSession {
@@ -130,6 +131,7 @@ fn push_balanced_conjunction(sql: &mut String, predicates: &[String]) {
 #[async_trait::async_trait]
 impl NotesRepository for TursoSession {
     async fn insert_note(&self, note: NewNote<'_>) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         let attachments = serialize_attachments(note.attachments)?;
         self.connection
             .execute(
@@ -153,6 +155,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn get_note_revision(&self, id: &str) -> StorageResult<Option<i64>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -175,6 +178,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn note_exists(&self, id: &str) -> StorageResult<bool> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -190,6 +194,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn get_note(&self, id: &str) -> StorageResult<Option<Note>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -211,7 +216,7 @@ impl NotesRepository for TursoSession {
         drop(rows);
 
         Ok(Some(Note {
-            labels: self.labels_for_note(&row.id).await?,
+            labels: labels_for_note_unlocked(self, &row.id).await?,
             id: row.id,
             title: row.title,
             content: row.content,
@@ -223,6 +228,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn get_note_content(&self, id: &str) -> StorageResult<Option<String>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -245,6 +251,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn update_note(&self, note: NoteUpdate<'_>) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         let attachments = serialize_attachments(note.attachments)?;
         self.connection
             .execute(
@@ -265,6 +272,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn update_note_fields(&self, note: NoteFieldsUpdate<'_>) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "UPDATE notes
@@ -286,6 +294,7 @@ impl NotesRepository for TursoSession {
         &self,
         note: AttachmentMetadataUpdate<'_>,
     ) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         let attachments = serialize_attachments(note.attachments)?;
         self.connection
             .execute(
@@ -299,6 +308,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn soft_delete_note(&self, id: &str, deleted_at: i64) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "UPDATE notes SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
@@ -312,6 +322,7 @@ impl NotesRepository for TursoSession {
         &self,
         id: &str,
     ) -> StorageResult<Option<(String, i64)>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -338,6 +349,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn restore_note(&self, id: &str, note_revision: i64) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "UPDATE notes
@@ -350,6 +362,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn permanently_delete_note(&self, id: &str) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "DELETE FROM notes WHERE id = ?1 AND deleted_at IS NOT NULL",
@@ -360,6 +373,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn list_expired_deleted_note_ids(&self, cutoff: i64) -> StorageResult<Vec<String>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -385,6 +399,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn clear_note_search_data(&self, id: &str) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         for (sql, context) in [
             (
                 "DELETE FROM note_chunk_embeddings WHERE note_id = ?1",
@@ -408,6 +423,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn clear_note_labels(&self, id: &str) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "DELETE FROM note_labels WHERE note_id = ?1",
@@ -419,6 +435,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn clear_note_chunk_derived(&self, id: &str, chunk_idx: i64) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "DELETE FROM note_chunk_embeddings WHERE note_id = ?1 AND chunk_idx = ?2",
@@ -434,6 +451,7 @@ impl NotesRepository for TursoSession {
         id: &str,
         min_chunk_idx: i64,
     ) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "DELETE FROM note_chunk_embeddings WHERE note_id = ?1 AND chunk_idx >= ?2",
@@ -450,6 +468,7 @@ impl NotesRepository for TursoSession {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<Note>> {
+        let _operation_guard = self.operation_guard().await;
         let resolved = if selectors.is_empty() {
             None
         } else {
@@ -492,7 +511,7 @@ impl NotesRepository for TursoSession {
         let mut notes = Vec::with_capacity(decoded.len());
         for row in decoded {
             notes.push(Note {
-                labels: self.labels_for_note(&row.id).await?,
+                labels: labels_for_note_unlocked(self, &row.id).await?,
                 id: row.id,
                 title: row.title,
                 content: row.content,
@@ -506,6 +525,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn list_all_notes(&self) -> StorageResult<Vec<Note>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -529,7 +549,7 @@ impl NotesRepository for TursoSession {
         let mut notes = Vec::with_capacity(decoded.len());
         for row in decoded {
             notes.push(Note {
-                labels: self.labels_for_note(&row.id).await?,
+                labels: labels_for_note_unlocked(self, &row.id).await?,
                 id: row.id,
                 title: row.title,
                 content: row.content,
@@ -548,6 +568,7 @@ impl NotesRepository for TursoSession {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> StorageResult<Vec<NoteListItem>> {
+        let _operation_guard = self.operation_guard().await;
         let resolved = if selectors.is_empty() {
             None
         } else {
@@ -589,7 +610,7 @@ impl NotesRepository for TursoSession {
         let mut notes = Vec::with_capacity(decoded.len());
         for row in decoded {
             notes.push(NoteListItem {
-                labels: self.labels_for_note(&row.id).await?,
+                labels: labels_for_note_unlocked(self, &row.id).await?,
                 id: row.id,
                 title: row.title,
                 created_at: row.created_at,
@@ -601,6 +622,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn list_deleted_note_summaries(&self) -> StorageResult<Vec<NoteListItem>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -625,7 +647,7 @@ impl NotesRepository for TursoSession {
         let mut notes = Vec::with_capacity(decoded.len());
         for row in decoded {
             notes.push(NoteListItem {
-                labels: self.labels_for_note(&row.id).await?,
+                labels: labels_for_note_unlocked(self, &row.id).await?,
                 id: row.id,
                 title: row.title,
                 created_at: row.created_at,
@@ -637,6 +659,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn count_notes(&self, selectors: &[LabelSelector]) -> StorageResult<usize> {
+        let _operation_guard = self.operation_guard().await;
         let resolved = if selectors.is_empty() {
             None
         } else {
@@ -670,6 +693,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn matching_note_ids(&self, selectors: &[LabelSelector]) -> StorageResult<Vec<String>> {
+        let _operation_guard = self.operation_guard().await;
         let resolved = if selectors.is_empty() {
             None
         } else {
@@ -705,6 +729,7 @@ impl NotesRepository for TursoSession {
     }
 
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(

@@ -1,9 +1,10 @@
 use crate::unit;
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewNote, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocumentUpdate,
-    OrgEventType, OrgProjectedWorkItem, StorageBackend, StorageErrorKind, StorageTransaction,
-    StoredOrgOperation, TransactionMode, UpsertNoteChunk,
+    CompareAndSwap, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
+    OrgAttemptStatus, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate,
+    OrgEventType, OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind,
+    StorageTransaction, StoredOrgOperation, TransactionMode, UpsertNoteChunk,
 };
 use serde_json::json;
 use std::str::FromStr as _;
@@ -158,6 +159,8 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .is_empty());
 
     let workspace_id = WorkspaceId::from_str("60000000-0000-0000-0000-000000000001").unwrap();
+    let target_workspace_id =
+        WorkspaceId::from_str("60000000-0000-0000-0000-000000000002").unwrap();
     let document_id = DocumentId::from_str("61000000-0000-0000-0000-000000000001").unwrap();
     let original_item_id = WorkItemId::from_str("62000000-0000-0000-0000-000000000001").unwrap();
     let replacement_item_id = WorkItemId::from_str("62000000-0000-0000-0000-000000000002").unwrap();
@@ -169,6 +172,19 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             slug: "transaction-ledger",
             display_name: "Transaction ledger",
             description: "shared Org rollback contract",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            now: 500,
+        })
+        .await
+        .unwrap();
+    org_seed
+        .insert_org_workspace(NewOrgWorkspace {
+            id: target_workspace_id,
+            slug: "transaction-ledger-target",
+            display_name: "Transaction ledger target",
+            description: "shared Org ownership rollback target",
             timezone: "UTC",
             policy_schema_version: 1,
             policy: &policy,
@@ -276,6 +292,25 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         created_at: 513,
     };
     let org_atomic = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let CompareAndSwap::Applied(updated_workspace) = org_atomic
+        .compare_and_swap_org_workspace(OrgWorkspaceUpdate {
+            id: workspace_id,
+            expected_revision: 1,
+            slug: "transaction-ledger",
+            display_name: "Transaction ledger changed",
+            description: "must roll back",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            archived_at: None,
+            updated_at: 510,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("Org rollback workspace compare-and-swap was not applied");
+    };
+    assert_eq!(updated_workspace.revision, 2);
     let CompareAndSwap::Applied(revision_three) = org_atomic
         .compare_and_swap_org_document(OrgDocumentUpdate {
             id: document_id,
@@ -295,6 +330,37 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .replace_org_document_projection(document_id, &replacement_projection)
         .await
         .unwrap();
+    let OrgDocumentOwnershipMoveResult::Applied(moved) = org_atomic
+        .compare_and_swap_org_document_ownership(OrgDocumentOwnershipMove {
+            document_id,
+            source_workspace_id: workspace_id,
+            target_workspace_id,
+            expected_document_revision: 3,
+            expected_source_workspace_revision: 2,
+            expected_target_workspace_revision: 1,
+            updated_at: 511,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("Org rollback ownership compare-and-swap was not applied");
+    };
+    assert_eq!(moved.document.workspace_id, target_workspace_id);
+    org_atomic
+        .insert_org_attempt(NewOrgAttempt {
+            id: "rolled-back-attempt",
+            workspace_id,
+            work_item_id: original_item_id,
+            attempt_number: 1,
+            actor_id: "contract-rollback",
+            status: OrgAttemptStatus::Running,
+            started_at: 511,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &json!({"rollback": true}),
+        })
+        .await
+        .unwrap();
     assert_eq!(
         org_atomic
             .append_org_event(NewOrgEvent {
@@ -303,7 +369,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                 subject_kind: "document",
                 subject_id: "61000000-0000-0000-0000-000000000001",
                 actor_id: "contract-rollback",
-                attempt_id: None,
+                attempt_id: Some("rolled-back-attempt"),
                 event_type: OrgEventType::DocumentImport,
                 occurred_at: 512,
                 summary: "Rolled-back event",
@@ -334,7 +400,31 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap()
         .unwrap();
     assert_eq!(stored_revision_two.revision, 2);
+    assert_eq!(stored_revision_two.workspace_id, workspace_id);
     assert_eq!(stored_revision_two.source, "* TODO Revision two");
+    assert_eq!(
+        org_observer
+            .get_org_workspace(workspace_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        1
+    );
+    assert_eq!(
+        org_observer
+            .get_org_workspace(target_workspace_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        1
+    );
+    assert!(org_observer
+        .get_org_attempt("rolled-back-attempt")
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         org_observer
             .list_org_document_projection(document_id)

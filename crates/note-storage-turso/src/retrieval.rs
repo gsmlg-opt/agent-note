@@ -28,6 +28,7 @@ impl RetrievalRepository for TursoSession {
         chunk_idx: i64,
         embedding: &[f32],
     ) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         let json = vector_to_json(embedding)?;
         self.connection
             .execute(
@@ -46,6 +47,7 @@ impl RetrievalRepository for TursoSession {
         limit: usize,
         allowed_note_ids: Option<&[String]>,
     ) -> StorageResult<Vec<String>> {
+        let _operation_guard = self.operation_guard().await;
         if allowed_note_ids.is_some_and(<[String]>::is_empty) {
             return Ok(Vec::new());
         }
@@ -110,6 +112,7 @@ impl RetrievalRepository for TursoSession {
         limit: usize,
         allowed_note_ids: Option<&[String]>,
     ) -> StorageResult<Vec<String>> {
+        let _operation_guard = self.operation_guard().await;
         if allowed_note_ids.is_some_and(<[String]>::is_empty) {
             return Ok(Vec::new());
         }

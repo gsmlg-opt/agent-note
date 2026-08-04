@@ -1,7 +1,8 @@
-use note_org::{WorkspaceId, WorkspacePolicy};
+use note_org::{DocumentId, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    NewNote, NewOrgEvent, NewOrgWorkspace, OrgEventType, OrgRepository, StorageBackend,
-    StorageErrorKind, StorageTransaction, TransactionMode, UpsertNoteChunk, EMBEDDING_DIMENSION,
+    NewNote, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocumentOwnershipMove,
+    OrgDocumentOwnershipMoveResult, OrgEventType, OrgRepository, StorageBackend, StorageErrorKind,
+    StorageTransaction, TransactionMode, UpsertNoteChunk, EMBEDDING_DIMENSION,
 };
 use note_storage_turso::TursoStorage;
 use serde_json::json;
@@ -61,6 +62,202 @@ fn assert_pending<F: Future>(mut future: Pin<&mut F>, message: &str) {
         matches!(future.as_mut().poll(&mut context), Poll::Pending),
         "{message}"
     );
+}
+
+#[tokio::test]
+async fn same_session_ownership_moves_are_serialized_across_the_entire_savepoint() {
+    let (_dir, storage) = storage().await;
+    let source_workspace = WorkspaceId::from_str("74000000-0000-0000-0000-000000000001").unwrap();
+    let target_workspace = WorkspaceId::from_str("74000000-0000-0000-0000-000000000002").unwrap();
+    let document_id = DocumentId::from_str("75000000-0000-0000-0000-000000000001").unwrap();
+    let policy = WorkspacePolicy::engineering_default();
+    let session = storage.connect().await.unwrap();
+    for (id, slug) in [
+        (source_workspace, "move-race-source"),
+        (target_workspace, "move-race-target"),
+    ] {
+        session
+            .insert_org_workspace(NewOrgWorkspace {
+                id,
+                slug,
+                display_name: slug,
+                description: "same-session ownership race regression",
+                timezone: "UTC",
+                policy_schema_version: 1,
+                policy: &policy,
+                now: 1,
+            })
+            .await
+            .unwrap();
+    }
+    session
+        .insert_org_document(NewOrgDocument {
+            id: document_id,
+            workspace_id: source_workspace,
+            path: "move-race.org",
+            source: "* TODO Move once",
+            content_hash: "move-race-one",
+            now: 1,
+        })
+        .await
+        .unwrap();
+
+    let external_writer = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let update = || OrgDocumentOwnershipMove {
+        document_id,
+        source_workspace_id: source_workspace,
+        target_workspace_id: target_workspace,
+        expected_document_revision: 1,
+        expected_source_workspace_revision: 1,
+        expected_target_workspace_revision: 1,
+        updated_at: 2,
+    };
+    let mut first = Box::pin(session.compare_and_swap_org_document_ownership(update()));
+    let mut second = Box::pin(session.compare_and_swap_org_document_ownership(update()));
+    assert_pending(
+        first.as_mut(),
+        "first ownership move did not reach the external writer lock",
+    );
+    assert_pending(
+        second.as_mut(),
+        "second ownership move did not wait behind the first operation",
+    );
+    let mut unrelated_read = Box::pin(session.get_org_workspace(source_workspace));
+    assert_pending(
+        unrelated_read.as_mut(),
+        "same-session read entered while ownership move held its savepoint",
+    );
+
+    external_writer.rollback().await.unwrap();
+    let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(first.as_mut(), second.as_mut())
+    })
+    .await
+    .expect("serialized ownership moves did not finish after releasing the writer");
+    let results = [first.unwrap(), second.unwrap()];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, OrgDocumentOwnershipMoveResult::Applied(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, OrgDocumentOwnershipMoveResult::Conflict { .. }))
+            .count(),
+        1
+    );
+    let source = unrelated_read.await.unwrap().unwrap();
+    assert_eq!(source.revision, 2);
+    let moved = session
+        .get_org_document(document_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved.workspace_id, target_workspace);
+    assert_eq!(moved.revision, 2);
+    assert_eq!(
+        session
+            .get_org_workspace(target_workspace)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        2
+    );
+    assert_eq!(
+        session.list_org_documents(target_workspace).await.unwrap(),
+        vec![moved]
+    );
+}
+
+#[tokio::test]
+async fn cancelled_ownership_move_cleans_up_before_releasing_the_session_gate() {
+    let (_dir, storage) = storage().await;
+    let source_workspace = WorkspaceId::from_str("74000000-0000-0000-0000-000000000011").unwrap();
+    let target_workspace = WorkspaceId::from_str("74000000-0000-0000-0000-000000000012").unwrap();
+    let document_id = DocumentId::from_str("75000000-0000-0000-0000-000000000011").unwrap();
+    let policy = WorkspacePolicy::engineering_default();
+    let session = storage.connect().await.unwrap();
+    for (id, slug) in [
+        (source_workspace, "cancelled-move-source"),
+        (target_workspace, "cancelled-move-target"),
+    ] {
+        session
+            .insert_org_workspace(NewOrgWorkspace {
+                id,
+                slug,
+                display_name: slug,
+                description: "ownership cancellation cleanup regression",
+                timezone: "UTC",
+                policy_schema_version: 1,
+                policy: &policy,
+                now: 1,
+            })
+            .await
+            .unwrap();
+    }
+    session
+        .insert_org_document(NewOrgDocument {
+            id: document_id,
+            workspace_id: source_workspace,
+            path: "cancelled-move.org",
+            source: "* TODO Cancel then retry",
+            content_hash: "cancelled-move-one",
+            now: 1,
+        })
+        .await
+        .unwrap();
+
+    let external_writer = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let update = || OrgDocumentOwnershipMove {
+        document_id,
+        source_workspace_id: source_workspace,
+        target_workspace_id: target_workspace,
+        expected_document_revision: 1,
+        expected_source_workspace_revision: 1,
+        expected_target_workspace_revision: 1,
+        updated_at: 2,
+    };
+    let mut cancelled = Box::pin(session.compare_and_swap_org_document_ownership(update()));
+    assert_pending(
+        cancelled.as_mut(),
+        "ownership move did not reach the external writer lock before cancellation",
+    );
+    drop(cancelled);
+
+    let mut read_after_cancellation = Box::pin(session.get_org_workspace(source_workspace));
+    assert_pending(
+        read_after_cancellation.as_mut(),
+        "cancelled ownership move released the session gate before savepoint cleanup",
+    );
+    external_writer.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), read_after_cancellation.as_mut())
+        .await
+        .expect("savepoint cleanup did not release the session gate")
+        .unwrap()
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        session.compare_and_swap_org_document_ownership(update()),
+    )
+    .await
+    .expect("session remained stuck after cancelled ownership move cleanup")
+    .unwrap();
+    assert!(matches!(result, OrgDocumentOwnershipMoveResult::Applied(_)));
+    let observed = storage
+        .connect()
+        .await
+        .unwrap()
+        .get_org_document(document_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.workspace_id, target_workspace);
+    assert_eq!(observed.revision, 2);
 }
 
 #[tokio::test]

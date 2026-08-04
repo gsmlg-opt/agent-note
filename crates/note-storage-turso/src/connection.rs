@@ -2,7 +2,9 @@ use note_storage::{
     StorageError, StorageErrorKind, StorageResult, StorageTransaction, TransactionMode,
 };
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::preflight::{
     incompatible_database, preflight, unsupported_schema, Preflight, APPLICATION_ID,
@@ -23,6 +25,7 @@ pub(crate) enum OpenedState {
 pub struct TursoSession {
     pub(crate) connection: turso::Connection,
     pub(crate) transaction_open: bool,
+    operation_gate: Arc<Mutex<()>>,
 }
 
 impl TursoSession {
@@ -49,7 +52,12 @@ impl TursoSession {
         Ok(Self {
             connection,
             transaction_open: false,
+            operation_gate: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub(crate) async fn operation_guard(&self) -> OwnedMutexGuard<()> {
+        self.operation_gate.clone().lock_owned().await
     }
 
     pub(crate) async fn begin_transaction(&mut self, mode: TransactionMode) -> StorageResult<()> {

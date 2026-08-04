@@ -2,13 +2,16 @@ use crate::connection::map_sqlx_error;
 use crate::PgSession;
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocument, OrgDocumentUpdate,
+    order_org_event_segments_by_lineage, AppliedOrgDocumentOwnershipMove, CompareAndSwap,
+    ConditionalUpdate, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
+    OrgArtifactReference, OrgAttempt, OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate,
+    OrgDocument, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate,
     OrgEvent, OrgEventType, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate,
     StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
 };
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
 
 // The widest projection statement binds 20 values per row, so 64 rows remain
@@ -225,6 +228,105 @@ impl OrgRepository for PgSession {
         })
     }
 
+    async fn compare_and_swap_org_document_ownership(
+        &self,
+        update: OrgDocumentOwnershipMove,
+    ) -> StorageResult<OrgDocumentOwnershipMoveResult> {
+        if update.source_workspace_id == update.target_workspace_id {
+            return Err(StorageError::new(
+                StorageErrorKind::Constraint,
+                "Org document ownership move requires distinct workspaces",
+            ));
+        }
+        let mut connection = self.connection().await?;
+        let applied = sqlx::query_as::<_, OwnershipMoveRow>(
+            "WITH locked AS MATERIALIZED (
+                 SELECT document.id
+                 FROM org_documents document
+                 JOIN org_workspaces source_workspace ON source_workspace.id = $2
+                 JOIN org_workspaces target_workspace ON target_workspace.id = $3
+                 WHERE document.id = $1
+                   AND document.workspace_id = $2
+                   AND document.revision = $4
+                   AND source_workspace.revision = $5
+                   AND target_workspace.revision = $6
+                 FOR UPDATE OF document, source_workspace, target_workspace
+             ), moved_document AS (
+                 UPDATE org_documents document
+                 SET workspace_id=$3, revision=document.revision+1, updated_at=$7
+                 WHERE document.id=$1 AND EXISTS (SELECT 1 FROM locked)
+                 RETURNING document.id, document.workspace_id, document.path, document.source,
+                           document.content_hash, document.revision, document.created_at,
+                           document.updated_at
+             ), advanced_source AS (
+                 UPDATE org_workspaces workspace
+                 SET revision=workspace.revision+1, updated_at=$7
+                 WHERE workspace.id=$2 AND EXISTS (SELECT 1 FROM moved_document)
+                 RETURNING workspace.revision
+             ), advanced_target AS (
+                 UPDATE org_workspaces workspace
+                 SET revision=workspace.revision+1, updated_at=$7
+                 WHERE workspace.id=$3 AND EXISTS (SELECT 1 FROM advanced_source)
+                 RETURNING workspace.revision
+             )
+             SELECT moved_document.id, moved_document.workspace_id, moved_document.path,
+                    moved_document.source, moved_document.content_hash, moved_document.revision,
+                    moved_document.created_at, moved_document.updated_at,
+                    advanced_source.revision AS source_workspace_revision,
+                    advanced_target.revision AS target_workspace_revision
+             FROM moved_document CROSS JOIN advanced_source CROSS JOIN advanced_target",
+        )
+        .bind(update.document_id.to_string())
+        .bind(update.source_workspace_id.to_string())
+        .bind(update.target_workspace_id.to_string())
+        .bind(update.expected_document_revision)
+        .bind(update.expected_source_workspace_revision)
+        .bind(update.expected_target_workspace_revision)
+        .bind(update.updated_at)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("compare-and-swap Org document ownership", error))?;
+        if let Some(applied) = applied {
+            return applied.into_result();
+        }
+
+        let document = sqlx::query_as::<_, DocumentRow>(
+            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at
+             FROM org_documents WHERE id=$1",
+        )
+        .bind(update.document_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query document after ownership conflict", error))?;
+        let source_revision: Option<i64> =
+            sqlx::query_scalar("SELECT revision FROM org_workspaces WHERE id=$1")
+                .bind(update.source_workspace_id.to_string())
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(|error| {
+                    map_sqlx_error("query source workspace after ownership conflict", error)
+                })?;
+        let target_revision: Option<i64> =
+            sqlx::query_scalar("SELECT revision FROM org_workspaces WHERE id=$1")
+                .bind(update.target_workspace_id.to_string())
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(|error| {
+                    map_sqlx_error("query target workspace after ownership conflict", error)
+                })?;
+        let (Some(document), Some(source_revision), Some(target_revision)) =
+            (document, source_revision, target_revision)
+        else {
+            return Ok(OrgDocumentOwnershipMoveResult::NotFound);
+        };
+        Ok(OrgDocumentOwnershipMoveResult::Conflict {
+            current_document_workspace_id: decode_workspace_id(document.workspace_id)?,
+            current_document_revision: document.revision,
+            current_source_workspace_revision: source_revision,
+            current_target_workspace_revision: target_revision,
+        })
+    }
+
     async fn replace_org_document_projection(
         &self,
         document_id: DocumentId,
@@ -259,6 +361,120 @@ impl OrgRepository for PgSession {
             items.push(decode_projected_item(row)?);
         }
         load_projection_relations(&mut connection, document_id, &mut items).await?;
+        Ok(items)
+    }
+
+    async fn get_org_work_item(
+        &self,
+        id: WorkItemId,
+    ) -> StorageResult<Option<OrgProjectedWorkItem>> {
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, WorkItemRow>(
+            "SELECT id, workspace_id, document_id, parent_id, source_order, item_type,
+                    title, state, priority, scheduled_raw, scheduled_local,
+                    scheduled_timezone, scheduled_utc, deadline_raw, deadline_local,
+                    deadline_timezone, deadline_utc, assignee, requires_review, created_at
+             FROM org_work_items WHERE id=$1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query Org work item", error))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut items = vec![decode_projected_item(row)?];
+        load_relations_for_projected_items(&mut connection, &mut items).await?;
+        Ok(items.pop())
+    }
+
+    async fn list_org_workspace_projection(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let mut connection = self.connection().await?;
+        let rows = sqlx::query_as::<_, WorkItemRow>(
+            "SELECT item.id, item.workspace_id, item.document_id, item.parent_id,
+                    item.source_order, item.item_type, item.title, item.state, item.priority,
+                    item.scheduled_raw, item.scheduled_local, item.scheduled_timezone,
+                    item.scheduled_utc, item.deadline_raw, item.deadline_local,
+                    item.deadline_timezone, item.deadline_utc, item.assignee,
+                    item.requires_review, item.created_at
+             FROM org_work_items item
+             JOIN org_documents document ON document.id=item.document_id
+             WHERE item.workspace_id=$1
+             ORDER BY document.path, document.id, item.source_order, item.id",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("list Org workspace projection", error))?;
+        let mut items = rows
+            .into_iter()
+            .map(decode_projected_item)
+            .collect::<StorageResult<Vec<_>>>()?;
+        load_relations_for_projected_items(&mut connection, &mut items).await?;
+        Ok(items)
+    }
+
+    async fn list_org_work_item_children(
+        &self,
+        parent_id: WorkItemId,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let mut connection = self.connection().await?;
+        let rows = sqlx::query_as::<_, WorkItemRow>(
+            "SELECT item.id, item.workspace_id, item.document_id, item.parent_id,
+                    item.source_order, item.item_type, item.title, item.state, item.priority,
+                    item.scheduled_raw, item.scheduled_local, item.scheduled_timezone,
+                    item.scheduled_utc, item.deadline_raw, item.deadline_local,
+                    item.deadline_timezone, item.deadline_utc, item.assignee,
+                    item.requires_review, item.created_at
+             FROM org_work_items item
+             JOIN org_documents document ON document.id=item.document_id
+             WHERE item.parent_id=$1
+             ORDER BY document.path, document.id, item.source_order, item.id",
+        )
+        .bind(parent_id.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("list Org work item children", error))?;
+        let mut items = rows
+            .into_iter()
+            .map(decode_projected_item)
+            .collect::<StorageResult<Vec<_>>>()?;
+        load_relations_for_projected_items(&mut connection, &mut items).await?;
+        Ok(items)
+    }
+
+    async fn list_org_work_items_linking_note(
+        &self,
+        note_id: &str,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let mut connection = self.connection().await?;
+        let rows = sqlx::query_as::<_, WorkItemRow>(
+            "SELECT item.id, item.workspace_id, item.document_id, item.parent_id,
+                    item.source_order, item.item_type, item.title, item.state, item.priority,
+                    item.scheduled_raw, item.scheduled_local, item.scheduled_timezone,
+                    item.scheduled_utc, item.deadline_raw, item.deadline_local,
+                    item.deadline_timezone, item.deadline_utc, item.assignee,
+                    item.requires_review, item.created_at
+             FROM org_work_items item
+             JOIN org_documents document ON document.id=item.document_id
+             WHERE EXISTS (
+                 SELECT 1 FROM org_note_links link
+                 WHERE link.work_item_id=item.id AND link.note_id=$1
+             )
+             ORDER BY item.workspace_id, document.path, item.source_order, item.id",
+        )
+        .bind(note_id)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("list Org reverse note links", error))?;
+        let mut items = rows
+            .into_iter()
+            .map(decode_projected_item)
+            .collect::<StorageResult<Vec<_>>>()?;
+        load_relations_for_projected_items(&mut connection, &mut items).await?;
         Ok(items)
     }
 
@@ -307,46 +523,12 @@ impl OrgRepository for PgSession {
 
     async fn append_org_event(&self, event: NewOrgEvent<'_>) -> StorageResult<OrgEvent> {
         let mut connection = self.connection().await?;
-        let row = sqlx::query_as::<_, EventRow>(
-            "WITH next_sequence AS (
-                 UPDATE org_workspaces
-                 SET last_event_sequence=last_event_sequence+1
-                 WHERE id=$1
-                 RETURNING last_event_sequence
-             )
-             INSERT INTO org_events (
-                 id, workspace_id, sequence, subject_kind, subject_id,
-                 actor_id, attempt_id, event_type, occurred_at, summary, metadata,
-                 previous_state, resulting_state
-             )
-             SELECT $2, $1, last_event_sequence, $3, $4, $5, $6, $7, $8, $9,
-                    $10, $11, $12
-             FROM next_sequence
-             RETURNING id, workspace_id, sequence, subject_kind, subject_id,
-                       actor_id, attempt_id, event_type, occurred_at, summary, metadata,
-                       previous_state, resulting_state",
-        )
-        .bind(event.workspace_id.to_string())
-        .bind(event.id)
-        .bind(event.subject_kind)
-        .bind(event.subject_id)
-        .bind(event.actor_id)
-        .bind(event.attempt_id)
-        .bind(event.event_type.as_str())
-        .bind(event.occurred_at)
-        .bind(event.summary)
-        .bind(event.metadata)
-        .bind(event.previous_state)
-        .bind(event.resulting_state)
-        .fetch_optional(&mut *connection)
-        .await
-        .map_err(|error| map_sqlx_error("append Org event", error))?;
-        row.map(EventRow::into_event).transpose()?.ok_or_else(|| {
-            StorageError::new(
-                StorageErrorKind::Constraint,
-                "Org event workspace does not exist",
-            )
-        })
+        append_event(&mut connection, event, false).await
+    }
+
+    async fn append_internal_org_event(&self, event: NewOrgEvent<'_>) -> StorageResult<OrgEvent> {
+        let mut connection = self.connection().await?;
+        append_event(&mut connection, event, true).await
     }
 
     async fn list_org_events(
@@ -375,6 +557,195 @@ impl OrgRepository for PgSession {
         .into_iter()
         .map(EventRow::into_event)
         .collect()
+    }
+
+    async fn list_org_subject_events(
+        &self,
+        workspace_id: WorkspaceId,
+        subject_kind: &str,
+        subject_id: &str,
+        after_sequence: Option<i64>,
+        limit: usize,
+    ) -> StorageResult<Vec<OrgEvent>> {
+        validate_event_limit(limit)?;
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, EventRow>(
+            "SELECT id, workspace_id, sequence, subject_kind, subject_id,
+                    actor_id, attempt_id, event_type, occurred_at, summary, metadata,
+                    previous_state, resulting_state
+             FROM org_events
+             WHERE workspace_id=$1 AND subject_kind=$2 AND subject_id=$3 AND sequence>$4
+             ORDER BY sequence
+             LIMIT $5",
+        )
+        .bind(workspace_id.to_string())
+        .bind(subject_kind)
+        .bind(subject_id)
+        .bind(after_sequence.unwrap_or(0))
+        .bind(limit as i64)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("list Org subject events", error))?
+        .into_iter()
+        .map(EventRow::into_event)
+        .collect()
+    }
+
+    async fn list_org_global_subject_events(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+    ) -> StorageResult<Vec<OrgEvent>> {
+        let mut connection = self.connection().await?;
+        let events = sqlx::query_as::<_, EventRow>(
+            "SELECT id, workspace_id, sequence, subject_kind, subject_id,
+                    actor_id, attempt_id, event_type, occurred_at, summary, metadata,
+                    previous_state, resulting_state
+             FROM org_events
+             WHERE subject_kind=$1 AND subject_id=$2
+             ORDER BY workspace_id, sequence",
+        )
+        .bind(subject_kind)
+        .bind(subject_id)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("list global Org subject events", error))?
+        .into_iter()
+        .map(EventRow::into_event)
+        .collect::<StorageResult<Vec<_>>>()?;
+        order_org_event_segments_by_lineage(events)
+    }
+
+    async fn insert_org_attempt(&self, attempt: NewOrgAttempt<'_>) -> StorageResult<OrgAttempt> {
+        validate_new_attempt(&attempt)?;
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, AttemptRow>(
+            "INSERT INTO org_attempts (
+                 id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                 started_at, ended_at, error, result_summary, review_outcome,
+                 note_refs, artifacts, metadata
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, NULL, $8, $9, $10)
+             RETURNING id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                       started_at, ended_at, error, result_summary, review_outcome,
+                       note_refs, artifacts, metadata",
+        )
+        .bind(attempt.id)
+        .bind(attempt.workspace_id.to_string())
+        .bind(attempt.work_item_id.to_string())
+        .bind(attempt.attempt_number)
+        .bind(attempt.actor_id)
+        .bind(attempt_status_name(attempt.status))
+        .bind(attempt.started_at)
+        .bind(serde_json::to_value(attempt.note_refs).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize Org attempt note refs",
+                error,
+            )
+        })?)
+        .bind(serde_json::to_value(attempt.artifacts).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize Org attempt artifacts",
+                error,
+            )
+        })?)
+        .bind(attempt.metadata)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("insert Org attempt", error))?
+        .into_attempt()
+    }
+
+    async fn get_org_attempt(&self, id: &str) -> StorageResult<Option<OrgAttempt>> {
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, AttemptRow>(
+            "SELECT id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                    started_at, ended_at, error, result_summary, review_outcome,
+                    note_refs, artifacts, metadata
+             FROM org_attempts WHERE id=$1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query Org attempt", error))?
+        .map(AttemptRow::into_attempt)
+        .transpose()
+    }
+
+    async fn list_org_attempts(&self, work_item_id: WorkItemId) -> StorageResult<Vec<OrgAttempt>> {
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, AttemptRow>(
+            "SELECT id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                    started_at, ended_at, error, result_summary, review_outcome,
+                    note_refs, artifacts, metadata
+             FROM org_attempts
+             WHERE work_item_id=$1
+             ORDER BY attempt_number, id",
+        )
+        .bind(work_item_id.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("list Org attempts", error))?
+        .into_iter()
+        .map(AttemptRow::into_attempt)
+        .collect()
+    }
+
+    async fn update_org_attempt(
+        &self,
+        update: OrgAttemptUpdate<'_>,
+    ) -> StorageResult<ConditionalUpdate<OrgAttempt>> {
+        validate_attempt_update(&update)?;
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, AttemptRow>(
+            "UPDATE org_attempts
+             SET status=$2, ended_at=$3, error=$4, result_summary=$5, review_outcome=$6,
+                 note_refs=$7, artifacts=$8, metadata=$9
+             WHERE id=$1 AND status=$10 AND ended_at IS NULL
+             RETURNING id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                       started_at, ended_at, error, result_summary, review_outcome,
+                       note_refs, artifacts, metadata",
+        )
+        .bind(update.id)
+        .bind(attempt_status_name(update.status))
+        .bind(update.ended_at)
+        .bind(update.error)
+        .bind(update.result_summary)
+        .bind(update.review_outcome)
+        .bind(serde_json::to_value(update.note_refs).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize Org attempt note refs",
+                error,
+            )
+        })?)
+        .bind(serde_json::to_value(update.artifacts).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize Org attempt artifacts",
+                error,
+            )
+        })?)
+        .bind(update.metadata)
+        .bind(attempt_status_name(update.expected_status))
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("conditionally update Org attempt", error))?;
+        if let Some(row) = row {
+            return row.into_attempt().map(ConditionalUpdate::Applied);
+        }
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM org_attempts WHERE id=$1)")
+                .bind(update.id)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(|error| map_sqlx_error("check Org attempt update conflict", error))?;
+        Ok(if exists {
+            ConditionalUpdate::Conflict
+        } else {
+            ConditionalUpdate::NotFound
+        })
     }
 
     async fn insert_org_operation(&self, operation: &StoredOrgOperation) -> StorageResult<()> {
@@ -413,6 +784,271 @@ impl OrgRepository for PgSession {
         .map_err(|error| map_sqlx_error("query Org operation", error))?
         .map(OperationRow::into_operation)
         .transpose()
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct OwnershipMoveRow {
+    id: String,
+    workspace_id: String,
+    path: String,
+    source: String,
+    content_hash: String,
+    revision: i64,
+    created_at: i64,
+    updated_at: i64,
+    source_workspace_revision: i64,
+    target_workspace_revision: i64,
+}
+
+impl OwnershipMoveRow {
+    fn into_result(self) -> StorageResult<OrgDocumentOwnershipMoveResult> {
+        Ok(OrgDocumentOwnershipMoveResult::Applied(
+            AppliedOrgDocumentOwnershipMove {
+                document: OrgDocument {
+                    id: decode_document_id(self.id)?,
+                    workspace_id: decode_workspace_id(self.workspace_id)?,
+                    path: self.path,
+                    source: self.source,
+                    content_hash: self.content_hash,
+                    revision: self.revision,
+                    created_at: self.created_at,
+                    updated_at: self.updated_at,
+                },
+                source_workspace_revision: self.source_workspace_revision,
+                target_workspace_revision: self.target_workspace_revision,
+            },
+        ))
+    }
+}
+
+async fn append_event(
+    connection: &mut PgConnection,
+    event: NewOrgEvent<'_>,
+    internal: bool,
+) -> StorageResult<OrgEvent> {
+    validate_event(connection, &event, internal).await?;
+    let row = sqlx::query_as::<_, EventRow>(
+        "WITH next_sequence AS (
+             UPDATE org_workspaces
+             SET last_event_sequence=last_event_sequence+1
+             WHERE id=$1
+             RETURNING last_event_sequence
+         )
+         INSERT INTO org_events (
+             id, workspace_id, sequence, subject_kind, subject_id,
+             actor_id, attempt_id, event_type, occurred_at, summary, metadata,
+             previous_state, resulting_state
+         )
+         SELECT $2, $1, last_event_sequence, $3, $4, $5, $6, $7, $8, $9,
+                $10, $11, $12
+         FROM next_sequence
+         RETURNING id, workspace_id, sequence, subject_kind, subject_id,
+                   actor_id, attempt_id, event_type, occurred_at, summary, metadata,
+                   previous_state, resulting_state",
+    )
+    .bind(event.workspace_id.to_string())
+    .bind(event.id)
+    .bind(event.subject_kind)
+    .bind(event.subject_id)
+    .bind(event.actor_id)
+    .bind(event.attempt_id)
+    .bind(event.event_type.as_str())
+    .bind(event.occurred_at)
+    .bind(event.summary)
+    .bind(event.metadata)
+    .bind(event.previous_state)
+    .bind(event.resulting_state)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|error| map_sqlx_error("append Org event", error))?;
+    row.map(EventRow::into_event).transpose()?.ok_or_else(|| {
+        StorageError::new(
+            StorageErrorKind::Constraint,
+            "Org event workspace does not exist",
+        )
+    })
+}
+
+async fn validate_event(
+    connection: &mut PgConnection,
+    event: &NewOrgEvent<'_>,
+    internal: bool,
+) -> StorageResult<()> {
+    for (label, value) in [
+        ("id", event.id),
+        ("subject kind", event.subject_kind),
+        ("subject id", event.subject_id),
+        ("actor id", event.actor_id),
+        ("summary", event.summary),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StorageError::new(
+                StorageErrorKind::Constraint,
+                format!("Org event {label} must not be empty"),
+            ));
+        }
+    }
+    if !event.event_type.is_known() {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "client and internal event writes require a known Org event type",
+        ));
+    }
+    if internal != (event.actor_id == "system") {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            if internal {
+                "internal Org events must use the system actor"
+            } else {
+                "client Org events cannot use the reserved system actor"
+            },
+        ));
+    }
+    if event.previous_state.is_some() != event.resulting_state.is_some()
+        || event
+            .previous_state
+            .is_some_and(|value| value.trim().is_empty())
+        || event
+            .resulting_state
+            .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "Org event state snapshots must be paired and non-empty",
+        ));
+    }
+    if let Some(attempt_id) = event.attempt_id {
+        let attempt = sqlx::query_as::<_, AttemptRow>(
+            "SELECT id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                    started_at, ended_at, error, result_summary, review_outcome,
+                    note_refs, artifacts, metadata
+             FROM org_attempts WHERE id=$1",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query Org event attempt", error))?
+        .ok_or_else(|| {
+            StorageError::new(
+                StorageErrorKind::Constraint,
+                "Org event attempt does not exist",
+            )
+        })?;
+        if attempt.workspace_id != event.workspace_id.to_string()
+            || (event.subject_kind == "work_item" && event.subject_id != attempt.work_item_id)
+        {
+            return Err(StorageError::new(
+                StorageErrorKind::Constraint,
+                "Org event attempt does not match its workspace and work item subject",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_attempt(attempt: &NewOrgAttempt<'_>) -> StorageResult<()> {
+    if attempt.id.trim().is_empty() || attempt.actor_id.trim().is_empty() {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org attempt id and actor id must not be empty",
+        ));
+    }
+    if attempt.attempt_number < 1 {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "Org attempt number must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attempt_update(update: &OrgAttemptUpdate<'_>) -> StorageResult<()> {
+    if update.id.trim().is_empty() {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org attempt id must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn attempt_status_name(status: OrgAttemptStatus) -> &'static str {
+    match status {
+        OrgAttemptStatus::Running => "running",
+        OrgAttemptStatus::Submitted => "submitted",
+        OrgAttemptStatus::Completed => "completed",
+        OrgAttemptStatus::Failed => "failed",
+        OrgAttemptStatus::Cancelled => "cancelled",
+        OrgAttemptStatus::Expired => "expired",
+    }
+}
+
+fn decode_attempt_status(value: &str) -> StorageResult<OrgAttemptStatus> {
+    match value {
+        "running" => Ok(OrgAttemptStatus::Running),
+        "submitted" => Ok(OrgAttemptStatus::Submitted),
+        "completed" => Ok(OrgAttemptStatus::Completed),
+        "failed" => Ok(OrgAttemptStatus::Failed),
+        "cancelled" => Ok(OrgAttemptStatus::Cancelled),
+        "expired" => Ok(OrgAttemptStatus::Expired),
+        _ => Err(StorageError::new(
+            StorageErrorKind::Corrupt,
+            format!("stored Org attempt has unknown status {value:?}"),
+        )),
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AttemptRow {
+    id: String,
+    workspace_id: String,
+    work_item_id: String,
+    attempt_number: i64,
+    actor_id: String,
+    status: String,
+    started_at: i64,
+    ended_at: Option<i64>,
+    error: Option<String>,
+    result_summary: Option<String>,
+    review_outcome: Option<String>,
+    note_refs: Value,
+    artifacts: Value,
+    metadata: Value,
+}
+
+impl AttemptRow {
+    fn into_attempt(self) -> StorageResult<OrgAttempt> {
+        Ok(OrgAttempt {
+            id: self.id,
+            workspace_id: decode_workspace_id(self.workspace_id)?,
+            work_item_id: decode_work_item_id(self.work_item_id)?,
+            attempt_number: self.attempt_number,
+            actor_id: self.actor_id,
+            status: decode_attempt_status(&self.status)?,
+            started_at: self.started_at,
+            ended_at: self.ended_at,
+            error: self.error,
+            result_summary: self.result_summary,
+            review_outcome: self.review_outcome,
+            note_refs: serde_json::from_value::<Vec<OrgAttemptNoteReference>>(self.note_refs)
+                .map_err(|error| {
+                    StorageError::with_source(
+                        StorageErrorKind::Corrupt,
+                        "decode stored Org attempt note refs",
+                        error,
+                    )
+                })?,
+            artifacts: serde_json::from_value::<Vec<OrgArtifactReference>>(self.artifacts)
+                .map_err(|error| {
+                    StorageError::with_source(
+                        StorageErrorKind::Corrupt,
+                        "decode stored Org attempt artifacts",
+                        error,
+                    )
+                })?,
+            metadata: self.metadata,
+        })
     }
 }
 
@@ -1154,6 +1790,20 @@ impl ListedNoteLinkRow {
             description: self.description,
         })
     }
+}
+
+async fn load_relations_for_projected_items(
+    connection: &mut PgConnection,
+    items: &mut [OrgProjectedWorkItem],
+) -> StorageResult<()> {
+    let document_ids = items
+        .iter()
+        .map(|item| item.document_id)
+        .collect::<BTreeSet<_>>();
+    for document_id in document_ids {
+        load_projection_relations(connection, document_id, items).await?;
+    }
+    Ok(())
 }
 
 async fn load_projection_relations(

@@ -8,6 +8,7 @@ use note_storage::{
 #[async_trait::async_trait]
 impl EmbeddingRepository for TursoSession {
     async fn embedding_dashboard_status(&self) -> StorageResult<EmbeddingDashboardStatus> {
+        let _operation_guard = self.operation_guard().await;
         let mut count_rows = self
             .connection
             .query(
@@ -76,6 +77,7 @@ impl EmbeddingRepository for TursoSession {
     }
 
     async fn list_note_chunks(&self, note_id: &str) -> StorageResult<Vec<NoteChunk>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -103,6 +105,7 @@ impl EmbeddingRepository for TursoSession {
         note_id: &str,
         chunk_idx: i64,
     ) -> StorageResult<Option<NoteChunk>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -121,6 +124,7 @@ impl EmbeddingRepository for TursoSession {
     }
 
     async fn upsert_note_chunk(&self, chunk: UpsertNoteChunk<'_>) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "INSERT INTO note_chunks (
@@ -157,6 +161,7 @@ impl EmbeddingRepository for TursoSession {
         status: &str,
         updated_at: i64,
     ) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "UPDATE note_chunks
@@ -183,6 +188,7 @@ impl EmbeddingRepository for TursoSession {
         note_id: &str,
         min_chunk_idx: i64,
     ) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "DELETE FROM note_chunks WHERE note_id = ?1 AND chunk_idx >= ?2",
@@ -193,6 +199,7 @@ impl EmbeddingRepository for TursoSession {
     }
 
     async fn chunk_embedding_exists(&self, note_id: &str, chunk_idx: i64) -> StorageResult<bool> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -219,6 +226,7 @@ impl EmbeddingRepository for TursoSession {
         note_revision: i64,
         now: i64,
     ) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "INSERT INTO embedding_jobs (
@@ -253,6 +261,7 @@ impl EmbeddingRepository for TursoSession {
         chunk_idx: i64,
         current_hash: &str,
     ) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "DELETE FROM embedding_jobs
@@ -271,6 +280,7 @@ impl EmbeddingRepository for TursoSession {
         note_id: &str,
         min_chunk_idx: i64,
     ) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "DELETE FROM embedding_jobs
@@ -288,6 +298,7 @@ impl EmbeddingRepository for TursoSession {
         limit: usize,
         now: i64,
     ) -> StorageResult<Vec<EmbeddingJob>> {
+        let _operation_guard = self.operation_guard().await;
         let limit = checked_limit(limit, "claim embedding jobs")?;
         let mut rows = self
             .connection
@@ -335,6 +346,7 @@ impl EmbeddingRepository for TursoSession {
     }
 
     async fn delete_embedding_job(&self, id: i64) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "DELETE FROM embedding_jobs WHERE id = ?1",
@@ -352,6 +364,7 @@ impl EmbeddingRepository for TursoSession {
         error: &str,
         now: i64,
     ) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         let status = if attempts >= max_attempts {
             "failed"
         } else {
@@ -369,6 +382,7 @@ impl EmbeddingRepository for TursoSession {
     }
 
     async fn requeue_processing_embedding_jobs(&self, now: i64) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "UPDATE embedding_jobs
@@ -381,6 +395,7 @@ impl EmbeddingRepository for TursoSession {
     }
 
     async fn reset_embeddings_for_regeneration(&self, now: i64) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute("DELETE FROM note_chunk_embeddings", ())
             .await

@@ -4,13 +4,14 @@ use note_attachments::{
 use note_core::{LabelSelector, NoteAttachment};
 use note_pipelines::EmbeddingJobNotifier;
 use note_storage::{
-    ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, CompareAndSwap,
+    ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, CompareAndSwap, ConditionalUpdate,
     EmbeddingDashboardStatus, EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote,
-    NewOrgDocument, NewOrgEvent, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteUpdate,
-    NotesRepository, OrgDocument, OrgDocumentUpdate, OrgEvent, OrgProjectedWorkItem, OrgRepository,
-    OrgWorkspace, OrgWorkspaceUpdate, RetrievalRepository, SettingsRepository, StorageBackend,
-    StorageError, StorageErrorKind, StorageResult, StorageSession, StorageTransaction,
-    StoredOrgOperation, TransactionMode, UpsertNoteChunk,
+    NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate,
+    NoteUpdate, NotesRepository, OrgAttempt, OrgAttemptUpdate, OrgDocument,
+    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
+    OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate, RetrievalRepository,
+    SettingsRepository, StorageBackend, StorageError, StorageErrorKind, StorageResult,
+    StorageSession, StorageTransaction, StoredOrgOperation, TransactionMode, UpsertNoteChunk,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -234,6 +235,9 @@ impl_forward_repository! {
         fn compare_and_swap_org_document(
             update: OrgDocumentUpdate<'_>,
         ) -> CompareAndSwap<OrgDocument>;
+        fn compare_and_swap_org_document_ownership(
+            update: OrgDocumentOwnershipMove,
+        ) -> OrgDocumentOwnershipMoveResult;
         fn replace_org_document_projection(
             document_id: note_org::DocumentId,
             items: &[OrgProjectedWorkItem],
@@ -241,16 +245,46 @@ impl_forward_repository! {
         fn list_org_document_projection(
             document_id: note_org::DocumentId,
         ) -> Vec<OrgProjectedWorkItem>;
+        fn get_org_work_item(
+            id: note_org::WorkItemId,
+        ) -> Option<OrgProjectedWorkItem>;
+        fn list_org_workspace_projection(
+            workspace_id: note_org::WorkspaceId,
+        ) -> Vec<OrgProjectedWorkItem>;
+        fn list_org_work_item_children(
+            parent_id: note_org::WorkItemId,
+        ) -> Vec<OrgProjectedWorkItem>;
+        fn list_org_work_items_linking_note(
+            note_id: &str,
+        ) -> Vec<OrgProjectedWorkItem>;
         fn rebuild_org_workspace_projection(
             workspace_id: note_org::WorkspaceId,
             items: &[OrgProjectedWorkItem],
         ) -> ();
         fn append_org_event(event: NewOrgEvent<'_>) -> OrgEvent;
+        fn append_internal_org_event(event: NewOrgEvent<'_>) -> OrgEvent;
         fn list_org_events(
             workspace_id: note_org::WorkspaceId,
             after_sequence: Option<i64>,
             limit: usize,
         ) -> Vec<OrgEvent>;
+        fn list_org_subject_events(
+            workspace_id: note_org::WorkspaceId,
+            subject_kind: &str,
+            subject_id: &str,
+            after_sequence: Option<i64>,
+            limit: usize,
+        ) -> Vec<OrgEvent>;
+        fn list_org_global_subject_events(
+            subject_kind: &str,
+            subject_id: &str,
+        ) -> Vec<OrgEvent>;
+        fn insert_org_attempt(attempt: NewOrgAttempt<'_>) -> OrgAttempt;
+        fn get_org_attempt(id: &str) -> Option<OrgAttempt>;
+        fn list_org_attempts(work_item_id: note_org::WorkItemId) -> Vec<OrgAttempt>;
+        fn update_org_attempt(
+            update: OrgAttemptUpdate<'_>,
+        ) -> ConditionalUpdate<OrgAttempt>;
         fn insert_org_operation(operation: &StoredOrgOperation) -> ();
         fn get_org_operation(
             workspace_id: note_org::WorkspaceId,

@@ -7,11 +7,12 @@ use std::str::FromStr;
 #[async_trait::async_trait]
 impl LabelRepository for TursoSession {
     async fn insert_label_key(&self, key: &str, description: &str) -> StorageResult<()> {
-        self.insert_label_key_with_type(key, description, LabelValueType::Text)
-            .await
+        let _operation_guard = self.operation_guard().await;
+        insert_label_key_with_type_unlocked(self, key, description, LabelValueType::Text).await
     }
 
     async fn insert_label_key_if_missing(&self, key: &str, description: &str) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "INSERT INTO label_keys (key, description, value_type) VALUES (?1, ?2, 'text')
@@ -29,17 +30,12 @@ impl LabelRepository for TursoSession {
         description: &str,
         value_type: LabelValueType,
     ) -> StorageResult<()> {
-        self.connection
-            .execute(
-                "INSERT INTO label_keys (key, description, value_type) VALUES (?1, ?2, ?3)",
-                turso::params![key, description, value_type.as_str()],
-            )
-            .await
-            .map_err(|error| map_turso_error("insert label key", error))?;
-        Ok(())
+        let _operation_guard = self.operation_guard().await;
+        insert_label_key_with_type_unlocked(self, key, description, value_type).await
     }
 
     async fn list_label_keys(&self) -> StorageResult<Vec<LabelKey>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -71,6 +67,7 @@ impl LabelRepository for TursoSession {
     }
 
     async fn update_label_key(&self, key: &str, description: &str) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "UPDATE label_keys SET description = ?2 WHERE key = ?1",
@@ -87,6 +84,7 @@ impl LabelRepository for TursoSession {
         description: &str,
         value_type: LabelValueType,
     ) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "UPDATE label_keys SET description = ?2, value_type = ?3 WHERE key = ?1",
@@ -98,6 +96,7 @@ impl LabelRepository for TursoSession {
     }
 
     async fn delete_label_key(&self, key: &str) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute("DELETE FROM label_keys WHERE key = ?1", turso::params![key])
             .await
@@ -106,6 +105,7 @@ impl LabelRepository for TursoSession {
     }
 
     async fn attach_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         let label_key_id = {
             let mut rows = self
                 .connection
@@ -140,42 +140,12 @@ impl LabelRepository for TursoSession {
     }
 
     async fn labels_for_note(&self, note_id: &str) -> StorageResult<Vec<Label>> {
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT lk.key, nl.value, lk.description, lk.value_type
-                 FROM note_labels nl JOIN label_keys lk ON lk.id = nl.label_key_id
-                 WHERE nl.note_id = ?1",
-                turso::params![note_id],
-            )
-            .await
-            .map_err(|error| map_turso_error("query note labels", error))?;
-        let mut labels = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read note labels", error))?
-        {
-            let value_type = row
-                .get::<String>(3)
-                .map_err(|error| map_turso_error("decode note label value type", error))?;
-            labels.push(Label {
-                key: row
-                    .get::<String>(0)
-                    .map_err(|error| map_turso_error("decode note label key", error))?,
-                value: row
-                    .get::<String>(1)
-                    .map_err(|error| map_turso_error("decode note label value", error))?,
-                description: row
-                    .get::<String>(2)
-                    .map_err(|error| map_turso_error("decode note label description", error))?,
-                value_type: parse_value_type(&value_type)?,
-            });
-        }
-        Ok(labels)
+        let _operation_guard = self.operation_guard().await;
+        labels_for_note_unlocked(self, note_id).await
     }
 
     async fn label_note_counts(&self) -> StorageResult<Vec<(String, usize)>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -210,6 +180,7 @@ impl LabelRepository for TursoSession {
         &self,
         labels: &[(String, String)],
     ) -> StorageResult<Option<String>> {
+        let _operation_guard = self.operation_guard().await;
         if labels.is_empty() {
             return Ok(None);
         }
@@ -254,6 +225,62 @@ impl LabelRepository for TursoSession {
             })
             .transpose()
     }
+}
+
+async fn insert_label_key_with_type_unlocked(
+    session: &TursoSession,
+    key: &str,
+    description: &str,
+    value_type: LabelValueType,
+) -> StorageResult<()> {
+    session
+        .connection
+        .execute(
+            "INSERT INTO label_keys (key, description, value_type) VALUES (?1, ?2, ?3)",
+            turso::params![key, description, value_type.as_str()],
+        )
+        .await
+        .map_err(|error| map_turso_error("insert label key", error))?;
+    Ok(())
+}
+
+pub(crate) async fn labels_for_note_unlocked(
+    session: &TursoSession,
+    note_id: &str,
+) -> StorageResult<Vec<Label>> {
+    let mut rows = session
+        .connection
+        .query(
+            "SELECT lk.key, nl.value, lk.description, lk.value_type
+             FROM note_labels nl JOIN label_keys lk ON lk.id = nl.label_key_id
+             WHERE nl.note_id = ?1",
+            turso::params![note_id],
+        )
+        .await
+        .map_err(|error| map_turso_error("query note labels", error))?;
+    let mut labels = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read note labels", error))?
+    {
+        let value_type = row
+            .get::<String>(3)
+            .map_err(|error| map_turso_error("decode note label value type", error))?;
+        labels.push(Label {
+            key: row
+                .get::<String>(0)
+                .map_err(|error| map_turso_error("decode note label key", error))?,
+            value: row
+                .get::<String>(1)
+                .map_err(|error| map_turso_error("decode note label value", error))?,
+            description: row
+                .get::<String>(2)
+                .map_err(|error| map_turso_error("decode note label description", error))?,
+            value_type: parse_value_type(&value_type)?,
+        });
+    }
+    Ok(labels)
 }
 
 fn parse_value_type(value: &str) -> StorageResult<LabelValueType> {

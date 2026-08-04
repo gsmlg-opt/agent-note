@@ -1,10 +1,177 @@
 use crate::{
     ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, CompareAndSwap,
-    EmbeddingDashboardStatus, EmbeddingJob, NewNote, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
-    NoteChunk, NoteFieldsUpdate, NoteUpdate, OrgDocument, OrgDocumentUpdate, OrgEvent,
-    OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceUpdate, StorageError, StorageErrorKind,
-    StorageResult, StoredOrgOperation, UpsertNoteChunk,
+    EmbeddingDashboardStatus, EmbeddingJob, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent,
+    NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteUpdate, OrgAttempt, OrgAttemptUpdate,
+    OrgDocument, OrgDocumentUpdate, OrgEvent, OrgProjectedWorkItem, OrgWorkspace,
+    OrgWorkspaceUpdate, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
+    UpsertNoteChunk,
 };
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// Orders global subject events as a single lineage of workspace-local
+/// sequence segments. Every cross-workspace segment must link its first event
+/// to the exact last event of its predecessor segment.
+pub fn order_org_event_segments_by_lineage(events: Vec<OrgEvent>) -> StorageResult<Vec<OrgEvent>> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let corrupt = |message| {
+        StorageError::new(
+            StorageErrorKind::Corrupt,
+            format!("invalid Org event lineage: {message}"),
+        )
+    };
+    let mut event_workspaces = HashMap::new();
+    for event in &events {
+        if event_workspaces
+            .insert(event.id.clone(), event.workspace_id)
+            .is_some()
+        {
+            return Err(corrupt("duplicate event id"));
+        }
+    }
+
+    let mut workspace_events = BTreeMap::<note_org::WorkspaceId, Vec<OrgEvent>>::new();
+    for event in events {
+        workspace_events
+            .entry(event.workspace_id)
+            .or_default()
+            .push(event);
+    }
+    for events in workspace_events.values_mut() {
+        events.sort_by_key(|event| event.sequence);
+    }
+
+    let mut segments = Vec::<Vec<OrgEvent>>::new();
+    for (workspace_id, events) in workspace_events {
+        let mut segment = Vec::new();
+        for event in events {
+            let previous_id = lineage_previous_event_id(&event)?;
+            let starts_segment = match previous_id {
+                Some(previous_id) => {
+                    let previous_workspace = event_workspaces
+                        .get(previous_id)
+                        .ok_or_else(|| corrupt("predecessor event does not exist"))?;
+                    if *previous_workspace == workspace_id {
+                        return Err(corrupt(
+                            "lineage predecessor must be in a different workspace",
+                        ));
+                    }
+                    true
+                }
+                None => false,
+            };
+            if starts_segment && !segment.is_empty() {
+                segments.push(std::mem::take(&mut segment));
+            }
+            segment.push(event);
+        }
+        if !segment.is_empty() {
+            segments.push(segment);
+        }
+    }
+
+    let mut event_segments = HashMap::new();
+    for (segment_index, segment) in segments.iter().enumerate() {
+        for event in segment {
+            event_segments.insert(event.id.as_str(), segment_index);
+        }
+    }
+
+    let mut successor = vec![None; segments.len()];
+    let mut roots = Vec::new();
+    for (segment_index, segment) in segments.iter().enumerate() {
+        let first = segment
+            .first()
+            .ok_or_else(|| corrupt("empty event segment"))?;
+        let Some(previous_id) = lineage_previous_event_id(first)? else {
+            roots.push(segment_index);
+            continue;
+        };
+        let previous_segment = *event_segments
+            .get(previous_id)
+            .ok_or_else(|| corrupt("predecessor event does not exist"))?;
+        let previous_last = segments[previous_segment]
+            .last()
+            .ok_or_else(|| corrupt("empty predecessor segment"))?;
+        if previous_last.id != previous_id {
+            return Err(corrupt(
+                "predecessor link does not reference the source segment boundary",
+            ));
+        }
+        if successor[previous_segment].replace(segment_index).is_some() {
+            return Err(corrupt("one segment has multiple successors"));
+        }
+    }
+
+    if roots.len() != 1 {
+        return Err(corrupt(
+            "lineage must contain exactly one unambiguous root segment",
+        ));
+    }
+    let mut ordered = Vec::new();
+    let mut visited = HashSet::new();
+    let mut current = Some(roots[0]);
+    while let Some(segment_index) = current {
+        if !visited.insert(segment_index) {
+            return Err(corrupt("lineage contains a cycle"));
+        }
+        ordered.extend(segments[segment_index].iter().cloned());
+        current = successor[segment_index];
+    }
+    if visited.len() != segments.len() {
+        return Err(corrupt("lineage is disconnected or cyclic"));
+    }
+    Ok(ordered)
+}
+
+fn lineage_previous_event_id(event: &OrgEvent) -> StorageResult<Option<&str>> {
+    match event.metadata.get("lineage_previous_event_id") {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => Ok(Some(value)),
+        Some(_) => Err(StorageError::new(
+            StorageErrorKind::Corrupt,
+            "invalid Org event lineage: predecessor id must be a non-empty string",
+        )),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalUpdate<T> {
+    Applied(T),
+    NotFound,
+    Conflict,
+}
+
+pub struct OrgDocumentOwnershipMove {
+    pub document_id: note_org::DocumentId,
+    pub source_workspace_id: note_org::WorkspaceId,
+    pub target_workspace_id: note_org::WorkspaceId,
+    pub expected_document_revision: i64,
+    pub expected_source_workspace_revision: i64,
+    pub expected_target_workspace_revision: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedOrgDocumentOwnershipMove {
+    pub document: OrgDocument,
+    pub source_workspace_revision: i64,
+    pub target_workspace_revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrgDocumentOwnershipMoveResult {
+    Applied(AppliedOrgDocumentOwnershipMove),
+    NotFound,
+    Conflict {
+        current_document_workspace_id: note_org::WorkspaceId,
+        current_document_revision: i64,
+        current_source_workspace_revision: i64,
+        current_target_workspace_revision: i64,
+    },
+}
 
 #[async_trait::async_trait]
 pub trait NotesRepository: Send + Sync {
@@ -274,6 +441,20 @@ pub trait OrgRepository: Send + Sync {
         ))
     }
 
+    /// Atomically moves one canonical document between distinct workspaces.
+    /// The document and both workspace revisions must all match; conflicts do
+    /// not change any of the three records.
+    async fn compare_and_swap_org_document_ownership(
+        &self,
+        update: OrgDocumentOwnershipMove,
+    ) -> StorageResult<OrgDocumentOwnershipMoveResult> {
+        let _ = update;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
     /// Must be called inside a storage transaction with the document write.
     async fn replace_org_document_projection(
         &self,
@@ -292,6 +473,50 @@ pub trait OrgRepository: Send + Sync {
         document_id: note_org::DocumentId,
     ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
         let _ = document_id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn get_org_work_item(
+        &self,
+        id: note_org::WorkItemId,
+    ) -> StorageResult<Option<OrgProjectedWorkItem>> {
+        let _ = id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_workspace_projection(
+        &self,
+        workspace_id: note_org::WorkspaceId,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let _ = workspace_id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_work_item_children(
+        &self,
+        parent_id: note_org::WorkItemId,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let _ = parent_id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_work_items_linking_note(
+        &self,
+        note_id: &str,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let _ = note_id;
         Err(StorageError::new(
             StorageErrorKind::UnsupportedSchema,
             "Org persistence is not implemented by this storage session",
@@ -320,6 +545,16 @@ pub trait OrgRepository: Send + Sync {
         ))
     }
 
+    /// Internal audit append for events whose actor is the reserved `system`
+    /// principal. Client-originated code must use `append_org_event`.
+    async fn append_internal_org_event(&self, event: NewOrgEvent<'_>) -> StorageResult<OrgEvent> {
+        let _ = event;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
     async fn list_org_events(
         &self,
         workspace_id: note_org::WorkspaceId,
@@ -327,6 +562,80 @@ pub trait OrgRepository: Send + Sync {
         limit: usize,
     ) -> StorageResult<Vec<OrgEvent>> {
         let _ = (workspace_id, after_sequence, limit);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_subject_events(
+        &self,
+        workspace_id: note_org::WorkspaceId,
+        subject_kind: &str,
+        subject_id: &str,
+        after_sequence: Option<i64>,
+        limit: usize,
+    ) -> StorageResult<Vec<OrgEvent>> {
+        let _ = (
+            workspace_id,
+            subject_kind,
+            subject_id,
+            after_sequence,
+            limit,
+        );
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    /// Returns global subject history grouped deterministically by workspace,
+    /// preserving each workspace's authoritative sequence without inventing a
+    /// cross-workspace counter.
+    async fn list_org_global_subject_events(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+    ) -> StorageResult<Vec<OrgEvent>> {
+        let _ = (subject_kind, subject_id);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn insert_org_attempt(&self, attempt: NewOrgAttempt<'_>) -> StorageResult<OrgAttempt> {
+        let _ = attempt;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn get_org_attempt(&self, id: &str) -> StorageResult<Option<OrgAttempt>> {
+        let _ = id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn list_org_attempts(
+        &self,
+        work_item_id: note_org::WorkItemId,
+    ) -> StorageResult<Vec<OrgAttempt>> {
+        let _ = work_item_id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn update_org_attempt(
+        &self,
+        update: OrgAttemptUpdate<'_>,
+    ) -> StorageResult<ConditionalUpdate<OrgAttempt>> {
+        let _ = update;
         Err(StorageError::new(
             StorageErrorKind::UnsupportedSchema,
             "Org persistence is not implemented by this storage session",

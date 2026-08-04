@@ -1,6 +1,8 @@
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocumentUpdate, OrgEventType,
+    CompareAndSwap, ConditionalUpdate, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
+    OrgArtifactReference, OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate,
+    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
     OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StoredOrgOperation,
     StoredOrgTimestamp, TransactionMode,
 };
@@ -944,5 +946,711 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             ("beta", beta_id),
             ("scale", scale_workspace_id)
         ]
+    );
+
+    run_workflow_audit_contracts(storage).await;
+}
+
+async fn run_workflow_audit_contracts(storage: Arc<dyn StorageBackend>) {
+    let source_workspace = workspace_id("70000000-0000-0000-0000-000000000002");
+    let target_workspace = workspace_id("70000000-0000-0000-0000-000000000001");
+    let document = document_id("71000000-0000-0000-0000-000000000001");
+    let parent = work_item_id("72000000-0000-0000-0000-000000000001");
+    let child = work_item_id("72000000-0000-0000-0000-000000000002");
+    let linked_note = "73000000-0000-0000-0000-000000000001";
+    let policy = WorkspacePolicy::engineering_default();
+    let session = storage.session().await.unwrap();
+
+    for (id, slug) in [
+        (source_workspace, "workflow-source"),
+        (target_workspace, "workflow-target"),
+    ] {
+        session
+            .insert_org_workspace(NewOrgWorkspace {
+                id,
+                slug,
+                display_name: slug,
+                description: "workflow/audit shared contract",
+                timezone: "UTC",
+                policy_schema_version: 1,
+                policy: &policy,
+                now: 1_000,
+            })
+            .await
+            .unwrap();
+    }
+    session
+        .insert_org_document(NewOrgDocument {
+            id: document,
+            workspace_id: source_workspace,
+            path: "workflow.org",
+            source: "* TODO Parent\n** TODO Child",
+            content_hash: "workflow-one",
+            now: 1_001,
+        })
+        .await
+        .unwrap();
+
+    let parent_projection = projected_item(
+        parent,
+        source_workspace,
+        document,
+        None,
+        0,
+        "Workflow parent",
+    );
+    let mut child_projection = projected_item(
+        child,
+        source_workspace,
+        document,
+        Some(parent),
+        1,
+        "Workflow child",
+    );
+    child_projection.note_links.push(NoteLink {
+        purpose: "evidence".into(),
+        note_id: linked_note.parse().unwrap(),
+        description: "Linked evidence".into(),
+    });
+    let source_projection = vec![parent_projection.clone(), child_projection.clone()];
+    let seed_projection = storage.begin(TransactionMode::Immediate).await.unwrap();
+    seed_projection
+        .replace_org_document_projection(document, &source_projection)
+        .await
+        .unwrap();
+    seed_projection.commit().await.unwrap();
+
+    assert_eq!(
+        session.get_org_work_item(parent).await.unwrap(),
+        Some(parent_projection.clone())
+    );
+    assert_eq!(
+        session
+            .list_org_workspace_projection(source_workspace)
+            .await
+            .unwrap(),
+        source_projection
+    );
+    assert_eq!(
+        session.list_org_work_item_children(parent).await.unwrap(),
+        vec![child_projection.clone()]
+    );
+    assert_eq!(
+        session
+            .list_org_work_items_linking_note(linked_note)
+            .await
+            .unwrap(),
+        vec![child_projection.clone()]
+    );
+
+    let ordering_workspace = workspace_id("70000000-0000-0000-0000-000000000010");
+    let zeta_document = document_id("71000000-0000-0000-0000-000000000010");
+    let alpha_document = document_id("71000000-0000-0000-0000-000000000020");
+    let ordering_parent = work_item_id("72000000-0000-0000-0000-000000000010");
+    let zeta_child = work_item_id("72000000-0000-0000-0000-000000000011");
+    let alpha_child = work_item_id("72000000-0000-0000-0000-000000000012");
+    session
+        .insert_org_workspace(NewOrgWorkspace {
+            id: ordering_workspace,
+            slug: "projection-ordering",
+            display_name: "Projection ordering",
+            description: "path ordering shared contract",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            now: 1_005,
+        })
+        .await
+        .unwrap();
+    for (id, path) in [(zeta_document, "zeta.org"), (alpha_document, "alpha.org")] {
+        session
+            .insert_org_document(NewOrgDocument {
+                id,
+                workspace_id: ordering_workspace,
+                path,
+                source: "* TODO Ordering fixture",
+                content_hash: path,
+                now: 1_006,
+            })
+            .await
+            .unwrap();
+    }
+    let ordering_parent_projection = projected_item(
+        ordering_parent,
+        ordering_workspace,
+        zeta_document,
+        None,
+        0,
+        "Ordering parent",
+    );
+    let zeta_child_projection = projected_item(
+        zeta_child,
+        ordering_workspace,
+        zeta_document,
+        Some(ordering_parent),
+        1,
+        "Zeta child",
+    );
+    let alpha_child_projection = projected_item(
+        alpha_child,
+        ordering_workspace,
+        alpha_document,
+        Some(ordering_parent),
+        0,
+        "Alpha child",
+    );
+    let seed_ordering = storage.begin(TransactionMode::Immediate).await.unwrap();
+    seed_ordering
+        .replace_org_document_projection(
+            zeta_document,
+            &[
+                ordering_parent_projection.clone(),
+                zeta_child_projection.clone(),
+            ],
+        )
+        .await
+        .unwrap();
+    seed_ordering
+        .replace_org_document_projection(alpha_document, &[alpha_child_projection.clone()])
+        .await
+        .unwrap();
+    seed_ordering.commit().await.unwrap();
+    assert_eq!(
+        session
+            .list_org_workspace_projection(ordering_workspace)
+            .await
+            .unwrap(),
+        vec![
+            alpha_child_projection.clone(),
+            ordering_parent_projection,
+            zeta_child_projection.clone(),
+        ],
+        "workspace projection must order documents by path before source order"
+    );
+    assert_eq!(
+        session
+            .list_org_work_item_children(ordering_parent)
+            .await
+            .unwrap(),
+        vec![alpha_child_projection, zeta_child_projection],
+        "children spanning documents must inherit workspace path ordering"
+    );
+
+    let note_refs = vec![OrgAttemptNoteReference {
+        purpose: "context".into(),
+        note_id: linked_note.into(),
+        description: "Attempt context snapshot".into(),
+    }];
+    let artifacts = vec![OrgArtifactReference {
+        uri: "artifact://build/one".into(),
+        media_type: "application/json".into(),
+        name: "build".into(),
+        description: "Build result".into(),
+    }];
+    let attempt_metadata = json!({"lease": {"fence": 1}});
+    let first_attempt = session
+        .insert_org_attempt(NewOrgAttempt {
+            id: "attempt-workflow-1",
+            workspace_id: source_workspace,
+            work_item_id: child,
+            attempt_number: 1,
+            actor_id: "agent-workflow",
+            status: OrgAttemptStatus::Running,
+            started_at: 1_010,
+            note_refs: &note_refs,
+            artifacts: &artifacts,
+            metadata: &attempt_metadata,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session.get_org_attempt("attempt-workflow-1").await.unwrap(),
+        Some(first_attempt.clone())
+    );
+
+    let event_metadata = json!({"percent": 50});
+    let attempt_event = session
+        .append_org_event(NewOrgEvent {
+            id: "event-workflow-source-1",
+            workspace_id: source_workspace,
+            subject_kind: "work_item",
+            subject_id: &child.to_string(),
+            actor_id: "agent-workflow",
+            attempt_id: Some("attempt-workflow-1"),
+            event_type: OrgEventType::Progress,
+            occurred_at: 1_040,
+            summary: "Halfway",
+            metadata: &event_metadata,
+            previous_state: Some("ACTIVE"),
+            resulting_state: Some("ACTIVE"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        attempt_event.attempt_id.as_deref(),
+        Some("attempt-workflow-1")
+    );
+    assert_eq!(attempt_event.previous_state.as_deref(), Some("ACTIVE"));
+    assert_eq!(attempt_event.resulting_state.as_deref(), Some("ACTIVE"));
+    assert_eq!(
+        session
+            .list_org_subject_events(source_workspace, "work_item", &child.to_string(), None, 200,)
+            .await
+            .unwrap(),
+        vec![attempt_event.clone()]
+    );
+
+    let invalid_state_pair = session
+        .append_org_event(NewOrgEvent {
+            id: "event-invalid-state-pair",
+            workspace_id: source_workspace,
+            subject_kind: "work_item",
+            subject_id: &child.to_string(),
+            actor_id: "agent-workflow",
+            attempt_id: None,
+            event_type: OrgEventType::Progress,
+            occurred_at: 1_041,
+            summary: "Invalid state pair",
+            metadata: &json!({}),
+            previous_state: Some("ACTIVE"),
+            resulting_state: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(invalid_state_pair.kind(), StorageErrorKind::Constraint);
+    let unknown_event_type = session
+        .append_org_event(NewOrgEvent {
+            id: "event-unknown-type",
+            workspace_id: source_workspace,
+            subject_kind: "work_item",
+            subject_id: &child.to_string(),
+            actor_id: "agent-workflow",
+            attempt_id: None,
+            event_type: OrgEventType::Other("future_type".into()),
+            occurred_at: 1_042,
+            summary: "Unknown client event",
+            metadata: &json!({}),
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(unknown_event_type.kind(), StorageErrorKind::Constraint);
+    let reserved_actor = session
+        .append_org_event(NewOrgEvent {
+            id: "event-reserved-actor",
+            workspace_id: source_workspace,
+            subject_kind: "work_item",
+            subject_id: &child.to_string(),
+            actor_id: "system",
+            attempt_id: None,
+            event_type: OrgEventType::LeaseExpiry,
+            occurred_at: 1_043,
+            summary: "Client cannot impersonate system",
+            metadata: &json!({}),
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reserved_actor.kind(), StorageErrorKind::Operation);
+    let internal_event = session
+        .append_internal_org_event(NewOrgEvent {
+            id: "event-internal-expiry",
+            workspace_id: source_workspace,
+            subject_kind: "work_item",
+            subject_id: &child.to_string(),
+            actor_id: "system",
+            attempt_id: Some("attempt-workflow-1"),
+            event_type: OrgEventType::LeaseExpiry,
+            occurred_at: 1_044,
+            summary: "Expired lease",
+            metadata: &json!({"recovery": true}),
+            previous_state: Some("ACTIVE"),
+            resulting_state: Some("TODO"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(internal_event.sequence, attempt_event.sequence + 1);
+
+    let closed_metadata = json!({"lease": {"fence": 1}, "closed": true});
+    let ConditionalUpdate::Applied(closed_attempt) = session
+        .update_org_attempt(OrgAttemptUpdate {
+            id: "attempt-workflow-1",
+            expected_status: OrgAttemptStatus::Running,
+            status: OrgAttemptStatus::Expired,
+            ended_at: 1_045,
+            error: Some("lease expired"),
+            result_summary: None,
+            review_outcome: None,
+            note_refs: &note_refs,
+            artifacts: &artifacts,
+            metadata: &closed_metadata,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("running attempt should close once");
+    };
+    assert_eq!(closed_attempt.status, OrgAttemptStatus::Expired);
+    assert_eq!(closed_attempt.ended_at, Some(1_045));
+    assert_eq!(
+        session
+            .update_org_attempt(OrgAttemptUpdate {
+                id: "attempt-workflow-1",
+                expected_status: OrgAttemptStatus::Running,
+                status: OrgAttemptStatus::Failed,
+                ended_at: 1_046,
+                error: Some("must not overwrite"),
+                result_summary: None,
+                review_outcome: None,
+                note_refs: &[],
+                artifacts: &[],
+                metadata: &json!({}),
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Conflict
+    );
+
+    let operation = StoredOrgOperation {
+        workspace_id: source_workspace,
+        operation_id: "workflow-preserved".into(),
+        request_fingerprint: "sha256:workflow-preserved".into(),
+        result: json!({"preserved": true}),
+        created_at: 1_050,
+    };
+    session.insert_org_operation(&operation).await.unwrap();
+
+    for (document_revision, source_revision, target_revision) in [(2, 1, 1), (1, 2, 1), (1, 1, 2)] {
+        let stale_move = session
+            .compare_and_swap_org_document_ownership(OrgDocumentOwnershipMove {
+                document_id: document,
+                source_workspace_id: source_workspace,
+                target_workspace_id: target_workspace,
+                expected_document_revision: document_revision,
+                expected_source_workspace_revision: source_revision,
+                expected_target_workspace_revision: target_revision,
+                updated_at: 1_060,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            stale_move,
+            OrgDocumentOwnershipMoveResult::Conflict { .. }
+        ));
+        let unchanged_document = session.get_org_document(document).await.unwrap().unwrap();
+        assert_eq!(unchanged_document.workspace_id, source_workspace);
+        assert_eq!(unchanged_document.revision, 1);
+        assert_eq!(
+            session
+                .get_org_workspace(source_workspace)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+        assert_eq!(
+            session
+                .get_org_workspace(target_workspace)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+    }
+    assert_eq!(
+        session
+            .compare_and_swap_org_document_ownership(OrgDocumentOwnershipMove {
+                document_id: document_id("71000000-0000-0000-0000-000000000099"),
+                source_workspace_id: source_workspace,
+                target_workspace_id: target_workspace,
+                expected_document_revision: 1,
+                expected_source_workspace_revision: 1,
+                expected_target_workspace_revision: 1,
+                updated_at: 1_060,
+            })
+            .await
+            .unwrap(),
+        OrgDocumentOwnershipMoveResult::NotFound
+    );
+
+    let OrgDocumentOwnershipMoveResult::Applied(moved) = session
+        .compare_and_swap_org_document_ownership(OrgDocumentOwnershipMove {
+            document_id: document,
+            source_workspace_id: source_workspace,
+            target_workspace_id: target_workspace,
+            expected_document_revision: 1,
+            expected_source_workspace_revision: 1,
+            expected_target_workspace_revision: 1,
+            updated_at: 1_061,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("document ownership move should apply");
+    };
+    assert_eq!(moved.document.workspace_id, target_workspace);
+    assert_eq!(moved.document.revision, 2);
+    assert_eq!(moved.source_workspace_revision, 2);
+    assert_eq!(moved.target_workspace_revision, 2);
+    assert_eq!(
+        session
+            .list_org_workspace_projection(source_workspace)
+            .await
+            .unwrap(),
+        source_projection,
+        "ownership CAS must not rewrite projection workspace ownership before caller rebuild"
+    );
+    assert!(
+        session
+            .list_org_workspace_projection(target_workspace)
+            .await
+            .unwrap()
+            .is_empty(),
+        "target projection must remain empty until caller rebuild"
+    );
+
+    let target_projection = source_projection
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            item.workspace_id = target_workspace;
+            item
+        })
+        .collect::<Vec<_>>();
+    let rebuild_after_move = storage.begin(TransactionMode::Immediate).await.unwrap();
+    rebuild_after_move
+        .rebuild_org_workspace_projection(source_workspace, &[])
+        .await
+        .unwrap();
+    rebuild_after_move
+        .rebuild_org_workspace_projection(target_workspace, &target_projection)
+        .await
+        .unwrap();
+    rebuild_after_move.commit().await.unwrap();
+
+    let second_attempt = session
+        .insert_org_attempt(NewOrgAttempt {
+            id: "attempt-workflow-2",
+            workspace_id: target_workspace,
+            work_item_id: child,
+            attempt_number: 2,
+            actor_id: "agent-target",
+            status: OrgAttemptStatus::Running,
+            started_at: 1_070,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &json!({"lease": {"fence": 2}}),
+        })
+        .await
+        .unwrap();
+    let duplicate_global_number = session
+        .insert_org_attempt(NewOrgAttempt {
+            id: "attempt-workflow-duplicate-number",
+            workspace_id: target_workspace,
+            work_item_id: child,
+            attempt_number: 1,
+            actor_id: "agent-target",
+            status: OrgAttemptStatus::Running,
+            started_at: 1_071,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &json!({}),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate_global_number.kind(), StorageErrorKind::Constraint);
+    assert_eq!(
+        session.list_org_attempts(child).await.unwrap(),
+        vec![closed_attempt.clone(), second_attempt]
+    );
+    assert_eq!(closed_attempt.workspace_id, source_workspace);
+
+    let target_event = session
+        .append_org_event(NewOrgEvent {
+            id: "event-workflow-target-1",
+            workspace_id: target_workspace,
+            subject_kind: "work_item",
+            subject_id: &child.to_string(),
+            actor_id: "agent-target",
+            attempt_id: Some("attempt-workflow-2"),
+            event_type: OrgEventType::Start,
+            occurred_at: 900,
+            summary: "Started after move",
+            metadata: &json!({"lineage_previous_event_id": internal_event.id}),
+            previous_state: Some("TODO"),
+            resulting_state: Some("ACTIVE"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(target_event.sequence, 1);
+    let return_event = session
+        .append_org_event(NewOrgEvent {
+            id: "event-workflow-source-return",
+            workspace_id: source_workspace,
+            subject_kind: "work_item",
+            subject_id: &child.to_string(),
+            actor_id: "agent-workflow",
+            attempt_id: None,
+            event_type: OrgEventType::DocumentMove,
+            occurred_at: 800,
+            summary: "Returned after target segment",
+            metadata: &json!({"lineage_previous_event_id": target_event.id}),
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .unwrap();
+    let global_history = session
+        .list_org_global_subject_events("work_item", &child.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        global_history
+            .iter()
+            .map(|event| (event.workspace_id, event.sequence))
+            .collect::<Vec<_>>(),
+        vec![
+            (source_workspace, attempt_event.sequence),
+            (source_workspace, internal_event.sequence),
+            (target_workspace, target_event.sequence),
+            (source_workspace, return_event.sequence),
+        ],
+        "global history must support repeated workspace segments without sorting by time or UUID"
+    );
+
+    for (id, workspace_id) in [
+        ("event-lineage-missing-a", source_workspace),
+        ("event-lineage-missing-b", target_workspace),
+    ] {
+        session
+            .append_org_event(NewOrgEvent {
+                id,
+                workspace_id,
+                subject_kind: "work_item",
+                subject_id: "lineage-missing",
+                actor_id: "lineage-test",
+                attempt_id: None,
+                event_type: OrgEventType::DocumentMove,
+                occurred_at: 700,
+                summary: "Missing lineage",
+                metadata: &json!({}),
+                previous_state: None,
+                resulting_state: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session
+            .list_org_global_subject_events("work_item", "lineage-missing")
+            .await
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::Corrupt
+    );
+
+    for (id, metadata) in [
+        ("event-lineage-early", json!({})),
+        ("event-lineage-boundary", json!({})),
+    ] {
+        session
+            .append_org_event(NewOrgEvent {
+                id,
+                workspace_id: source_workspace,
+                subject_kind: "work_item",
+                subject_id: "lineage-non-boundary",
+                actor_id: "lineage-test",
+                attempt_id: None,
+                event_type: OrgEventType::DocumentMove,
+                occurred_at: 600,
+                summary: "Source lineage segment",
+                metadata: &metadata,
+                previous_state: None,
+                resulting_state: None,
+            })
+            .await
+            .unwrap();
+    }
+    session
+        .append_org_event(NewOrgEvent {
+            id: "event-lineage-target",
+            workspace_id: target_workspace,
+            subject_kind: "work_item",
+            subject_id: "lineage-non-boundary",
+            actor_id: "lineage-test",
+            attempt_id: None,
+            event_type: OrgEventType::DocumentMove,
+            occurred_at: 500,
+            summary: "Links before source boundary",
+            metadata: &json!({"lineage_previous_event_id": "event-lineage-early"}),
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .list_org_global_subject_events("work_item", "lineage-non-boundary")
+            .await
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::Corrupt
+    );
+
+    for (id, workspace_id, previous_id) in [
+        (
+            "event-lineage-cycle-a",
+            source_workspace,
+            "event-lineage-cycle-b",
+        ),
+        (
+            "event-lineage-cycle-b",
+            target_workspace,
+            "event-lineage-cycle-a",
+        ),
+    ] {
+        session
+            .append_org_event(NewOrgEvent {
+                id,
+                workspace_id,
+                subject_kind: "work_item",
+                subject_id: "lineage-cycle",
+                actor_id: "lineage-test",
+                attempt_id: None,
+                event_type: OrgEventType::DocumentMove,
+                occurred_at: 400,
+                summary: "Cyclic lineage",
+                metadata: &json!({"lineage_previous_event_id": previous_id}),
+                previous_state: None,
+                resulting_state: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session
+            .list_org_global_subject_events("work_item", "lineage-cycle")
+            .await
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::Corrupt
+    );
+    assert_eq!(
+        session
+            .get_org_operation(source_workspace, "workflow-preserved")
+            .await
+            .unwrap(),
+        Some(operation)
+    );
+    assert_eq!(
+        session
+            .list_org_work_items_linking_note(linked_note)
+            .await
+            .unwrap(),
+        vec![target_projection[1].clone()]
     );
 }

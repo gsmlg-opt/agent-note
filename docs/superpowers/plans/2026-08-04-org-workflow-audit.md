@@ -278,10 +278,18 @@ cargo fmt --all -- --check
 **Files:**
 
 - Modify: `crates/note-storage/src/repositories.rs`
+- Modify: `crates/note-storage-turso/src/connection.rs`
+- Modify: `crates/note-storage-turso/src/embedding_jobs.rs`
+- Modify: `crates/note-storage-turso/src/labels.rs`
+- Modify: `crates/note-storage-turso/src/notes.rs`
 - Modify: `crates/note-storage-turso/src/org.rs`
+- Modify: `crates/note-storage-turso/src/retrieval.rs`
+- Modify: `crates/note-storage-turso/src/settings.rs`
+- Modify: `crates/note-storage-turso/tests/transactions_test.rs`
 - Modify: `crates/note-storage-pg/src/org.rs`
 - Modify: `crates/note-storage-contract-tests/src/org.rs`
 - Modify: `crates/note-storage-contract-tests/src/lib.rs`
+- Modify: `crates/note-storage-contract-tests/src/transactions.rs`
 - Modify: `crates/note-pipelines/tests/support/events.rs`
 
 - [ ] Add failing shared contracts for point work-item reads, workspace

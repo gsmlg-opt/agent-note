@@ -2,12 +2,16 @@ use crate::connection::map_turso_error;
 use crate::TursoSession;
 use note_org::{DocumentId, NoteLink, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocument, OrgDocumentUpdate,
+    order_org_event_segments_by_lineage, AppliedOrgDocumentOwnershipMove, CompareAndSwap,
+    ConditionalUpdate, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
+    OrgArtifactReference, OrgAttempt, OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate,
+    OrgDocument, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate,
     OrgEvent, OrgEventType, OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate,
     StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
+use tokio::sync::OwnedMutexGuard;
 
 const WORKSPACE_COLUMNS: &str =
     "id, slug, display_name, description, timezone, policy_schema_version, policy, revision, created_at, updated_at, archived_at";
@@ -24,10 +28,15 @@ const PROJECTION_BATCH_SIZE: usize = 64;
 const EVENT_COLUMNS: &str =
     "id, workspace_id, sequence, subject_kind, subject_id, actor_id, attempt_id,
      event_type, occurred_at, summary, metadata, previous_state, resulting_state";
+const ATTEMPT_COLUMNS: &str =
+    "id, workspace_id, work_item_id, attempt_number, actor_id, status, started_at, ended_at,
+     error, result_summary, review_outcome, note_refs, artifacts, metadata";
+const OWNERSHIP_MOVE_SAVEPOINT: &str = "org_document_ownership_move";
 
 #[async_trait::async_trait]
 impl OrgRepository for TursoSession {
     async fn insert_org_workspace(&self, value: NewOrgWorkspace<'_>) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         let policy = serialize_policy(value.policy)?;
         self.connection
             .execute(
@@ -53,11 +62,12 @@ impl OrgRepository for TursoSession {
     }
 
     async fn get_org_workspace(&self, id: WorkspaceId) -> StorageResult<Option<OrgWorkspace>> {
-        let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM org_workspaces WHERE id = ?1");
-        query_optional_workspace(self, &sql, turso::params![id.to_string()]).await
+        let _operation_guard = self.operation_guard().await;
+        get_org_workspace_unlocked(self, id).await
     }
 
     async fn get_org_workspace_by_slug(&self, slug: &str) -> StorageResult<Option<OrgWorkspace>> {
+        let _operation_guard = self.operation_guard().await;
         let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM org_workspaces WHERE slug = ?1");
         query_optional_workspace(self, &sql, turso::params![slug]).await
     }
@@ -66,6 +76,7 @@ impl OrgRepository for TursoSession {
         &self,
         include_archived: bool,
     ) -> StorageResult<Vec<OrgWorkspace>> {
+        let _operation_guard = self.operation_guard().await;
         let sql = format!(
             "SELECT {WORKSPACE_COLUMNS}
              FROM org_workspaces
@@ -92,6 +103,7 @@ impl OrgRepository for TursoSession {
         &self,
         update: OrgWorkspaceUpdate<'_>,
     ) -> StorageResult<CompareAndSwap<OrgWorkspace>> {
+        let _operation_guard = self.operation_guard().await;
         let policy = serialize_policy(update.policy)?;
         let sql = format!(
             "UPDATE org_workspaces
@@ -138,6 +150,7 @@ impl OrgRepository for TursoSession {
     }
 
     async fn insert_org_document(&self, value: NewOrgDocument<'_>) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         self.connection
             .execute(
                 "INSERT INTO org_documents (
@@ -158,14 +171,15 @@ impl OrgRepository for TursoSession {
     }
 
     async fn get_org_document(&self, id: DocumentId) -> StorageResult<Option<OrgDocument>> {
-        let sql = format!("SELECT {DOCUMENT_COLUMNS} FROM org_documents WHERE id = ?1");
-        query_optional_document(self, &sql, turso::params![id.to_string()]).await
+        let _operation_guard = self.operation_guard().await;
+        get_org_document_unlocked(self, id).await
     }
 
     async fn list_org_documents(
         &self,
         workspace_id: WorkspaceId,
     ) -> StorageResult<Vec<OrgDocument>> {
+        let _operation_guard = self.operation_guard().await;
         let sql = format!(
             "SELECT {DOCUMENT_COLUMNS}
              FROM org_documents
@@ -192,6 +206,7 @@ impl OrgRepository for TursoSession {
         &self,
         update: OrgDocumentUpdate<'_>,
     ) -> StorageResult<CompareAndSwap<OrgDocument>> {
+        let _operation_guard = self.operation_guard().await;
         let sql = format!(
             "UPDATE org_documents
              SET path=?2, source=?3, content_hash=?4, updated_at=?5, revision=revision+1
@@ -230,11 +245,28 @@ impl OrgRepository for TursoSession {
             })
     }
 
+    async fn compare_and_swap_org_document_ownership(
+        &self,
+        update: OrgDocumentOwnershipMove,
+    ) -> StorageResult<OrgDocumentOwnershipMoveResult> {
+        let operation_guard = self.operation_guard().await;
+        if update.source_workspace_id == update.target_workspace_id {
+            return Err(StorageError::new(
+                StorageErrorKind::Constraint,
+                "Org document ownership move requires distinct workspaces",
+            ));
+        }
+        let savepoint = OwnershipMoveSavepoint::begin(self, operation_guard).await?;
+        let result = move_document_ownership(self, &update).await;
+        savepoint.finish(result).await
+    }
+
     async fn replace_org_document_projection(
         &self,
         document_id: DocumentId,
         items: &[OrgProjectedWorkItem],
     ) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         let plan = validate_document_projection(self, document_id, items).await?;
         stage_source_orders(self, &plan.staged_existing).await?;
         upsert_projection(self, items, &plan.order).await
@@ -244,6 +276,7 @@ impl OrgRepository for TursoSession {
         &self,
         document_id: DocumentId,
     ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let _operation_guard = self.operation_guard().await;
         let sql = format!(
             "SELECT {WORK_ITEM_COLUMNS}
              FROM org_work_items
@@ -268,11 +301,83 @@ impl OrgRepository for TursoSession {
         Ok(items)
     }
 
+    async fn get_org_work_item(
+        &self,
+        id: WorkItemId,
+    ) -> StorageResult<Option<OrgProjectedWorkItem>> {
+        let _operation_guard = self.operation_guard().await;
+        get_org_work_item_unlocked(self, id).await
+    }
+
+    async fn list_org_workspace_projection(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let _operation_guard = self.operation_guard().await;
+        list_org_workspace_projection_unlocked(self, workspace_id).await
+    }
+
+    async fn list_org_work_item_children(
+        &self,
+        parent_id: WorkItemId,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let _operation_guard = self.operation_guard().await;
+        let Some(parent) = get_org_work_item_unlocked(self, parent_id).await? else {
+            return Ok(Vec::new());
+        };
+        Ok(
+            list_org_workspace_projection_unlocked(self, parent.workspace_id)
+                .await?
+                .into_iter()
+                .filter(|item| item.parent_id == Some(parent_id))
+                .collect(),
+        )
+    }
+
+    async fn list_org_work_items_linking_note(
+        &self,
+        note_id: &str,
+    ) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+        let _operation_guard = self.operation_guard().await;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT DISTINCT link.work_item_id
+                 FROM org_note_links link
+                 JOIN org_work_items item ON item.id = link.work_item_id
+                 JOIN org_documents document ON document.id = item.document_id
+                 WHERE link.note_id = ?1
+                 ORDER BY item.workspace_id, document.path, item.source_order, item.id",
+                turso::params![note_id],
+            )
+            .await
+            .map_err(|error| map_turso_error("list Org reverse note links", error))?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read Org reverse note links", error))?
+        {
+            ids.push(decode_work_item_id(row.get(0).map_err(|error| {
+                map_turso_error("decode Org reverse note link owner", error)
+            })?)?);
+        }
+        drop(rows);
+        let mut items = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(item) = get_org_work_item_unlocked(self, id).await? {
+                items.push(item);
+            }
+        }
+        Ok(items)
+    }
+
     async fn rebuild_org_workspace_projection(
         &self,
         workspace_id: WorkspaceId,
         items: &[OrgProjectedWorkItem],
     ) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         let plan = validate_workspace_rebuild(self, workspace_id, items).await?;
         let workspace = workspace_id.to_string();
         for (sql, context) in [
@@ -310,72 +415,13 @@ impl OrgRepository for TursoSession {
     }
 
     async fn append_org_event(&self, event: NewOrgEvent<'_>) -> StorageResult<OrgEvent> {
-        let metadata = serde_json::to_string(event.metadata).map_err(|error| {
-            StorageError::with_source(
-                StorageErrorKind::Operation,
-                "serialize Org event metadata",
-                error,
-            )
-        })?;
-        let sql = format!(
-            "INSERT INTO org_events (
-                 id, workspace_id, sequence, subject_kind, subject_id,
-                 actor_id, attempt_id, event_type, occurred_at, summary, metadata,
-                 previous_state, resulting_state
-             )
-             SELECT ?1, workspace.id, workspace.last_event_sequence+1,
-                    ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
-             FROM org_workspaces workspace
-             WHERE workspace.id=?2
-             RETURNING {EVENT_COLUMNS}"
-        );
-        let mut rows = self
-            .connection
-            .query(
-                &sql,
-                turso::params![
-                    event.id,
-                    event.workspace_id.to_string(),
-                    event.subject_kind,
-                    event.subject_id,
-                    event.actor_id,
-                    event.attempt_id,
-                    event.event_type.as_str(),
-                    event.occurred_at,
-                    event.summary,
-                    metadata,
-                    event.previous_state,
-                    event.resulting_state
-                ],
-            )
-            .await
-            .map_err(|error| map_turso_error("append Org event", error))?;
-        let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read appended Org event", error))?
-        else {
-            return Err(StorageError::new(
-                StorageErrorKind::Constraint,
-                "Org event workspace does not exist",
-            ));
-        };
-        let stored = decode_event(&row)?;
-        // Drain RETURNING so a successful response is only produced after the
-        // statement reaches Done. Cancellation leaves no savepoint or statement
-        // lock, but after the first row it may commit without returning success.
-        if rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("finish atomic Org event append", error))?
-            .is_some()
-        {
-            return Err(StorageError::new(
-                StorageErrorKind::Operation,
-                "append Org event returned more than one row",
-            ));
-        }
-        Ok(stored)
+        let _operation_guard = self.operation_guard().await;
+        append_event(self, event, false).await
+    }
+
+    async fn append_internal_org_event(&self, event: NewOrgEvent<'_>) -> StorageResult<OrgEvent> {
+        let _operation_guard = self.operation_guard().await;
+        append_event(self, event, true).await
     }
 
     async fn list_org_events(
@@ -384,6 +430,7 @@ impl OrgRepository for TursoSession {
         after_sequence: Option<i64>,
         limit: usize,
     ) -> StorageResult<Vec<OrgEvent>> {
+        let _operation_guard = self.operation_guard().await;
         validate_event_limit(limit)?;
         let sql = format!(
             "SELECT {EVENT_COLUMNS}
@@ -415,7 +462,171 @@ impl OrgRepository for TursoSession {
         Ok(events)
     }
 
+    async fn list_org_subject_events(
+        &self,
+        workspace_id: WorkspaceId,
+        subject_kind: &str,
+        subject_id: &str,
+        after_sequence: Option<i64>,
+        limit: usize,
+    ) -> StorageResult<Vec<OrgEvent>> {
+        let _operation_guard = self.operation_guard().await;
+        validate_event_limit(limit)?;
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS}
+             FROM org_events
+             WHERE workspace_id=?1 AND subject_kind=?2 AND subject_id=?3 AND sequence>?4
+             ORDER BY sequence
+             LIMIT ?5"
+        );
+        query_events(
+            self,
+            &sql,
+            turso::params![
+                workspace_id.to_string(),
+                subject_kind,
+                subject_id,
+                after_sequence.unwrap_or(0),
+                limit as i64
+            ],
+            "list Org subject events",
+        )
+        .await
+    }
+
+    async fn list_org_global_subject_events(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+    ) -> StorageResult<Vec<OrgEvent>> {
+        let _operation_guard = self.operation_guard().await;
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS}
+             FROM org_events
+             WHERE subject_kind=?1 AND subject_id=?2
+             ORDER BY workspace_id, sequence"
+        );
+        let events = query_events(
+            self,
+            &sql,
+            turso::params![subject_kind, subject_id],
+            "list global Org subject events",
+        )
+        .await?;
+        order_org_event_segments_by_lineage(events)
+    }
+
+    async fn insert_org_attempt(&self, attempt: NewOrgAttempt<'_>) -> StorageResult<OrgAttempt> {
+        let _operation_guard = self.operation_guard().await;
+        validate_new_attempt(&attempt)?;
+        let note_refs = serialize_json(attempt.note_refs, "serialize Org attempt note refs")?;
+        let artifacts = serialize_json(attempt.artifacts, "serialize Org attempt artifacts")?;
+        let metadata = serialize_json(attempt.metadata, "serialize Org attempt metadata")?;
+        let sql = format!(
+            "INSERT INTO org_attempts (
+                 id, workspace_id, work_item_id, attempt_number, actor_id, status,
+                 started_at, ended_at, error, result_summary, review_outcome,
+                 note_refs, artifacts, metadata
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, NULL, ?8, ?9, ?10)
+             RETURNING {ATTEMPT_COLUMNS}"
+        );
+        query_one_attempt(
+            self,
+            &sql,
+            turso::params![
+                attempt.id,
+                attempt.workspace_id.to_string(),
+                attempt.work_item_id.to_string(),
+                attempt.attempt_number,
+                attempt.actor_id,
+                attempt_status_name(attempt.status),
+                attempt.started_at,
+                note_refs,
+                artifacts,
+                metadata
+            ],
+            "insert Org attempt",
+        )
+        .await
+    }
+
+    async fn get_org_attempt(&self, id: &str) -> StorageResult<Option<OrgAttempt>> {
+        let _operation_guard = self.operation_guard().await;
+        get_org_attempt_unlocked(self, id).await
+    }
+
+    async fn list_org_attempts(&self, work_item_id: WorkItemId) -> StorageResult<Vec<OrgAttempt>> {
+        let _operation_guard = self.operation_guard().await;
+        let sql = format!(
+            "SELECT {ATTEMPT_COLUMNS}
+             FROM org_attempts
+             WHERE work_item_id=?1
+             ORDER BY attempt_number, id"
+        );
+        let mut rows = self
+            .connection
+            .query(&sql, turso::params![work_item_id.to_string()])
+            .await
+            .map_err(|error| map_turso_error("list Org attempts", error))?;
+        let mut attempts = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read Org attempt list", error))?
+        {
+            attempts.push(decode_attempt(&row)?);
+        }
+        Ok(attempts)
+    }
+
+    async fn update_org_attempt(
+        &self,
+        update: OrgAttemptUpdate<'_>,
+    ) -> StorageResult<ConditionalUpdate<OrgAttempt>> {
+        let _operation_guard = self.operation_guard().await;
+        validate_attempt_update(&update)?;
+        let note_refs = serialize_json(update.note_refs, "serialize Org attempt note refs")?;
+        let artifacts = serialize_json(update.artifacts, "serialize Org attempt artifacts")?;
+        let metadata = serialize_json(update.metadata, "serialize Org attempt metadata")?;
+        let sql = format!(
+            "UPDATE org_attempts
+             SET status=?2, ended_at=?3, error=?4, result_summary=?5, review_outcome=?6,
+                 note_refs=?7, artifacts=?8, metadata=?9
+             WHERE id=?1 AND status=?10 AND ended_at IS NULL
+             RETURNING {ATTEMPT_COLUMNS}"
+        );
+        let updated = query_optional_attempt(
+            self,
+            &sql,
+            turso::params![
+                update.id,
+                attempt_status_name(update.status),
+                update.ended_at,
+                update.error,
+                update.result_summary,
+                update.review_outcome,
+                note_refs,
+                artifacts,
+                metadata,
+                attempt_status_name(update.expected_status)
+            ],
+            "conditionally update Org attempt",
+        )
+        .await?;
+        if let Some(attempt) = updated {
+            return Ok(ConditionalUpdate::Applied(attempt));
+        }
+        Ok(
+            if get_org_attempt_unlocked(self, update.id).await?.is_some() {
+                ConditionalUpdate::Conflict
+            } else {
+                ConditionalUpdate::NotFound
+            },
+        )
+    }
+
     async fn insert_org_operation(&self, operation: &StoredOrgOperation) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         let result = serde_json::to_string(&operation.result).map_err(|error| {
             StorageError::with_source(
                 StorageErrorKind::Operation,
@@ -446,6 +657,7 @@ impl OrgRepository for TursoSession {
         workspace_id: WorkspaceId,
         operation_id: &str,
     ) -> StorageResult<Option<StoredOrgOperation>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -463,6 +675,640 @@ impl OrgRepository for TursoSession {
             .map(decode_operation)
             .transpose()
     }
+}
+
+async fn get_org_workspace_unlocked(
+    session: &TursoSession,
+    id: WorkspaceId,
+) -> StorageResult<Option<OrgWorkspace>> {
+    let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM org_workspaces WHERE id = ?1");
+    query_optional_workspace(session, &sql, turso::params![id.to_string()]).await
+}
+
+async fn get_org_document_unlocked(
+    session: &TursoSession,
+    id: DocumentId,
+) -> StorageResult<Option<OrgDocument>> {
+    let sql = format!("SELECT {DOCUMENT_COLUMNS} FROM org_documents WHERE id = ?1");
+    query_optional_document(session, &sql, turso::params![id.to_string()]).await
+}
+
+async fn get_org_work_item_unlocked(
+    session: &TursoSession,
+    id: WorkItemId,
+) -> StorageResult<Option<OrgProjectedWorkItem>> {
+    let sql = format!("SELECT {WORK_ITEM_COLUMNS} FROM org_work_items WHERE id = ?1");
+    let mut rows = session
+        .connection
+        .query(&sql, turso::params![id.to_string()])
+        .await
+        .map_err(|error| map_turso_error("query Org work item", error))?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read Org work item", error))?
+    else {
+        return Ok(None);
+    };
+    let item = decode_projected_item(&row)?;
+    drop(rows);
+    let document_id = item.document_id;
+    let mut items = vec![item];
+    load_projection_relations(session, document_id, &mut items).await?;
+    Ok(items.pop())
+}
+
+async fn list_org_workspace_projection_unlocked(
+    session: &TursoSession,
+    workspace_id: WorkspaceId,
+) -> StorageResult<Vec<OrgProjectedWorkItem>> {
+    let sql = "SELECT item.id, item.workspace_id, item.document_id, item.parent_id,
+                item.source_order, item.item_type, item.title, item.state, item.priority,
+                item.scheduled_raw, item.scheduled_local, item.scheduled_timezone,
+                item.scheduled_utc, item.deadline_raw, item.deadline_local,
+                item.deadline_timezone, item.deadline_utc, item.assignee,
+                item.requires_review, item.created_at
+         FROM org_work_items item
+         JOIN org_documents document ON document.id=item.document_id
+         WHERE item.workspace_id = ?1
+         ORDER BY document.path, document.id, item.source_order, item.id";
+    let mut rows = session
+        .connection
+        .query(sql, turso::params![workspace_id.to_string()])
+        .await
+        .map_err(|error| map_turso_error("list Org workspace projection", error))?;
+    let mut items = Vec::new();
+    let mut document_ids = BTreeSet::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read Org workspace projection", error))?
+    {
+        let item = decode_projected_item(&row)?;
+        document_ids.insert(item.document_id);
+        items.push(item);
+    }
+    drop(rows);
+    for document_id in document_ids {
+        load_projection_relations(session, document_id, &mut items).await?;
+    }
+    Ok(items)
+}
+
+async fn get_org_attempt_unlocked(
+    session: &TursoSession,
+    id: &str,
+) -> StorageResult<Option<OrgAttempt>> {
+    let sql = format!("SELECT {ATTEMPT_COLUMNS} FROM org_attempts WHERE id=?1");
+    query_optional_attempt(session, &sql, turso::params![id], "query Org attempt").await
+}
+
+async fn move_document_ownership(
+    session: &TursoSession,
+    update: &OrgDocumentOwnershipMove,
+) -> StorageResult<OrgDocumentOwnershipMoveResult> {
+    let Some(document) = get_org_document_unlocked(session, update.document_id).await? else {
+        return Ok(OrgDocumentOwnershipMoveResult::NotFound);
+    };
+    let Some(source_workspace) =
+        get_org_workspace_unlocked(session, update.source_workspace_id).await?
+    else {
+        return Ok(OrgDocumentOwnershipMoveResult::NotFound);
+    };
+    let Some(target_workspace) =
+        get_org_workspace_unlocked(session, update.target_workspace_id).await?
+    else {
+        return Ok(OrgDocumentOwnershipMoveResult::NotFound);
+    };
+    if document.workspace_id != update.source_workspace_id
+        || document.revision != update.expected_document_revision
+        || source_workspace.revision != update.expected_source_workspace_revision
+        || target_workspace.revision != update.expected_target_workspace_revision
+    {
+        return Ok(OrgDocumentOwnershipMoveResult::Conflict {
+            current_document_workspace_id: document.workspace_id,
+            current_document_revision: document.revision,
+            current_source_workspace_revision: source_workspace.revision,
+            current_target_workspace_revision: target_workspace.revision,
+        });
+    }
+
+    let moved = self_execute(
+        session,
+        "UPDATE org_documents
+         SET workspace_id=?2, revision=revision+1, updated_at=?3
+         WHERE id=?1 AND workspace_id=?4 AND revision=?5",
+        turso::params![
+            update.document_id.to_string(),
+            update.target_workspace_id.to_string(),
+            update.updated_at,
+            update.source_workspace_id.to_string(),
+            update.expected_document_revision
+        ],
+        "move Org document ownership",
+    )
+    .await?;
+    if moved != 1 {
+        return Err(StorageError::new(
+            StorageErrorKind::Conflict,
+            "Org document ownership changed during compare-and-swap",
+        ));
+    }
+    for (workspace_id, expected_revision, context) in [
+        (
+            update.source_workspace_id,
+            update.expected_source_workspace_revision,
+            "advance source Org workspace revision",
+        ),
+        (
+            update.target_workspace_id,
+            update.expected_target_workspace_revision,
+            "advance target Org workspace revision",
+        ),
+    ] {
+        let changed = self_execute(
+            session,
+            "UPDATE org_workspaces
+             SET revision=revision+1, updated_at=?2
+             WHERE id=?1 AND revision=?3",
+            turso::params![
+                workspace_id.to_string(),
+                update.updated_at,
+                expected_revision
+            ],
+            context,
+        )
+        .await?;
+        if changed != 1 {
+            return Err(StorageError::new(
+                StorageErrorKind::Conflict,
+                "Org workspace changed during document ownership compare-and-swap",
+            ));
+        }
+    }
+
+    let document = get_org_document_unlocked(session, update.document_id)
+        .await?
+        .ok_or_else(|| {
+            StorageError::new(StorageErrorKind::Corrupt, "moved Org document vanished")
+        })?;
+    Ok(OrgDocumentOwnershipMoveResult::Applied(
+        AppliedOrgDocumentOwnershipMove {
+            document,
+            source_workspace_revision: update.expected_source_workspace_revision + 1,
+            target_workspace_revision: update.expected_target_workspace_revision + 1,
+        },
+    ))
+}
+
+struct OwnershipMoveSavepoint {
+    connection: turso::Connection,
+    operation_guard: Option<OwnedMutexGuard<()>>,
+    active: bool,
+}
+
+impl OwnershipMoveSavepoint {
+    async fn begin(
+        session: &TursoSession,
+        operation_guard: OwnedMutexGuard<()>,
+    ) -> StorageResult<Self> {
+        let mut savepoint = Self {
+            connection: session.connection.clone(),
+            operation_guard: Some(operation_guard),
+            active: true,
+        };
+        let begin = savepoint
+            .connection
+            .execute(&format!("SAVEPOINT {OWNERSHIP_MOVE_SAVEPOINT}"), ())
+            .await;
+        match begin {
+            Ok(_) => Ok(savepoint),
+            Err(error) => {
+                let primary = map_turso_error("begin Org document ownership move", error);
+                Err(savepoint.rollback_with_cleanup(primary).await)
+            }
+        }
+    }
+
+    async fn finish<T>(mut self, result: StorageResult<T>) -> StorageResult<T> {
+        match result {
+            Ok(value) => match self
+                .connection
+                .execute(&format!("RELEASE SAVEPOINT {OWNERSHIP_MOVE_SAVEPOINT}"), ())
+                .await
+            {
+                Ok(_) => {
+                    self.active = false;
+                    Ok(value)
+                }
+                Err(error) => {
+                    let primary = map_turso_error("finish Org document ownership move", error);
+                    Err(self.rollback_with_cleanup(primary).await)
+                }
+            },
+            Err(primary) => Err(self.rollback_with_cleanup(primary).await),
+        }
+    }
+
+    async fn rollback_with_cleanup(&mut self, primary: StorageError) -> StorageError {
+        let rollback = self
+            .connection
+            .execute(
+                &format!("ROLLBACK TO SAVEPOINT {OWNERSHIP_MOVE_SAVEPOINT}"),
+                (),
+            )
+            .await
+            .err();
+        let release = self
+            .connection
+            .execute(&format!("RELEASE SAVEPOINT {OWNERSHIP_MOVE_SAVEPOINT}"), ())
+            .await
+            .err();
+        self.active = false;
+        savepoint_cleanup_error(primary, rollback, release)
+    }
+}
+
+impl Drop for OwnershipMoveSavepoint {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let connection = self.connection.clone();
+        let Some(operation_guard) = self.operation_guard.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _operation_guard = operation_guard;
+                let _ = connection
+                    .execute(
+                        &format!("ROLLBACK TO SAVEPOINT {OWNERSHIP_MOVE_SAVEPOINT}"),
+                        (),
+                    )
+                    .await;
+                let _ = connection
+                    .execute(&format!("RELEASE SAVEPOINT {OWNERSHIP_MOVE_SAVEPOINT}"), ())
+                    .await;
+            });
+        } else {
+            // Never allow another operation to enter an abandoned savepoint.
+            std::mem::forget(operation_guard);
+        }
+    }
+}
+
+fn savepoint_cleanup_error(
+    primary: StorageError,
+    rollback: Option<turso::Error>,
+    release: Option<turso::Error>,
+) -> StorageError {
+    if rollback.is_none() && release.is_none() {
+        return primary;
+    }
+    let mut message = primary.to_string();
+    if let Some(rollback) = rollback {
+        message.push_str(&format!("; savepoint rollback also failed: {rollback}"));
+    }
+    if let Some(release) = release {
+        message.push_str(&format!("; savepoint release also failed: {release}"));
+    }
+    StorageError::with_source(primary.kind(), message, primary)
+}
+
+async fn self_execute(
+    session: &TursoSession,
+    sql: &str,
+    params: impl turso::IntoParams,
+    context: &str,
+) -> StorageResult<u64> {
+    session
+        .connection
+        .execute(sql, params)
+        .await
+        .map_err(|error| map_turso_error(context, error))
+}
+
+async fn append_event(
+    session: &TursoSession,
+    event: NewOrgEvent<'_>,
+    internal: bool,
+) -> StorageResult<OrgEvent> {
+    validate_event(session, &event, internal).await?;
+    let metadata = serialize_json(event.metadata, "serialize Org event metadata")?;
+    let sql = format!(
+        "INSERT INTO org_events (
+             id, workspace_id, sequence, subject_kind, subject_id,
+             actor_id, attempt_id, event_type, occurred_at, summary, metadata,
+             previous_state, resulting_state
+         )
+         SELECT ?1, workspace.id, workspace.last_event_sequence+1,
+                ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+         FROM org_workspaces workspace
+         WHERE workspace.id=?2
+         RETURNING {EVENT_COLUMNS}"
+    );
+    let mut rows = session
+        .connection
+        .query(
+            &sql,
+            turso::params![
+                event.id,
+                event.workspace_id.to_string(),
+                event.subject_kind,
+                event.subject_id,
+                event.actor_id,
+                event.attempt_id,
+                event.event_type.as_str(),
+                event.occurred_at,
+                event.summary,
+                metadata,
+                event.previous_state,
+                event.resulting_state
+            ],
+        )
+        .await
+        .map_err(|error| map_turso_error("append Org event", error))?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read appended Org event", error))?
+    else {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "Org event workspace does not exist",
+        ));
+    };
+    let stored = decode_event(&row)?;
+    if rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("finish atomic Org event append", error))?
+        .is_some()
+    {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "append Org event returned more than one row",
+        ));
+    }
+    Ok(stored)
+}
+
+async fn validate_event(
+    session: &TursoSession,
+    event: &NewOrgEvent<'_>,
+    internal: bool,
+) -> StorageResult<()> {
+    for (label, value) in [
+        ("id", event.id),
+        ("subject kind", event.subject_kind),
+        ("subject id", event.subject_id),
+        ("actor id", event.actor_id),
+        ("summary", event.summary),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StorageError::new(
+                StorageErrorKind::Constraint,
+                format!("Org event {label} must not be empty"),
+            ));
+        }
+    }
+    if !event.event_type.is_known() {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "client and internal event writes require a known Org event type",
+        ));
+    }
+    if internal != (event.actor_id == "system") {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            if internal {
+                "internal Org events must use the system actor"
+            } else {
+                "client Org events cannot use the reserved system actor"
+            },
+        ));
+    }
+    if event.previous_state.is_some() != event.resulting_state.is_some()
+        || event
+            .previous_state
+            .is_some_and(|value| value.trim().is_empty())
+        || event
+            .resulting_state
+            .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "Org event state snapshots must be paired and non-empty",
+        ));
+    }
+    if let Some(attempt_id) = event.attempt_id {
+        let Some(attempt) = get_org_attempt_unlocked(session, attempt_id).await? else {
+            return Err(StorageError::new(
+                StorageErrorKind::Constraint,
+                "Org event attempt does not exist",
+            ));
+        };
+        if attempt.workspace_id != event.workspace_id
+            || (event.subject_kind == "work_item"
+                && event.subject_id != attempt.work_item_id.to_string())
+        {
+            return Err(StorageError::new(
+                StorageErrorKind::Constraint,
+                "Org event attempt does not match its workspace and work item subject",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn query_events(
+    session: &TursoSession,
+    sql: &str,
+    params: impl turso::IntoParams,
+    context: &str,
+) -> StorageResult<Vec<OrgEvent>> {
+    let mut rows = session
+        .connection
+        .query(sql, params)
+        .await
+        .map_err(|error| map_turso_error(context, error))?;
+    let mut events = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error(context, error))?
+    {
+        events.push(decode_event(&row)?);
+    }
+    Ok(events)
+}
+
+fn validate_new_attempt(attempt: &NewOrgAttempt<'_>) -> StorageResult<()> {
+    if attempt.id.trim().is_empty() || attempt.actor_id.trim().is_empty() {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org attempt id and actor id must not be empty",
+        ));
+    }
+    if attempt.attempt_number < 1 {
+        return Err(StorageError::new(
+            StorageErrorKind::Constraint,
+            "Org attempt number must be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attempt_update(update: &OrgAttemptUpdate<'_>) -> StorageResult<()> {
+    if update.id.trim().is_empty() {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org attempt id must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn attempt_status_name(status: OrgAttemptStatus) -> &'static str {
+    match status {
+        OrgAttemptStatus::Running => "running",
+        OrgAttemptStatus::Submitted => "submitted",
+        OrgAttemptStatus::Completed => "completed",
+        OrgAttemptStatus::Failed => "failed",
+        OrgAttemptStatus::Cancelled => "cancelled",
+        OrgAttemptStatus::Expired => "expired",
+    }
+}
+
+fn decode_attempt_status(value: &str) -> StorageResult<OrgAttemptStatus> {
+    match value {
+        "running" => Ok(OrgAttemptStatus::Running),
+        "submitted" => Ok(OrgAttemptStatus::Submitted),
+        "completed" => Ok(OrgAttemptStatus::Completed),
+        "failed" => Ok(OrgAttemptStatus::Failed),
+        "cancelled" => Ok(OrgAttemptStatus::Cancelled),
+        "expired" => Ok(OrgAttemptStatus::Expired),
+        _ => Err(StorageError::new(
+            StorageErrorKind::Corrupt,
+            format!("stored Org attempt has unknown status {value:?}"),
+        )),
+    }
+}
+
+fn serialize_json<T: serde::Serialize + ?Sized>(value: &T, context: &str) -> StorageResult<String> {
+    serde_json::to_string(value)
+        .map_err(|error| StorageError::with_source(StorageErrorKind::Operation, context, error))
+}
+
+async fn query_one_attempt(
+    session: &TursoSession,
+    sql: &str,
+    params: impl turso::IntoParams,
+    context: &str,
+) -> StorageResult<OrgAttempt> {
+    query_optional_attempt(session, sql, params, context)
+        .await?
+        .ok_or_else(|| {
+            StorageError::new(
+                StorageErrorKind::Operation,
+                "Org attempt write returned no row",
+            )
+        })
+}
+
+async fn query_optional_attempt(
+    session: &TursoSession,
+    sql: &str,
+    params: impl turso::IntoParams,
+    context: &str,
+) -> StorageResult<Option<OrgAttempt>> {
+    let mut rows = session
+        .connection
+        .query(sql, params)
+        .await
+        .map_err(|error| map_turso_error(context, error))?;
+    rows.next()
+        .await
+        .map_err(|error| map_turso_error(context, error))?
+        .as_ref()
+        .map(decode_attempt)
+        .transpose()
+}
+
+fn decode_attempt(row: &turso::Row) -> StorageResult<OrgAttempt> {
+    let note_refs_text: String = row
+        .get(11)
+        .map_err(|error| map_turso_error("decode Org attempt note refs", error))?;
+    let artifacts_text: String = row
+        .get(12)
+        .map_err(|error| map_turso_error("decode Org attempt artifacts", error))?;
+    let metadata_text: String = row
+        .get(13)
+        .map_err(|error| map_turso_error("decode Org attempt metadata", error))?;
+    Ok(OrgAttempt {
+        id: row
+            .get(0)
+            .map_err(|error| map_turso_error("decode Org attempt id", error))?,
+        workspace_id: decode_workspace_id(
+            row.get(1)
+                .map_err(|error| map_turso_error("decode Org attempt workspace", error))?,
+        )?,
+        work_item_id: decode_work_item_id(
+            row.get(2)
+                .map_err(|error| map_turso_error("decode Org attempt work item", error))?,
+        )?,
+        attempt_number: row
+            .get(3)
+            .map_err(|error| map_turso_error("decode Org attempt number", error))?,
+        actor_id: row
+            .get(4)
+            .map_err(|error| map_turso_error("decode Org attempt actor", error))?,
+        status: decode_attempt_status(
+            &row.get::<String>(5)
+                .map_err(|error| map_turso_error("decode Org attempt status", error))?,
+        )?,
+        started_at: row
+            .get(6)
+            .map_err(|error| map_turso_error("decode Org attempt start", error))?,
+        ended_at: row
+            .get(7)
+            .map_err(|error| map_turso_error("decode Org attempt end", error))?,
+        error: row
+            .get(8)
+            .map_err(|error| map_turso_error("decode Org attempt error", error))?,
+        result_summary: row
+            .get(9)
+            .map_err(|error| map_turso_error("decode Org attempt result", error))?,
+        review_outcome: row
+            .get(10)
+            .map_err(|error| map_turso_error("decode Org attempt review", error))?,
+        note_refs: serde_json::from_str::<Vec<OrgAttemptNoteReference>>(&note_refs_text).map_err(
+            |error| {
+                StorageError::with_source(
+                    StorageErrorKind::Corrupt,
+                    "decode stored Org attempt note refs",
+                    error,
+                )
+            },
+        )?,
+        artifacts: serde_json::from_str::<Vec<OrgArtifactReference>>(&artifacts_text).map_err(
+            |error| {
+                StorageError::with_source(
+                    StorageErrorKind::Corrupt,
+                    "decode stored Org attempt artifacts",
+                    error,
+                )
+            },
+        )?,
+        metadata: serde_json::from_str(&metadata_text).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Corrupt,
+                "decode stored Org attempt metadata",
+                error,
+            )
+        })?,
+    })
 }
 
 fn validate_event_limit(limit: usize) -> StorageResult<()> {

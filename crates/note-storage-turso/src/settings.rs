@@ -9,6 +9,7 @@ const EMBEDDING_FINGERPRINT_KEY: &str = "embedding_fingerprint";
 #[async_trait::async_trait]
 impl SettingsRepository for TursoSession {
     async fn get_system_config(&self) -> StorageResult<SystemConfig> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -37,6 +38,7 @@ impl SettingsRepository for TursoSession {
     }
 
     async fn set_system_config(&self, config: &SystemConfig) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         let json = serde_json::to_string(config).map_err(|error| {
             StorageError::with_source(
                 StorageErrorKind::Operation,
@@ -56,6 +58,7 @@ impl SettingsRepository for TursoSession {
     }
 
     async fn get_embedding_fingerprint(&self) -> StorageResult<Option<String>> {
+        let _operation_guard = self.operation_guard().await;
         let mut rows = self
             .connection
             .query(
@@ -75,6 +78,7 @@ impl SettingsRepository for TursoSession {
     }
 
     async fn set_embedding_fingerprint(&self, fingerprint: &str) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
         if fingerprint.trim().is_empty() {
             return Err(StorageError::new(
                 StorageErrorKind::Operation,
