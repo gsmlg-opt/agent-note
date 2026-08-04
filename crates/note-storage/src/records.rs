@@ -322,6 +322,68 @@ pub struct OrgAttemptUpdate<'a> {
     pub metadata: &'a serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgLeaseKind {
+    Execution,
+    Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgLeaseEndReason {
+    Release,
+    Completion,
+    Failure,
+    Block,
+    Cancellation,
+    LeaseExpiry,
+    ReviewRequest,
+    Approval,
+    Rejection,
+    Reassignment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgLease {
+    pub id: String,
+    pub workspace_id: note_org::WorkspaceId,
+    pub work_item_id: note_org::WorkItemId,
+    pub attempt_id: String,
+    pub kind: OrgLeaseKind,
+    pub actor_id: String,
+    pub fencing_token_hash: String,
+    pub acquired_at: i64,
+    pub last_heartbeat_at: i64,
+    pub expires_at: i64,
+    pub ended_at: Option<i64>,
+    pub end_reason: Option<OrgLeaseEndReason>,
+    pub expiry_event_id: Option<String>,
+}
+
+pub struct NewOrgLease<'a> {
+    pub id: &'a str,
+    pub workspace_id: note_org::WorkspaceId,
+    pub work_item_id: note_org::WorkItemId,
+    pub attempt_id: &'a str,
+    pub kind: OrgLeaseKind,
+    pub actor_id: &'a str,
+    pub fencing_token_hash: &'a str,
+    pub acquired_at: i64,
+    pub last_heartbeat_at: i64,
+    pub expires_at: i64,
+}
+
+pub struct OrgLeaseUpdate<'a> {
+    pub id: &'a str,
+    pub workspace_id: note_org::WorkspaceId,
+    pub last_heartbeat_at: i64,
+    pub expires_at: i64,
+    pub ended_at: Option<i64>,
+    pub end_reason: Option<OrgLeaseEndReason>,
+    pub expiry_event_id: Option<&'a str>,
+}
+
 pub struct NewOrgEvent<'a> {
     pub id: &'a str,
     pub workspace_id: note_org::WorkspaceId,

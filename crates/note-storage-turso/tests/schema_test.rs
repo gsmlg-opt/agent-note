@@ -5,7 +5,7 @@ use std::path::Path;
 use std::str::FromStr as _;
 
 const APPLICATION_ID: u32 = 0x414E4F54;
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 fn normalize_schema_sql(sql: &str) -> String {
     sql.split_whitespace()
@@ -14,6 +14,8 @@ fn normalize_schema_sql(sql: &str) -> String {
         .replace("( ", "(")
         .replace(" )", ")")
         .replace(" ,", ",")
+        .replace("length (", "length(")
+        .replace("trim (", "trim(")
 }
 
 async fn normalized_org_schema(connection: &turso::Connection) -> Vec<(String, String, String)> {
@@ -39,6 +41,64 @@ async fn normalized_org_schema(connection: &turso::Connection) -> Vec<(String, S
         ));
     }
     schema
+}
+
+async fn sqlite_index_spec(
+    connection: &turso::Connection,
+    table: &str,
+    index: &str,
+) -> (bool, bool, Vec<String>, Option<String>) {
+    let mut properties = connection
+        .query(
+            "SELECT \"unique\", partial
+             FROM pragma_index_list(?1)
+             WHERE name = ?2",
+            turso::params![table, index],
+        )
+        .await
+        .unwrap();
+    let properties = properties
+        .next()
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("missing index {index}"));
+
+    let mut column_rows = connection
+        .query(
+            "SELECT name FROM pragma_index_info(?1) ORDER BY seqno",
+            turso::params![index],
+        )
+        .await
+        .unwrap();
+    let mut columns = Vec::new();
+    while let Some(row) = column_rows.next().await.unwrap() {
+        columns.push(row.get::<String>(0).unwrap());
+    }
+
+    let index_sql = connection
+        .query(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+            turso::params![index],
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    let normalized = normalize_schema_sql(&index_sql);
+    let predicate = normalized
+        .split_once(" WHERE ")
+        .map(|(_, predicate)| predicate.to_owned());
+
+    (
+        properties.get::<i64>(0).unwrap() == 1,
+        properties.get::<i64>(1).unwrap() == 1,
+        columns,
+        predicate,
+    )
 }
 
 async fn create_schema_v2_database(path: &Path) {
@@ -149,6 +209,64 @@ async fn create_schema_v3_database(path: &Path) {
     while rows.next().await.unwrap().is_some() {}
 }
 
+async fn create_schema_v4_database(path: &Path) {
+    let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/schema-v4.sql"))
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO org_workspaces (
+                 id, slug, display_name, description, timezone,
+                 policy_schema_version, policy, revision, last_event_sequence,
+                 created_at, updated_at, archived_at
+             ) VALUES (
+                 '11111111-1111-4111-8111-111111111111', 'migration',
+                 'Migration', '', 'UTC', 1, '{}', 1, 0, 1, 1, NULL
+             )",
+            (),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO org_attempts (
+                 id, workspace_id, work_item_id, attempt_number, actor_id,
+                 status, started_at, ended_at, error, result_summary,
+                 review_outcome, note_refs, artifacts, metadata
+             ) VALUES (
+                 'attempt-before-v5', '11111111-1111-4111-8111-111111111111',
+                 '22222222-2222-4222-8222-222222222222', 1, 'migration-test',
+                 'running', 1, NULL, NULL, NULL, NULL, '[]', '[]', '{}'
+             )",
+            (),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA application_id = 1095651156", ())
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA user_version = 4", ())
+        .await
+        .unwrap();
+    connection.execute("COMMIT", ()).await.unwrap();
+    connection.cacheflush().unwrap();
+    let mut rows = connection
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+}
+
 fn database_header(path: &Path) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap();
     assert!(bytes.len() >= 100);
@@ -237,7 +355,7 @@ async fn unsupported_marked_schema_is_rejected_without_modification() {
     let path = dir.path().join("future.db");
     drop(TursoStorage::open(&path).await.unwrap());
     let mut before = std::fs::read(&path).unwrap();
-    before[60..64].copy_from_slice(&5_u32.to_be_bytes());
+    before[60..64].copy_from_slice(&6_u32.to_be_bytes());
     std::fs::write(&path, &before).unwrap();
 
     let error = match TursoStorage::open(&path).await {
@@ -299,6 +417,7 @@ async fn schema_v2_is_migrated_without_losing_notes() {
         "org_events",
         "org_operations",
         "org_attempts",
+        "org_leases",
     ] {
         assert!(tables.iter().any(|table| table == expected), "{expected}");
     }
@@ -307,7 +426,7 @@ async fn schema_v2_is_migrated_without_losing_notes() {
     drop(connection);
     drop(database);
 
-    let fresh_path = dir.path().join("fresh-v4.db");
+    let fresh_path = dir.path().join("fresh-v5.db");
     drop(TursoStorage::open(&fresh_path).await.unwrap());
     let fresh_database = turso::Builder::new_local(fresh_path.to_str().unwrap())
         .experimental_index_method(true)
@@ -431,7 +550,52 @@ async fn schema_v3_is_migrated_without_rewriting_existing_events() {
     drop(connection);
     drop(database);
 
-    let fresh_path = dir.path().join("fresh-v4.db");
+    let fresh_path = dir.path().join("fresh-v5.db");
+    drop(TursoStorage::open(&fresh_path).await.unwrap());
+    let fresh_database = turso::Builder::new_local(fresh_path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let fresh_connection = fresh_database.connect().unwrap();
+    let fresh_schema = normalized_org_schema(&fresh_connection).await;
+    assert_eq!(migrated_schema, fresh_schema);
+}
+
+#[tokio::test]
+async fn schema_v4_is_migrated_without_rewriting_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v4.db");
+    create_schema_v4_database(&path).await;
+
+    drop(TursoStorage::open(&path).await.unwrap());
+    database_header(&path);
+
+    let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    let attempt_count: i64 = connection
+        .query(
+            "SELECT count(*) FROM org_attempts WHERE id = 'attempt-before-v5'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(attempt_count, 1);
+    let migrated_schema = normalized_org_schema(&connection).await;
+    drop(connection);
+    drop(database);
+
+    let fresh_path = dir.path().join("fresh-v5.db");
     drop(TursoStorage::open(&fresh_path).await.unwrap());
     let fresh_database = turso::Builder::new_local(fresh_path.to_str().unwrap())
         .experimental_index_method(true)
@@ -519,6 +683,7 @@ async fn fresh_database_contains_current_schema_objects() {
         "org_events",
         "org_operations",
         "org_attempts",
+        "org_leases",
     ] {
         assert!(
             tables.iter().any(|table| table == expected),
@@ -546,6 +711,116 @@ async fn fresh_database_contains_current_schema_objects() {
     assert!(indexes
         .iter()
         .any(|index| index == "idx_org_events_attempt"));
+    for (table, index, unique, predicate, columns) in [
+        (
+            "org_leases",
+            "idx_org_leases_one_open_per_item",
+            true,
+            Some("ended_at IS NULL"),
+            &["work_item_id"][..],
+        ),
+        (
+            "org_leases",
+            "idx_org_leases_workspace_open_expiry",
+            false,
+            Some("ended_at IS NULL"),
+            &["workspace_id", "expires_at", "work_item_id"][..],
+        ),
+        (
+            "org_leases",
+            "idx_org_leases_item_history",
+            false,
+            None,
+            &["work_item_id", "acquired_at", "id"][..],
+        ),
+        (
+            "org_leases",
+            "idx_org_leases_actor_kind",
+            false,
+            Some("ended_at IS NULL"),
+            &["actor_id", "kind", "expires_at"][..],
+        ),
+        (
+            "org_work_items",
+            "idx_org_work_items_operational_order",
+            false,
+            None,
+            &[
+                "workspace_id",
+                "state",
+                "priority",
+                "deadline_utc",
+                "scheduled_utc",
+                "created_at",
+                "id",
+            ][..],
+        ),
+        (
+            "org_work_items",
+            "idx_org_work_items_assignment_order",
+            false,
+            None,
+            &[
+                "workspace_id",
+                "assignee",
+                "state",
+                "priority",
+                "deadline_utc",
+                "scheduled_utc",
+                "created_at",
+                "id",
+            ][..],
+        ),
+        (
+            "org_work_items",
+            "idx_org_work_items_schedule_order",
+            false,
+            None,
+            &[
+                "workspace_id",
+                "scheduled_utc",
+                "priority",
+                "deadline_utc",
+                "created_at",
+                "id",
+            ][..],
+        ),
+        (
+            "org_work_items",
+            "idx_org_work_items_deadline_order",
+            false,
+            None,
+            &[
+                "workspace_id",
+                "deadline_utc",
+                "priority",
+                "scheduled_utc",
+                "created_at",
+                "id",
+            ][..],
+        ),
+        (
+            "org_dependencies",
+            "idx_org_dependencies_target",
+            false,
+            None,
+            &["depends_on_id", "work_item_id"][..],
+        ),
+    ] {
+        let actual = sqlite_index_spec(&connection, table, index).await;
+        assert_eq!(actual.0, unique, "unexpected uniqueness for {index}");
+        assert_eq!(
+            actual.1,
+            predicate.is_some(),
+            "unexpected partial flag for {index}"
+        );
+        assert_eq!(actual.2, columns, "unexpected column order for {index}");
+        assert_eq!(
+            actual.3,
+            predicate.map(str::to_owned),
+            "unexpected predicate for {index}"
+        );
+    }
     assert!(!tables.iter().any(|table| table == "note_chunk_sparse"));
     assert!(!indexes
         .iter()
@@ -557,6 +832,69 @@ async fn fresh_database_contains_current_schema_objects() {
     assert!(!indexes
         .iter()
         .any(|index| index == "idx_note_chunk_embedding"));
+
+    let mut columns = connection
+        .query("PRAGMA table_info(org_leases)", ())
+        .await
+        .unwrap();
+    let mut column_names = Vec::new();
+    while let Some(row) = columns.next().await.unwrap() {
+        column_names.push(row.get::<String>(1).unwrap());
+    }
+    assert!(column_names
+        .iter()
+        .any(|column| column == "fencing_token_hash"));
+    assert!(!column_names.iter().any(|column| column == "fencing_token"));
+
+    let mut foreign_keys = connection
+        .query("PRAGMA foreign_key_list(org_leases)", ())
+        .await
+        .unwrap();
+    let mut lease_foreign_keys = Vec::new();
+    while let Some(row) = foreign_keys.next().await.unwrap() {
+        lease_foreign_keys.push((row.get::<String>(3).unwrap(), row.get::<String>(2).unwrap()));
+    }
+    lease_foreign_keys.sort();
+    assert_eq!(
+        lease_foreign_keys,
+        vec![
+            ("attempt_id".into(), "org_attempts".into()),
+            ("workspace_id".into(), "org_workspaces".into()),
+        ]
+    );
+    let lease_table_sql = connection
+        .query(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'table' AND name = 'org_leases'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    let lease_table_sql = normalize_schema_sql(&lease_table_sql);
+    assert_eq!(lease_table_sql.matches("CHECK (").count(), 10);
+    for expected in [
+        "CHECK (kind IN ('execution', 'review'))",
+        "CHECK (length(trim(actor_id)) > 0)",
+        "CHECK (length(fencing_token_hash) = 64)",
+        "CHECK (acquired_at > 0)",
+        "CHECK (last_heartbeat_at >= acquired_at)",
+        "CHECK (expires_at >= last_heartbeat_at)",
+        "CHECK (ended_at IS NULL OR ended_at >= acquired_at)",
+        "CHECK (end_reason IS NULL OR end_reason IN ('release', 'completion', 'failure', 'block', 'cancellation', 'lease_expiry', 'review_request', 'approval', 'rejection', 'reassignment'))",
+        "CHECK ((ended_at IS NULL) = (end_reason IS NULL))",
+        "CHECK ((expiry_event_id IS NOT NULL) = (end_reason IS NOT NULL AND end_reason = 'lease_expiry'))",
+    ] {
+        assert!(
+            lease_table_sql.contains(expected),
+            "missing Org lease constraint: {expected}; actual schema: {lease_table_sql}"
+        );
+    }
 }
 
 #[tokio::test]

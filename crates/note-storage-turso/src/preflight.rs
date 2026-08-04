@@ -12,8 +12,9 @@ const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_HEADER_LEN: usize = 100;
 pub(crate) const APPLICATION_ID: u32 = 0x414E4F54;
 pub(crate) const OLDEST_SCHEMA_VERSION: u32 = 2;
-pub(crate) const PREVIOUS_SCHEMA_VERSION: u32 = 3;
-pub(crate) const SCHEMA_VERSION: u32 = 4;
+pub(crate) const SCHEMA_V3_VERSION: u32 = 3;
+pub(crate) const PREVIOUS_SCHEMA_VERSION: u32 = 4;
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Preflight {
@@ -200,7 +201,7 @@ fn classify_header(path: &Path, header: &[u8]) -> StorageResult<Preflight> {
     }
     if !matches!(
         user_version,
-        OLDEST_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
+        OLDEST_SCHEMA_VERSION | SCHEMA_V3_VERSION | PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
     ) {
         return Err(unsupported_schema(user_version));
     }

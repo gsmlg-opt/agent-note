@@ -8,12 +8,13 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::preflight::{
     incompatible_database, preflight, unsupported_schema, Preflight, APPLICATION_ID,
-    OLDEST_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION,
+    OLDEST_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION, SCHEMA_V3_VERSION, SCHEMA_VERSION,
 };
 
 const SCHEMA: &str = include_str!("../schema.sql");
 const MIGRATION_2_TO_3: &str = include_str!("../migrations/0002_to_0003_org.sql");
 const MIGRATION_3_TO_4: &str = include_str!("../migrations/0003_to_0004_org_workflow_audit.sql");
+const MIGRATION_4_TO_5: &str = include_str!("../migrations/0004_to_0005_org_claims.sql");
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,7 +99,10 @@ impl TursoSession {
             let version = user_version as u32;
             if !matches!(
                 version,
-                OLDEST_SCHEMA_VERSION | PREVIOUS_SCHEMA_VERSION | SCHEMA_VERSION
+                OLDEST_SCHEMA_VERSION
+                    | SCHEMA_V3_VERSION
+                    | PREVIOUS_SCHEMA_VERSION
+                    | SCHEMA_VERSION
             ) {
                 return Err(unsupported_schema(version));
             }
@@ -111,7 +115,7 @@ impl TursoSession {
     }
 
     pub(crate) async fn initialize(&self, path: &Path) -> StorageResult<()> {
-        self.initialize_with_migrations(path, MIGRATION_2_TO_3, MIGRATION_3_TO_4)
+        self.initialize_with_migrations(path, MIGRATION_2_TO_3, MIGRATION_3_TO_4, MIGRATION_4_TO_5)
             .await
     }
 
@@ -120,6 +124,7 @@ impl TursoSession {
         path: &Path,
         migration_2_to_3: &str,
         migration_3_to_4: &str,
+        migration_4_to_5: &str,
     ) -> StorageResult<()> {
         self.connection
             .execute("BEGIN IMMEDIATE", ())
@@ -127,7 +132,7 @@ impl TursoSession {
             .map_err(|error| initialization_error(error, None))?;
 
         let result = self
-            .initialize_transaction_body(path, migration_2_to_3, migration_3_to_4)
+            .initialize_transaction_body(path, migration_2_to_3, migration_3_to_4, migration_4_to_5)
             .await;
         if let Err(primary) = result {
             let rollback = self.connection.execute("ROLLBACK", ()).await.err();
@@ -142,6 +147,7 @@ impl TursoSession {
         path: &Path,
         migration_2_to_3: &str,
         migration_3_to_4: &str,
+        migration_4_to_5: &str,
     ) -> StorageResult<()> {
         match self.opened_state(path).await? {
             OpenedState::Empty => {
@@ -170,16 +176,39 @@ impl TursoSession {
                     .map_err(|error| {
                         map_turso_error("migrate database schema from v3 to v4", error)
                     })?;
+                self.connection
+                    .execute_batch(migration_4_to_5)
+                    .await
+                    .map_err(|error| {
+                        map_turso_error("migrate database schema from v4 to v5", error)
+                    })?;
                 set_user_version(&self.connection, SCHEMA_VERSION).await?;
             }
             OpenedState::Existing {
-                version: PREVIOUS_SCHEMA_VERSION,
+                version: SCHEMA_V3_VERSION,
             } => {
                 self.connection
                     .execute_batch(migration_3_to_4)
                     .await
                     .map_err(|error| {
                         map_turso_error("migrate database schema from v3 to v4", error)
+                    })?;
+                self.connection
+                    .execute_batch(migration_4_to_5)
+                    .await
+                    .map_err(|error| {
+                        map_turso_error("migrate database schema from v4 to v5", error)
+                    })?;
+                set_user_version(&self.connection, SCHEMA_VERSION).await?;
+            }
+            OpenedState::Existing {
+                version: PREVIOUS_SCHEMA_VERSION,
+            } => {
+                self.connection
+                    .execute_batch(migration_4_to_5)
+                    .await
+                    .map_err(|error| {
+                        map_turso_error("migrate database schema from v4 to v5", error)
                     })?;
                 set_user_version(&self.connection, SCHEMA_VERSION).await?;
             }
@@ -380,7 +409,7 @@ fn initialization_storage_error(
 mod tests {
     use super::{
         map_turso_error, verify_checkpoint_result, StorageErrorKind, TursoSession,
-        MIGRATION_2_TO_3, MIGRATION_3_TO_4,
+        MIGRATION_2_TO_3, MIGRATION_3_TO_4, MIGRATION_4_TO_5,
     };
     use crate::TursoStorage;
 
@@ -453,7 +482,7 @@ mod tests {
         );
 
         session
-            .initialize_with_migrations(&path, &bad_migration, MIGRATION_3_TO_4)
+            .initialize_with_migrations(&path, &bad_migration, MIGRATION_3_TO_4, MIGRATION_4_TO_5)
             .await
             .expect_err("bad migration tail must fail");
 
@@ -524,7 +553,12 @@ mod tests {
         );
 
         session
-            .initialize_with_migrations(&path, MIGRATION_2_TO_3, &bad_second_migration)
+            .initialize_with_migrations(
+                &path,
+                MIGRATION_2_TO_3,
+                &bad_second_migration,
+                MIGRATION_4_TO_5,
+            )
             .await
             .expect_err("failure in v3-to-v4 must roll the whole chain back");
 
@@ -598,7 +632,7 @@ mod tests {
         );
 
         session
-            .initialize_with_migrations(&path, MIGRATION_2_TO_3, &bad_migration)
+            .initialize_with_migrations(&path, MIGRATION_2_TO_3, &bad_migration, MIGRATION_4_TO_5)
             .await
             .expect_err("bad v3 migration tail must fail");
 
@@ -636,6 +670,80 @@ mod tests {
             rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn failed_v4_migration_rolls_back_schema_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration-v4-rollback.db");
+        let database = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let connection = database.connect().unwrap();
+        connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        connection
+            .execute_batch(include_str!("../tests/fixtures/schema-v4.sql"))
+            .await
+            .unwrap();
+        connection
+            .execute("PRAGMA application_id = 1095651156", ())
+            .await
+            .unwrap();
+        connection
+            .execute("PRAGMA user_version = 4", ())
+            .await
+            .unwrap();
+        connection.execute("COMMIT", ()).await.unwrap();
+        connection.cacheflush().unwrap();
+        let mut rows = connection
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .unwrap();
+        while rows.next().await.unwrap().is_some() {}
+        drop(connection);
+        drop(database);
+
+        let database = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let session = TursoSession::configured(&database).await.unwrap();
+        let bad_migration = format!(
+            "{MIGRATION_4_TO_5}\n\
+             CREATE TABLE migration_v4_probe (id INTEGER PRIMARY KEY);\n\
+             INSERT INTO missing_migration_table(id) VALUES (1);"
+        );
+
+        session
+            .initialize_with_migrations(&path, MIGRATION_2_TO_3, MIGRATION_3_TO_4, &bad_migration)
+            .await
+            .expect_err("bad v4 migration tail must fail");
+
+        assert_eq!(
+            pragma_value(&session.connection, "PRAGMA user_version").await,
+            4
+        );
+        for table in ["org_leases", "migration_v4_probe"] {
+            let mut rows = session
+                .connection
+                .query(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_schema
+                         WHERE type = 'table' AND name = ?1
+                     )",
+                    turso::params![table],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                0,
+                "{table} must not survive the rolled-back v4 migration"
+            );
+        }
     }
 
     #[test]
