@@ -543,25 +543,6 @@ async fn execute_release_transaction(
     }
 
     let token_hash = token_hash(&request.fencing_token);
-    if lease.id != request.lease_id
-        || lease.workspace_id != workspace.id
-        || lease.work_item_id != item.id
-        || lease.fencing_token_hash != token_hash
-        || lease.kind != storage_kind(request.kind)
-        || lease.actor_id != command.actor_id
-        || lease.ended_at.is_some()
-    {
-        return Err(stale_lease());
-    }
-    validate_document_revision(&document, request.expected_document_revision)?;
-    let target = release_target(&workspace, &item, request)?;
-    let projection = transaction
-        .list_org_workspace_projection(workspace.id)
-        .await
-        .map_err(OrgError::storage)?;
-    if let Some(target) = &target {
-        validate_item_transition(&workspace.policy, &item, &projection, target, false)?;
-    }
     resolve_lease_update(
         transaction
             .close_org_lease(OrgLeaseClosure {
@@ -580,6 +561,15 @@ async fn execute_release_transaction(
             .await
             .map_err(OrgError::storage)?,
     )?;
+    validate_document_revision(&document, request.expected_document_revision)?;
+    let target = release_target(&workspace, &item, request)?;
+    let projection = transaction
+        .list_org_workspace_projection(workspace.id)
+        .await
+        .map_err(OrgError::storage)?;
+    if let Some(target) = &target {
+        validate_item_transition(&workspace.policy, &item, &projection, target, false)?;
+    }
     let resulting_document = if let Some(target) = &target {
         write_claim_state(
             transaction,
@@ -637,7 +627,27 @@ async fn execute_release_transaction(
     Ok(ReleaseTransactionOutcome::Released(result))
 }
 
-async fn bookkeep_expired_lease(
+pub(crate) async fn bookkeep_expired_open_lease(
+    transaction: &dyn StorageTransaction,
+    workspace: &OrgWorkspace,
+    item: &OrgProjectedWorkItem,
+    now: i64,
+) -> Result<bool, OrgError> {
+    let Some(lease) = transaction
+        .get_open_org_lease_internal(item.id)
+        .await
+        .map_err(OrgError::storage)?
+    else {
+        return Ok(false);
+    };
+    if lease.expires_at > now {
+        return Ok(false);
+    }
+    bookkeep_expired_lease(transaction, workspace, item, &lease, now).await?;
+    Ok(true)
+}
+
+pub(crate) async fn bookkeep_expired_lease(
     transaction: &dyn StorageTransaction,
     workspace: &OrgWorkspace,
     item: &OrgProjectedWorkItem,
@@ -742,8 +752,8 @@ async fn update_attempt_for_release(
                 expected_status: attempt.status,
                 status: next,
                 ended_at: now,
-                error: None,
-                result_summary: None,
+                error: attempt.error.as_deref(),
+                result_summary: attempt.result_summary.as_deref(),
                 review_outcome: if kind == OrgClaimKind::Review {
                     Some("released")
                 } else {
@@ -793,7 +803,7 @@ fn release_target(
     Ok(target)
 }
 
-async fn write_claim_state(
+pub(crate) async fn write_claim_state(
     transaction: &dyn StorageTransaction,
     workspace: &OrgWorkspace,
     document: &OrgDocument,
@@ -856,7 +866,7 @@ async fn write_claim_state(
     Ok(updated)
 }
 
-async fn append_event(
+pub(crate) async fn append_event(
     transaction: &dyn StorageTransaction,
     event_id: &str,
     workspace: &OrgWorkspace,
@@ -892,7 +902,7 @@ async fn append_event(
     result.map(|event| event.id).map_err(OrgError::storage)
 }
 
-fn command_result(
+pub(crate) fn command_result(
     command: &CommandEnvelope,
     workspace: &OrgWorkspace,
     event_ids: Vec<String>,
@@ -913,7 +923,7 @@ fn command_result(
     }
 }
 
-async fn require_active_workspace(
+pub(crate) async fn require_active_workspace(
     transaction: &dyn StorageTransaction,
     workspace_id: note_org::WorkspaceId,
 ) -> Result<OrgWorkspace, OrgError> {
@@ -933,7 +943,7 @@ async fn require_active_workspace(
     Ok(workspace)
 }
 
-async fn load_document(
+pub(crate) async fn load_document(
     transaction: &dyn StorageTransaction,
     workspace: &OrgWorkspace,
     document_id: note_org::DocumentId,
@@ -946,7 +956,7 @@ async fn load_document(
         .ok_or_else(|| not_found("document"))
 }
 
-fn validate_document_revision(
+pub(crate) fn validate_document_revision(
     document: &OrgDocument,
     expected_revision: i64,
 ) -> Result<(), OrgError> {
@@ -998,12 +1008,12 @@ fn validate_token_request(lease_id: &str, token: &str) -> Result<(), OrgError> {
         || token.trim().is_empty()
         || token != token.trim()
     {
-        return Err(OrgError::invalid_input("Invalid Org lease proof"));
+        return Err(stale_lease());
     }
     Ok(())
 }
 
-fn token_hash(token: &str) -> String {
+pub(crate) fn token_hash(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
@@ -1031,7 +1041,7 @@ fn domain_kind(kind: OrgClaimKind) -> LeaseKind {
     }
 }
 
-fn storage_kind(kind: OrgClaimKind) -> OrgLeaseKind {
+pub(crate) fn storage_kind(kind: OrgClaimKind) -> OrgLeaseKind {
     match kind {
         OrgClaimKind::Execution => OrgLeaseKind::Execution,
         OrgClaimKind::Review => OrgLeaseKind::Review,
@@ -1052,16 +1062,16 @@ fn domain_lease_kind(kind: OrgLeaseKind) -> LeaseKind {
     }
 }
 
-fn lease_duration(workspace: &OrgWorkspace) -> i64 {
+pub(crate) fn lease_duration(workspace: &OrgWorkspace) -> i64 {
     i64::try_from(workspace.policy.lease_duration_secs).unwrap_or(i64::MAX)
 }
 
-fn capacity(workspace: &OrgWorkspace) -> Result<i64, OrgError> {
+pub(crate) fn capacity(workspace: &OrgWorkspace) -> Result<i64, OrgError> {
     i64::try_from(workspace.policy.concurrency_limit)
         .map_err(|_| OrgError::invalid_input("Org concurrency limit is too large"))
 }
 
-fn map_claim_error(error: ClaimDecisionError) -> OrgError {
+pub(crate) fn map_claim_error(error: ClaimDecisionError) -> OrgError {
     match error {
         ClaimDecisionError::Blocked(blockers) => {
             let code = if blockers.contains(&ReadinessBlocker::ActiveLease) {
@@ -1096,14 +1106,17 @@ fn map_claim_error(error: ClaimDecisionError) -> OrgError {
     }
 }
 
-fn resolve_lease_update<T>(value: ConditionalUpdate<T>) -> Result<T, OrgError> {
+pub(crate) fn resolve_lease_update<T>(value: ConditionalUpdate<T>) -> Result<T, OrgError> {
     match value {
         ConditionalUpdate::Applied(value) => Ok(value),
         ConditionalUpdate::NotFound | ConditionalUpdate::Conflict => Err(stale_lease()),
     }
 }
 
-fn resolve_update<T>(value: ConditionalUpdate<T>, resource: &str) -> Result<T, OrgError> {
+pub(crate) fn resolve_update<T>(
+    value: ConditionalUpdate<T>,
+    resource: &str,
+) -> Result<T, OrgError> {
     match value {
         ConditionalUpdate::Applied(value) => Ok(value),
         ConditionalUpdate::NotFound => Err(not_found(resource)),
@@ -1125,7 +1138,7 @@ fn not_found(resource: &str) -> OrgError {
     )
 }
 
-fn stale_lease() -> OrgError {
+pub(crate) fn stale_lease() -> OrgError {
     OrgError::new(
         OrgErrorCode::StaleLease,
         "Org lease proof is stale or invalid",
@@ -1143,7 +1156,7 @@ fn active_lease(item_id: note_org::WorkItemId) -> OrgError {
     )
 }
 
-fn concurrency_limit(workspace_id: note_org::WorkspaceId) -> OrgError {
+pub(crate) fn concurrency_limit(workspace_id: note_org::WorkspaceId) -> OrgError {
     OrgError::new(
         OrgErrorCode::ConcurrencyLimit,
         "Org workspace claim capacity is exhausted",

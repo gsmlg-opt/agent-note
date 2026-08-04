@@ -811,6 +811,19 @@ pub trait OrgRepository: Send + Sync {
         ))
     }
 
+    /// Validates an active lease fence without extending, closing, or otherwise
+    /// changing the lease. A missing or stale proof is reported as a conflict.
+    async fn validate_org_lease_proof(
+        &self,
+        proof: OrgLeaseProof<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _ = proof;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
     async fn heartbeat_org_lease(
         &self,
         update: OrgLeaseHeartbeat<'_>,

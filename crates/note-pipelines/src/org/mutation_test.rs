@@ -2,8 +2,9 @@
 mod support;
 
 use super::{
-    execute_idempotent, execute_idempotent_create, resolve_cas, CommandEnvelope, FixedOrgClock,
-    OrgCommandKind, OrgCommandResult, OrgContext, OrgError, OrgErrorCode,
+    execute_idempotent, execute_idempotent_create, execute_idempotent_outcome, resolve_cas,
+    CommandEnvelope, FixedOrgClock, OrgCommandKind, OrgCommandResult, OrgContext, OrgError,
+    OrgErrorCode, OrgMutationOutcome,
 };
 use note_org::WorkspacePolicy;
 use note_storage::{
@@ -616,4 +617,63 @@ async fn failed_mutation_rolls_back_event_and_operation_result() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn commit_error_persists_system_bookkeeping_without_an_operation_result() {
+    let (context, backend, _dir, _db_path, workspace_id) = org_test_context(88).await;
+    let command = envelope(workspace_id, "agent-one", "operation-commit-error");
+    let metadata = json!({"schema_version": 1});
+
+    let error = execute_idempotent_outcome(
+        &context,
+        TEST_COMMAND,
+        &command,
+        &request("commit-error"),
+        |transaction, now| {
+            let metadata = metadata.clone();
+            Box::pin(async move {
+                transaction
+                    .append_internal_org_event(NewOrgEvent {
+                        id: "committed-bookkeeping-event",
+                        workspace_id,
+                        subject_kind: "workspace",
+                        subject_id: "11111111-1111-4111-8111-111111111111",
+                        actor_id: "system",
+                        attempt_id: None,
+                        event_type: OrgEventType::WorkspaceChange,
+                        occurred_at: now,
+                        summary: "must commit",
+                        metadata: &metadata,
+                        previous_state: None,
+                        resulting_state: None,
+                    })
+                    .await
+                    .map_err(OrgError::storage)?;
+                Ok(OrgMutationOutcome::CommitError(OrgError::new(
+                    OrgErrorCode::StaleLease,
+                    "Org lease proof is stale or invalid",
+                    json!({}),
+                    true,
+                )))
+            })
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, OrgErrorCode::StaleLease, "{error:?}");
+    assert_eq!(error.details, json!({}));
+
+    let session = backend.session().await.unwrap();
+    let events = session
+        .list_org_events(workspace_id, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "committed-bookkeeping-event");
+    assert!(session
+        .get_org_operation(workspace_id, "operation-commit-error")
+        .await
+        .unwrap()
+        .is_none());
 }

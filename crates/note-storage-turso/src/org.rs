@@ -8,10 +8,11 @@ use note_storage::{
     OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument,
     OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
     OrgEventType, OrgLease, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind,
-    OrgLeaseOwnershipMove, OrgOperationalCounts, OrgOperationalQuery, OrgOperationalRow,
-    OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker, OrgRepository, OrgReviewLeaseMarker,
-    OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, SanitizedOrgLease,
-    StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
+    OrgLeaseOwnershipMove, OrgLeaseProof, OrgOperationalCounts, OrgOperationalQuery,
+    OrgOperationalRow, OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker, OrgRepository,
+    OrgReviewLeaseMarker, OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate,
+    SanitizedOrgLease, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
+    StoredOrgTimestamp,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
@@ -861,6 +862,39 @@ impl OrgRepository for TursoSession {
             .ok_or_else(|| StorageError::new(StorageErrorKind::Operation, "missing count row"))?;
         row.get(0)
             .map_err(|error| map_turso_error("decode active Org lease count", error))
+    }
+
+    async fn validate_org_lease_proof(
+        &self,
+        proof: OrgLeaseProof<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        let _operation_guard = self.operation_guard().await;
+        validate_lease_proof(&proof)?;
+        let sql = format!(
+            "UPDATE org_leases
+             SET last_heartbeat_at=last_heartbeat_at
+             WHERE id=?1 AND workspace_id=?2 AND work_item_id=?3
+               AND fencing_token_hash=?4 AND kind=?5 AND actor_id=?6
+               AND ended_at IS NULL AND expires_at>?7
+             RETURNING {LEASE_COLUMNS}"
+        );
+        Ok(query_optional_lease(
+            self,
+            &sql,
+            turso::params![
+                proof.lease_id,
+                proof.workspace_id.to_string(),
+                proof.work_item_id.to_string(),
+                proof.fencing_token_hash,
+                lease_kind_name(proof.kind),
+                proof.actor_id,
+                proof.now
+            ],
+            "validate Org lease proof",
+        )
+        .await?
+        .map(|lease| ConditionalUpdate::Applied(lease.into()))
+        .unwrap_or(ConditionalUpdate::Conflict))
     }
 
     async fn heartbeat_org_lease(

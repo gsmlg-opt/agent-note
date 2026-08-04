@@ -4,9 +4,9 @@ use note_storage::{
     CompareAndSwap, ConditionalUpdate, NewNote, NewOrgAttempt, NewOrgAttemptAllocation,
     NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace, OrgAttemptStatus,
     OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
-    OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof, OrgProjectedWorkItem, OrgWorkspaceUpdate,
-    StorageBackend, StorageErrorKind, StorageTransaction, StoredOrgOperation, TransactionMode,
-    UpsertNoteChunk,
+    OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof,
+    OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StorageTransaction,
+    StoredOrgOperation, TransactionMode, UpsertNoteChunk,
 };
 use serde_json::json;
 use std::str::FromStr as _;
@@ -735,6 +735,220 @@ pub(crate) async fn run_org_claim_races(storage: Arc<dyn StorageBackend>) {
             1
         );
     }
+}
+
+pub(crate) async fn run_org_lease_proof_validation(storage: Arc<dyn StorageBackend>) {
+    let workspace_id = WorkspaceId::from_str("6a000000-0000-0000-0000-000000000001").unwrap();
+    let other_workspace_id = WorkspaceId::from_str("6a000000-0000-0000-0000-000000000002").unwrap();
+    let work_item_id = WorkItemId::from_str("6b000000-0000-0000-0000-000000000001").unwrap();
+    let other_work_item_id = WorkItemId::from_str("6b000000-0000-0000-0000-000000000002").unwrap();
+    let policy = WorkspacePolicy::engineering_default();
+    let seed = storage.begin(TransactionMode::Immediate).await.unwrap();
+    for (id, slug) in [
+        (workspace_id, "lease-proof"),
+        (other_workspace_id, "lease-proof-other"),
+    ] {
+        seed.insert_org_workspace(NewOrgWorkspace {
+            id,
+            slug,
+            display_name: slug,
+            description: "proof-only active lease validation",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            now: 1_000,
+        })
+        .await
+        .unwrap();
+    }
+    let attempt = seed
+        .allocate_next_org_attempt(NewOrgAttemptAllocation {
+            id: "lease-proof-attempt",
+            workspace_id,
+            work_item_id,
+            actor_id: "lease-proof-agent",
+            started_at: 1_000,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &json!({}),
+        })
+        .await
+        .unwrap();
+    let ConditionalUpdate::Applied(inserted) = seed
+        .insert_org_lease_if_capacity(
+            NewOrgLease {
+                id: "lease-proof-active",
+                workspace_id,
+                work_item_id,
+                attempt_id: &attempt.id,
+                kind: OrgLeaseKind::Execution,
+                actor_id: "lease-proof-agent",
+                fencing_token_hash:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                acquired_at: 1_000,
+                last_heartbeat_at: 1_010,
+                expires_at: 1_100,
+            },
+            1,
+            1_000,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("lease proof fixture should fit workspace capacity");
+    };
+    seed.commit().await.unwrap();
+
+    let session = storage.session().await.unwrap();
+    let proof = |now| OrgLeaseProof {
+        lease_id: "lease-proof-active",
+        workspace_id,
+        work_item_id,
+        fencing_token_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        kind: OrgLeaseKind::Execution,
+        actor_id: "lease-proof-agent",
+        now,
+    };
+    let ConditionalUpdate::Applied(validated) = session
+        .validate_org_lease_proof(proof(1_050))
+        .await
+        .unwrap()
+    else {
+        panic!("the exact current lease proof should validate");
+    };
+    assert_eq!(validated, inserted);
+    let after_validation = session
+        .get_open_org_lease_internal(work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_validation.last_heartbeat_at, 1_010);
+    assert_eq!(after_validation.expires_at, 1_100);
+    assert_eq!(after_validation.ended_at, None);
+    assert_eq!(after_validation.end_reason, None);
+
+    for invalid_proof in [
+        OrgLeaseProof {
+            lease_id: "lease-proof-missing",
+            ..proof(1_050)
+        },
+        OrgLeaseProof {
+            workspace_id: other_workspace_id,
+            ..proof(1_050)
+        },
+        OrgLeaseProof {
+            work_item_id: other_work_item_id,
+            ..proof(1_050)
+        },
+        OrgLeaseProof {
+            fencing_token_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ..proof(1_050)
+        },
+        OrgLeaseProof {
+            kind: OrgLeaseKind::Review,
+            ..proof(1_050)
+        },
+        OrgLeaseProof {
+            actor_id: "lease-proof-other-agent",
+            ..proof(1_050)
+        },
+        proof(1_100),
+    ] {
+        assert_eq!(
+            session
+                .validate_org_lease_proof(invalid_proof)
+                .await
+                .unwrap(),
+            ConditionalUpdate::Conflict,
+            "every stale active-lease proof must have one generic result"
+        );
+    }
+
+    let lease_before_rollback = session
+        .get_open_org_lease_internal(work_item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let events_before_rollback = session
+        .list_org_events(workspace_id, None, 100)
+        .await
+        .unwrap();
+    drop(session);
+
+    let rollback = storage.begin(TransactionMode::Immediate).await.unwrap();
+    assert!(matches!(
+        rollback
+            .validate_org_lease_proof(proof(1_055))
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    rollback
+        .append_org_event(NewOrgEvent {
+            id: "lease-proof-rolled-back-event",
+            workspace_id,
+            subject_kind: "work_item",
+            subject_id: "6b000000-0000-0000-0000-000000000001",
+            actor_id: "lease-proof-agent",
+            attempt_id: Some(&attempt.id),
+            event_type: OrgEventType::Progress,
+            occurred_at: 1_055,
+            summary: "This event must roll back",
+            metadata: &json!({"contract": "lease-proof-rollback"}),
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rollback
+            .list_org_events(workspace_id, None, 100)
+            .await
+            .unwrap()
+            .len(),
+        events_before_rollback.len() + 1,
+        "the transaction must observe its own event before rollback"
+    );
+    rollback.rollback().await.unwrap();
+
+    let session = storage.session().await.unwrap();
+    assert_eq!(
+        session
+            .get_open_org_lease_internal(work_item_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        lease_before_rollback,
+        "proof validation followed by rollback must preserve every lease field"
+    );
+    assert_eq!(
+        session
+            .list_org_events(workspace_id, None, 100)
+            .await
+            .unwrap(),
+        events_before_rollback,
+        "the event appended after proof validation must roll back completely"
+    );
+
+    assert!(matches!(
+        session
+            .close_org_lease(OrgLeaseClosure {
+                proof: proof(1_060),
+                ended_at: 1_060,
+                end_reason: OrgLeaseEndReason::Release,
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    assert_eq!(
+        session
+            .validate_org_lease_proof(proof(1_061))
+            .await
+            .unwrap(),
+        ConditionalUpdate::Conflict,
+        "a released lease proof must stay stale"
+    );
 }
 
 async fn race_claim(

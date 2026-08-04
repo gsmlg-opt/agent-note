@@ -27,6 +27,53 @@ fn work_item_id(value: &str) -> WorkItemId {
     WorkItemId::from_str(value).unwrap()
 }
 
+pub(crate) async fn run_org_workflow_event_decoding(storage: Arc<dyn StorageBackend>) {
+    let workspace_id = workspace_id("5f000000-0000-4000-8000-000000000001");
+    let session = storage.session().await.unwrap();
+    session
+        .insert_org_workspace(NewOrgWorkspace {
+            id: workspace_id,
+            slug: "workflow-event-decoding",
+            display_name: "Workflow event decoding",
+            description: "backend event decoding contract",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &WorkspacePolicy::engineering_default(),
+            now: 1,
+        })
+        .await
+        .unwrap();
+    for (id, event_type) in [
+        ("workflow-result-submission", OrgEventType::ResultSubmission),
+        ("workflow-transition", OrgEventType::Transition),
+    ] {
+        session
+            .append_org_event(NewOrgEvent {
+                id,
+                workspace_id,
+                subject_kind: "work_item",
+                subject_id: "5f000000-0000-4000-8000-000000000002",
+                actor_id: "workflow-agent",
+                attempt_id: None,
+                event_type,
+                occurred_at: 2,
+                summary: "workflow event",
+                metadata: &json!({"schema_version": 1}),
+                previous_state: Some("RUNNING"),
+                resulting_state: Some("REVIEW"),
+            })
+            .await
+            .unwrap();
+    }
+    let events = session
+        .list_org_events(workspace_id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, OrgEventType::ResultSubmission);
+    assert_eq!(events[1].event_type, OrgEventType::Transition);
+}
+
 fn scheduled(raw: &str, local: &str, utc_timestamp: i64) -> StoredOrgTimestamp {
     StoredOrgTimestamp {
         raw: raw.into(),

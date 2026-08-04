@@ -8,10 +8,11 @@ use note_storage::{
     OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument,
     OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
     OrgEventType, OrgLease, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind,
-    OrgLeaseOwnershipMove, OrgOperationalCounts, OrgOperationalQuery, OrgOperationalRow,
-    OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker, OrgRepository, OrgReviewLeaseMarker,
-    OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, SanitizedOrgLease,
-    StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
+    OrgLeaseOwnershipMove, OrgLeaseProof, OrgOperationalCounts, OrgOperationalQuery,
+    OrgOperationalRow, OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker, OrgRepository,
+    OrgReviewLeaseMarker, OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate,
+    SanitizedOrgLease, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
+    StoredOrgTimestamp,
 };
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
@@ -957,6 +958,38 @@ impl OrgRepository for PgSession {
         .fetch_one(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("count active Org leases", error))
+    }
+
+    async fn validate_org_lease_proof(
+        &self,
+        proof: OrgLeaseProof<'_>,
+    ) -> StorageResult<ConditionalUpdate<SanitizedOrgLease>> {
+        validate_lease_proof(&proof)?;
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, LeaseRow>(
+            "UPDATE org_leases
+             SET last_heartbeat_at=last_heartbeat_at
+             WHERE id=$1 AND workspace_id=$2 AND work_item_id=$3
+               AND fencing_token_hash=$4 AND kind=$5 AND actor_id=$6
+               AND ended_at IS NULL AND expires_at>$7
+             RETURNING id, workspace_id, work_item_id, attempt_id, kind, actor_id,
+                       fencing_token_hash, acquired_at, last_heartbeat_at, expires_at,
+                       ended_at, end_reason, expiry_event_id",
+        )
+        .bind(proof.lease_id)
+        .bind(proof.workspace_id.to_string())
+        .bind(proof.work_item_id.to_string())
+        .bind(proof.fencing_token_hash)
+        .bind(lease_kind_name(proof.kind))
+        .bind(proof.actor_id)
+        .bind(proof.now)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("validate Org lease proof", error))?;
+        Ok(match row {
+            Some(row) => ConditionalUpdate::Applied(row.into_lease()?.into()),
+            None => ConditionalUpdate::Conflict,
+        })
     }
 
     async fn heartbeat_org_lease(

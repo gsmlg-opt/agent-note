@@ -15,6 +15,7 @@ use note_storage::StorageBackend;
 use note_storage_turso::TursoStorage;
 use std::sync::Arc;
 
+#[allow(dead_code)]
 pub async fn test_context() -> (Context, Arc<dyn StorageBackend>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let backend: Arc<dyn StorageBackend> = Arc::new(

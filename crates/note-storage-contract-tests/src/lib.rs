@@ -27,6 +27,17 @@ pub async fn run_org_claim_races(storage: Arc<dyn StorageBackend>) {
     transactions::run_org_claim_races(storage).await;
 }
 
+/// Runs the proof-only active lease validation contract against a fresh
+/// backend database.
+pub async fn run_org_lease_proof_validation(storage: Arc<dyn StorageBackend>) {
+    transactions::run_org_lease_proof_validation(storage).await;
+}
+
+/// Proves that workflow-specific event names round-trip through backend decoding.
+pub async fn run_org_workflow_event_decoding(storage: Arc<dyn StorageBackend>) {
+    org::run_org_workflow_event_decoding(storage).await;
+}
+
 pub(crate) fn unit(axis: usize) -> Vec<f32> {
     let mut vector = vec![0.0; note_storage::EMBEDDING_DIMENSION];
     vector[axis] = 1.0;

@@ -5,12 +5,14 @@ mod context_read;
 mod documents;
 mod dto;
 mod error;
+mod execution;
 mod idempotency;
 mod items;
 mod mutation;
 #[cfg(test)]
 mod mutation_test;
 mod projection;
+mod reviews;
 mod workspaces;
 
 pub use audit::*;
@@ -20,7 +22,9 @@ pub use context_read::*;
 pub use documents::*;
 pub use dto::*;
 pub use error::*;
+pub use execution::*;
 pub use items::*;
 pub(crate) use mutation::*;
 pub use projection::*;
+pub use reviews::*;
 pub use workspaces::*;

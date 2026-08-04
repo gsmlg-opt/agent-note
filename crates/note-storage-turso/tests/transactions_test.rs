@@ -46,6 +46,20 @@ async fn org_claim_races_preserve_uniqueness_capacity_and_rollback() {
 }
 
 #[tokio::test]
+async fn org_lease_proof_validation_is_conditional_and_does_not_mutate_the_lease() {
+    let (_dir, storage) = storage().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(storage);
+    note_storage_contract_tests::run_org_lease_proof_validation(backend).await;
+}
+
+#[tokio::test]
+async fn org_workflow_event_types_round_trip_through_turso_decoding() {
+    let (_dir, storage) = storage().await;
+    let backend: Arc<dyn StorageBackend> = Arc::new(storage);
+    note_storage_contract_tests::run_org_workflow_event_decoding(backend).await;
+}
+
+#[tokio::test]
 async fn dropping_pending_immediate_claim_waiter_does_not_consume_attempt_number() {
     let (_dir, storage) = storage().await;
     let workspace_id = WorkspaceId::from_str("7a000000-0000-0000-0000-000000000001").unwrap();

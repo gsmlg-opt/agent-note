@@ -7,8 +7,10 @@ use note_pipelines::org::{
     PutDocumentRequest, ReleaseClaimRequest, StartClaimRequest,
 };
 use note_storage::{
-    CompareAndSwap, NewOrgAttemptAllocation, NewOrgLease, OrgAttemptStatus, OrgEventType,
-    OrgLeaseEndReason, OrgLeaseKind, OrgWorkspaceUpdate, StorageBackend, TransactionMode,
+    CompareAndSwap, ConditionalUpdate, NewOrgAttempt, NewOrgAttemptAllocation, NewOrgLease,
+    OrgArtifactReference, OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate,
+    OrgEventType, OrgLeaseEndReason, OrgLeaseKind, OrgWorkspaceUpdate, StorageBackend,
+    TransactionMode,
 };
 use sha2::{Digest, Sha256};
 use std::str::FromStr as _;
@@ -395,6 +397,73 @@ async fn heartbeat_boundary_and_wrong_token_are_stale_and_secret_safe() {
         .unwrap()
         .contains("wrong-secret-token"));
     assert!(!format!("{wrong:?}").contains("wrong-secret-token"));
+    assert_eq!(
+        release_claim(
+            &context,
+            &envelope("agent", "wrong-release-stale-revision"),
+            &ReleaseClaimRequest {
+                schema_version: 1,
+                work_item_id: item,
+                document_id: document,
+                expected_document_revision: 1,
+                lease_id: claim.lease_id.clone(),
+                kind: OrgClaimKind::Execution,
+                fencing_token: "wrong-secret-token".into(),
+                target_state: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .code,
+        OrgErrorCode::StaleLease
+    );
+
+    for (operation, lease_id, fencing_token) in [
+        ("blank-lease-heartbeat", " ", claim.fencing_token.as_str()),
+        ("blank-token-heartbeat", claim.lease_id.as_str(), " "),
+        (
+            "malformed-token-heartbeat",
+            claim.lease_id.as_str(),
+            " surrounded ",
+        ),
+    ] {
+        assert_eq!(
+            heartbeat_claim(
+                &context,
+                &envelope("agent", operation),
+                &HeartbeatClaimRequest {
+                    work_item_id: item,
+                    lease_id: lease_id.into(),
+                    kind: OrgClaimKind::Execution,
+                    fencing_token: fencing_token.into(),
+                },
+            )
+            .await
+            .unwrap_err()
+            .code,
+            OrgErrorCode::StaleLease
+        );
+    }
+    assert_eq!(
+        release_claim(
+            &context,
+            &envelope("agent", "blank-token-release"),
+            &ReleaseClaimRequest {
+                schema_version: 1,
+                work_item_id: item,
+                document_id: document,
+                expected_document_revision: 2,
+                lease_id: claim.lease_id.clone(),
+                kind: OrgClaimKind::Execution,
+                fencing_token: " ".into(),
+                target_state: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .code,
+        OrgErrorCode::StaleLease
+    );
 
     let boundary_error = heartbeat_claim(
         &context.with_clock(Arc::new(FixedOrgClock::new(claim.expires_at))),
@@ -1475,7 +1544,65 @@ async fn changed_review_release_closes_attempt_with_matrix_status() {
         let item = item_id(80 + index);
         seed_document(&context, document, item, "REVIEW", "", "").await;
         let attempt_id = format!("review-release-attempt-{index}");
-        seed_review_attempt(&backend, item, &attempt_id).await;
+        let note_refs = vec![OrgAttemptNoteReference {
+            purpose: "result".into(),
+            note_id: format!("review-note-{index}"),
+            description: "review result note".into(),
+        }];
+        let artifacts = vec![OrgArtifactReference {
+            uri: format!("artifact://review-release-{index}"),
+            media_type: "text/plain".into(),
+            name: "result.txt".into(),
+            description: "review result artifact".into(),
+        }];
+        let metadata = serde_json::json!({"preserved": index});
+        backend
+            .session()
+            .await
+            .unwrap()
+            .insert_org_attempt(NewOrgAttempt {
+                id: &attempt_id,
+                workspace_id: workspace_id(),
+                work_item_id: item,
+                attempt_number: 1,
+                actor_id: "author",
+                status: OrgAttemptStatus::Running,
+                started_at: NOW - 2,
+                note_refs: &note_refs,
+                artifacts: &artifacts,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            backend
+                .session()
+                .await
+                .unwrap()
+                .update_org_attempt(OrgAttemptUpdate {
+                    id: &attempt_id,
+                    expected_status: OrgAttemptStatus::Running,
+                    status: OrgAttemptStatus::Submitted,
+                    ended_at: NOW - 1,
+                    error: Some("pre-release error"),
+                    result_summary: Some("pre-release result"),
+                    review_outcome: Some("pending"),
+                    note_refs: &note_refs,
+                    artifacts: &artifacts,
+                    metadata: &metadata,
+                })
+                .await
+                .unwrap(),
+            ConditionalUpdate::Applied(_)
+        ));
+        let before_attempt = backend
+            .session()
+            .await
+            .unwrap()
+            .get_org_attempt(&attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
         let claim = claim_item(
             &context,
             &envelope("reviewer", &format!("review-release-claim-{index}")),
@@ -1514,6 +1641,21 @@ async fn changed_review_release_closes_attempt_with_matrix_status() {
             .unwrap();
         assert_eq!(attempt.status, expected);
         assert_eq!(attempt.review_outcome.as_deref(), Some("released"));
+        assert_eq!(attempt.error.as_deref(), Some("pre-release error"));
+        assert_eq!(
+            attempt.result_summary.as_deref(),
+            Some("pre-release result")
+        );
+        assert_eq!(attempt.note_refs, note_refs);
+        assert_eq!(attempt.artifacts, artifacts);
+        assert_eq!(attempt.metadata, metadata);
+        assert_eq!(attempt.id, before_attempt.id);
+        assert_eq!(attempt.workspace_id, before_attempt.workspace_id);
+        assert_eq!(attempt.work_item_id, before_attempt.work_item_id);
+        assert_eq!(attempt.attempt_number, before_attempt.attempt_number);
+        assert_eq!(attempt.actor_id, before_attempt.actor_id);
+        assert_eq!(attempt.started_at, before_attempt.started_at);
+        assert_ne!(attempt.ended_at, before_attempt.ended_at);
         let release_event = backend
             .session()
             .await

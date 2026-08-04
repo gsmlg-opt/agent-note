@@ -1,6 +1,7 @@
 use super::idempotency::request_fingerprint;
 use super::{
     CommandEnvelope, OrgCommandKind, OrgCommandResult, OrgContext, OrgError, OrgErrorCode,
+    OrgWorkflowPhase,
 };
 use note_storage::{CompareAndSwap, StorageTransaction, StoredOrgOperation, TransactionMode};
 use serde::Serialize;
@@ -9,6 +10,14 @@ use std::pin::Pin;
 
 pub(crate) type OrgMutationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<OrgCommandResult, OrgError>> + Send + 'a>>;
+
+pub(crate) enum OrgMutationOutcome {
+    Success(OrgCommandResult),
+    CommitError(OrgError),
+}
+
+pub(crate) type OrgMutationOutcomeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<OrgMutationOutcome, OrgError>> + Send + 'a>>;
 
 pub(crate) async fn execute_idempotent<R, F>(
     context: &OrgContext,
@@ -21,7 +30,32 @@ where
     R: Serialize + ?Sized,
     F: for<'a> FnOnce(&'a dyn StorageTransaction, i64) -> OrgMutationFuture<'a>,
 {
-    execute_idempotent_with_workspace(
+    execute_idempotent_outcome_with_workspace(
+        context,
+        command_kind,
+        envelope,
+        request,
+        WorkspaceRequirement::Existing,
+        move |transaction, now| {
+            let mutation = mutation(transaction, now);
+            Box::pin(async move { mutation.await.map(OrgMutationOutcome::Success) })
+        },
+    )
+    .await
+}
+
+pub(crate) async fn execute_idempotent_outcome<R, F>(
+    context: &OrgContext,
+    command_kind: OrgCommandKind,
+    envelope: &CommandEnvelope,
+    request: &R,
+    mutation: F,
+) -> Result<OrgCommandResult, OrgError>
+where
+    R: Serialize + ?Sized,
+    F: for<'a> FnOnce(&'a dyn StorageTransaction, i64) -> OrgMutationOutcomeFuture<'a>,
+{
+    execute_idempotent_outcome_with_workspace(
         context,
         command_kind,
         envelope,
@@ -43,13 +77,16 @@ where
     R: Serialize + ?Sized,
     F: for<'a> FnOnce(&'a dyn StorageTransaction, i64) -> OrgMutationFuture<'a>,
 {
-    execute_idempotent_with_workspace(
+    execute_idempotent_outcome_with_workspace(
         context,
         command_kind,
         envelope,
         request,
         WorkspaceRequirement::Missing,
-        mutation,
+        move |transaction, now| {
+            let mutation = mutation(transaction, now);
+            Box::pin(async move { mutation.await.map(OrgMutationOutcome::Success) })
+        },
     )
     .await
 }
@@ -60,7 +97,7 @@ enum WorkspaceRequirement {
     Missing,
 }
 
-async fn execute_idempotent_with_workspace<R, F>(
+async fn execute_idempotent_outcome_with_workspace<R, F>(
     context: &OrgContext,
     command_kind: OrgCommandKind,
     envelope: &CommandEnvelope,
@@ -70,7 +107,7 @@ async fn execute_idempotent_with_workspace<R, F>(
 ) -> Result<OrgCommandResult, OrgError>
 where
     R: Serialize + ?Sized,
-    F: for<'a> FnOnce(&'a dyn StorageTransaction, i64) -> OrgMutationFuture<'a>,
+    F: for<'a> FnOnce(&'a dyn StorageTransaction, i64) -> OrgMutationOutcomeFuture<'a>,
 {
     validate_envelope(envelope)?;
     validate_command_kind(command_kind)?;
@@ -168,7 +205,11 @@ where
     let now = context.clock().now();
     let result = mutation(transaction.as_ref(), now).await;
     let result = match result {
-        Ok(result) => result,
+        Ok(OrgMutationOutcome::Success(result)) => result,
+        Ok(OrgMutationOutcome::CommitError(error)) => {
+            transaction.commit().await.map_err(OrgError::storage)?;
+            return Err(error);
+        }
         Err(error) => return finish_write(transaction, Err(error)).await,
     };
     if result.schema_version != super::ORG_COMMAND_SCHEMA_VERSION
@@ -206,6 +247,9 @@ where
         .await
     {
         return finish_write(transaction, Err(OrgError::storage(error))).await;
+    }
+    if let Err(error) = context.after_workflow_phase(OrgWorkflowPhase::OperationWrite) {
+        return finish_write(transaction, Err(error)).await;
     }
     finish_write(transaction, Ok(result)).await
 }

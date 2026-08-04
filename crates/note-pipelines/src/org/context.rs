@@ -69,6 +69,30 @@ pub trait OrgClaimTestHook: Send + Sync {
     fn after_phase(&self, phase: OrgClaimPhase) -> Result<(), OrgError>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgWorkflowPhase {
+    Proof,
+    SourceEdit,
+    AttemptUpdate,
+    LeaseUpdate,
+    Events,
+    ContextHydration,
+    OperationWrite,
+}
+
+pub trait OrgWorkflowTestHook: Send + Sync {
+    fn after_phase(&self, phase: OrgWorkflowPhase) -> Result<(), OrgError>;
+}
+
+#[derive(Debug, Default)]
+struct NoopOrgWorkflowTestHook;
+
+impl OrgWorkflowTestHook for NoopOrgWorkflowTestHook {
+    fn after_phase(&self, _phase: OrgWorkflowPhase) -> Result<(), OrgError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 struct NoopOrgClaimTestHook;
 
@@ -84,6 +108,7 @@ pub struct OrgContext {
     clock: Arc<dyn OrgClock>,
     token_source: Arc<dyn OrgTokenSource>,
     claim_test_hook: Arc<dyn OrgClaimTestHook>,
+    workflow_test_hook: Arc<dyn OrgWorkflowTestHook>,
 }
 
 impl OrgContext {
@@ -93,6 +118,7 @@ impl OrgContext {
             clock,
             token_source: Arc::new(SystemOrgTokenSource),
             claim_test_hook: Arc::new(NoopOrgClaimTestHook),
+            workflow_test_hook: Arc::new(NoopOrgWorkflowTestHook),
         }
     }
 
@@ -111,6 +137,11 @@ impl OrgContext {
         self
     }
 
+    pub fn with_workflow_test_hook(mut self, hook: Arc<dyn OrgWorkflowTestHook>) -> Self {
+        self.workflow_test_hook = hook;
+        self
+    }
+
     pub(crate) fn storage(&self) -> &dyn StorageBackend {
         self.storage.as_ref()
     }
@@ -125,5 +156,9 @@ impl OrgContext {
 
     pub(crate) fn after_claim_phase(&self, phase: OrgClaimPhase) -> Result<(), OrgError> {
         self.claim_test_hook.after_phase(phase)
+    }
+
+    pub(crate) fn after_workflow_phase(&self, phase: OrgWorkflowPhase) -> Result<(), OrgError> {
+        self.workflow_test_hook.after_phase(phase)
     }
 }

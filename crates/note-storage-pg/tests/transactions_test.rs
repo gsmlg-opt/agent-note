@@ -56,6 +56,30 @@ async fn org_claim_races_preserve_uniqueness_capacity_and_rollback() {
 }
 
 #[tokio::test]
+async fn org_lease_proof_validation_is_conditional_and_does_not_mutate_the_lease() {
+    let Some((database, storage)) =
+        storage("org_lease_proof_validation_is_conditional_and_does_not_mutate_the_lease").await
+    else {
+        return;
+    };
+    let backend: Arc<dyn StorageBackend> = storage.clone();
+    note_storage_contract_tests::run_org_lease_proof_validation(backend).await;
+    database.cleanup(Some(&storage)).await.unwrap();
+}
+
+#[tokio::test]
+async fn org_workflow_event_types_round_trip_through_postgresql_decoding() {
+    let Some((database, storage)) =
+        storage("org_workflow_event_types_round_trip_through_postgresql_decoding").await
+    else {
+        return;
+    };
+    let backend: Arc<dyn StorageBackend> = storage.clone();
+    note_storage_contract_tests::run_org_workflow_event_decoding(backend).await;
+    database.cleanup(Some(&storage)).await.unwrap();
+}
+
+#[tokio::test]
 async fn dropping_pending_immediate_claim_waiter_does_not_consume_attempt_number() {
     let Some((database, storage)) =
         storage("dropping_pending_immediate_claim_waiter_does_not_consume_attempt_number").await

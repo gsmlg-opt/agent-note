@@ -1,4 +1,5 @@
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
+use note_storage::{OrgArtifactReference, OrgAttemptNoteReference};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -281,6 +282,219 @@ pub struct OrgClaimResult {
     pub expires_at: i64,
     pub event_ids: Vec<String>,
     pub context: OrgItemContext,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportProgressRequest {
+    pub schema_version: u32,
+    pub work_item_id: WorkItemId,
+    pub lease_id: String,
+    pub kind: OrgClaimKind,
+    pub fencing_token: String,
+    pub summary: String,
+    pub metadata: serde_json::Value,
+}
+
+impl std::fmt::Debug for ReportProgressRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReportProgressRequest")
+            .field("schema_version", &self.schema_version)
+            .field("work_item_id", &self.work_item_id)
+            .field("lease_id", &self.lease_id)
+            .field("kind", &self.kind)
+            .field("fencing_token", &"[REDACTED]")
+            .field("summary", &self.summary)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitResultRequest {
+    pub schema_version: u32,
+    pub work_item_id: WorkItemId,
+    pub document_id: DocumentId,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    pub fencing_token: String,
+    pub result_summary: String,
+    pub note_refs: Vec<OrgAttemptNoteReference>,
+    pub artifacts: Vec<OrgArtifactReference>,
+    pub metadata: serde_json::Value,
+}
+
+impl std::fmt::Debug for SubmitResultRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubmitResultRequest")
+            .field("schema_version", &self.schema_version)
+            .field("work_item_id", &self.work_item_id)
+            .field("document_id", &self.document_id)
+            .field(
+                "expected_document_revision",
+                &self.expected_document_revision,
+            )
+            .field("lease_id", &self.lease_id)
+            .field("fencing_token", &"[REDACTED]")
+            .field("result_summary", &self.result_summary)
+            .field("note_refs", &self.note_refs)
+            .field("artifacts", &self.artifacts)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestReviewRequest {
+    pub schema_version: u32,
+    pub work_item_id: WorkItemId,
+    pub document_id: DocumentId,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    pub fencing_token: String,
+    pub result_summary: Option<String>,
+    pub note_refs: Vec<OrgAttemptNoteReference>,
+    pub artifacts: Vec<OrgArtifactReference>,
+    pub metadata: serde_json::Value,
+}
+
+impl std::fmt::Debug for RequestReviewRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestReviewRequest")
+            .field("schema_version", &self.schema_version)
+            .field("work_item_id", &self.work_item_id)
+            .field("document_id", &self.document_id)
+            .field(
+                "expected_document_revision",
+                &self.expected_document_revision,
+            )
+            .field("lease_id", &self.lease_id)
+            .field("fencing_token", &"[REDACTED]")
+            .field("result_summary", &self.result_summary)
+            .field("note_refs", &self.note_refs)
+            .field("artifacts", &self.artifacts)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveItemRequest {
+    pub schema_version: u32,
+    pub work_item_id: WorkItemId,
+    pub document_id: DocumentId,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    pub fencing_token: String,
+    pub metadata: serde_json::Value,
+}
+
+impl std::fmt::Debug for ApproveItemRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApproveItemRequest")
+            .field("schema_version", &self.schema_version)
+            .field("work_item_id", &self.work_item_id)
+            .field("document_id", &self.document_id)
+            .field(
+                "expected_document_revision",
+                &self.expected_document_revision,
+            )
+            .field("lease_id", &self.lease_id)
+            .field("fencing_token", &"[REDACTED]")
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectItemRequest {
+    pub schema_version: u32,
+    pub work_item_id: WorkItemId,
+    pub document_id: DocumentId,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    pub fencing_token: String,
+    pub reason: String,
+    pub metadata: serde_json::Value,
+}
+
+impl std::fmt::Debug for RejectItemRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RejectItemRequest")
+            .field("schema_version", &self.schema_version)
+            .field("work_item_id", &self.work_item_id)
+            .field("document_id", &self.document_id)
+            .field(
+                "expected_document_revision",
+                &self.expected_document_revision,
+            )
+            .field("lease_id", &self.lease_id)
+            .field("fencing_token", &"[REDACTED]")
+            .field("reason", &self.reason)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionLeaseProof {
+    pub lease_id: String,
+    pub kind: OrgClaimKind,
+    pub fencing_token: String,
+}
+
+impl std::fmt::Debug for TransitionLeaseProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransitionLeaseProof")
+            .field("lease_id", &self.lease_id)
+            .field("kind", &self.kind)
+            .field("fencing_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionItemRequest {
+    pub schema_version: u32,
+    pub work_item_id: WorkItemId,
+    pub document_id: DocumentId,
+    pub expected_document_revision: i64,
+    pub target_state: String,
+    pub lease: Option<TransitionLeaseProof>,
+    pub error: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+impl std::fmt::Debug for TransitionItemRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TransitionItemRequest")
+            .field("schema_version", &self.schema_version)
+            .field("work_item_id", &self.work_item_id)
+            .field("document_id", &self.document_id)
+            .field(
+                "expected_document_revision",
+                &self.expected_document_revision,
+            )
+            .field("target_state", &self.target_state)
+            .field("lease", &self.lease)
+            .field("error", &self.error)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryItemRequest {
+    pub schema_version: u32,
+    pub work_item_id: WorkItemId,
+    pub document_id: DocumentId,
+    pub expected_document_revision: i64,
 }
 
 impl std::fmt::Debug for OrgClaimResult {

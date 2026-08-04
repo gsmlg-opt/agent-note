@@ -1,6 +1,7 @@
 use note_org::{WorkspaceId, WorkspacePolicy};
 use note_pipelines::org::{
     FixedOrgClock, OrgClaimPhase, OrgClaimTestHook, OrgContext, OrgError, OrgTokenSource,
+    OrgWorkflowPhase, OrgWorkflowTestHook,
 };
 use note_storage::{NewOrgWorkspace, StorageBackend};
 use note_storage_turso::TursoStorage;
@@ -51,6 +52,34 @@ impl OrgClaimTestHook for FailOnceAtPhase {
             return Err(OrgError::new(
                 note_pipelines::org::OrgErrorCode::StorageFailure,
                 "injected claim failure",
+                serde_json::json!({"phase": format!("{phase:?}")}),
+                true,
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub struct FailOnceAtWorkflowPhase {
+    phase: OrgWorkflowPhase,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl FailOnceAtWorkflowPhase {
+    pub fn new(phase: OrgWorkflowPhase) -> Self {
+        Self {
+            phase,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl OrgWorkflowTestHook for FailOnceAtWorkflowPhase {
+    fn after_phase(&self, phase: OrgWorkflowPhase) -> Result<(), OrgError> {
+        if phase == self.phase && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(OrgError::new(
+                note_pipelines::org::OrgErrorCode::StorageFailure,
+                "injected workflow failure",
                 serde_json::json!({"phase": format!("{phase:?}")}),
                 true,
             ));

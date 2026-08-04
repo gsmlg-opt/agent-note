@@ -9,8 +9,8 @@ use note_pipelines::org::{
     PutDocumentRequest,
 };
 use note_storage::{
-    NewNote, NewOrgAttempt, NewOrgEvent, NewOrgWorkspace, OrgArtifactReference,
-    OrgAttemptNoteReference, OrgAttemptStatus, OrgEventType, OrgWorkspaceUpdate,
+    ConditionalUpdate, NewNote, NewOrgAttempt, NewOrgEvent, NewOrgWorkspace, OrgArtifactReference,
+    OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate, OrgEventType, OrgWorkspaceUpdate,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
@@ -99,7 +99,7 @@ async fn context_maps_canonical_relations_attempts_history_and_note_availability
             work_item_id: child,
             attempt_number: 1,
             actor_id: "worker-1",
-            status: OrgAttemptStatus::Failed,
+            status: OrgAttemptStatus::Submitted,
             started_at: NOW + 1,
             note_refs: &[OrgAttemptNoteReference {
                 purpose: "runbook".into(),
@@ -116,10 +116,39 @@ async fn context_maps_canonical_relations_attempts_history_and_note_availability
         })
         .await
         .unwrap();
+    assert!(matches!(
+        session
+            .update_org_attempt(OrgAttemptUpdate {
+                id: "attempt-1",
+                expected_status: OrgAttemptStatus::Submitted,
+                status: OrgAttemptStatus::Failed,
+                ended_at: NOW + 1,
+                error: Some("review requested changes"),
+                result_summary: Some("candidate result"),
+                review_outcome: Some("rejected"),
+                note_refs: &[OrgAttemptNoteReference {
+                    purpose: "runbook".into(),
+                    note_id: note_id.into(),
+                    description: "Runbook".into(),
+                }],
+                artifacts: &[OrgArtifactReference {
+                    uri: "s3://artifacts/log.txt".into(),
+                    media_type: "text/plain".into(),
+                    name: "log".into(),
+                    description: "Failure log".into(),
+                }],
+                metadata: &serde_json::json!({"runner": "ci"}),
+            })
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
     for (index, event_type) in [
         OrgEventType::Progress,
+        OrgEventType::ResultSubmission,
         OrgEventType::Failure,
         OrgEventType::ReviewRequest,
+        OrgEventType::Rejection,
     ]
     .into_iter()
     .enumerate()
@@ -157,6 +186,18 @@ async fn context_maps_canonical_relations_attempts_history_and_note_availability
     assert!(hydrated.dependencies[0].satisfied);
     assert!(hydrated.note_links[0].available);
     assert_eq!(hydrated.attempts[0].artifacts[0].name, "log");
+    assert_eq!(
+        hydrated.attempts[0].result_summary.as_deref(),
+        Some("candidate result")
+    );
+    assert_eq!(
+        hydrated.attempts[0].review_outcome.as_deref(),
+        Some("rejected")
+    );
+    assert_eq!(
+        hydrated.attempts[0].error.as_deref(),
+        Some("review requested changes")
+    );
     assert_eq!(hydrated.history_segments[0].workspace_id, workspace_id);
     let event_types = hydrated.history_segments[0]
         .events
@@ -164,8 +205,10 @@ async fn context_maps_canonical_relations_attempts_history_and_note_availability
         .map(|event| event.event_type.as_str())
         .collect::<Vec<_>>();
     assert!(event_types.contains(&"progress"));
+    assert!(event_types.contains(&"result_submission"));
     assert!(event_types.contains(&"failure"));
     assert!(event_types.contains(&"review_request"));
+    assert!(event_types.contains(&"rejection"));
     assert!(hydrated.history_segments[0]
         .events
         .windows(2)
@@ -174,6 +217,7 @@ async fn context_maps_canonical_relations_attempts_history_and_note_availability
     let json = serde_json::to_value(&hydrated).unwrap();
     assert_eq!(json["lease"], serde_json::Value::Null);
     assert!(!json.to_string().contains("fencing_token"));
+    assert!(!json.to_string().contains("fencing_token_hash"));
     assert!(!json.to_string().contains("secret body"));
 
     session.soft_delete_note(note_id, NOW + 10).await.unwrap();

@@ -117,6 +117,8 @@ pub enum OrgEventType {
     Release,
     Start,
     Progress,
+    ResultSubmission,
+    Transition,
     Block,
     Unblock,
     ReviewRequest,
@@ -145,7 +147,7 @@ pub enum OrgEventType {
 }
 
 impl OrgEventType {
-    pub const KNOWN: [Self; 28] = [
+    pub const KNOWN: [Self; 30] = [
         Self::Creation,
         Self::Assignment,
         Self::Claim,
@@ -153,6 +155,8 @@ impl OrgEventType {
         Self::Release,
         Self::Start,
         Self::Progress,
+        Self::ResultSubmission,
+        Self::Transition,
         Self::Block,
         Self::Unblock,
         Self::ReviewRequest,
@@ -185,6 +189,8 @@ impl OrgEventType {
             Self::Release => "release",
             Self::Start => "start",
             Self::Progress => "progress",
+            Self::ResultSubmission => "result_submission",
+            Self::Transition => "transition",
             Self::Block => "block",
             Self::Unblock => "unblock",
             Self::ReviewRequest => "review_request",
