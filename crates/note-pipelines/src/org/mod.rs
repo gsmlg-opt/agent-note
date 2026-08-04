@@ -1,4 +1,6 @@
+mod audit;
 mod context;
+mod context_read;
 mod documents;
 mod dto;
 mod error;
@@ -8,7 +10,9 @@ mod mutation;
 mod projection;
 mod workspaces;
 
+pub use audit::*;
 pub use context::*;
+pub use context_read::*;
 pub use documents::*;
 pub use dto::*;
 pub use error::*;

@@ -1,4 +1,4 @@
-use note_org::WorkspaceId;
+use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -44,4 +44,167 @@ pub struct OrgCommandResult {
     pub workspace_revision: Option<i64>,
     pub document_revisions: BTreeMap<String, i64>,
     pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgWorkspaceView {
+    pub id: WorkspaceId,
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub timezone: String,
+    pub policy_schema_version: i64,
+    pub policy: WorkspacePolicy,
+    pub revision: i64,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgDocumentView {
+    pub id: DocumentId,
+    pub path: String,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgTimestampView {
+    pub raw: String,
+    pub local: String,
+    pub timezone: String,
+    pub utc_timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgItemView {
+    pub id: WorkItemId,
+    pub workspace_id: WorkspaceId,
+    pub document_id: DocumentId,
+    pub parent_id: Option<WorkItemId>,
+    pub item_type: WorkItemType,
+    pub title: String,
+    pub state: Option<String>,
+    pub priority: Option<char>,
+    pub scheduled: Option<OrgTimestampView>,
+    pub deadline: Option<OrgTimestampView>,
+    pub assignee: Option<String>,
+    pub requires_review: bool,
+    pub created_at: i64,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgDependencyView {
+    pub item: OrgItemView,
+    pub satisfied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgNoteLinkView {
+    pub purpose: String,
+    pub note_id: String,
+    pub description: String,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgAttemptNoteView {
+    pub purpose: String,
+    pub note_id: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgArtifactView {
+    pub uri: String,
+    pub media_type: String,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgAttemptView {
+    pub id: String,
+    pub workspace_id: WorkspaceId,
+    pub work_item_id: WorkItemId,
+    pub attempt_number: i64,
+    pub actor_id: String,
+    pub status: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub error: Option<String>,
+    pub result_summary: Option<String>,
+    pub review_outcome: Option<String>,
+    pub note_refs: Vec<OrgAttemptNoteView>,
+    pub artifacts: Vec<OrgArtifactView>,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgEventView {
+    pub id: String,
+    pub workspace_id: WorkspaceId,
+    pub sequence: i64,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub actor_id: String,
+    pub attempt_id: Option<String>,
+    pub event_type: String,
+    pub occurred_at: i64,
+    pub summary: String,
+    pub metadata: serde_json::Value,
+    pub previous_state: Option<String>,
+    pub resulting_state: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgHistorySegment {
+    pub workspace_id: WorkspaceId,
+    pub events: Vec<OrgEventView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OrgOriginView {
+    WorkItem {
+        work_item_id: WorkItemId,
+        item: Option<Box<OrgItemView>>,
+    },
+    Event {
+        event_id: String,
+        event: Option<Box<OrgEventView>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgLeaseView {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgItemContext {
+    pub workspace: OrgWorkspaceView,
+    pub workspace_revision: i64,
+    pub document: OrgDocumentView,
+    pub item: OrgItemView,
+    pub parent: Option<OrgItemView>,
+    pub children: Vec<OrgItemView>,
+    pub dependencies: Vec<OrgDependencyView>,
+    pub note_links: Vec<OrgNoteLinkView>,
+    pub attempts: Vec<OrgAttemptView>,
+    pub origin: Option<OrgOriginView>,
+    pub history_segments: Vec<OrgHistorySegment>,
+    pub lease: Option<OrgLeaseView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgEventQuery {
+    pub workspace_id: WorkspaceId,
+    pub subject_kind: Option<String>,
+    pub subject_id: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgEventPage {
+    pub events: Vec<OrgEventView>,
+    pub next_cursor: Option<String>,
 }

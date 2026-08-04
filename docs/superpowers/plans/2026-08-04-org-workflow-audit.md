@@ -472,6 +472,8 @@ cargo test -p note-org --test policy_test --test dependencies_test
 
 **Files:**
 
+- Modify: `Cargo.lock`
+- Modify: `crates/note-pipelines/Cargo.toml`
 - Create: `crates/note-pipelines/src/org/audit.rs`
 - Create: `crates/note-pipelines/src/org/context_read.rs`
 - Modify: `crates/note-pipelines/src/org/dto.rs`
