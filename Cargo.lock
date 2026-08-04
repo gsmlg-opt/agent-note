@@ -3459,6 +3459,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "flate2",
+ "getrandom 0.3.4",
  "note-attachments",
  "note-core",
  "note-embedding",

@@ -1,8 +1,9 @@
 use note_org::{WorkItemId, WorkspaceId};
 use note_storage::{
     NewOrgLease, OrgAttemptStatus, OrgEventType, OrgLease, OrgLeaseEndReason, OrgLeaseKind,
-    OrgLeaseUpdate,
+    OrgLeaseUpdate, StoredOrgOperation,
 };
+use serde_json::json;
 use std::str::FromStr;
 
 #[test]
@@ -109,4 +110,29 @@ fn lease_records_keep_only_the_token_hash() {
     assert_eq!(lease.fencing_token_hash.len(), 64);
     assert_eq!(new.fencing_token_hash.len(), 64);
     assert_eq!(update.end_reason, Some(OrgLeaseEndReason::Release));
+}
+
+#[test]
+fn stored_org_operation_debug_redacts_the_persisted_result() {
+    let raw_token = "raw-claim-token";
+    let token_hash = "a".repeat(64);
+    let result = json!({
+        "fencing_token": raw_token,
+        "fencing_token_hash": token_hash,
+        "lease_id": "lease-1"
+    });
+    let operation = StoredOrgOperation {
+        workspace_id: WorkspaceId::from_str("11111111-1111-4111-8111-111111111111").unwrap(),
+        operation_id: "claim-1".into(),
+        request_fingerprint: "fingerprint-1".into(),
+        result: result.clone(),
+        created_at: 10,
+    };
+
+    let debug = format!("{operation:?}");
+
+    assert!(!debug.contains(raw_token));
+    assert!(!debug.contains(&token_hash));
+    assert!(debug.contains("[REDACTED]"));
+    assert_eq!(operation.result, result);
 }

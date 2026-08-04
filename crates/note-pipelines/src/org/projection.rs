@@ -309,7 +309,7 @@ fn state_roles(policy: &WorkspacePolicy, state: &str) -> [bool; 11] {
     ]
 }
 
-fn projected_to_domain(item: &OrgProjectedWorkItem) -> WorkItem {
+pub(crate) fn projected_to_domain(item: &OrgProjectedWorkItem) -> WorkItem {
     WorkItem {
         id: item.id,
         item_type: item.item_type,

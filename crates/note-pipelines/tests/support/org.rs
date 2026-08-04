@@ -1,10 +1,63 @@
 use note_org::{WorkspaceId, WorkspacePolicy};
-use note_pipelines::org::{FixedOrgClock, OrgContext};
+use note_pipelines::org::{
+    FixedOrgClock, OrgClaimPhase, OrgClaimTestHook, OrgContext, OrgError, OrgTokenSource,
+};
 use note_storage::{NewOrgWorkspace, StorageBackend};
 use note_storage_turso::TursoStorage;
 use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::sync::Mutex;
+
+pub struct DeterministicTokenSource {
+    values: Mutex<std::collections::VecDeque<String>>,
+}
+
+impl DeterministicTokenSource {
+    pub fn new(values: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            values: Mutex::new(values.into_iter().map(Into::into).collect()),
+        }
+    }
+}
+
+impl OrgTokenSource for DeterministicTokenSource {
+    fn generate_token(&self) -> Result<String, OrgError> {
+        self.values
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| OrgError::invalid_input("deterministic token source exhausted"))
+    }
+}
+
+pub struct FailOnceAtPhase {
+    phase: OrgClaimPhase,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl FailOnceAtPhase {
+    pub fn new(phase: OrgClaimPhase) -> Self {
+        Self {
+            phase,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl OrgClaimTestHook for FailOnceAtPhase {
+    fn after_phase(&self, phase: OrgClaimPhase) -> Result<(), OrgError> {
+        if phase == self.phase && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(OrgError::new(
+                note_pipelines::org::OrgErrorCode::StorageFailure,
+                "injected claim failure",
+                serde_json::json!({"phase": format!("{phase:?}")}),
+                true,
+            ));
+        }
+        Ok(())
+    }
+}
 
 pub async fn org_test_context(
     now: i64,

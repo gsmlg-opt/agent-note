@@ -555,13 +555,26 @@ pub struct OrgEvent {
     pub resulting_state: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredOrgOperation {
     pub workspace_id: note_org::WorkspaceId,
     pub operation_id: String,
     pub request_fingerprint: String,
     pub result: serde_json::Value,
     pub created_at: i64,
+}
+
+impl fmt::Debug for StoredOrgOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredOrgOperation")
+            .field("workspace_id", &self.workspace_id)
+            .field("operation_id", &self.operation_id)
+            .field("request_fingerprint", &self.request_fingerprint)
+            .field("result", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

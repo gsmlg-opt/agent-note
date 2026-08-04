@@ -176,7 +176,18 @@ pub enum OrgOriginView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OrgLeaseView {}
+pub struct OrgLeaseView {
+    pub id: String,
+    pub workspace_id: WorkspaceId,
+    pub work_item_id: WorkItemId,
+    pub attempt_id: String,
+    pub kind: String,
+    pub actor_id: String,
+    pub acquired_at: i64,
+    pub last_heartbeat_at: i64,
+    pub expires_at: i64,
+    pub status: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgItemContext {
@@ -192,6 +203,100 @@ pub struct OrgItemContext {
     pub origin: Option<OrgOriginView>,
     pub history_segments: Vec<OrgHistorySegment>,
     pub lease: Option<OrgLeaseView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgClaimKind {
+    Execution,
+    Review,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartClaimRequest {
+    pub work_item_id: WorkItemId,
+    pub document_id: DocumentId,
+    pub expected_document_revision: i64,
+    pub kind: OrgClaimKind,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatClaimRequest {
+    pub work_item_id: WorkItemId,
+    pub lease_id: String,
+    pub kind: OrgClaimKind,
+    pub fencing_token: String,
+}
+
+impl std::fmt::Debug for HeartbeatClaimRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HeartbeatClaimRequest")
+            .field("work_item_id", &self.work_item_id)
+            .field("lease_id", &self.lease_id)
+            .field("kind", &self.kind)
+            .field("fencing_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseClaimRequest {
+    pub schema_version: u32,
+    pub work_item_id: WorkItemId,
+    pub document_id: DocumentId,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    pub kind: OrgClaimKind,
+    pub fencing_token: String,
+    pub target_state: Option<String>,
+}
+
+impl std::fmt::Debug for ReleaseClaimRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReleaseClaimRequest")
+            .field("schema_version", &self.schema_version)
+            .field("work_item_id", &self.work_item_id)
+            .field("document_id", &self.document_id)
+            .field(
+                "expected_document_revision",
+                &self.expected_document_revision,
+            )
+            .field("lease_id", &self.lease_id)
+            .field("kind", &self.kind)
+            .field("fencing_token", &"[REDACTED]")
+            .field("target_state", &self.target_state)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgClaimResult {
+    pub schema_version: u32,
+    pub workspace_id: WorkspaceId,
+    pub operation_id: String,
+    pub lease_id: String,
+    pub fencing_token: String,
+    pub expires_at: i64,
+    pub event_ids: Vec<String>,
+    pub context: OrgItemContext,
+}
+
+impl std::fmt::Debug for OrgClaimResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OrgClaimResult")
+            .field("schema_version", &self.schema_version)
+            .field("workspace_id", &self.workspace_id)
+            .field("operation_id", &self.operation_id)
+            .field("lease_id", &self.lease_id)
+            .field("fencing_token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("event_ids", &self.event_ids)
+            .field("context", &self.context)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

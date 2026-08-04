@@ -1,7 +1,7 @@
 use super::{
     audit::map_event, OrgArtifactView, OrgAttemptNoteView, OrgAttemptView, OrgContext,
     OrgDependencyView, OrgDocumentView, OrgError, OrgErrorCode, OrgHistorySegment, OrgItemContext,
-    OrgItemView, OrgNoteLinkView, OrgOriginView, OrgTimestampView, OrgWorkspaceView,
+    OrgItemView, OrgLeaseView, OrgNoteLinkView, OrgOriginView, OrgTimestampView, OrgWorkspaceView,
 };
 use note_org::{WorkItemId, WorkspaceId};
 use note_storage::{
@@ -19,15 +19,22 @@ pub async fn get_item_context(
         .begin(TransactionMode::Deferred)
         .await
         .map_err(OrgError::storage)?;
-    let result = get_item_context_in_transaction(transaction.as_ref(), workspace_id, item_id).await;
+    let result = get_item_context_in_transaction(
+        transaction.as_ref(),
+        workspace_id,
+        item_id,
+        context.clock().now(),
+    )
+    .await;
     transaction.rollback().await.map_err(OrgError::storage)?;
     result
 }
 
-async fn get_item_context_in_transaction(
+pub(crate) async fn get_item_context_in_transaction(
     transaction: &dyn StorageTransaction,
     workspace_id: WorkspaceId,
     item_id: WorkItemId,
+    now: i64,
 ) -> Result<OrgItemContext, OrgError> {
     let workspace = transaction
         .get_org_workspace(workspace_id)
@@ -123,6 +130,31 @@ async fn get_item_context_in_transaction(
         .map_err(OrgError::storage)?;
     let origin = hydrate_origin(transaction, &history).await?;
     let history_segments = history_segments(history);
+    let lease = transaction
+        .get_open_org_lease_internal(item.id)
+        .await
+        .map_err(OrgError::storage)?
+        .map(|lease| OrgLeaseView {
+            id: lease.id,
+            workspace_id: lease.workspace_id,
+            work_item_id: lease.work_item_id,
+            attempt_id: lease.attempt_id,
+            kind: match lease.kind {
+                note_storage::OrgLeaseKind::Execution => "execution",
+                note_storage::OrgLeaseKind::Review => "review",
+            }
+            .into(),
+            actor_id: lease.actor_id,
+            acquired_at: lease.acquired_at,
+            last_heartbeat_at: lease.last_heartbeat_at,
+            expires_at: lease.expires_at,
+            status: if lease.expires_at > now {
+                "active"
+            } else {
+                "expired"
+            }
+            .into(),
+        });
     Ok(OrgItemContext {
         workspace: OrgWorkspaceView {
             id: workspace.id,
@@ -149,7 +181,7 @@ async fn get_item_context_in_transaction(
         attempts,
         origin,
         history_segments,
-        lease: None,
+        lease,
     })
 }
 
