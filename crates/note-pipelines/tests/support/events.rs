@@ -32,6 +32,7 @@ pub struct EventStorageBackend {
     inner: Arc<dyn StorageBackend>,
     events: EventLog,
     fail_commit: Arc<AtomicBool>,
+    fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl EventStorageBackend {
@@ -40,11 +41,19 @@ impl EventStorageBackend {
             inner,
             events,
             fail_commit: Arc::new(AtomicBool::new(false)),
+            fail_repository_calls: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
     pub fn fail_next_commit(&self) {
         self.fail_commit.store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_next_repository_call(&self, name: &str) {
+        self.fail_repository_calls
+            .lock()
+            .unwrap()
+            .push_back(name.to_string());
     }
 }
 
@@ -52,6 +61,21 @@ struct EventTransaction {
     inner: Box<dyn StorageTransaction>,
     events: EventLog,
     fail_commit: Arc<AtomicBool>,
+    fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl EventTransaction {
+    fn fail_if_requested(&self, name: &str) -> StorageResult<()> {
+        let mut failures = self.fail_repository_calls.lock().unwrap();
+        if failures.front().is_some_and(|failure| failure == name) {
+            failures.pop_front();
+            return Err(StorageError::new(
+                StorageErrorKind::Operation,
+                format!("controlled repository failure at {name}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -67,6 +91,7 @@ impl StorageBackend for EventStorageBackend {
             inner: transaction,
             events: self.events.clone(),
             fail_commit: self.fail_commit.clone(),
+            fail_repository_calls: self.fail_repository_calls.clone(),
         }))
     }
 
@@ -81,6 +106,7 @@ macro_rules! impl_forward_repository {
         impl $repository for EventTransaction {
             $(
                 async fn $name(&self, $($arg: $ty),*) -> StorageResult<$result> {
+                    self.fail_if_requested(stringify!($name))?;
                     self.inner.$name($($arg),*).await
                 }
             )*
@@ -300,6 +326,7 @@ impl StorageTransaction for EventTransaction {
             inner,
             events,
             fail_commit,
+            fail_repository_calls: _,
         } = *self;
         if fail_commit.swap(false, Ordering::SeqCst) {
             inner.rollback().await?;
@@ -319,6 +346,7 @@ impl StorageTransaction for EventTransaction {
             inner,
             events,
             fail_commit: _,
+            fail_repository_calls: _,
         } = *self;
         inner.rollback().await?;
         events.lock().unwrap().push("rollback".into());
