@@ -2,9 +2,9 @@ use super::{
     append_event, bookkeep_expired_open_lease, command_result, execute_idempotent_outcome,
     get_item_context_in_transaction, load_document, require_active_workspace, resolve_lease_update,
     resolve_update, stale_lease, token_hash, unique_successful_target, validate_document_revision,
-    validate_item_transition, validate_lease_input, write_claim_state, ApproveItemRequest,
-    CommandEnvelope, OrgCommandKind, OrgCommandResult, OrgContext, OrgError, OrgMutationOutcome,
-    OrgWorkflowPhase, RejectItemRequest, RequestReviewRequest,
+    validate_item_transition, validate_lease_input, validate_public_payload, write_claim_state,
+    ApproveItemRequest, CommandEnvelope, OrgCommandKind, OrgCommandResult, OrgContext, OrgError,
+    OrgMutationOutcome, OrgWorkflowPhase, RejectItemRequest, RequestReviewRequest,
 };
 use note_storage::{
     OrgAttemptStatus, OrgAttemptUpdate, OrgEventType, OrgLeaseClosure, OrgLeaseEndReason,
@@ -23,6 +23,15 @@ pub async fn request_review(
 ) -> Result<OrgCommandResult, OrgError> {
     validate_schema(request.schema_version)?;
     validate_lease_input(&request.lease_id, &request.fencing_token)?;
+    validate_public_payload(
+        &request.fencing_token,
+        &json!({
+            "result_summary": request.result_summary,
+            "note_refs": request.note_refs,
+            "artifacts": request.artifacts,
+            "metadata": request.metadata,
+        }),
+    )?;
     let fingerprint = json!({
         "schema_version": request.schema_version,
         "work_item_id": request.work_item_id,
@@ -199,6 +208,10 @@ pub async fn approve_item(
 ) -> Result<OrgCommandResult, OrgError> {
     validate_schema(request.schema_version)?;
     validate_lease_input(&request.lease_id, &request.fencing_token)?;
+    validate_public_payload(
+        &request.fencing_token,
+        &json!({"metadata": request.metadata}),
+    )?;
     let fingerprint = json!({
         "schema_version": request.schema_version,
         "work_item_id": request.work_item_id,
@@ -352,6 +365,13 @@ pub async fn reject_item(
 ) -> Result<OrgCommandResult, OrgError> {
     validate_schema(request.schema_version)?;
     validate_lease_input(&request.lease_id, &request.fencing_token)?;
+    validate_public_payload(
+        &request.fencing_token,
+        &json!({
+            "reason": request.reason,
+            "metadata": request.metadata,
+        }),
+    )?;
     let fingerprint = json!({
         "schema_version": request.schema_version,
         "work_item_id": request.work_item_id,

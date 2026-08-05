@@ -3,10 +3,10 @@ use super::{
     execute_idempotent, execute_idempotent_outcome, get_item_context_in_transaction,
     lease_duration, load_document, map_claim_error, projected_to_domain, require_active_workspace,
     resolve_lease_update, resolve_update, storage_kind, token_hash, validate_document_revision,
-    validate_item_transition, write_claim_state, CommandEnvelope, OrgClaimKind, OrgClaimResult,
-    OrgCommandKind, OrgCommandResult, OrgContext, OrgError, OrgErrorCode, OrgMutationOutcome,
-    OrgWorkflowPhase, ReportProgressRequest, RetryItemRequest, SubmitResultRequest,
-    TransitionItemRequest, ORG_COMMAND_SCHEMA_VERSION,
+    validate_item_transition, validate_public_payload, write_claim_state, CommandEnvelope,
+    OrgClaimKind, OrgClaimResult, OrgCommandKind, OrgCommandResult, OrgContext, OrgError,
+    OrgErrorCode, OrgMutationOutcome, OrgWorkflowPhase, ReportProgressRequest, RetryItemRequest,
+    SubmitResultRequest, TransitionItemRequest, ORG_COMMAND_SCHEMA_VERSION,
 };
 use note_org::{AttemptPhase, ClaimKind, ClaimQueue, ClaimRequest, LeaseStatus, ReadinessContext};
 use note_storage::{
@@ -42,6 +42,13 @@ pub async fn report_progress(
 ) -> Result<OrgCommandResult, OrgError> {
     validate_request_schema(request.schema_version)?;
     validate_lease_input(&request.lease_id, &request.fencing_token)?;
+    validate_public_payload(
+        &request.fencing_token,
+        &json!({
+            "summary": request.summary,
+            "metadata": request.metadata,
+        }),
+    )?;
     let fingerprint = json!({
         "schema_version": request.schema_version,
         "work_item_id": request.work_item_id,
@@ -144,6 +151,15 @@ pub async fn submit_result(
 ) -> Result<OrgCommandResult, OrgError> {
     validate_request_schema(request.schema_version)?;
     validate_lease_input(&request.lease_id, &request.fencing_token)?;
+    validate_public_payload(
+        &request.fencing_token,
+        &json!({
+            "result_summary": request.result_summary,
+            "note_refs": request.note_refs,
+            "artifacts": request.artifacts,
+            "metadata": request.metadata,
+        }),
+    )?;
     let fingerprint = json!({
         "schema_version": request.schema_version,
         "work_item_id": request.work_item_id,
@@ -366,6 +382,14 @@ pub async fn transition_item(
     }
     if let Some(proof) = &request.lease {
         validate_lease_input(&proof.lease_id, &proof.fencing_token)?;
+        validate_public_payload(
+            &proof.fencing_token,
+            &json!({
+                "target_state": request.target_state,
+                "error": request.error,
+                "metadata": request.metadata,
+            }),
+        )?;
     }
     let lease_fingerprint = request.lease.as_ref().map(|proof| {
         json!({

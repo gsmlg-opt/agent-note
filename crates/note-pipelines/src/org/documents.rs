@@ -2,9 +2,10 @@ use super::{
     capacity, classify_transition, closes_lease, concurrency_limit, execute_idempotent,
     inspect_touched_lease_proofs_except, lifecycle_attempt, lifecycle_end_reason, lifecycle_events,
     lifecycle_summary, resolve_lease_update, resolve_update, stale_lease, storage_kind, token_hash,
-    validate_item_transition, validate_lease_input, validate_touched_lease_proofs_except,
-    CommandEnvelope, LeaseProofInput, OrgCommandKind, OrgCommandResult, OrgContext, OrgError,
-    OrgErrorCode, OrgWorkflowPhase, TransitionLifecycle, ORG_COMMAND_SCHEMA_VERSION,
+    validate_item_transition, validate_lease_input, validate_public_payload,
+    validate_touched_lease_proofs_except, CommandEnvelope, LeaseProofInput, OrgCommandKind,
+    OrgCommandResult, OrgContext, OrgError, OrgErrorCode, OrgWorkflowPhase, TransitionLifecycle,
+    ORG_COMMAND_SCHEMA_VERSION,
 };
 use note_org::{parse_document, ClaimPolicy, DocumentId, WorkspaceId};
 use note_storage::{
@@ -91,6 +92,11 @@ async fn execute_import(
     request: ImportDocumentsRequest,
 ) -> Result<OrgCommandResult, OrgError> {
     validate_import_shape(&request)?;
+    let public_payload = json!({"documents": request.documents});
+    for proof in request.lease_proofs.values() {
+        validate_lease_input(&proof.lease_id, &proof.fencing_token)?;
+        validate_public_payload(&proof.fencing_token, &public_payload)?;
+    }
     let fingerprint_request = import_fingerprint(&request);
     let command_envelope = envelope.clone();
     let workflow_context = context.clone();
