@@ -123,6 +123,7 @@ fn operational_query<'a>(
         item_type: None,
         state: None,
         priority: None,
+        priority_is_none: false,
         tags: &[],
         assignee: None,
         scheduled_from: None,
@@ -2335,6 +2336,28 @@ async fn run_operational_ready_contract(storage: Arc<dyn StorageBackend>) {
             .collect::<Vec<_>>(),
         vec![tagged_id]
     );
+    let unprioritized_rows = session
+        .query_org_operational({
+            let mut query = operational_query(OrgOperationalView::Ready, &workspace_ids, 1_000);
+            query.priority_is_none = true;
+            query
+        })
+        .await
+        .unwrap();
+    assert!(!unprioritized_rows.is_empty());
+    assert!(unprioritized_rows
+        .iter()
+        .all(|row| row.item.priority.is_none()));
+    let error = session
+        .query_org_operational({
+            let mut query = operational_query(OrgOperationalView::Ready, &workspace_ids, 1_000);
+            query.priority = Some('A');
+            query.priority_is_none = true;
+            query
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Operation);
     let lowercase_tag = ["backend"];
     let mut lowercase_tag_query =
         operational_query(OrgOperationalView::Ready, &workspace_ids, 1_000);

@@ -163,7 +163,8 @@ pub(crate) struct OperationalQueryInput<V> {
     pub view: V,
     pub item_type: Option<WorkItemTypeInput>,
     pub state: Option<String>,
-    pub priority: Option<char>,
+    #[schemars(regex(pattern = r"^(none|[A-Z])$"))]
+    pub priority: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     pub assignee: Option<String>,
@@ -189,6 +190,7 @@ pub(crate) trait IntoOperationalView {
 
 impl<V: IntoOperationalView> OperationalQueryInput<V> {
     pub(crate) fn into_pipeline(self) -> Result<note_pipelines::org::OperationalQuery, OrgError> {
+        let (priority, priority_is_none) = operational_priority_filter(self.priority)?;
         let mut workspace_ids = Vec::with_capacity(self.workspace_ids.len());
         let mut canonical_ids = std::collections::BTreeSet::new();
         for id in self.workspace_ids {
@@ -208,7 +210,8 @@ impl<V: IntoOperationalView> OperationalQueryInput<V> {
                 .map(|value| adapt_input(value, "item type"))
                 .transpose()?,
             state: self.state,
-            priority: self.priority,
+            priority,
+            priority_is_none,
             tags: self.tags,
             assignee: self.assignee,
             scheduled_from: self.scheduled_from,
@@ -223,6 +226,24 @@ impl<V: IntoOperationalView> OperationalQueryInput<V> {
             cursor: self.cursor,
             limit: Some(usize::from(self.limit)),
         })
+    }
+}
+
+fn operational_priority_filter(value: Option<String>) -> Result<(Option<char>, bool), OrgError> {
+    match value.as_deref() {
+        None => Ok((None, false)),
+        Some("none") => Ok((None, true)),
+        Some(value) => {
+            let mut chars = value.chars();
+            match (chars.next(), chars.next()) {
+                (Some(priority), None) if priority.is_ascii_uppercase() => {
+                    Ok((Some(priority), false))
+                }
+                _ => Err(OrgError::invalid_input(
+                    "Org priority filter must be 'none' or one uppercase ASCII letter",
+                )),
+            }
+        }
     }
 }
 

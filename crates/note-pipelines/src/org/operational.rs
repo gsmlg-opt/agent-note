@@ -34,6 +34,7 @@ pub struct OperationalQuery {
     pub item_type: Option<WorkItemType>,
     pub state: Option<String>,
     pub priority: Option<char>,
+    pub priority_is_none: bool,
     pub tags: Vec<String>,
     pub assignee: Option<String>,
     pub scheduled_from: Option<i64>,
@@ -57,6 +58,7 @@ impl OperationalQuery {
             item_type: None,
             state: None,
             priority: None,
+            priority_is_none: false,
             tags: Vec::new(),
             assignee: None,
             scheduled_from: None,
@@ -85,6 +87,7 @@ impl OperationalQuery {
             "item_type": normalized.item_type,
             "state": normalized.state,
             "priority": normalized.priority,
+            "priority_is_none": normalized.priority_is_none,
             "tags": normalized.tags,
             "assignee": normalized.assignee,
             "scheduled_from": normalized.scheduled_from,
@@ -166,6 +169,7 @@ struct NormalizedQuery {
     item_type: Option<WorkItemType>,
     state: Option<String>,
     priority: Option<char>,
+    priority_is_none: bool,
     tags: Vec<String>,
     assignee: Option<String>,
     scheduled_from: Option<i64>,
@@ -226,6 +230,11 @@ impl NormalizedQuery {
                 "Org priority filter must be an uppercase ASCII letter",
             ));
         }
+        if query.priority.is_some() && query.priority_is_none {
+            return Err(OrgError::invalid_input(
+                "Org priority filters are mutually exclusive",
+            ));
+        }
         for (from, to) in [
             (query.scheduled_from, query.scheduled_to),
             (query.deadline_from, query.deadline_to),
@@ -245,6 +254,7 @@ impl NormalizedQuery {
             item_type: query.item_type,
             state,
             priority: query.priority,
+            priority_is_none: query.priority_is_none,
             tags,
             assignee,
             scheduled_from: query.scheduled_from,
@@ -489,6 +499,7 @@ fn storage_query<'a>(
         item_type: query.item_type,
         state: query.state.as_deref(),
         priority: query.priority,
+        priority_is_none: query.priority_is_none,
         tags,
         assignee: query.assignee.as_deref(),
         scheduled_from,

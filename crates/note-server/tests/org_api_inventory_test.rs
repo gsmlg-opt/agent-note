@@ -462,6 +462,25 @@ fn generated_openapi_has_exact_mcp_org_inventory() {
 }
 
 #[test]
+fn operational_priority_query_documents_none_or_uppercase_letter() {
+    let document = document();
+    for path in ["/api/org/queue", "/api/org/agenda"] {
+        let priority = document["paths"][path]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "priority")
+            .unwrap();
+        assert_eq!(
+            priority["schema"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(priority["schema"]["pattern"], "^(none|[A-Z])$");
+        assert_eq!(priority["required"], false);
+    }
+}
+
+#[test]
 fn every_org_operation_documents_success_structured_errors_and_input_constraints() {
     let document = document();
     let schemas = document["components"]["schemas"]

@@ -184,6 +184,12 @@ async fn org_schemas_are_closed_and_expose_concurrency_contracts() {
         assert!(required_fields(tool(name).input_schema.as_ref()).contains("fencing_token"));
     }
 
+    for name in ["org_query_queue", "org_query_agenda"] {
+        let priority = &tool(name).input_schema["properties"]["priority"];
+        assert_eq!(priority["type"], serde_json::json!(["string", "null"]));
+        assert_eq!(priority["pattern"], "^(none|[A-Z])$");
+    }
+
     for name in [
         "org_put_document",
         "org_move_document",

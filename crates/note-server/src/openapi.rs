@@ -1009,6 +1009,13 @@ fn normalize_org_query_parameters(mut openapi: OpenApi) -> OpenApi {
                         schema.default = Some(serde_json::json!(false));
                     }
                 }
+                "priority" => {
+                    parameter.required = Required::False;
+                    parameter.description = Some(
+                        "Omit to disable priority filtering, use `none` for items without a priority, or use one uppercase letter A-Z."
+                            .to_owned(),
+                    );
+                }
                 _ => {}
             }
         }

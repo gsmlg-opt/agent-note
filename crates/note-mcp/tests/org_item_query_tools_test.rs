@@ -227,8 +227,10 @@ async fn seed_all_operational_views(mcp: &TestServer) -> Vec<String> {
         }
         if index == 1 {
             row.assignee = Some("agent-one".into());
+            row.priority = None;
         }
         if index == 5 {
+            row.priority = None;
             row.scheduled = base.scheduled.clone().or_else(|| {
                 Some(StoredOrgTimestamp {
                     raw: "<2027-01-15 Fri 09:00>".into(),
@@ -674,6 +676,23 @@ async fn operational_filters_timestamps_limits_and_cursors_are_pipeline_owned() 
     assert_eq!(stamp["timezone"], "Asia/Shanghai");
     assert_eq!(stamp["utc_timestamp"], NOW);
 
+    for (tool, view) in [
+        ("org_query_queue", "assigned"),
+        ("org_query_agenda", "scheduled"),
+    ] {
+        let mut args = operational_args(vec![WORKSPACE_ID], view);
+        args.as_object_mut()
+            .unwrap()
+            .insert("priority".into(), json!("none"));
+        let unprioritized = mcp.call(tool, args).await.unwrap();
+        assert!(!unprioritized["items"].as_array().unwrap().is_empty());
+        assert!(unprioritized["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["item"]["priority"].is_null()));
+    }
+
     let mut agenda = operational_args(vec![WORKSPACE_ID], "scheduled");
     agenda
         .as_object_mut()
@@ -743,6 +762,13 @@ async fn operational_filters_timestamps_limits_and_cursors_are_pipeline_owned() 
         .unwrap()
         .insert("cursor".into(), json!("not-a-cursor"));
     assert!(mcp.call("org_query_queue", malformed).await.is_err());
+    for invalid in ["None", "AA", "a"] {
+        let mut args = operational_args(vec![WORKSPACE_ID], "ready");
+        args.as_object_mut()
+            .unwrap()
+            .insert("priority".into(), json!(invalid));
+        assert!(mcp.call("org_query_queue", args).await.is_err());
+    }
     let mut maximum = operational_args(vec![WORKSPACE_ID], "ready");
     maximum
         .as_object_mut()

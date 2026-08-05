@@ -1623,6 +1623,12 @@ fn validate_operational_query(query: &OrgOperationalQuery<'_>) -> StorageResult<
             "invalid Org operational query scope, time, or limit",
         ));
     }
+    if query.priority.is_some() && query.priority_is_none {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org operational priority filters are mutually exclusive",
+        ));
+    }
     for (from, to) in [
         (query.scheduled_from, query.scheduled_to),
         (query.deadline_from, query.deadline_to),
@@ -1757,7 +1763,9 @@ fn push_pg_operational_filters(
     if let Some(state) = query.state {
         sql.push(" AND item.state=").push_bind(state.to_owned());
     }
-    if let Some(priority) = query.priority {
+    if query.priority_is_none {
+        sql.push(" AND item.priority IS NULL");
+    } else if let Some(priority) = query.priority {
         sql.push(" AND item.priority=")
             .push_bind(priority.to_string());
     }

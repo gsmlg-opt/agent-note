@@ -370,7 +370,8 @@ macro_rules! operational_query_body {
             pub view: $view,
             pub item_type: Option<WorkItemTypeBody>,
             pub state: Option<String>,
-            pub priority: Option<char>,
+            #[param(pattern = r"^(none|[A-Z])$")]
+            pub priority: Option<String>,
             /// Comma-separated tag intersection filter.
             pub tags: Option<String>,
             pub assignee: Option<String>,
@@ -394,6 +395,7 @@ macro_rules! operational_query_body {
 
         impl $name {
             pub fn into_pipeline(self) -> Result<OperationalQuery, OrgError> {
+                let (priority, priority_is_none) = operational_priority_filter(self.priority)?;
                 let mut workspace_ids = Vec::new();
                 let mut canonical_ids = std::collections::BTreeSet::new();
                 for id in self.workspace_ids.split(',') {
@@ -413,7 +415,8 @@ macro_rules! operational_query_body {
                         .map(WorkItemTypeBody::into_pipeline)
                         .transpose()?,
                     state: self.state,
-                    priority: self.priority,
+                    priority,
+                    priority_is_none,
                     tags: self
                         .tags
                         .map(|tags| tags.split(',').map(str::to_owned).collect())
@@ -434,6 +437,24 @@ macro_rules! operational_query_body {
             }
         }
     };
+}
+
+fn operational_priority_filter(value: Option<String>) -> Result<(Option<char>, bool), OrgError> {
+    match value.as_deref() {
+        None => Ok((None, false)),
+        Some("none") => Ok((None, true)),
+        Some(value) => {
+            let mut chars = value.chars();
+            match (chars.next(), chars.next()) {
+                (Some(priority), None) if priority.is_ascii_uppercase() => {
+                    Ok((Some(priority), false))
+                }
+                _ => Err(OrgError::invalid_input(
+                    "Org priority filter must be 'none' or one uppercase ASCII letter",
+                )),
+            }
+        }
+    }
 }
 
 operational_query_body!(QueueQueryBody, QueueViewBody);

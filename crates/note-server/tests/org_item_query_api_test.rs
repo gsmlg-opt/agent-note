@@ -522,7 +522,9 @@ async fn seed_views(api: &TestApp, workspace_id: &str, document_id: DocumentId, 
     rows[0].scheduled = Some(timestamp("<2027-01-15 Fri 09:00>"));
     rows[0].deadline = Some(timestamp("<2027-01-15 Fri 09:00>"));
     rows[1].assignee = Some("agent-one".to_owned());
+    rows[1].priority = None;
     rows[5].scheduled = Some(timestamp("<2027-01-15 Fri 09:00>"));
+    rows[5].priority = None;
     rows[6].deadline = Some(timestamp("<2027-01-15 Fri 09:00>"));
     session
         .replace_org_document_projection(document_id, &rows)
@@ -697,6 +699,37 @@ async fn queue_and_agenda_cover_all_views_filters_multi_workspace_cursors_and_li
         "<2027-01-15 Fri 09:00>"
     );
 
+    for (route, view) in [("queue", "assigned"), ("agenda", "scheduled")] {
+        let (_, rest) = api
+            .call(
+                Method::GET,
+                &operational_uri(route, WORKSPACE_A, view, "&priority=none"),
+                None,
+            )
+            .await;
+        let mut args = mcp_operational_args(vec![WORKSPACE_A], view);
+        args.as_object_mut()
+            .unwrap()
+            .insert("priority".into(), json!("none"));
+        let mcp = api
+            .mcp_call(
+                if route == "queue" {
+                    "org_query_queue"
+                } else {
+                    "org_query_agenda"
+                },
+                args,
+            )
+            .await;
+        assert_eq!(rest, mcp, "REST/MCP priority=none parity");
+        assert!(!rest["items"].as_array().unwrap().is_empty());
+        assert!(rest["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["item"]["priority"].is_null()));
+    }
+
     let (_, agenda) = api
         .call(
             Method::GET,
@@ -787,6 +820,9 @@ async fn queue_and_agenda_cover_all_views_filters_multi_workspace_cursors_and_li
         ),
         operational_uri("agenda", WORKSPACE_A, "ready", ""),
         operational_uri("queue", WORKSPACE_A, "ready", "&cursor=not-a-cursor"),
+        operational_uri("queue", WORKSPACE_A, "ready", "&priority=None"),
+        operational_uri("queue", WORKSPACE_A, "ready", "&priority=AA"),
+        operational_uri("queue", WORKSPACE_A, "ready", "&priority=a"),
     ] {
         let (status, error) = api.call(Method::GET, &uri, None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

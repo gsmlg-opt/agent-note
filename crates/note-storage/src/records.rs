@@ -470,6 +470,7 @@ pub struct OrgOperationalQuery<'a> {
     pub item_type: Option<note_org::WorkItemType>,
     pub state: Option<&'a str>,
     pub priority: Option<char>,
+    pub priority_is_none: bool,
     pub tags: &'a [&'a str],
     pub assignee: Option<&'a str>,
     pub scheduled_from: Option<i64>,

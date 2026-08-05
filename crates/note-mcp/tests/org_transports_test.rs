@@ -596,7 +596,7 @@ async fn run_representative_scenario(kind: TransportKind) -> Vec<Value> {
                 "schema_version": 1, "workspace_id": WORKSPACE_ID, "actor_id": "agent-one",
                 "operation_id": "create-item", "document_id": DOCUMENT_ID, "parent_id": null,
                 "item_id": ITEM_ID, "item_type": "task", "title": "Transport item",
-                "initial_state": "READY", "priority": "A", "tags": ["transport"],
+                "initial_state": "READY", "priority": null, "tags": ["transport"],
                 "assignee": "agent-one", "requires_review": true,
                 "expected_revisions": { DOCUMENT_ID: 1 }
             }),
@@ -614,6 +614,19 @@ async fn run_representative_scenario(kind: TransportKind) -> Vec<Value> {
     assert_success(&queue, "queue");
     assert_eq!(tool_content(&queue)["items"][0]["item"]["id"], ITEM_ID);
     responses.push(queue);
+
+    let unprioritized = client
+        .call(
+            "org_query_queue",
+            json!({"workspace_ids": [WORKSPACE_ID], "view": "ready", "priority": "none"}),
+        )
+        .await;
+    assert_success(&unprioritized, "unprioritized queue");
+    assert_eq!(
+        tool_content(&unprioritized)["items"][0]["item"]["priority"],
+        Value::Null
+    );
+    responses.push(unprioritized);
 
     let claim = client
         .call(

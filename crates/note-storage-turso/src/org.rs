@@ -1893,6 +1893,12 @@ fn validate_operational_query(query: &OrgOperationalQuery<'_>) -> StorageResult<
             "invalid Org operational query scope, time, or limit",
         ));
     }
+    if query.priority.is_some() && query.priority_is_none {
+        return Err(StorageError::new(
+            StorageErrorKind::Operation,
+            "Org operational priority filters are mutually exclusive",
+        ));
+    }
     for (from, to) in [
         (query.scheduled_from, query.scheduled_to),
         (query.deadline_from, query.deadline_to),
@@ -2116,7 +2122,9 @@ fn push_turso_operational_filters(
         let value = push_turso_param(params, state.to_owned());
         sql.push_str(&format!(" AND item.state={value}"));
     }
-    if let Some(priority) = query.priority {
+    if query.priority_is_none {
+        sql.push_str(" AND item.priority IS NULL");
+    } else if let Some(priority) = query.priority {
         let value = push_turso_param(params, priority.to_string());
         sql.push_str(&format!(" AND item.priority={value}"));
     }

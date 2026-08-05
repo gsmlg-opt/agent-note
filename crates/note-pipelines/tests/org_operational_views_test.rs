@@ -102,8 +102,8 @@ async fn seed_operational_rows(
     rows[6].deadline = Some(timestamp("<2027-12-28 Tue 09:20>", NOW));
     rows[9].assignee = Some("other-agent".into());
     rows[9].priority = Some('A');
-    rows[10].priority = Some('A');
-    rows[11].priority = Some('A');
+    rows[10].priority = None;
+    rows[11].priority = None;
     for (index, item) in rows.iter_mut().enumerate() {
         item.source_order = index as i64 + 1;
     }
@@ -251,6 +251,20 @@ async fn queue_defaults_to_fifty_and_rejects_family_and_limit_errors() {
             &OperationalQuery {
                 workspace_ids: Vec::new(),
                 ..query
+            },
+        )
+        .await
+        .unwrap_err()
+        .code,
+        OrgErrorCode::InvalidInput
+    );
+    assert_eq!(
+        query_queue(
+            &context,
+            &OperationalQuery {
+                priority: Some('A'),
+                priority_is_none: true,
+                ..OperationalQuery::for_workspace(workspace_id, OperationalView::Ready)
             },
         )
         .await
@@ -574,6 +588,27 @@ async fn cursor_uses_last_scanned_fingerprint_and_frozen_time_without_duplicates
     mismatched.cursor = Some("not-a-cursor".into());
     assert_eq!(
         query_queue(&later, &mismatched).await.unwrap_err().code,
+        OrgErrorCode::InvalidInput
+    );
+}
+
+#[tokio::test]
+async fn unprioritized_filter_is_distinct_from_an_omitted_priority_filter() {
+    let (context, backend, _dir, _db_path, workspace_id) = org_test_context(NOW).await;
+    seed_operational_rows(&backend, workspace_id).await;
+
+    let mut unprioritized = OperationalQuery::for_workspace(workspace_id, OperationalView::Ready);
+    unprioritized.priority_is_none = true;
+    unprioritized.limit = Some(1);
+    let first = query_queue(&context, &unprioritized).await.unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert!(first.items[0].item.priority.is_none());
+
+    let mut omitted = OperationalQuery::for_workspace(workspace_id, OperationalView::Ready);
+    omitted.limit = Some(1);
+    omitted.cursor = first.next_cursor;
+    assert_eq!(
+        query_queue(&context, &omitted).await.unwrap_err().code,
         OrgErrorCode::InvalidInput
     );
 }
