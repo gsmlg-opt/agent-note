@@ -3459,6 +3459,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "flate2",
+ "futures-util",
  "getrandom 0.3.4",
  "hmac 0.12.1",
  "note-attachments",
@@ -3471,11 +3472,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "subtle",
  "tar",
  "tempfile",
  "text-splitter",
  "tokio",
+ "url",
  "uuid",
 ]
 

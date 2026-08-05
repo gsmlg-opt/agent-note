@@ -51,6 +51,8 @@ jobs:
         run: cargo test -p note-storage-turso
       - name: Run PostgreSQL storage suite
         run: cargo test -p note-storage-pg
+      - name: Run PostgreSQL claims acceptance
+        run: cargo test -p note-pipelines --test org_claims_acceptance_test -- --nocapture
 
   s3-integration:
     name: S3 integration (MinIO)
