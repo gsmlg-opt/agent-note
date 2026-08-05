@@ -44,8 +44,8 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
                    • org — transport-free, revision-safe workspace/document/item commands,
                      append-only audit reads, and recovery-context assembly
    ▲
-   ├── note-mcp     save_note / semantic_search tools over stdio AND Streamable HTTP (same server type)
-   └── note-server  Axum REST (/api/notes, /api/labels) + /mcp; one binary, `--stdio` flag picks the door
+   ├── note-mcp     11 Markdown-note + 36 Org tools over stdio and Streamable HTTP (one registry)
+   └── note-server  Axum REST (/api/notes, /api/labels) + /mcp, plus storage-only Org commands
                         ▲
                    note-frontend   Yew MVU (AppState + pure reducer) → talks to note-server over REST
 ```
@@ -77,9 +77,9 @@ counts active execution and review leases and is checked in the same transaction
 idempotent operation replay returns the original result without duplicate attempts, events, state
 changes, or tokens. Actor IDs are client-asserted audit data, not trusted identities.
 
-At the end of Delivery Slice 4 this remains a Rust pipeline foundation: Org operations are not yet
-registered with MCP, REST, offline commands, or the Web UI. Those transports are separate later
-slices and must call the same pipeline boundary rather than duplicate its policy or lease logic.
+Delivery Slice 5 exposes Org orchestration through MCP and four storage-only offline commands.
+It deliberately adds no Org REST/OpenAPI route and no Org Web/frontend behavior. Later slices must
+call the same pipeline boundary rather than duplicate its policy or lease logic.
 Agent Note implements no inbound authentication, authorization, proxy-identity-header, or workspace
 ACL behavior. A front proxy owns TLS, authentication, authorization, and network access; direct
 exposure to an untrusted network is unsupported.
@@ -169,10 +169,10 @@ behind an authenticating reverse proxy.
 
 ## Runtime configuration
 
-Every normal entrypoint—HTTP server, MCP over HTTP, MCP over stdio, `--import`, and `--export`—loads
-a configuration file before opening storage. `NOTE_CONFIG_PATH` selects it; a relative selector is
-resolved from the process working directory. Without that variable, the path is
-`./dev-data/config.toml`.
+Every normal entrypoint—HTTP server, MCP over HTTP, MCP over stdio, legacy `--import`/`--export`,
+and the four `org` offline modes—loads a configuration file before opening storage.
+`NOTE_CONFIG_PATH` selects it; a relative selector is resolved from the process working directory.
+Without that variable, the path is `./dev-data/config.toml`.
 
 The server atomically creates the implicit `./dev-data/config.toml` when it is missing. An
 explicitly selected missing file is always an error. Existing configuration files that do not
@@ -274,9 +274,9 @@ max_retries = 3
 `api_key_env` names an environment variable that contains the bearer token; it never contains the
 secret itself. Set `EMBEDDING_API_KEY` in the server process environment for the example above.
 Omit `api_key_env` for a service that requires no authentication. Normal remote HTTP or MCP server
-startup resolves the named variable and fails when its value is missing or blank. `--import` and
-`--export` do not resolve that value and remain embedding-service offline even when the named
-variable is absent.
+startup resolves the named variable and fails when its value is missing or blank. Legacy
+`--import`/`--export` and all four `org` offline modes do not resolve that value and remain
+embedding-service offline even when the named variable is absent.
 
 The adapter preserves any non-root path in `base_url`, normalizes its trailing slash, and appends
 the `v1/embeddings` suffix. The root example above therefore posts to
@@ -422,6 +422,63 @@ cannot change its normalized path, so rename an attachment with delete followed 
 `get_note_attachment_content` is the only MCP tool that reads attachment bytes. It returns exactly
 one content representation: direct `content` when the bytes are valid UTF-8, otherwise canonical
 Base64 in `content_base64`. These changes apply only to MCP; REST attachment behavior is unchanged.
+
+The same registry also exposes exactly these 36 Org tools over both transports (47 tools total):
+
+```text
+org_list_workspaces       org_create_workspace      org_get_workspace
+org_update_workspace      org_archive_workspace     org_list_documents
+org_get_document          org_put_document           org_move_document
+org_move_item             org_import_workspace       org_export_workspace
+org_create_item           org_get_item               org_get_item_context
+org_create_follow_up      org_assign_item            org_schedule_item
+org_query_queue           org_query_agenda           org_claim_item
+org_heartbeat_claim       org_release_claim          org_report_progress
+org_submit_result         org_transition_item        org_retry_item
+org_request_review        org_approve_item            org_reject_item
+org_add_dependency        org_remove_dependency      org_link_note
+org_unlink_note           org_list_note_work_items   org_list_events
+```
+
+Client-supplied Org `actor_id` values are asserted audit attribution, not authenticated identities.
+Opaque fencing tokens are sensitive ownership proofs: only successful claim and retry/reclaim
+results return them. Do not log them or expose them through general reads, errors, events, or
+exports. Agent Note has no inbound authentication, authorization, sessions, or trusted
+proxy-identity-header contract; a front proxy is responsible for TLS, authentication,
+authorization, Host/origin, and network restrictions. Slice 5 adds no `/api/org` REST/OpenAPI
+operations and no Org frontend or browser controls.
+
+### Org offline commands
+
+The binary provides four storage-only modes:
+
+```text
+note-server org export-workspace --workspace-id <uuid> --output <directory>
+note-server org import-workspace --input <directory> --mode create|update \
+  --actor-id <id> --operation-id <id>
+note-server org export-document --document-id <uuid> --output <file.org>
+note-server org import-document --workspace-id <uuid> --document-id <uuid> \
+  --path <org-path> --input <file.org> --mode create|update \
+  --actor-id <id> --operation-id <id> [--expected-revision <n>]
+```
+
+Document `update` requires `--expected-revision`; `create` rejects it and rejects an existing ID.
+Workspace update uses the workspace and document revisions embedded in its export. A workspace
+snapshot has this portable layout:
+
+```text
+manifest.json
+documents/<document-uuid>.org
+```
+
+The manifest records its format version, workspace metadata/policy/revision, and each document's
+stable ID, canonical Org path, revision, content hash, and relative UUID filename. Imports validate
+the complete snapshot before mutation; exports write atomically and do not implicitly replace a
+non-empty destination. On Linux, Android, and Apple-vendor targets, publication uses an atomic
+`NOREPLACE` rename. On Windows and other targets without that primitive, exports fail closed with
+an `Unsupported` publish error; imports remain supported. Every mode writes a machine-readable
+report to stdout, starts only storage, and does not initialize attachments, embeddings, workers,
+HTTP, MCP, or Markdown-note data.
 
 The HTTP server additionally exposes the MCP Streamable HTTP transport at `/mcp`.
 

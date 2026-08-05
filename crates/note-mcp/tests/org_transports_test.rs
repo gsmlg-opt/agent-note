@@ -1,4 +1,14 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -8,10 +18,12 @@ use axum::{
 use note_attachments::FilesystemAttachmentStore;
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    org::{FixedOrgClock, OrgContext},
+    org::{OrgClock, OrgContext},
     Context,
 };
-use note_storage::StorageBackend;
+use note_storage::{
+    BackendInfo, StorageBackend, StorageResult, StorageSession, StorageTransaction, TransactionMode,
+};
 use note_storage_turso::TursoStorage;
 use serde_json::{json, Value};
 use tokio::io::{split, AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -26,29 +38,197 @@ const ITEM_ID: &str = "30000000-0000-4000-8000-000000000051";
 struct Bundle {
     note: Arc<Context>,
     org: Arc<OrgContext>,
+    backend: Arc<dyn StorageBackend>,
+    clock: Arc<AdjustableClock>,
+    database_path: PathBuf,
+    attachments_path: PathBuf,
     _dir: tempfile::TempDir,
+}
+
+#[derive(Debug)]
+struct AdjustableClock(AtomicI64);
+
+struct BeginBarrierStorageBackend {
+    inner: Arc<dyn StorageBackend>,
+    gate: Mutex<Option<BeginBarrierGate>>,
+}
+
+struct BeginBarrierGate {
+    barrier: Arc<tokio::sync::Barrier>,
+    remaining: usize,
+}
+
+impl BeginBarrierStorageBackend {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            gate: Mutex::new(None),
+        }
+    }
+
+    fn arm_immediate_pair(&self) {
+        let mut gate = self.gate.lock().unwrap();
+        assert!(gate.is_none(), "begin barrier is already armed");
+        *gate = Some(BeginBarrierGate {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            remaining: 2,
+        });
+    }
+}
+
+impl StorageBackend for BeginBarrierStorageBackend {
+    fn session<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<Box<dyn Future<Output = StorageResult<Box<dyn StorageSession>>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { self.inner.session().await })
+    }
+
+    fn begin<'life0, 'async_trait>(
+        &'life0 self,
+        mode: TransactionMode,
+    ) -> Pin<
+        Box<dyn Future<Output = StorageResult<Box<dyn StorageTransaction>>> + Send + 'async_trait>,
+    >
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let barrier = if mode == TransactionMode::Immediate {
+                let mut gate = self.gate.lock().unwrap();
+                let barrier = gate.as_ref().map(|state| state.barrier.clone());
+                let disarm = gate.as_mut().is_some_and(|state| {
+                    state.remaining -= 1;
+                    state.remaining == 0
+                });
+                if disarm {
+                    *gate = None;
+                }
+                barrier
+            } else {
+                None
+            };
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+            self.inner.begin(mode).await
+        })
+    }
+
+    fn info<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> Pin<Box<dyn Future<Output = StorageResult<BackendInfo>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { self.inner.info().await })
+    }
+}
+
+impl AdjustableClock {
+    fn new(now: i64) -> Self {
+        Self(AtomicI64::new(now))
+    }
+
+    fn set(&self, now: i64) {
+        self.0.store(now, Ordering::SeqCst);
+    }
+}
+
+impl OrgClock for AdjustableClock {
+    fn now(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 impl Bundle {
     async fn new(name: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Arc<dyn StorageBackend> = Arc::new(
-            TursoStorage::open(dir.path().join(format!("{name}.db")))
-                .await
-                .unwrap(),
-        );
+        let database_path = dir.path().join(format!("{name}.db"));
+        let attachments_path = dir.path().join("attachments");
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(&database_path).await.unwrap());
         let note = Arc::new(Context::new(
             backend.clone(),
             Arc::new(StubEmbedder),
-            Arc::new(FilesystemAttachmentStore::new(
-                dir.path().join("attachments"),
-            )),
+            Arc::new(FilesystemAttachmentStore::new(attachments_path.clone())),
         ));
-        let org = Arc::new(OrgContext::new(backend, Arc::new(FixedOrgClock::new(NOW))));
+        let clock = Arc::new(AdjustableClock::new(NOW));
+        let org = Arc::new(OrgContext::new(backend.clone(), clock.clone()));
         Self {
             note,
             org,
+            backend,
+            clock,
+            database_path,
+            attachments_path,
             _dir: dir,
+        }
+    }
+
+    async fn new_with_begin_barrier(name: &str) -> (Self, Arc<BeginBarrierStorageBackend>) {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join(format!("{name}.db"));
+        let attachments_path = dir.path().join("attachments");
+        let inner: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(&database_path).await.unwrap());
+        let gated = Arc::new(BeginBarrierStorageBackend::new(inner));
+        let backend: Arc<dyn StorageBackend> = gated.clone();
+        let note = Arc::new(Context::new(
+            backend.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(attachments_path.clone())),
+        ));
+        let clock = Arc::new(AdjustableClock::new(NOW));
+        let org = Arc::new(OrgContext::new(backend.clone(), clock.clone()));
+        (
+            Self {
+                note,
+                org,
+                backend,
+                clock,
+                database_path,
+                attachments_path,
+                _dir: dir,
+            },
+            gated,
+        )
+    }
+
+    async fn reopen(self) -> Self {
+        let Self {
+            note,
+            org,
+            backend,
+            clock,
+            database_path,
+            attachments_path,
+            _dir,
+        } = self;
+        drop(note);
+        drop(org);
+        drop(backend);
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(&database_path).await.unwrap());
+        let note = Arc::new(Context::new(
+            backend.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(attachments_path.clone())),
+        ));
+        let org = Arc::new(OrgContext::new(backend.clone(), clock.clone()));
+        Self {
+            note,
+            org,
+            backend,
+            clock,
+            database_path,
+            attachments_path,
+            _dir,
         }
     }
 }
@@ -332,15 +512,21 @@ fn workspace_input(display_name: &str) -> Value {
     })
 }
 
+fn acceptance_source() -> String {
+    format!(
+        "#+TITLE: Acceptance\r\n#+CUSTOM: opaque syntax\r\n* READY [#A] Imported task :acceptance:\r\n:PROPERTIES:\r\n:ID: {ITEM_ID}\r\n:AGENT_NOTE_TYPE: task\r\n:REQUIRES_REVIEW: true\r\n:END:\r\nBody  \r\n"
+    )
+}
+
 fn tool_content(response: &Value) -> &Value {
     &response["result"]["structuredContent"]
 }
 
 fn assert_success(response: &Value, operation: &str) {
-    assert!(response.get("error").is_none(), "{operation}: {response}");
+    assert!(response.get("error").is_none(), "{operation} failed");
     assert!(
         response["result"]["structuredContent"].is_object(),
-        "{operation}: {response}"
+        "{operation} returned no structured content"
     );
 }
 
@@ -763,4 +949,455 @@ async fn production_transport_factories_serve_note_tools_alongside_org_tools() {
     assert_eq!(tool_content(&stdio_notes), tool_content(&http_notes));
 
     stdio.close().await;
+}
+
+#[tokio::test]
+async fn turso_mcp_workflow_survives_race_expiry_review_export_restart_and_replay() {
+    let (bundle, race_gate) = Bundle::new_with_begin_barrier("task7-acceptance").await;
+    let mut client = HttpClient::start(&bundle).await;
+
+    let saved_note = client
+        .call(
+            "save_note",
+            json!({
+                "title": "Legacy Markdown",
+                "content": "# Existing\nbody",
+                "labels": [["kind", "legacy"]]
+            }),
+        )
+        .await;
+    assert_success(&saved_note, "save legacy Markdown note");
+    let note_id = tool_content(&saved_note)["id"].as_str().unwrap().to_owned();
+
+    let created = client
+        .call("org_create_workspace", workspace_input("Task 7 acceptance"))
+        .await;
+    assert_success(&created, "create acceptance workspace");
+
+    let import_input = json!({
+        "schema_version": 1,
+        "workspace_id": WORKSPACE_ID,
+        "actor_id": "agent-a",
+        "operation_id": "acceptance-import",
+        "documents": [{
+            "document_id": DOCUMENT_ID,
+            "path": "acceptance.org",
+            "source": acceptance_source()
+        }],
+        "expected_revisions": {},
+        "lease_proofs": {}
+    });
+    let imported = client
+        .call("org_import_workspace", import_input.clone())
+        .await;
+    assert_success(&imported, "import acceptance workspace");
+
+    let ready = client
+        .call(
+            "org_query_queue",
+            json!({"workspace_ids": [WORKSPACE_ID], "view": "ready"}),
+        )
+        .await;
+    assert_success(&ready, "query ready queue");
+    assert_eq!(tool_content(&ready)["items"][0]["item"]["id"], ITEM_ID);
+
+    let mut agent_a = HttpClient::start(&bundle).await;
+    let mut agent_b = HttpClient::start(&bundle).await;
+    let claim_a_input = json!({
+        "schema_version": 1, "workspace_id": WORKSPACE_ID, "actor_id": "agent-a",
+        "operation_id": "claim-a", "work_item_id": ITEM_ID, "document_id": DOCUMENT_ID,
+        "expected_document_revision": 1, "kind": "execution"
+    });
+    let claim_b_input = json!({
+        "schema_version": 1, "workspace_id": WORKSPACE_ID, "actor_id": "agent-b",
+        "operation_id": "claim-b", "work_item_id": ITEM_ID, "document_id": DOCUMENT_ID,
+        "expected_document_revision": 1, "kind": "execution"
+    });
+    race_gate.arm_immediate_pair();
+    let (claim_a, claim_b) = tokio::join!(
+        agent_a.call("org_claim_item", claim_a_input.clone()),
+        agent_b.call("org_claim_item", claim_b_input.clone())
+    );
+    assert_ne!(
+        claim_a.get("error").is_none(),
+        claim_b.get("error").is_none()
+    );
+    let (winner_actor, loser_actor, winner_claim, loser_claim, winner_claim_input) =
+        if claim_a.get("error").is_none() {
+            ("agent-a", "agent-b", claim_a, claim_b, claim_a_input)
+        } else {
+            ("agent-b", "agent-a", claim_b, claim_a, claim_b_input)
+        };
+    assert_success(&winner_claim, "winning claim");
+    assert_error(&loser_claim, "active_lease");
+    let winner = tool_content(&winner_claim).clone();
+    assert_eq!(winner["context"]["attempts"].as_array().unwrap().len(), 1);
+
+    bundle.clock.set(winner["expires_at"].as_i64().unwrap() - 1);
+    let heartbeat = client
+        .call(
+            "org_heartbeat_claim",
+            json!({
+                "schema_version": 1, "workspace_id": WORKSPACE_ID,
+                "actor_id": winner_actor, "operation_id": "heartbeat-before-expiry",
+                "work_item_id": ITEM_ID, "lease_id": winner["lease_id"],
+                "kind": "execution", "fencing_token": winner["fencing_token"]
+            }),
+        )
+        .await;
+    assert_success(&heartbeat, "heartbeat before expiry");
+    let heartbeat_data = tool_content(&heartbeat);
+    assert_eq!(
+        heartbeat_data["data"]["context"]["document"]["revision"],
+        winner["context"]["document"]["revision"]
+    );
+    let renewed_expiry = heartbeat_data["data"]["lease"]["expires_at"]
+        .as_i64()
+        .unwrap();
+    bundle.clock.set(renewed_expiry);
+
+    let expired_heartbeat = client
+        .call(
+            "org_heartbeat_claim",
+            json!({
+                "schema_version": 1, "workspace_id": WORKSPACE_ID,
+                "actor_id": winner_actor, "operation_id": "heartbeat-at-expiry",
+                "work_item_id": ITEM_ID, "lease_id": winner["lease_id"],
+                "kind": "execution", "fencing_token": winner["fencing_token"]
+            }),
+        )
+        .await;
+    assert_error(&expired_heartbeat, "stale_lease");
+
+    let reclaimed = client
+        .call(
+            "org_claim_item",
+            json!({
+                "schema_version": 1, "workspace_id": WORKSPACE_ID,
+                "actor_id": loser_actor, "operation_id": "reclaim-expired",
+                "work_item_id": ITEM_ID, "document_id": DOCUMENT_ID,
+                "expected_document_revision": winner["context"]["document"]["revision"],
+                "kind": "execution"
+            }),
+        )
+        .await;
+    assert_success(&reclaimed, "reclaim expired execution");
+    let reclaimed_data = tool_content(&reclaimed).clone();
+    assert!(
+        reclaimed_data["fencing_token"] != winner["fencing_token"],
+        "reclaim did not rotate the fencing token"
+    );
+    assert_eq!(
+        reclaimed_data["context"]["attempts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let events_before_stale = client
+        .call(
+            "org_list_events",
+            json!({
+                "workspace_id": WORKSPACE_ID, "subject_kind": "work_item",
+                "subject_id": ITEM_ID, "limit": 200
+            }),
+        )
+        .await;
+    let workspace_id = WORKSPACE_ID.parse().unwrap();
+    let document_id = DOCUMENT_ID.parse().unwrap();
+    let item_id = ITEM_ID.parse().unwrap();
+    let session = bundle.backend.session().await.unwrap();
+    let document_before_stale = session
+        .get_org_document(document_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let projection_before_stale = session
+        .list_org_workspace_projection(workspace_id)
+        .await
+        .unwrap();
+    let attempts_before_stale = session.list_org_attempts(item_id).await.unwrap();
+    let leases_before_stale = session.list_org_lease_history(item_id).await.unwrap();
+    let stored_events_before_stale = session
+        .list_org_events(workspace_id, None, 200)
+        .await
+        .unwrap();
+    assert!(session
+        .get_org_operation(workspace_id, "delayed-owner-progress")
+        .await
+        .unwrap()
+        .is_none());
+    drop(session);
+    let delayed = client
+        .call(
+            "org_report_progress",
+            json!({
+                "schema_version": 1, "workspace_id": WORKSPACE_ID,
+                "actor_id": winner_actor, "operation_id": "delayed-owner-progress",
+                "work_item_id": ITEM_ID, "lease_id": winner["lease_id"],
+                "kind": "execution", "fencing_token": winner["fencing_token"],
+                "summary": "late", "metadata": {}
+            }),
+        )
+        .await;
+    assert_error(&delayed, "stale_lease");
+    let events_after_stale = client
+        .call(
+            "org_list_events",
+            json!({
+                "workspace_id": WORKSPACE_ID, "subject_kind": "work_item",
+                "subject_id": ITEM_ID, "limit": 200
+            }),
+        )
+        .await;
+    assert_eq!(
+        tool_content(&events_before_stale),
+        tool_content(&events_after_stale)
+    );
+    let session = bundle.backend.session().await.unwrap();
+    assert_eq!(
+        session
+            .get_org_document(document_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        document_before_stale
+    );
+    assert_eq!(
+        session
+            .list_org_workspace_projection(workspace_id)
+            .await
+            .unwrap(),
+        projection_before_stale
+    );
+    assert_eq!(
+        session.list_org_attempts(item_id).await.unwrap(),
+        attempts_before_stale
+    );
+    assert_eq!(
+        session.list_org_lease_history(item_id).await.unwrap(),
+        leases_before_stale
+    );
+    assert_eq!(
+        session
+            .list_org_events(workspace_id, None, 200)
+            .await
+            .unwrap(),
+        stored_events_before_stale
+    );
+    assert!(session
+        .get_org_operation(workspace_id, "delayed-owner-progress")
+        .await
+        .unwrap()
+        .is_none());
+    drop(session);
+
+    let review_requested = client
+        .call(
+            "org_request_review",
+            json!({
+                "schema_version": 1, "workspace_id": WORKSPACE_ID,
+                "actor_id": loser_actor, "operation_id": "acceptance-review-request",
+                "work_item_id": ITEM_ID, "document_id": DOCUMENT_ID,
+                "expected_document_revision": reclaimed_data["context"]["document"]["revision"],
+                "lease_id": reclaimed_data["lease_id"],
+                "fencing_token": reclaimed_data["fencing_token"],
+                "result_summary": "ready for review", "note_refs": [], "artifacts": [],
+                "metadata": {"stage": "acceptance"}
+            }),
+        )
+        .await;
+    assert_success(&review_requested, "request review");
+    let review_request_data = tool_content(&review_requested);
+
+    let review_claim = client
+        .call(
+            "org_claim_item",
+            json!({
+                "schema_version": 1, "workspace_id": WORKSPACE_ID,
+                "actor_id": "reviewer", "operation_id": "acceptance-review-claim",
+                "work_item_id": ITEM_ID, "document_id": DOCUMENT_ID,
+                "expected_document_revision": review_request_data["data"]["context"]["document"]["revision"],
+                "kind": "review"
+            }),
+        )
+        .await;
+    assert_success(&review_claim, "claim review");
+    let review_claim_data = tool_content(&review_claim).clone();
+    let approved = client
+        .call(
+            "org_approve_item",
+            json!({
+                "schema_version": 1, "workspace_id": WORKSPACE_ID,
+                "actor_id": "reviewer", "operation_id": "acceptance-approve",
+                "work_item_id": ITEM_ID, "document_id": DOCUMENT_ID,
+                "expected_document_revision": review_claim_data["context"]["document"]["revision"],
+                "lease_id": review_claim_data["lease_id"],
+                "fencing_token": review_claim_data["fencing_token"],
+                "metadata": {"verdict": "approved"}
+            }),
+        )
+        .await;
+    assert_success(&approved, "approve review");
+    assert_eq!(
+        tool_content(&approved)["data"]["context"]["item"]["state"],
+        "DONE"
+    );
+
+    let document = client
+        .call(
+            "org_get_document",
+            json!({"workspace_id": WORKSPACE_ID, "document_id": DOCUMENT_ID}),
+        )
+        .await;
+    let linked = client
+        .call(
+            "org_link_note",
+            json!({
+                "schema_version": 1, "workspace_id": WORKSPACE_ID,
+                "actor_id": "operator", "operation_id": "link-legacy-note",
+                "item_id": ITEM_ID, "document_id": DOCUMENT_ID, "purpose": "evidence",
+                "note_id": note_id, "description": "legacy compatibility",
+                "expected_revisions": {DOCUMENT_ID: tool_content(&document)["revision"]},
+                "lease": null
+            }),
+        )
+        .await;
+    assert_success(&linked, "link legacy Markdown note");
+
+    let context_before = client
+        .call(
+            "org_get_item_context",
+            json!({"workspace_id": WORKSPACE_ID, "item_id": ITEM_ID}),
+        )
+        .await;
+    let events_before = client
+        .call(
+            "org_list_events",
+            json!({
+                "workspace_id": WORKSPACE_ID, "subject_kind": "work_item",
+                "subject_id": ITEM_ID, "limit": 200
+            }),
+        )
+        .await;
+    let sequences = tool_content(&events_before)["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["sequence"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    let event_types = tool_content(&events_before)["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["event_type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types,
+        [
+            "claim",
+            "start",
+            "heartbeat",
+            "lease_expiry",
+            "claim",
+            "start",
+            "result_submission",
+            "review_request",
+            "claim",
+            "approval",
+            "completion",
+            "note_link_change",
+        ]
+    );
+    let export_before = client
+        .call(
+            "org_export_workspace",
+            json!({"workspace_id": WORKSPACE_ID}),
+        )
+        .await;
+    assert_success(&export_before, "export before restart");
+    assert!(tool_content(&export_before)["documents"][0]["source"]
+        .as_str()
+        .unwrap()
+        .contains("#+CUSTOM: opaque syntax\r\n"));
+
+    let replay_before = client
+        .call("org_import_workspace", import_input.clone())
+        .await;
+    assert_eq!(tool_content(&replay_before), tool_content(&imported));
+
+    drop(client);
+    drop(agent_a);
+    drop(agent_b);
+    drop(race_gate);
+    let bundle = bundle.reopen().await;
+    let mut reopened = HttpClient::start(&bundle).await;
+
+    let note_after = reopened.call("get_note", json!({"id": note_id})).await;
+    assert_success(&note_after, "get legacy Markdown note after restart");
+    assert_eq!(tool_content(&note_after)["title"], "Legacy Markdown");
+    assert_eq!(tool_content(&note_after)["content"], "# Existing\nbody");
+
+    let context_after = reopened
+        .call(
+            "org_get_item_context",
+            json!({"workspace_id": WORKSPACE_ID, "item_id": ITEM_ID}),
+        )
+        .await;
+    let events_after = reopened
+        .call(
+            "org_list_events",
+            json!({
+                "workspace_id": WORKSPACE_ID, "subject_kind": "work_item",
+                "subject_id": ITEM_ID, "limit": 200
+            }),
+        )
+        .await;
+    let export_after = reopened
+        .call(
+            "org_export_workspace",
+            json!({"workspace_id": WORKSPACE_ID}),
+        )
+        .await;
+    assert_eq!(tool_content(&context_after), tool_content(&context_before));
+    assert_eq!(tool_content(&events_after), tool_content(&events_before));
+    assert_eq!(tool_content(&export_after), tool_content(&export_before));
+    assert_eq!(
+        tool_content(&context_after)["attempts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        tool_content(&context_after)["note_links"][0]["note_id"],
+        note_id
+    );
+
+    let import_replay_after = reopened.call("org_import_workspace", import_input).await;
+    assert_eq!(tool_content(&import_replay_after), tool_content(&imported));
+    let claim_replay_after = reopened.call("org_claim_item", winner_claim_input).await;
+    assert!(
+        tool_content(&claim_replay_after)["fencing_token"] == winner["fencing_token"],
+        "claim replay returned a different fencing token"
+    );
+    let mut redacted_claim_replay = tool_content(&claim_replay_after).clone();
+    redacted_claim_replay["fencing_token"] = json!("<redacted>");
+    let mut redacted_winner_claim = tool_content(&winner_claim).clone();
+    redacted_winner_claim["fencing_token"] = json!("<redacted>");
+    assert_eq!(
+        redacted_claim_replay, redacted_winner_claim,
+        "claim replay changed its non-sensitive result"
+    );
+    assert!(bundle
+        .backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(WORKSPACE_ID.parse().unwrap(), "acceptance-import")
+        .await
+        .unwrap()
+        .is_some());
 }

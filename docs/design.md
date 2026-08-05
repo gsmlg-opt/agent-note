@@ -12,7 +12,9 @@ implementation details are left to the builder.
   `embedding.model_path` (or its `NOTE_MODEL_PATH` fallback) is configured, or the deterministic
   stub otherwise. The same file can select a self-hosted OpenAI-compatible BGE-M3 service when
   remote inference is desired.
-- **One core, two front doors.** REST/MCP-over-HTTP and MCP-over-stdio both call the same pipeline functions. No duplicated business logic per transport.
+- **One core, shared interfaces.** REST/MCP-over-HTTP and MCP-over-stdio call the same pipeline
+  functions. Storage-only Org commands call the same Org import/export pipelines before attachment
+  or embedding startup. No interface duplicates business logic.
 
 ## 2. System Topology
 
@@ -36,11 +38,14 @@ implementation details are left to the builder.
                   filesystem or S3-compatible object storage
 ```
 
+The Org offline CLI is a third, storage-only branch into the shared pipelines; it deliberately
+bypasses the embedding and attachment adapters shown below the pipeline boundary.
+
 stdio is the same binary, selected by an entrypoint flag, and calls pipelines directly — never
-proxies through Axum. The composition root resolves configuration once, constructs one shared
-storage backend, embedding backend, and attachment store, and passes them explicitly to whichever
-transport is active. HTTP, stdio, import, and export all load the mandatory configuration file
-before opening an adapter.
+proxies through Axum. The composition root resolves configuration once and passes explicit shared
+contexts to the active transport. HTTP and stdio construct storage, embedding, and attachment
+adapters. Legacy note import/export and Org offline modes also load configuration and storage, but
+dispatch before attachment construction or embedding-secret/worker startup.
 
 ## 3. Storage Contract
 
@@ -385,13 +390,59 @@ Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than 
 
 ## 8. MCP Integration
 
-**Tools**: `save_note_tool { title, content, labels }`,
-`semantic_search_tool { query, limit, label? }`.
-Both call the pipeline contracts in §6 directly — no MCP-specific business logic. Saving through
-MCP uses the same missing-label-key auto-creation behavior; explicit catalog management remains
-REST/UI-only.
+One `NoteMcpServer` registry exposes 47 tools through both transports. The eleven Markdown-note
+tools are `save_note`, `get_note`, `read_note_lines`, `edit_note`, `update_note`, `delete_note`,
+`list_notes`, `semantic_search`, `put_note_attachment`, `get_note_attachment_content`, and
+`delete_note_attachment`. Explicit label-catalog management remains REST/UI-only.
 
-**Transports**: stdio (subprocess, JSON-RPC over stdin/stdout, stderr for logs) and Streamable HTTP (single `/mcp` endpoint, POST+GET, optional SSE upgrade per-response for long calls). Do not implement legacy two-endpoint HTTP+SSE — it's deprecated protocol-side; add only if a specific client requires it, as a documented exception.
+The exact 36 Org tools are:
+
+```text
+org_list_workspaces       org_create_workspace      org_get_workspace
+org_update_workspace      org_archive_workspace     org_list_documents
+org_get_document          org_put_document           org_move_document
+org_move_item             org_import_workspace       org_export_workspace
+org_create_item           org_get_item               org_get_item_context
+org_create_follow_up      org_assign_item            org_schedule_item
+org_query_queue           org_query_agenda           org_claim_item
+org_heartbeat_claim       org_release_claim          org_report_progress
+org_submit_result         org_transition_item        org_retry_item
+org_request_review        org_approve_item            org_reject_item
+org_add_dependency        org_remove_dependency      org_link_note
+org_unlink_note           org_list_note_work_items   org_list_events
+```
+
+Every handler delegates to the corresponding pipeline operation. The composition root constructs
+one Markdown-note `Context` and one `Arc<OrgContext>` over the same storage backend and injects
+those exact contexts into stdio or HTTP. Stdio uses JSON-RPC over process stdin/stdout with logs on
+stderr. Streamable HTTP is stateless JSON POST at the single `/mcp` endpoint; it has no GET/SSE
+transport, MCP sessions, authentication middleware, or legacy two-endpoint HTTP+SSE path.
+
+### 8.1 Org Offline Interfaces
+
+The storage-only command surface is:
+
+```text
+note-server org export-workspace --workspace-id <uuid> --output <directory>
+note-server org import-workspace --input <directory> --mode create|update \
+  --actor-id <id> --operation-id <id>
+note-server org export-document --document-id <uuid> --output <file.org>
+note-server org import-document --workspace-id <uuid> --document-id <uuid> \
+  --path <org-path> --input <file.org> --mode create|update \
+  --actor-id <id> --operation-id <id> [--expected-revision <n>]
+```
+
+Document update requires the expected revision; create rejects that option and an existing ID.
+Workspace update consumes the workspace/document revisions in the exported manifest. The portable
+layout is `manifest.json` plus `documents/<document-uuid>.org`. The manifest carries its format
+version, workspace metadata/policy/revision, and stable document ID, canonical Org path, revision,
+content hash, and relative UUID filename. Import validates path containment, file inventory,
+uniqueness, hashes, format, and UTF-8 before mutation. Export uses sibling temporary output and an
+atomic `NOREPLACE` rename on Linux, Android, and Apple-vendor targets and never silently overwrites
+a non-empty destination. Windows and other targets without that primitive fail export closed with
+an `Unsupported` publish error; imports remain supported. All modes emit structured stdout reports
+and start storage only; they do not touch Markdown notes or construct attachment, embedding,
+worker, HTTP, or MCP runtime state.
 
 ## 9. Org Orchestration Pipeline
 
@@ -421,7 +472,8 @@ than the raw token. Heartbeat, release, progress, result submission, ownership-s
 transitions, review, failure, and completion require the current unexpired token. General
 reads, context, queues, events, errors, and logs never expose a raw token or token hash. Expiry,
 release, reassignment, unassignment, reclaim, and terminal transitions permanently invalidate the
-old token.
+old token. Treat the raw token as a sensitive bearer-like ownership proof: clients must not log it
+or copy it into audit metadata, source documents, exports, or general application state.
 
 Heartbeat changes lease state without changing the Org document revision. Voluntary execution
 release closes the active attempt and returns the item to the configured recovery state; default
@@ -445,11 +497,12 @@ workspace with any active lease and accepts no ownership proof. Raw import may c
 leased item only when it supplies and validates that item's exact current proof. Import reuses the
 same lifecycle decisions and typed events as structured commands rather than bypassing fencing.
 
-Delivery Slice 4 intentionally has no Org MCP tools, REST routes, offline commands, or Web UI. Later
-slices expose the same pipeline results and structured errors without moving policy into transports.
-Agent Note implements no inbound authentication, authorization, proxy identity protocol, or
-workspace ACL. A front proxy owns TLS, authentication, authorization, and access restriction;
-direct exposure of the service to an untrusted network is unsupported.
+Delivery Slice 5 exposes Org only through the 36 MCP tools and four storage-only offline commands.
+It intentionally has no `/api/org` REST/OpenAPI route, Org Web/frontend route, browser control,
+session, or polling behavior. Actor IDs are asserted audit attribution, not authenticated identity.
+Agent Note implements no inbound authentication, authorization, trusted proxy-identity protocol,
+or workspace ACL. A front proxy owns TLS, authentication, authorization, Host/origin validation,
+and network restriction; direct exposure of the service to an untrusted network is unsupported.
 
 ## 10. Open Decisions (resolve during implementation, not before)
 

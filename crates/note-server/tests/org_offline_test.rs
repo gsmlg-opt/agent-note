@@ -1,8 +1,16 @@
+use axum::{
+    body::{to_bytes, Body},
+    http::{header, Request, StatusCode},
+    Router,
+};
+use note_attachments::FilesystemAttachmentStore;
+use note_embedding::StubEmbedder;
 use note_pipelines::org::{
     archive_workspace, claim_item, create_workspace, put_document, ArchiveWorkspaceRequest,
     CommandEnvelope, CreateWorkspaceRequest, FixedOrgClock, OrgClaimKind, OrgContext,
     PutDocumentRequest, StartClaimRequest,
 };
+use note_pipelines::Context;
 use note_server::org_offline::{
     execute_command, parse_command, ImportMode, OrgOfflineCommand, WorkspaceManifest,
 };
@@ -12,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tower::ServiceExt as _;
 
 const NOW: i64 = 1_800_000_000;
 const WORKSPACE_ID: &str = "10000000-0000-4000-8000-000000000001";
@@ -115,6 +124,35 @@ fn copy_snapshot(source: &Path, target: &Path) {
 
 fn hash(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+async fn call_org_mcp(
+    router: &Router,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::HOST, "offline-acceptance.example.test")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments}
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
 }
 
 #[test]
@@ -811,20 +849,6 @@ async fn workspace_update_is_revision_safe_and_all_or_nothing() {
         .ok
     );
 
-    put_document(
-        &context,
-        &envelope("concurrent-first-update"),
-        &PutDocumentRequest {
-            document_id: DOCUMENT_ID.parse().unwrap(),
-            path: "inbox/tasks.org".into(),
-            source: first.replace("Opaque  CRLF", "Concurrent change"),
-            expected_revision: Some(1),
-            lease_proofs: BTreeMap::new(),
-        },
-    )
-    .await
-    .unwrap();
-
     let mut manifest = read_manifest(&snapshot);
     manifest.workspace.description = "Imported metadata".into();
     let second_entry = manifest
@@ -837,6 +861,59 @@ async fn workspace_update_is_revision_safe_and_all_or_nothing() {
     second_entry.content_hash = hash(changed_second.as_bytes());
     write_manifest(&snapshot, &manifest);
 
+    let note_context = Arc::new(Context::new(
+        storage.clone(),
+        Arc::new(StubEmbedder),
+        Arc::new(FilesystemAttachmentStore::new(
+            dir.path().join("attachments"),
+        )),
+    ));
+    let router = note_mcp::mcp_router(note_context, Arc::new(context.clone()));
+    let mcp_update = call_org_mcp(
+        &router,
+        "org_put_document",
+        serde_json::json!({
+            "schema_version": 1,
+            "workspace_id": WORKSPACE_ID,
+            "actor_id": "mcp-agent",
+            "operation_id": "task7-mcp-revision-n-plus-one",
+            "document_id": DOCUMENT_ID,
+            "path": "inbox/tasks.org",
+            "source": first.replace("Opaque  CRLF", "Concurrent change"),
+            "expected_revision": 1,
+            "lease_proofs": {}
+        }),
+    )
+    .await;
+    assert!(mcp_update.get("error").is_none(), "{mcp_update}");
+
+    let workspace_id = WORKSPACE_ID.parse().unwrap();
+    let document_id = DOCUMENT_ID.parse().unwrap();
+    let item_id = ITEM_ID.parse().unwrap();
+    let before_session = storage.session().await.unwrap();
+    let document_before = before_session
+        .get_org_document(document_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let projection_before = before_session
+        .list_org_workspace_projection(workspace_id)
+        .await
+        .unwrap();
+    let leases_before = before_session
+        .list_org_lease_history(item_id)
+        .await
+        .unwrap();
+    let events_before = before_session
+        .list_org_events(workspace_id, None, 200)
+        .await
+        .unwrap();
+    let mcp_operation_before = before_session
+        .get_org_operation(workspace_id, "task7-mcp-revision-n-plus-one")
+        .await
+        .unwrap();
+    drop(before_session);
+
     let stale = execute_command(
         &context,
         OrgOfflineCommand::ImportWorkspace {
@@ -848,6 +925,8 @@ async fn workspace_update_is_revision_safe_and_all_or_nothing() {
     )
     .await;
     assert!(!stale.ok);
+    assert_eq!(stale.error.as_ref().unwrap().code, "stale_revision");
+    assert_eq!(stale.error.as_ref().unwrap().details["current_revision"], 2);
     assert!(stale.documents.iter().all(|document| !document.applied));
     let session = storage.session().await.unwrap();
     assert_eq!(
@@ -868,6 +947,44 @@ async fn workspace_update_is_revision_safe_and_all_or_nothing() {
             .source,
         second
     );
+    assert_eq!(
+        session
+            .get_org_document(document_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        document_before
+    );
+    assert_eq!(
+        session
+            .list_org_workspace_projection(workspace_id)
+            .await
+            .unwrap(),
+        projection_before
+    );
+    assert_eq!(
+        session.list_org_lease_history(item_id).await.unwrap(),
+        leases_before
+    );
+    assert_eq!(
+        session
+            .list_org_events(workspace_id, None, 200)
+            .await
+            .unwrap(),
+        events_before
+    );
+    assert_eq!(
+        session
+            .get_org_operation(workspace_id, "task7-mcp-revision-n-plus-one")
+            .await
+            .unwrap(),
+        mcp_operation_before
+    );
+    assert!(session
+        .get_org_operation(workspace_id, "stale-update")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -1079,6 +1196,73 @@ async fn offline_document_import_keeps_unresolved_note_links_without_note_rows()
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn reopened_turso_offline_exports_preserve_ids_revisions_and_raw_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("offline-reopen.db");
+    let (context, storage) = test_context(&database).await;
+    let (first, second) = seed_workspace(&context).await;
+
+    drop(context);
+    drop(storage);
+
+    let (reopened, _reopened_storage) = test_context(&database).await;
+    let workspace_output = dir.path().join("reopened-workspace");
+    let workspace_report = execute_command(
+        &reopened,
+        OrgOfflineCommand::ExportWorkspace {
+            workspace_id: WORKSPACE_ID.parse().unwrap(),
+            output: workspace_output.clone(),
+        },
+    )
+    .await;
+    assert!(workspace_report.ok, "workspace export failed after reopen");
+    assert_eq!(
+        workspace_report.workspace_id.unwrap().to_string(),
+        WORKSPACE_ID
+    );
+    assert_eq!(workspace_report.document_revisions[DOCUMENT_ID], 1);
+    assert_eq!(workspace_report.document_revisions[SECOND_DOCUMENT_ID], 1);
+
+    let manifest = read_manifest(&workspace_output);
+    assert_eq!(manifest.workspace.id.to_string(), WORKSPACE_ID);
+    assert_eq!(manifest.workspace.revision, 1);
+    let exported = manifest
+        .documents
+        .iter()
+        .map(|document| {
+            (
+                document.id.to_string(),
+                (
+                    document.revision,
+                    std::fs::read(workspace_output.join(&document.file)).unwrap(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(exported[DOCUMENT_ID].0, 1);
+    assert_eq!(exported[DOCUMENT_ID].1, first.as_bytes());
+    assert_eq!(exported[SECOND_DOCUMENT_ID].0, 1);
+    assert_eq!(exported[SECOND_DOCUMENT_ID].1, second.as_bytes());
+
+    let document_output = dir.path().join("reopened-document.org");
+    let document_report = execute_command(
+        &reopened,
+        OrgOfflineCommand::ExportDocument {
+            document_id: DOCUMENT_ID.parse().unwrap(),
+            output: document_output.clone(),
+        },
+    )
+    .await;
+    assert!(document_report.ok, "document export failed after reopen");
+    assert_eq!(
+        document_report.document_id.unwrap().to_string(),
+        DOCUMENT_ID
+    );
+    assert_eq!(document_report.document_revisions[DOCUMENT_ID], 1);
+    assert_eq!(std::fs::read(document_output).unwrap(), first.as_bytes());
 }
 
 #[cfg(unix)]
