@@ -12,17 +12,17 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     org_dto::{
-        ApproveInput, AssignItemInput, ClaimInput, ClaimOutput, CommandOutput, CreateFollowUpInput,
-        CreateItemInput, DependencyInput, DocumentCountData, DocumentOutput, DocumentReadInput,
-        DocumentSourceOutput, EventListInput, EventOutput, HeartbeatClaimInput,
+        AgendaViewInput, ApproveInput, AssignItemInput, ClaimInput, ClaimOutput, CommandOutput,
+        CreateFollowUpInput, CreateItemInput, DependencyInput, DocumentCountData, DocumentOutput,
+        DocumentReadInput, DocumentSourceOutput, EventListInput, EventOutput, HeartbeatClaimInput,
         ImportWorkspaceInput, ItemCommandData, ItemContextOutput, ItemOutput, ItemReadInput,
         LeaseCommandData, ListInput, MoveDocumentData, MoveDocumentInput, MoveItemData,
         MoveItemInput, NoteItemsInput, NoteLinkInput, NoteUnlinkInput, OperationalPageOutput,
-        OperationalQueryInput, PageOutput, ProgressInput, PutDocumentInput, RejectInput,
-        ReleaseClaimInput, RequestReviewInput, RetryInput, ScheduleItemInput, SubmitResultInput,
-        TransitionInput, WorkspaceArchiveData, WorkspaceArchiveInput, WorkspaceCreateInput,
-        WorkspaceExportOutput, WorkspaceListInput, WorkspaceOutput, WorkspaceReadInput,
-        WorkspaceRevisionData, WorkspaceSummaryOutput, WorkspaceUpdateInput,
+        OperationalQueryInput, PageOutput, ProgressInput, PutDocumentInput, QueueViewInput,
+        RejectInput, ReleaseClaimInput, RequestReviewInput, RetryInput, ScheduleItemInput,
+        SubmitResultInput, TransitionInput, WorkspaceArchiveData, WorkspaceArchiveInput,
+        WorkspaceCreateInput, WorkspaceExportOutput, WorkspaceListInput, WorkspaceOutput,
+        WorkspaceReadInput, WorkspaceRevisionData, WorkspaceSummaryOutput, WorkspaceUpdateInput,
     },
     NoteMcpServer,
 };
@@ -226,41 +226,53 @@ pub(crate) fn org_tool_router() -> ToolRouter<NoteMcpServer> {
         "Export an Org workspace",
         export_workspace_handler,
     );
-    add::<CreateItemInput, ItemMutationOutput>(
+    add_handler::<CreateItemInput, ItemMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[12],
         "Create an Org item",
+        create_item_handler,
     );
-    add::<ItemReadInput, ItemOutput>(&mut router, ORG_TOOL_NAMES[13], "Get an Org item");
-    add::<ItemReadInput, ItemContextOutput>(
+    add_handler::<ItemReadInput, ItemOutput, _, _>(
+        &mut router,
+        ORG_TOOL_NAMES[13],
+        "Get an Org item",
+        get_item_handler,
+    );
+    add_handler::<ItemReadInput, ItemContextOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[14],
         "Get an Org item context",
+        get_item_context_handler,
     );
-    add::<CreateFollowUpInput, ItemMutationOutput>(
+    add_handler::<CreateFollowUpInput, ItemMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[15],
         "Create a follow-up item",
+        create_follow_up_handler,
     );
-    add::<AssignItemInput, ItemMutationOutput>(
+    add_handler::<AssignItemInput, ItemMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[16],
         "Assign an Org item",
+        assign_item_handler,
     );
-    add::<ScheduleItemInput, ItemMutationOutput>(
+    add_handler::<ScheduleItemInput, ItemMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[17],
         "Schedule an Org item",
+        schedule_item_handler,
     );
-    add::<OperationalQueryInput, OperationalPageOutput>(
+    add_handler::<OperationalQueryInput<QueueViewInput>, OperationalPageOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[18],
         "Query the Org queue",
+        query_queue_handler,
     );
-    add::<OperationalQueryInput, OperationalPageOutput>(
+    add_handler::<OperationalQueryInput<AgendaViewInput>, OperationalPageOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[19],
         "Query the Org agenda",
+        query_agenda_handler,
     );
     add::<ClaimInput, ClaimOutput>(&mut router, ORG_TOOL_NAMES[20], "Claim an Org item");
     add::<HeartbeatClaimInput, LeaseMutationOutput>(
@@ -450,6 +462,82 @@ async fn export_workspace_handler(
         .try_into()
 }
 
+async fn create_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: CreateItemInput,
+) -> Result<ItemMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::create_item(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn get_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: ItemReadInput,
+) -> Result<ItemOutput, note_pipelines::org::OrgError> {
+    let (workspace_id, item_id) = input.into_pipeline()?;
+    note_pipelines::org::get_item(&context, workspace_id, item_id)
+        .await?
+        .try_into()
+}
+
+async fn get_item_context_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: ItemReadInput,
+) -> Result<ItemContextOutput, note_pipelines::org::OrgError> {
+    let (workspace_id, item_id) = input.into_pipeline()?;
+    note_pipelines::org::get_item_context(&context, workspace_id, item_id)
+        .await?
+        .try_into()
+}
+
+async fn create_follow_up_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: CreateFollowUpInput,
+) -> Result<ItemMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::create_follow_up(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn assign_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: AssignItemInput,
+) -> Result<ItemMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::assign_item(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn schedule_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: ScheduleItemInput,
+) -> Result<ItemMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::schedule_item(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn query_queue_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: OperationalQueryInput<QueueViewInput>,
+) -> Result<OperationalPageOutput, note_pipelines::org::OrgError> {
+    let query = input.into_pipeline()?;
+    note_pipelines::org::query_queue(&context, &query)
+        .await?
+        .try_into()
+}
+
+async fn query_agenda_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: OperationalQueryInput<AgendaViewInput>,
+) -> Result<OperationalPageOutput, note_pipelines::org::OrgError> {
+    let query = input.into_pipeline()?;
+    note_pipelines::org::query_agenda(&context, &query)
+        .await?
+        .try_into()
+}
+
 fn add_handler<I, O, F, Fut>(
     router: &mut ToolRouter<NoteMcpServer>,
     name: &'static str,
@@ -496,9 +584,6 @@ fn add<I: JsonSchema + DeserializeOwned, O: JsonSchema>(
     router.add_route(ToolRoute::new_dyn(
         tool,
         |context: ToolCallContext<'_, NoteMcpServer>| {
-            // The registration skeleton deliberately reaches the single injected Org
-            // context; delivery Task 2 replaces this error with pipeline delegation.
-            let _ = context.service.org_context().clock();
             let arguments = context.arguments.unwrap_or_default();
             if serde_json::from_value::<I>(serde_json::Value::Object(arguments)).is_err() {
                 return Box::pin(async move { Err(invalid_org_tool_input()) });

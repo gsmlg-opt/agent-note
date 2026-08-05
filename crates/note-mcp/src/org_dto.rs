@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use note_pipelines::org::{
     CommandEnvelope, CreateWorkspaceRequest, OrgClaimResult, OrgCommandResult,
     OrgDocumentSourceView, OrgDocumentView, OrgError, OrgEventView, OrgItemContext, OrgItemView,
-    OrgLeaseView, OrgReadPage, OrgReadQuery, OrgTimestampView, OrgWorkspaceExport,
-    OrgWorkspaceView, WorkspaceSummary,
+    OrgLeaseView, OrgOperationalPage, OrgReadPage, OrgReadQuery, OrgTimestampView,
+    OrgWorkspaceExport, OrgWorkspaceView, WorkspaceSummary,
 };
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -115,6 +115,19 @@ pub(crate) struct ItemReadInput {
     pub item_id: String,
 }
 
+impl ItemReadInput {
+    pub(crate) fn into_pipeline<W, I>(self) -> Result<(W, I), OrgError>
+    where
+        W: std::str::FromStr,
+        I: std::str::FromStr,
+    {
+        Ok((
+            parse_id(self.workspace_id, "workspace_id")?,
+            parse_id(self.item_id, "item_id")?,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -131,10 +144,11 @@ pub(crate) struct NoteItemsInput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
-pub(crate) struct OperationalQueryInput {
+pub(crate) struct OperationalQueryInput<V> {
+    #[schemars(length(min = 1))]
     pub workspace_ids: Vec<String>,
-    pub view: String,
-    pub item_type: Option<String>,
+    pub view: V,
+    pub item_type: Option<WorkItemTypeInput>,
     pub state: Option<String>,
     pub priority: Option<char>,
     #[serde(default)]
@@ -154,6 +168,107 @@ pub(crate) struct OperationalQueryInput {
     #[serde(default = "default_limit")]
     #[schemars(default = "default_limit", range(min = 1, max = 200))]
     pub limit: u16,
+}
+
+pub(crate) trait IntoOperationalView {
+    fn into_operational_view(self) -> note_pipelines::org::OperationalView;
+}
+
+impl<V: IntoOperationalView> OperationalQueryInput<V> {
+    pub(crate) fn into_pipeline(self) -> Result<note_pipelines::org::OperationalQuery, OrgError> {
+        let mut workspace_ids = Vec::with_capacity(self.workspace_ids.len());
+        let mut canonical_ids = std::collections::BTreeSet::new();
+        for id in self.workspace_ids {
+            let parsed = parse_id(id, "workspace_id")?;
+            if !canonical_ids.insert(parsed) {
+                return Err(OrgError::invalid_input(
+                    "Org operational workspace IDs must be unique",
+                ));
+            }
+            workspace_ids.push(parsed);
+        }
+        Ok(note_pipelines::org::OperationalQuery {
+            workspace_ids,
+            view: self.view.into_operational_view(),
+            item_type: self
+                .item_type
+                .map(|value| adapt_input(value, "item type"))
+                .transpose()?,
+            state: self.state,
+            priority: self.priority,
+            tags: self.tags,
+            assignee: self.assignee,
+            scheduled_from: self.scheduled_from,
+            scheduled_to: self.scheduled_to,
+            deadline_from: self.deadline_from,
+            deadline_to: self.deadline_to,
+            completed_from: self.completed_from,
+            completed_to: self.completed_to,
+            from: self.from,
+            to: self.to,
+            include_archived: self.include_archived,
+            cursor: self.cursor,
+            limit: Some(usize::from(self.limit)),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueueViewInput {
+    Ready,
+    Assigned,
+    Running,
+    Blocked,
+    Review,
+    Failed,
+    ExpiredLease,
+    Completed,
+}
+
+impl IntoOperationalView for QueueViewInput {
+    fn into_operational_view(self) -> note_pipelines::org::OperationalView {
+        match self {
+            Self::Ready => note_pipelines::org::OperationalView::Ready,
+            Self::Assigned => note_pipelines::org::OperationalView::Assigned,
+            Self::Running => note_pipelines::org::OperationalView::Running,
+            Self::Blocked => note_pipelines::org::OperationalView::Blocked,
+            Self::Review => note_pipelines::org::OperationalView::Review,
+            Self::Failed => note_pipelines::org::OperationalView::Failed,
+            Self::ExpiredLease => note_pipelines::org::OperationalView::ExpiredLease,
+            Self::Completed => note_pipelines::org::OperationalView::Completed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AgendaViewInput {
+    Scheduled,
+    UpcomingDeadline,
+}
+
+impl IntoOperationalView for AgendaViewInput {
+    fn into_operational_view(self) -> note_pipelines::org::OperationalView {
+        match self {
+            Self::Scheduled => note_pipelines::org::OperationalView::Scheduled,
+            Self::UpcomingDeadline => note_pipelines::org::OperationalView::UpcomingDeadline,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkItemTypeInput {
+    Project,
+    Epic,
+    Issue,
+    Task,
+    Subtask,
+    Review,
+    Approval,
+    Incident,
+    Milestone,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -466,7 +581,7 @@ pub(crate) struct CreateItemInput {
     pub document_id: String,
     pub parent_id: Option<String>,
     pub item_id: String,
-    pub item_type: String,
+    pub item_type: WorkItemTypeInput,
     pub title: String,
     pub initial_state: Option<String>,
     pub priority: Option<char>,
@@ -476,12 +591,27 @@ pub(crate) struct CreateItemInput {
     pub expected_revisions: BTreeMap<String, i64>,
 }
 
+impl CreateItemInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::CreateItemRequest), OrgError> {
+        let request = create_item_request(self.clone().into())?;
+        let envelope = mutation_envelope(
+            self.schema_version,
+            self.workspace_id,
+            self.actor_id,
+            self.operation_id,
+        )?;
+        Ok((envelope, request))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
 #[schemars(deny_unknown_fields)]
-pub(crate) struct FollowUpOriginInput {
-    pub kind: String,
-    pub id: String,
+pub(crate) enum FollowUpOriginInput {
+    WorkItem { id: String },
+    Event { id: String },
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -503,7 +633,7 @@ pub(crate) struct CreateItemPayload {
     pub document_id: String,
     pub parent_id: Option<String>,
     pub item_id: String,
-    pub item_type: String,
+    pub item_type: WorkItemTypeInput,
     pub title: String,
     pub initial_state: Option<String>,
     pub priority: Option<char>,
@@ -511,6 +641,75 @@ pub(crate) struct CreateItemPayload {
     pub assignee: Option<String>,
     pub requires_review: bool,
     pub expected_revisions: BTreeMap<String, i64>,
+}
+
+impl From<CreateItemInput> for CreateItemPayload {
+    fn from(value: CreateItemInput) -> Self {
+        Self {
+            document_id: value.document_id,
+            parent_id: value.parent_id,
+            item_id: value.item_id,
+            item_type: value.item_type,
+            title: value.title,
+            initial_state: value.initial_state,
+            priority: value.priority,
+            tags: value.tags,
+            assignee: value.assignee,
+            requires_review: value.requires_review,
+            expected_revisions: value.expected_revisions,
+        }
+    }
+}
+
+fn create_item_request(
+    value: CreateItemPayload,
+) -> Result<note_pipelines::org::CreateItemRequest, OrgError> {
+    Ok(note_pipelines::org::CreateItemRequest {
+        document_id: parse_id(value.document_id, "document_id")?,
+        parent_id: value
+            .parent_id
+            .map(|id| parse_id(id, "parent_id"))
+            .transpose()?,
+        item_id: parse_id(value.item_id, "item_id")?,
+        item_type: adapt_input(value.item_type, "item type")?,
+        title: value.title,
+        initial_state: value.initial_state,
+        priority: value.priority,
+        tags: value.tags.into_iter().collect(),
+        assignee: value.assignee,
+        requires_review: value.requires_review,
+        expected_revisions: adapt_id_map(
+            value.expected_revisions,
+            "document_id",
+            "document revision",
+        )?,
+    })
+}
+
+impl CreateFollowUpInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::CreateFollowUpRequest), OrgError> {
+        let envelope = mutation_envelope(
+            self.schema_version,
+            self.workspace_id,
+            self.actor_id,
+            self.operation_id,
+        )?;
+        let origin = match self.origin {
+            FollowUpOriginInput::WorkItem { id } => {
+                note_pipelines::org::FollowUpOrigin::WorkItem(parse_id(id, "origin.id")?)
+            }
+            FollowUpOriginInput::Event { id } => note_pipelines::org::FollowUpOrigin::Event(id),
+        };
+        Ok((
+            envelope,
+            note_pipelines::org::CreateFollowUpRequest {
+                item: create_item_request(self.item)?,
+                origin,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -573,6 +772,35 @@ pub(crate) struct AssignItemInput {
     pub lease: Option<LeaseProofInput>,
 }
 
+impl AssignItemInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::AssignItemRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::AssignItemRequest {
+                item_id: parse_id(self.item_id, "item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                assignee: self.assignee,
+                expected_revisions: adapt_id_map(
+                    self.expected_revisions,
+                    "document_id",
+                    "document revision",
+                )?,
+                lease: self
+                    .lease
+                    .map(|lease| adapt_input(lease, "lease proof"))
+                    .transpose()?,
+            },
+        ))
+    }
+}
+
 #[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -589,12 +817,58 @@ pub(crate) struct ScheduleItemInput {
     pub lease: Option<LeaseProofInput>,
 }
 
+impl ScheduleItemInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::ScheduleItemRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::ScheduleItemRequest {
+                item_id: parse_id(self.item_id, "item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                scheduled: self.scheduled.into(),
+                deadline: self.deadline.into(),
+                expected_revisions: adapt_id_map(
+                    self.expected_revisions,
+                    "document_id",
+                    "document revision",
+                )?,
+                lease: self
+                    .lease
+                    .map(|lease| adapt_input(lease, "lease proof"))
+                    .transpose()?,
+            },
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", tag = "action", content = "value")]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "snake_case",
+    tag = "action",
+    content = "value"
+)]
+#[schemars(deny_unknown_fields)]
 pub(crate) enum FieldPatchInput {
     Unchanged,
     Set(String),
     Clear,
+}
+
+impl From<FieldPatchInput> for note_pipelines::org::OrgFieldPatch<String> {
+    fn from(value: FieldPatchInput) -> Self {
+        match value {
+            FieldPatchInput::Unchanged => Self::Unchanged,
+            FieldPatchInput::Set(value) => Self::Set(value),
+            FieldPatchInput::Clear => Self::Clear,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1009,7 +1283,7 @@ pub(crate) struct EventOutput {
     pub resulting_state: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(transparent)]
 pub(crate) struct SafeJsonOutput(serde_json::Value);
 
@@ -1233,13 +1507,105 @@ pub(crate) struct MoveItemOperationData {
     pub resulting_parent_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub(crate) struct ItemCommandData {
-    pub item_id: Option<String>,
-    pub source_document_id: Option<String>,
-    pub target_document_id: Option<String>,
-    pub context: Option<ItemContextOutput>,
+    pub affected_document_count: usize,
+    pub resulting_items: Vec<ResultingItemData>,
+    pub operation: ItemOperationData,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub(crate) enum ItemOperationData {
+    Create(CreateItemOperationData),
+    Assignment(AssignmentOperationData),
+    Schedule(ScheduleOperationData),
+    Deadline(DeadlineOperationData),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct CreateItemOperationData {
+    pub schema_version: u32,
+    pub document_id: String,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub parent_id: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub origin: Option<FollowUpOperationOrigin>,
+    pub initial_state: String,
+    pub item_type: String,
+    pub title: String,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub priority: Option<char>,
+    pub tags: Vec<String>,
+    pub requires_review: bool,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub initial_assignee: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+#[schemars(deny_unknown_fields)]
+pub(crate) enum FollowUpOperationOrigin {
+    WorkItem {
+        schema_version: u32,
+        work_item_id: String,
+    },
+    Event {
+        schema_version: u32,
+        event_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct AssignmentOperationData {
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub previous_assignee: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub resulting_assignee: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct ScheduleOperationData {
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub previous_scheduled: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub resulting_scheduled: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct DeadlineOperationData {
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub previous_deadline: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required)]
+    pub resulting_deadline: Option<String>,
+}
+
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
@@ -1424,6 +1790,36 @@ impl TryFrom<OrgItemView> for ItemOutput {
             requires_review: value.requires_review,
             created_at: value.created_at,
             tags: value.tags,
+        })
+    }
+}
+
+impl TryFrom<OrgOperationalPage> for OperationalPageOutput {
+    type Error = OrgError;
+
+    fn try_from(value: OrgOperationalPage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            items: value
+                .items
+                .into_iter()
+                .map(|summary| {
+                    Ok(OperationalItemOutput {
+                        item: summary.item.try_into()?,
+                        attempt_count: summary.attempt_count,
+                        current_attempt_status: summary.current_attempt_status,
+                        retry_exhausted: summary.retry_exhausted,
+                        ready_status: summary.ready_status.map(wire_name).transpose()?,
+                        review_lease_status: summary
+                            .review_lease_status
+                            .map(wire_name)
+                            .transpose()?,
+                        lease: summary.lease.map(Into::into),
+                        completion_at: summary.completion_at,
+                    })
+                })
+                .collect::<Result<Vec<_>, OrgError>>()?,
+            next_cursor: value.next_cursor,
+            evaluated_at: value.evaluated_at,
         })
     }
 }
@@ -1619,22 +2015,34 @@ fn redact_sensitive_metadata(value: &mut serde_json::Value) {
 }
 
 fn is_sensitive_metadata_key(key: &str) -> bool {
-    let key = key
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    [
-        "fencingtoken",
-        "secret",
-        "authentication",
-        "authorization",
-        "password",
-        "apikey",
-        "accesstoken",
-    ]
-    .iter()
-    .any(|forbidden| key.contains(forbidden))
+    let mut normalized = String::new();
+    let mut previous_was_lower_or_digit = false;
+    for character in key.chars() {
+        if character.is_ascii_alphanumeric() {
+            if character.is_ascii_uppercase() && previous_was_lower_or_digit {
+                normalized.push('_');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            previous_was_lower_or_digit =
+                character.is_ascii_lowercase() || character.is_ascii_digit();
+        } else if !normalized.ends_with('_') && !normalized.is_empty() {
+            normalized.push('_');
+            previous_was_lower_or_digit = false;
+        }
+    }
+    let normalized = normalized.trim_matches('_');
+    let contains_sensitive_word = normalized.split('_').any(|word| {
+        matches!(
+            word,
+            "token" | "hash" | "secret" | "password" | "authentication" | "authorization"
+        )
+    });
+    let compact = normalized.replace('_', "");
+    contains_sensitive_word
+        || matches!(compact.as_str(), "apikey" | "accesstoken")
+        || ["token", "hash", "secret", "password"]
+            .iter()
+            .any(|suffix| compact.ends_with(suffix))
 }
 
 fn mutation_envelope(
@@ -1757,6 +2165,79 @@ mod tests {
         assert_eq!(round_trip["authentication-secret"], "[REDACTED]");
         assert_eq!(round_trip["apiKey"], "[REDACTED]");
         assert_eq!(round_trip["accessToken"], "[REDACTED]");
+    }
+
+    #[test]
+    fn sensitive_metadata_matching_redacts_exact_or_suffix_tokens_without_false_positives() {
+        let source = json!({
+            "token": "one",
+            "token_hash": "two",
+            "lease_token": "three",
+            "lease_hash": "four",
+            "fencingToken": "five",
+            "fencing_token_digest": "six",
+            "token_digest": "seven",
+            "hash_value": "eight",
+            "fencingtoken": "nine",
+            "secretary": "kept",
+            "passwordless": "also-kept"
+        });
+        let output = serde_json::to_value(SafeJsonOutput::from(source)).unwrap();
+        for key in [
+            "token",
+            "token_hash",
+            "lease_token",
+            "lease_hash",
+            "fencingToken",
+            "fencing_token_digest",
+            "token_digest",
+            "hash_value",
+            "fencingtoken",
+        ] {
+            assert_eq!(output[key], "[REDACTED]");
+        }
+        assert_eq!(output["secretary"], "kept");
+        assert_eq!(output["passwordless"], "also-kept");
+    }
+
+    #[test]
+    fn field_patch_contract_rejects_unknown_fields_and_advertises_closed_variants() {
+        assert!(serde_json::from_value::<FieldPatchInput>(json!({
+            "action": "set",
+            "value": "<2027-01-15 Fri>",
+            "unexpected": true
+        }))
+        .is_err());
+        let schema = serde_json::to_value(schemars::schema_for!(FieldPatchInput)).unwrap();
+        assert!(schema
+            .to_string()
+            .contains("\"additionalProperties\":false"));
+    }
+
+    #[test]
+    fn item_operation_contract_rejects_missing_null_extra_and_wrong_shapes() {
+        let valid = json!({
+            "previous_assignee": "agent-one",
+            "resulting_assignee": "agent-two"
+        });
+        assert!(serde_json::from_value::<ItemOperationData>(valid.clone()).is_ok());
+
+        let mut extra = valid.clone();
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), json!(true));
+        assert!(serde_json::from_value::<ItemOperationData>(extra).is_err());
+        assert!(serde_json::from_value::<ItemOperationData>(json!({
+            "previous_assignee": "agent-one"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ItemOperationData>(serde_json::Value::Null).is_err());
+        assert!(serde_json::from_value::<ItemOperationData>(json!({
+            "previous_assignee": 42,
+            "resulting_assignee": "agent-two"
+        }))
+        .is_err());
     }
 
     #[test]
