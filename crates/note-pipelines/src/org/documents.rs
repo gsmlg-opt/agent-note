@@ -243,6 +243,14 @@ async fn import_workspace_snapshot_with_mode(
             "Snapshot create revision exceeds the supported restoration limit",
         ));
     }
+    validate_import_public_payload(
+        &request.lease_proofs,
+        &json!({
+            "workspace": &request.workspace,
+            "documents": &request.documents,
+            "document_revisions": &request.document_revisions,
+        }),
+    )?;
     let mode = request.mode;
     let command_kind = match import_mode {
         DocumentImportMode::Online => IMPORT_WORKSPACE_SNAPSHOT,
@@ -310,11 +318,10 @@ async fn execute_import(
     import_mode: DocumentImportMode,
 ) -> Result<OrgCommandResult, OrgError> {
     validate_import_shape(&request)?;
-    let public_payload = json!({"documents": request.documents});
-    for proof in request.lease_proofs.values() {
-        validate_lease_input(&proof.lease_id, &proof.fencing_token)?;
-        validate_public_payload(&proof.fencing_token, &public_payload)?;
-    }
+    validate_import_public_payload(
+        &request.lease_proofs,
+        &json!({"documents": &request.documents}),
+    )?;
     let fingerprint_request = import_fingerprint(&request);
     let command_envelope = envelope.clone();
     let workflow_context = context.clone();
@@ -348,6 +355,17 @@ async fn execute_import(
         },
     )
     .await
+}
+
+fn validate_import_public_payload(
+    lease_proofs: &BTreeMap<note_org::WorkItemId, LeaseProofInput>,
+    public_payload: &serde_json::Value,
+) -> Result<(), OrgError> {
+    for proof in lease_proofs.values() {
+        validate_lease_input(&proof.lease_id, &proof.fencing_token)?;
+        validate_public_payload(&proof.fencing_token, public_payload)?;
+    }
+    Ok(())
 }
 
 async fn apply_workspace_snapshot(

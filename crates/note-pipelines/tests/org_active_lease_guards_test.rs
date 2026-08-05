@@ -3,16 +3,18 @@ mod support;
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId};
 use note_pipelines::org::{
     add_dependency, approve_item, archive_workspace, assign_item, claim_item, create_item,
-    get_item_context, heartbeat_claim, import_documents, link_note, list_event_history,
-    move_document, move_item, put_document, reject_item, release_claim, reparent_item,
-    report_progress, retry_item, schedule_item, submit_result, transition_item, update_workspace,
-    ApproveItemRequest, ArchiveWorkspaceRequest, AssignItemRequest, CommandEnvelope,
-    CreateItemRequest, DependencyRequest, DocumentImport, FixedOrgClock, HeartbeatClaimRequest,
-    ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest, MoveItemRequest, NoteLinkRequest,
-    OrgClaimKind, OrgErrorCode, OrgEventQuery, OrgFieldPatch, OrgWorkflowPhase, PutDocumentRequest,
-    RejectItemRequest, ReleaseClaimRequest, ReparentItemRequest, ReportProgressRequest,
-    RetryItemRequest, ScheduleItemRequest, StartClaimRequest, SubmitResultRequest,
-    TransitionItemRequest, UpdateWorkspaceRequest,
+    get_item_context, heartbeat_claim, import_documents, import_offline_workspace_snapshot,
+    import_workspace_snapshot, link_note, list_event_history, move_document, move_item,
+    put_document, reject_item, release_claim, reparent_item, report_progress, retry_item,
+    schedule_item, submit_result, transition_item, update_workspace, ApproveItemRequest,
+    ArchiveWorkspaceRequest, AssignItemRequest, CommandEnvelope, CreateItemRequest,
+    DependencyRequest, DocumentImport, FixedOrgClock, HeartbeatClaimRequest,
+    ImportDocumentsRequest, ImportWorkspaceSnapshotRequest, LeaseProofInput, MoveDocumentRequest,
+    MoveItemRequest, NoteLinkRequest, OrgClaimKind, OrgErrorCode, OrgEventQuery, OrgFieldPatch,
+    OrgWorkflowPhase, PutDocumentRequest, RejectItemRequest, ReleaseClaimRequest,
+    ReparentItemRequest, ReportProgressRequest, RetryItemRequest, ScheduleItemRequest,
+    StartClaimRequest, SubmitResultRequest, TransitionItemRequest, UpdateWorkspaceRequest,
+    WorkspaceImportMode, WorkspaceSnapshotMetadata,
 };
 use note_storage::{
     NewNote, OrgAttempt, OrgAttemptStatus, OrgDocument, OrgEvent, OrgLeaseEndReason,
@@ -1755,6 +1757,120 @@ async fn raw_put_and_import_reject_fencing_material_before_fingerprint_or_writes
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn workspace_snapshot_rejects_fencing_material_before_fingerprint_or_writes() {
+    let (context, backend, _dir, workspace_id, claim) = claimed_item().await;
+    let before = public_payload_snapshot(&backend, workspace_id).await;
+    let workspace_before = backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_workspace(workspace_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let proof = LeaseProofInput {
+        lease_id: claim.lease_id,
+        kind: OrgClaimKind::Execution,
+        fencing_token: claim.fencing_token.clone(),
+    };
+    let base = ImportWorkspaceSnapshotRequest {
+        mode: WorkspaceImportMode::Update,
+        workspace: WorkspaceSnapshotMetadata {
+            slug: workspace_before.slug.clone(),
+            display_name: workspace_before.display_name.clone(),
+            description: workspace_before.description.clone(),
+            timezone: workspace_before.timezone.clone(),
+            policy_schema_version: workspace_before.policy_schema_version,
+            policy: workspace_before.policy.clone(),
+            revision: workspace_before.revision,
+            archived_at: workspace_before.archived_at,
+        },
+        documents: vec![DocumentImport {
+            document_id: before.document.id,
+            path: before.document.path.clone(),
+            source: before.document.source.clone(),
+        }],
+        document_revisions: BTreeMap::from([(before.document.id, before.document.revision)]),
+        lease_proofs: BTreeMap::from([(item_id(), proof)]),
+    };
+
+    let digest = format!("{:x}", Sha256::digest(claim.fencing_token.as_bytes()));
+    for (payload_case, request) in [
+        {
+            let mut request = base.clone();
+            request.workspace.description = claim.fencing_token.clone();
+            ("workspace-token", request)
+        },
+        {
+            let mut request = base.clone();
+            request.documents[0]
+                .source
+                .push_str(&format!("\r\nOpaque digest {digest}.\r\n"));
+            ("document-digest", request)
+        },
+    ] {
+        for mode in [WorkspaceImportMode::Create, WorkspaceImportMode::Update] {
+            for offline in [false, true] {
+                let mut request = request.clone();
+                request.mode = mode;
+                let mode_name = match mode {
+                    WorkspaceImportMode::Create => "create",
+                    WorkspaceImportMode::Update => "update",
+                };
+                let transport_name = if offline { "offline" } else { "online" };
+                let operation_id =
+                    format!("reject-snapshot-{payload_case}-{mode_name}-{transport_name}");
+                let error = if offline {
+                    import_offline_workspace_snapshot(
+                        &context,
+                        &envelope(workspace_id, "agent", &operation_id),
+                        &request,
+                    )
+                    .await
+                } else {
+                    import_workspace_snapshot(
+                        &context,
+                        &envelope(workspace_id, "agent", &operation_id),
+                        &request,
+                    )
+                    .await
+                }
+                .unwrap_err();
+                assert_eq!(error.code, OrgErrorCode::InvalidInput);
+                assert_eq!(
+                    error.message,
+                    "Org workflow public payload contains reserved fencing material"
+                );
+                assert_eq!(error.details, serde_json::json!({}));
+                assert_eq!(
+                    public_payload_snapshot(&backend, workspace_id).await,
+                    before
+                );
+                assert_eq!(
+                    backend
+                        .session()
+                        .await
+                        .unwrap()
+                        .get_org_workspace(workspace_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    workspace_before
+                );
+                assert!(backend
+                    .session()
+                    .await
+                    .unwrap()
+                    .get_org_operation(workspace_id, &operation_id)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+        }
+    }
 }
 
 #[tokio::test]
