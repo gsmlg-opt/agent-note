@@ -3,7 +3,7 @@ use yew_router::prelude::*;
 
 use crate::pages::{
     DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage,
-    OrgWorkspacesPage, SystemPage, TrashPage,
+    OrgWorkspacePage, OrgWorkspacesPage, SystemPage, TrashPage,
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -32,6 +32,11 @@ pub enum Route {
     Org,
     #[at("/org/:workspace_id")]
     OrgWorkspace { workspace_id: String },
+    #[at("/org/:workspace_id/items/:item_id")]
+    OrgItem {
+        workspace_id: String,
+        item_id: String,
+    },
     #[at("/new")]
     NewNote,
     #[at("/notes/:id/show")]
@@ -55,8 +60,14 @@ pub fn switch(route: Route) -> Html {
         Route::Notes => html! { <NotesPage /> },
         Route::Org => html! { <OrgWorkspacesPage /> },
         Route::OrgWorkspace { workspace_id } => {
-            html! { <p>{ format!("Org workspace {workspace_id}") }</p> }
+            html! { <OrgWorkspacePage {workspace_id} /> }
         }
+        Route::OrgItem {
+            workspace_id,
+            item_id,
+        } => html! {
+            <p>{ format!("Org item {item_id} in workspace {workspace_id}") }</p>
+        },
         Route::NewNote => html! { <NewNotePage /> },
         Route::NoteShow { id } => html! { <NoteShowPage {id} /> },
         Route::NoteEdit { id } => html! { <NoteEditPage {id} /> },
@@ -76,6 +87,23 @@ mod tests {
     fn recognizes_org_directory_as_a_first_class_route() {
         assert_eq!(Route::recognize("/org"), Some(Route::Org));
         assert_eq!(Route::Org.to_path(), "/org");
+    }
+
+    #[test]
+    fn recognizes_workspace_and_item_context_routes() {
+        assert_eq!(
+            Route::recognize("/org/workspace-a"),
+            Some(Route::OrgWorkspace {
+                workspace_id: "workspace-a".into()
+            })
+        );
+        assert_eq!(
+            Route::recognize("/org/workspace-a/items/item-1"),
+            Some(Route::OrgItem {
+                workspace_id: "workspace-a".into(),
+                item_id: "item-1".into(),
+            })
+        );
     }
 
     #[test]
