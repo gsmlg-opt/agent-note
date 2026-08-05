@@ -238,7 +238,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+#[cfg(test)]
 fn ensure_data_directories(config: &RuntimeConfig) -> anyhow::Result<()> {
+    ensure_database_directory(config)?;
+    ensure_attachment_directory(config)
+}
+
+fn ensure_database_directory(config: &RuntimeConfig) -> anyhow::Result<()> {
     if let DatabaseConfig::Embed { path } = &config.database {
         if let Some(parent) = path
             .parent()
@@ -247,6 +253,10 @@ fn ensure_data_directories(config: &RuntimeConfig) -> anyhow::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
+    Ok(())
+}
+
+fn ensure_attachment_directory(config: &RuntimeConfig) -> anyhow::Result<()> {
     if let AttachmentConfig::Filesystem { path } = &config.attachments {
         std::fs::create_dir_all(path)?;
     }
@@ -442,9 +452,62 @@ async fn run_trash_retention(ctx: Arc<Context>, mut shutdown: watch::Receiver<bo
     }
 }
 
+fn finish_org_offline(report: note_server::org_offline::OfflineReport) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string(&report)?);
+    if !report.ok {
+        anyhow::bail!("Org offline command failed");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) == Some("org") {
+        let command_name = note_server::org_offline::command_name(&args);
+        let command = match note_server::org_offline::parse_command(&args) {
+            Ok(Some(command)) => command,
+            Ok(None) | Err(_) => {
+                return finish_org_offline(note_server::org_offline::startup_failure_report(
+                    command_name,
+                    "invalid_input",
+                    "Org offline command arguments are invalid",
+                ));
+            }
+        };
+        let config = match note_server::config::load_runtime_config() {
+            Ok(config) => config,
+            Err(_) => {
+                return finish_org_offline(note_server::org_offline::startup_failure_report(
+                    command_name,
+                    "invalid_input",
+                    "Org offline configuration is invalid",
+                ));
+            }
+        };
+        if ensure_database_directory(&config).is_err() {
+            return finish_org_offline(note_server::org_offline::startup_failure_report(
+                command_name,
+                "storage_failure",
+                "Org offline storage is unavailable",
+            ));
+        }
+        let storage = match build_storage(&config.database).await {
+            Ok(storage) => storage,
+            Err(_) => {
+                return finish_org_offline(note_server::org_offline::startup_failure_report(
+                    command_name,
+                    "storage_failure",
+                    "Org offline storage is unavailable",
+                ));
+            }
+        };
+        let context = OrgContext::new(storage, Arc::new(SystemOrgClock));
+        return finish_org_offline(
+            note_server::org_offline::execute_command(&context, command).await,
+        );
+    }
+
     if arg_value(&args, "--internal-role").as_deref() == Some("embedding-worker") {
         let ipc_name = arg_value(&args, "--ipc-name")
             .ok_or_else(|| anyhow::anyhow!("missing --ipc-name for embedding worker"))?;
@@ -453,8 +516,10 @@ async fn main() -> anyhow::Result<()> {
 
     let stdio_mode = args.iter().any(|a| a == "--stdio");
     let config = note_server::config::load_runtime_config()?;
-    ensure_data_directories(&config)?;
+    ensure_database_directory(&config)?;
     let storage = build_storage(&config.database).await?;
+
+    ensure_attachment_directory(&config)?;
     let attachments = build_attachment_store(&config.attachments).await?;
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
