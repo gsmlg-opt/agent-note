@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{FromRef, Path, Query, State},
     response::{Html, Response},
     routing::get as route_get,
     Json,
@@ -967,7 +967,11 @@ fn rewrite_relative_attachment_urls(html: &str, base: &str) -> String {
         .replace("src=\"./", &format!("src=\"{base}/"))
 }
 
-pub fn notes_router() -> OpenApiRouter<Arc<Context>> {
+pub fn notes_router<S>() -> OpenApiRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+    Arc<Context>: FromRef<S>,
+{
     #[derive(OpenApi)]
     #[openapi(paths(get_attachment_handler))]
     struct AttachmentOpenApi;
@@ -1073,7 +1077,7 @@ mod tests {
     }
 
     fn note_openapi_document() -> Value {
-        let (_, openapi) = notes_router().split_for_parts();
+        let (_, openapi) = notes_router::<Arc<Context>>().split_for_parts();
         serde_json::to_value(openapi).unwrap()
     }
 
@@ -1358,7 +1362,9 @@ mod tests {
             )),
         ));
         (
-            notes_router().with_state(ctx.clone()).into(),
+            notes_router::<Arc<Context>>()
+                .with_state(ctx.clone())
+                .into(),
             ctx,
             storage,
             dir,
@@ -1981,7 +1987,7 @@ mod tests {
             Arc::new(StubEmbedder),
             attachments.clone(),
         ));
-        let app: Router = notes_router().with_state(ctx).into();
+        let app: Router = notes_router::<Arc<Context>>().with_state(ctx).into();
         let id = save_note_id(
             app.clone(),
             r#"{"title":"Proof","content":"See [proof](./proof.txt)","attachments":[{"id":"proof","path":"./proof.txt","mime":"text/plain","description":"proof","content":"evidence"}],"labels":[]}"#,

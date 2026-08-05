@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{FromRef, Path, State},
     Json,
 };
 use note_core::LabelKey;
@@ -187,7 +187,11 @@ fn label_value_type_with_text_default_schema() -> utoipa::openapi::schema::Objec
         .build()
 }
 
-pub fn labels_router() -> OpenApiRouter<Arc<Context>> {
+pub fn labels_router<S>() -> OpenApiRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+    Arc<Context>: FromRef<S>,
+{
     // GET has no body (unlike /api/notes/search), so a browser GET is safe here.
     OpenApiRouter::new()
         .routes(routes!(define_label_key_handler, list_label_keys_handler))
@@ -209,7 +213,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn label_openapi_document() -> Value {
-        let (_, openapi) = labels_router().split_for_parts();
+        let (_, openapi) = labels_router::<Arc<Context>>().split_for_parts();
         serde_json::to_value(openapi).unwrap()
     }
 
@@ -317,7 +321,7 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        (labels_router().with_state(ctx).into(), dir)
+        (labels_router::<Arc<Context>>().with_state(ctx).into(), dir)
     }
 
     fn post(uri: &str, body: &str) -> Request<Body> {

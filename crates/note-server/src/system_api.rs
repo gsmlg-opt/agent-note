@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::State,
+    extract::{FromRef, State},
     http::{header, StatusCode},
     response::Response,
     Json,
@@ -115,7 +115,11 @@ async fn get_backup_handler(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
-pub fn system_router() -> OpenApiRouter<Arc<Context>> {
+pub fn system_router<S>() -> OpenApiRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+    Arc<Context>: FromRef<S>,
+{
     OpenApiRouter::new()
         .routes(routes!(get_config_handler, update_config_handler))
         .routes(routes!(get_info_handler))
@@ -143,7 +147,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn system_openapi_document() -> serde_json::Value {
-        let (_, openapi) = system_router().split_for_parts();
+        let (_, openapi) = system_router::<Arc<Context>>().split_for_parts();
         serde_json::to_value(openapi).unwrap()
     }
 
@@ -264,7 +268,13 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        (system_router().with_state(ctx.clone()).into(), ctx, dir)
+        (
+            system_router::<Arc<Context>>()
+                .with_state(ctx.clone())
+                .into(),
+            ctx,
+            dir,
+        )
     }
 
     fn request(method: &str, uri: &str, body: &str) -> Request<Body> {
@@ -370,7 +380,7 @@ mod tests {
             .unwrap(),
         );
         let ctx = Arc::new(Context::new(storage, Arc::new(StubEmbedder), attachments));
-        let app: Router = system_router().with_state(ctx).into();
+        let app: Router = system_router::<Arc<Context>>().with_state(ctx).into();
         let response = app
             .oneshot(request("GET", "/api/system/info", ""))
             .await
@@ -415,7 +425,7 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        let app: Router = system_router().with_state(ctx).into();
+        let app: Router = system_router::<Arc<Context>>().with_state(ctx).into();
 
         let response = app
             .oneshot(request("GET", "/api/system/info", ""))

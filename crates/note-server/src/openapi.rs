@@ -1,6 +1,4 @@
 use axum::Router;
-use note_pipelines::Context;
-use std::sync::Arc;
 use utoipa::{
     openapi::{
         schema::{Array, ArrayBuilder, Object, ObjectBuilder, Schema, Type},
@@ -108,7 +106,7 @@ pub(crate) fn note_content_type_schema() -> Object {
         .build()
 }
 
-pub fn rest_router() -> (Router<Arc<Context>>, OpenApi) {
+pub fn rest_router() -> (Router<crate::AppState>, OpenApi) {
     let openapi = OpenApiBuilder::new()
         .info(Info::new("Agent Note HTTP API", env!("CARGO_PKG_VERSION")))
         .tags(Some([
@@ -121,13 +119,18 @@ pub fn rest_router() -> (Router<Arc<Context>>, OpenApi) {
             tag("rendering", "Render Markdown as HTML"),
             tag("labels", "Manage the label-key catalog"),
             tag("system", "Read and update system configuration and backups"),
+            tag(
+                "org",
+                "Manage Org workspaces, documents, work items, and workflows",
+            ),
         ]))
         .build();
 
     OpenApiRouter::with_openapi(openapi)
-        .merge(crate::notes_api::notes_router())
-        .merge(crate::labels_api::labels_router())
-        .merge(crate::system_api::system_router())
+        .merge(crate::notes_api::notes_router::<crate::AppState>())
+        .merge(crate::labels_api::labels_router::<crate::AppState>())
+        .merge(crate::system_api::system_router::<crate::AppState>())
+        .merge(crate::org_api::router())
         .split_for_parts()
 }
 

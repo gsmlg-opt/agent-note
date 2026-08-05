@@ -1,9 +1,3 @@
-mod labels_api;
-mod notes_api;
-mod openapi;
-mod render;
-mod system_api;
-
 use axum::extract::DefaultBodyLimit;
 use axum::response::IntoResponse;
 use axum::Router;
@@ -19,6 +13,7 @@ use note_pipelines::{
     Context, EmbeddingJobNotifier, FingerprintReconciliation, ProcessEmbeddingJobStatus,
 };
 use note_server::config::{AttachmentConfig, DatabaseConfig, EmbeddingConfig, RuntimeConfig};
+use note_server::{openapi as rest_openapi, AppState};
 use note_storage::StorageBackend;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -318,7 +313,7 @@ fn compose_transport_router(
     max_request_bytes: usize,
 ) -> Router {
     rest.merge(mcp)
-        .merge(openapi::swagger_router(openapi))
+        .merge(rest_openapi::swagger_router(openapi))
         .layer(DefaultBodyLimit::max(max_request_bytes))
 }
 
@@ -601,10 +596,15 @@ async fn main() -> anyhow::Result<()> {
             scheduler_shutdown_rx,
         ));
 
-        let (rest, openapi) = openapi::rest_router();
-        let rest = rest.with_state(ctx.clone());
-        let max_request_bytes = env_u64("NOTE_MAX_REQUEST_BYTES", 512 * 1024 * 1024);
         let mcp_contexts = compose_mcp_contexts(ctx.clone(), &org_runtime);
+        let app_state = AppState::new(ctx.clone(), mcp_contexts.org.clone());
+        assert!(
+            Arc::ptr_eq(&app_state.org, &mcp_contexts.org),
+            "REST and MCP must share the same Org context"
+        );
+        let (rest, openapi) = rest_openapi::rest_router();
+        let rest = rest.with_state(app_state);
+        let max_request_bytes = env_u64("NOTE_MAX_REQUEST_BYTES", 512 * 1024 * 1024);
         let mut app = compose_transport_router(
             rest,
             note_mcp::mcp_router(mcp_contexts.note, mcp_contexts.org),
@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn generated_rest_openapi_is_complete_and_excludes_mcp() {
-        let (_, document) = openapi::rest_router();
+        let (_, document) = rest_openapi::rest_router();
         let document = serde_json::to_value(document).unwrap();
         let paths = document["paths"].as_object().expect("OpenAPI paths");
         let operation_methods = [
@@ -770,8 +770,8 @@ mod tests {
             })
             .sum::<usize>();
 
-        assert_eq!(paths.len(), 17);
-        assert_eq!(operation_count, 23);
+        assert_eq!(paths.len(), 49);
+        assert_eq!(operation_count, 59);
         assert!(!paths.keys().any(|path| path.starts_with("/mcp")));
         assert!(document["tags"]
             .as_array()
