@@ -10,6 +10,169 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
 
+pub async fn get_workspace(
+    context: &OrgContext,
+    workspace_id: note_org::WorkspaceId,
+) -> Result<super::OrgWorkspaceView, OrgError> {
+    context
+        .storage()
+        .session()
+        .await
+        .map_err(OrgError::storage)?
+        .get_org_workspace(workspace_id)
+        .await
+        .map_err(OrgError::storage)?
+        .map(map_workspace_view)
+        .ok_or_else(|| {
+            OrgError::new(
+                OrgErrorCode::NotFound,
+                "Org workspace was not found",
+                json!({"workspace_id": workspace_id}),
+                false,
+            )
+        })
+}
+
+pub async fn list_workspaces(
+    context: &OrgContext,
+    query: &super::OrgReadQuery,
+) -> Result<super::OrgReadPage<super::WorkspaceSummary>, OrgError> {
+    let now = context.clock().now();
+    if now <= 0 {
+        return Err(OrgError::invalid_input(
+            "Org operational evaluation time must be positive",
+        ));
+    }
+    let transaction = context
+        .storage()
+        .begin(note_storage::TransactionMode::Deferred)
+        .await
+        .map_err(OrgError::storage)?;
+    let result = async {
+        // Page the lightweight workspace identities first. Operational
+        // summaries and readiness scans are then bounded by the requested page
+        // size instead of the total workspace count.
+        let workspace_page = super::paginate_read(
+            transaction
+                .list_org_workspaces(query.include_archived)
+                .await
+                .map_err(OrgError::storage)?,
+            query,
+            context.cursor_signer(),
+            "workspaces",
+            None,
+            |workspace| workspace.id.to_string(),
+        )?;
+        let mut summaries = Vec::with_capacity(workspace_page.items.len());
+        for workspace in workspace_page.items {
+            summaries.push(workspace_summary_for(transaction.as_ref(), workspace, now).await?);
+        }
+        Ok(super::OrgReadPage {
+            items: summaries,
+            next_cursor: workspace_page.next_cursor,
+        })
+    }
+    .await;
+    transaction.rollback().await.map_err(OrgError::storage)?;
+    result
+}
+
+pub async fn get_workspace_summary(
+    context: &OrgContext,
+    workspace_id: note_org::WorkspaceId,
+) -> Result<super::WorkspaceSummary, OrgError> {
+    let now = context.clock().now();
+    if now <= 0 {
+        return Err(OrgError::invalid_input(
+            "Org operational evaluation time must be positive",
+        ));
+    }
+    let transaction = context
+        .storage()
+        .begin(note_storage::TransactionMode::Deferred)
+        .await
+        .map_err(OrgError::storage)?;
+    let result = workspace_summary_in_transaction(transaction.as_ref(), workspace_id, now).await;
+    transaction.rollback().await.map_err(OrgError::storage)?;
+    result
+}
+
+async fn workspace_summary_in_transaction(
+    transaction: &dyn note_storage::StorageTransaction,
+    workspace_id: note_org::WorkspaceId,
+    now: i64,
+) -> Result<super::WorkspaceSummary, OrgError> {
+    let workspace = transaction
+        .get_org_workspace(workspace_id)
+        .await
+        .map_err(OrgError::storage)?
+        .ok_or_else(|| {
+            OrgError::new(
+                OrgErrorCode::NotFound,
+                "Org workspace was not found",
+                json!({"workspace_id": workspace_id}),
+                false,
+            )
+        })?;
+    workspace_summary_for(transaction, workspace, now).await
+}
+
+async fn workspace_summary_for(
+    transaction: &dyn note_storage::StorageTransaction,
+    workspace: note_storage::OrgWorkspace,
+    now: i64,
+) -> Result<super::WorkspaceSummary, OrgError> {
+    let raw = transaction
+        .get_org_workspace_operational_summary(workspace.id, now)
+        .await
+        .map_err(OrgError::storage)?
+        .ok_or_else(|| {
+            OrgError::new(
+                OrgErrorCode::StorageFailure,
+                "Org workspace summary is inconsistent",
+                json!({"workspace_id": workspace.id}),
+                false,
+            )
+        })?;
+    let ready = super::count_ready_in_transaction(transaction, workspace.id, now).await?;
+    Ok(super::WorkspaceSummary {
+        workspace_id: workspace.id,
+        slug: workspace.slug,
+        display_name: workspace.display_name,
+        description: workspace.description,
+        timezone: raw.timezone,
+        archived_at: raw.archived_at,
+        workspace_revision: raw.workspace_revision,
+        evaluated_at: raw.evaluated_at,
+        counts: super::OperationalCounts {
+            ready,
+            assigned: raw.counts.assigned,
+            running: raw.counts.running,
+            blocked: raw.counts.blocked,
+            review: raw.counts.review,
+            scheduled: raw.counts.scheduled,
+            upcoming_deadline: raw.counts.upcoming_deadline,
+            failed: raw.counts.failed,
+            expired_lease: raw.counts.expired_lease,
+            completed: raw.counts.completed,
+        },
+    })
+}
+
+pub(crate) fn map_workspace_view(workspace: note_storage::OrgWorkspace) -> super::OrgWorkspaceView {
+    super::OrgWorkspaceView {
+        id: workspace.id,
+        slug: workspace.slug,
+        display_name: workspace.display_name,
+        description: workspace.description,
+        timezone: workspace.timezone,
+        policy_schema_version: workspace.policy_schema_version,
+        policy: workspace.policy,
+        revision: workspace.revision,
+        archived_at: workspace.archived_at,
+    }
+}
+
 const CREATE_WORKSPACE: OrgCommandKind = OrgCommandKind::new("create_workspace", 1);
 const UPDATE_WORKSPACE: OrgCommandKind = OrgCommandKind::new("update_workspace", 1);
 const ARCHIVE_WORKSPACE: OrgCommandKind = OrgCommandKind::new("archive_workspace", 1);

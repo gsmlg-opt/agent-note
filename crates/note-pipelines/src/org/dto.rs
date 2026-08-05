@@ -190,6 +190,160 @@ pub struct OrgLeaseView {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationalView {
+    Ready,
+    Assigned,
+    Running,
+    Blocked,
+    Review,
+    Scheduled,
+    UpcomingDeadline,
+    Failed,
+    ExpiredLease,
+    Completed,
+}
+
+impl OperationalView {
+    pub const ALL: [Self; 10] = [
+        Self::Ready,
+        Self::Assigned,
+        Self::Running,
+        Self::Blocked,
+        Self::Review,
+        Self::Scheduled,
+        Self::UpcomingDeadline,
+        Self::Failed,
+        Self::ExpiredLease,
+        Self::Completed,
+    ];
+
+    pub const fn is_agenda(self) -> bool {
+        matches!(self, Self::Scheduled | Self::UpcomingDeadline)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgReadyStatus {
+    Ready,
+    RecoveryCandidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgReviewLeaseStatus {
+    Unleased,
+    Active,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalItemSummary {
+    pub item: OrgItemView,
+    pub attempt_count: i64,
+    pub current_attempt_status: Option<String>,
+    pub retry_exhausted: bool,
+    pub ready_status: Option<OrgReadyStatus>,
+    pub review_lease_status: Option<OrgReviewLeaseStatus>,
+    pub lease: Option<OrgLeaseView>,
+    pub completion_at: Option<i64>,
+}
+
+pub type OrgOperationalItemSummary = OperationalItemSummary;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalPage {
+    pub items: Vec<OperationalItemSummary>,
+    pub next_cursor: Option<String>,
+    pub evaluated_at: i64,
+}
+
+pub type OrgOperationalPage = OperationalPage;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OrgReadQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+    pub include_archived: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgReadPage<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgDocumentSourceView {
+    pub id: DocumentId,
+    pub workspace_id: WorkspaceId,
+    pub path: String,
+    pub source: String,
+    pub content_hash: String,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgWorkspaceExport {
+    pub workspace: OrgWorkspaceView,
+    pub documents: Vec<OrgDocumentSourceView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationalCounts {
+    pub ready: i64,
+    pub assigned: i64,
+    pub running: i64,
+    pub blocked: i64,
+    pub review: i64,
+    pub scheduled: i64,
+    pub upcoming_deadline: i64,
+    pub failed: i64,
+    pub expired_lease: i64,
+    pub completed: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSummary {
+    pub workspace_id: WorkspaceId,
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub timezone: String,
+    pub archived_at: Option<i64>,
+    pub workspace_revision: i64,
+    pub evaluated_at: i64,
+    pub counts: OperationalCounts,
+}
+
+pub type OrgWorkspaceSummary = WorkspaceSummary;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgAttemptBudgetView {
+    pub execution_attempt_count: u32,
+    pub max_attempts: u32,
+    pub remaining_attempts: u32,
+    pub retry_exhausted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgRecoveryStatusView {
+    pub eligible: bool,
+    pub candidate: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgOperationalContextView {
+    pub classifications: Vec<OperationalView>,
+    pub readiness: Option<OrgReadyStatus>,
+    pub blockers: Vec<String>,
+    pub attempt_budget: OrgAttemptBudgetView,
+    pub recovery: OrgRecoveryStatusView,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgItemContext {
     pub workspace: OrgWorkspaceView,
@@ -204,6 +358,7 @@ pub struct OrgItemContext {
     pub origin: Option<OrgOriginView>,
     pub history_segments: Vec<OrgHistorySegment>,
     pub lease: Option<OrgLeaseView>,
+    pub operational: OrgOperationalContextView,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

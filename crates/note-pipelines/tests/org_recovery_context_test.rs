@@ -215,10 +215,23 @@ async fn context_maps_canonical_relations_attempts_history_and_note_availability
         .windows(2)
         .all(|pair| pair[0].sequence < pair[1].sequence));
     assert_eq!(hydrated.lease, None);
+    assert_eq!(
+        hydrated.operational.attempt_budget.execution_attempt_count,
+        1
+    );
+    assert_eq!(hydrated.operational.attempt_budget.max_attempts, 3);
+    assert_eq!(hydrated.operational.attempt_budget.remaining_attempts, 2);
+    assert!(!hydrated.operational.recovery.candidate);
+    assert!(!hydrated.operational.recovery.eligible);
+    assert!(hydrated
+        .operational
+        .blockers
+        .contains(&"non_executable_state".to_string()));
     let json = serde_json::to_value(&hydrated).unwrap();
     assert_eq!(json["lease"], serde_json::Value::Null);
     assert!(!json.to_string().contains("fencing_token"));
     assert!(!json.to_string().contains("fencing_token_hash"));
+    assert!(!json.to_string().contains("token_hash"));
     assert!(!json.to_string().contains("secret body"));
 
     session.soft_delete_note(note_id, NOW + 10).await.unwrap();

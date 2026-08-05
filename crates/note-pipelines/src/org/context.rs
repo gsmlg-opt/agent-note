@@ -1,6 +1,8 @@
 use super::{OrgError, OrgErrorCode};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use hmac::{Hmac, Mac};
 use note_storage::StorageBackend;
+use sha2::Sha256;
 use std::sync::Arc;
 
 pub trait OrgClock: Send + Sync {
@@ -35,6 +37,80 @@ impl OrgClock for SystemOrgClock {
 
 pub trait OrgTokenSource: Send + Sync {
     fn generate_token(&self) -> Result<String, OrgError>;
+}
+
+/// Signs opaque cursor state for integrity only. This is not an authentication
+/// or authorization boundary.
+pub trait OrgCursorSigner: Send + Sync {
+    fn sign(&self, payload: &[u8]) -> Result<[u8; 32], OrgError>;
+    fn verify(&self, payload: &[u8], signature: &[u8]) -> Result<bool, OrgError>;
+}
+
+struct HmacOrgCursorSigner {
+    key: [u8; 32],
+}
+
+impl HmacOrgCursorSigner {
+    fn process_random() -> Result<Self, ()> {
+        let mut key = [0_u8; 32];
+        getrandom::fill(&mut key).map_err(|_| ())?;
+        Ok(Self { key })
+    }
+}
+
+impl OrgCursorSigner for HmacOrgCursorSigner {
+    fn sign(&self, payload: &[u8]) -> Result<[u8; 32], OrgError> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).map_err(|_| cursor_key_error())?;
+        mac.update(payload);
+        Ok(mac.finalize().into_bytes().into())
+    }
+
+    fn verify(&self, payload: &[u8], signature: &[u8]) -> Result<bool, OrgError> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).map_err(|_| cursor_key_error())?;
+        mac.update(payload);
+        Ok(mac.verify_slice(signature).is_ok())
+    }
+}
+
+/// Deterministic signer for tests and explicitly controlled composition roots.
+/// The key is intentionally absent from Debug and serialization surfaces.
+pub struct FixedOrgCursorSigner(HmacOrgCursorSigner);
+
+impl FixedOrgCursorSigner {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(HmacOrgCursorSigner { key })
+    }
+}
+
+impl OrgCursorSigner for FixedOrgCursorSigner {
+    fn sign(&self, payload: &[u8]) -> Result<[u8; 32], OrgError> {
+        self.0.sign(payload)
+    }
+
+    fn verify(&self, payload: &[u8], signature: &[u8]) -> Result<bool, OrgError> {
+        self.0.verify(payload, signature)
+    }
+}
+
+struct UnavailableOrgCursorSigner;
+
+impl OrgCursorSigner for UnavailableOrgCursorSigner {
+    fn sign(&self, _payload: &[u8]) -> Result<[u8; 32], OrgError> {
+        Err(cursor_key_error())
+    }
+
+    fn verify(&self, _payload: &[u8], _signature: &[u8]) -> Result<bool, OrgError> {
+        Err(cursor_key_error())
+    }
+}
+
+fn cursor_key_error() -> OrgError {
+    OrgError::new(
+        OrgErrorCode::StorageFailure,
+        "Org cursor integrity key is unavailable",
+        serde_json::json!({}),
+        true,
+    )
 }
 
 #[derive(Debug, Default)]
@@ -110,16 +186,27 @@ pub struct OrgContext {
     token_source: Arc<dyn OrgTokenSource>,
     claim_test_hook: Arc<dyn OrgClaimTestHook>,
     workflow_test_hook: Arc<dyn OrgWorkflowTestHook>,
+    cursor_signer: Arc<dyn OrgCursorSigner>,
 }
 
 impl OrgContext {
+    /// Creates a context with an ephemeral cursor-integrity key.
+    ///
+    /// Cursors issued by this context are valid only for the lifetime of the
+    /// server process that owns it and are intentionally invalid after restart.
     pub fn new(storage: Arc<dyn StorageBackend>, clock: Arc<dyn OrgClock>) -> Self {
+        // The default key is intentionally ephemeral: cursors are scoped to
+        // this server process and become invalid after restart.
+        let cursor_signer: Arc<dyn OrgCursorSigner> = HmacOrgCursorSigner::process_random()
+            .map(|signer| Arc::new(signer) as Arc<dyn OrgCursorSigner>)
+            .unwrap_or_else(|_| Arc::new(UnavailableOrgCursorSigner));
         Self {
             storage,
             clock,
             token_source: Arc::new(SystemOrgTokenSource),
             claim_test_hook: Arc::new(NoopOrgClaimTestHook),
             workflow_test_hook: Arc::new(NoopOrgWorkflowTestHook),
+            cursor_signer,
         }
     }
 
@@ -143,6 +230,13 @@ impl OrgContext {
         self
     }
 
+    /// Replaces the ephemeral signer, primarily for deterministic tests or a
+    /// composition root that explicitly manages cursor-key lifetime.
+    pub fn with_cursor_signer(mut self, signer: Arc<dyn OrgCursorSigner>) -> Self {
+        self.cursor_signer = signer;
+        self
+    }
+
     pub(crate) fn storage(&self) -> &dyn StorageBackend {
         self.storage.as_ref()
     }
@@ -153,6 +247,10 @@ impl OrgContext {
 
     pub(crate) fn token_source(&self) -> &dyn OrgTokenSource {
         self.token_source.as_ref()
+    }
+
+    pub(crate) fn cursor_signer(&self) -> &dyn OrgCursorSigner {
+        self.cursor_signer.as_ref()
     }
 
     pub(crate) fn after_claim_phase(&self, phase: OrgClaimPhase) -> Result<(), OrgError> {

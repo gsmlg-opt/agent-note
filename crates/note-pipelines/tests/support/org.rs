@@ -1,7 +1,7 @@
 use note_org::{WorkspaceId, WorkspacePolicy};
 use note_pipelines::org::{
-    FixedOrgClock, OrgClaimPhase, OrgClaimTestHook, OrgContext, OrgError, OrgTokenSource,
-    OrgWorkflowPhase, OrgWorkflowTestHook,
+    FixedOrgClock, FixedOrgCursorSigner, OrgClaimPhase, OrgClaimTestHook, OrgContext, OrgError,
+    OrgTokenSource, OrgWorkflowPhase, OrgWorkflowTestHook,
 };
 use note_storage::{NewOrgWorkspace, StorageBackend};
 use note_storage_turso::TursoStorage;
@@ -154,7 +154,8 @@ pub async fn org_test_context(
         .await
         .unwrap();
     (
-        OrgContext::new(backend.clone(), Arc::new(FixedOrgClock::new(now))),
+        OrgContext::new(backend.clone(), Arc::new(FixedOrgClock::new(now)))
+            .with_cursor_signer(Arc::new(FixedOrgCursorSigner::new([0x5a; 32]))),
         backend,
         dir,
         db_path,

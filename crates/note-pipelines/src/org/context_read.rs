@@ -1,13 +1,156 @@
 use super::{
-    audit::map_event, OrgArtifactView, OrgAttemptNoteView, OrgAttemptView, OrgContext,
-    OrgDependencyView, OrgDocumentView, OrgError, OrgErrorCode, OrgHistorySegment, OrgItemContext,
-    OrgItemView, OrgLeaseView, OrgNoteLinkView, OrgOriginView, OrgTimestampView, OrgWorkspaceView,
+    audit::map_event, OperationalView, OrgArtifactView, OrgAttemptBudgetView, OrgAttemptNoteView,
+    OrgAttemptView, OrgContext, OrgDependencyView, OrgDocumentView, OrgError, OrgErrorCode,
+    OrgHistorySegment, OrgItemContext, OrgItemView, OrgLeaseView, OrgNoteLinkView,
+    OrgOperationalContextView, OrgOriginView, OrgReadyStatus, OrgRecoveryStatusView,
+    OrgTimestampView, OrgWorkspaceView,
 };
-use note_org::{WorkItemId, WorkspaceId};
+use note_org::{
+    decide_claim, evaluate_readiness, AttemptPhase, ClaimDecisionError, ClaimKind, ClaimQueue,
+    ClaimRequest, LeaseKind, LeaseStatus, Readiness, ReadinessBlocker, ReadinessContext,
+    WorkItemId, WorkspaceId,
+};
 use note_storage::{
-    OrgAttempt, OrgAttemptStatus, OrgEvent, OrgProjectedWorkItem, StorageTransaction,
+    OrgAttempt, OrgAttemptStatus, OrgDocument, OrgEvent, OrgProjectedWorkItem, StorageTransaction,
     TransactionMode,
 };
+
+pub async fn list_documents(
+    context: &OrgContext,
+    workspace_id: WorkspaceId,
+    query: &super::OrgReadQuery,
+) -> Result<super::OrgReadPage<super::OrgDocumentView>, OrgError> {
+    let session = context
+        .storage()
+        .session()
+        .await
+        .map_err(OrgError::storage)?;
+    let workspace = session
+        .get_org_workspace(workspace_id)
+        .await
+        .map_err(OrgError::storage)?
+        .ok_or_else(|| not_found("workspace"))?;
+    if workspace.archived_at.is_some() && !query.include_archived {
+        return Ok(super::OrgReadPage {
+            items: Vec::new(),
+            next_cursor: None,
+        });
+    }
+    let documents = session
+        .list_org_documents(workspace_id)
+        .await
+        .map_err(OrgError::storage)?
+        .into_iter()
+        .map(map_document)
+        .collect();
+    super::paginate_read(
+        documents,
+        query,
+        context.cursor_signer(),
+        "documents",
+        Some(&workspace_id.to_string()),
+        |document| document.id.to_string(),
+    )
+}
+
+pub async fn get_document(
+    context: &OrgContext,
+    workspace_id: WorkspaceId,
+    document_id: note_org::DocumentId,
+) -> Result<super::OrgDocumentSourceView, OrgError> {
+    context
+        .storage()
+        .session()
+        .await
+        .map_err(OrgError::storage)?
+        .get_org_document(document_id)
+        .await
+        .map_err(OrgError::storage)?
+        .filter(|document| document.workspace_id == workspace_id)
+        .map(map_document_source)
+        .ok_or_else(|| not_found("document"))
+}
+
+pub async fn export_workspace(
+    context: &OrgContext,
+    workspace_id: WorkspaceId,
+) -> Result<super::OrgWorkspaceExport, OrgError> {
+    let session = context
+        .storage()
+        .session()
+        .await
+        .map_err(OrgError::storage)?;
+    let workspace = session
+        .get_org_workspace(workspace_id)
+        .await
+        .map_err(OrgError::storage)?
+        .ok_or_else(|| not_found("workspace"))?;
+    let mut documents = session
+        .list_org_documents(workspace_id)
+        .await
+        .map_err(OrgError::storage)?;
+    documents.sort_by_key(|document| document.id);
+    Ok(super::OrgWorkspaceExport {
+        workspace: super::map_workspace_view(workspace),
+        documents: documents.into_iter().map(map_document_source).collect(),
+    })
+}
+
+pub async fn get_item(
+    context: &OrgContext,
+    workspace_id: WorkspaceId,
+    item_id: WorkItemId,
+) -> Result<OrgItemView, OrgError> {
+    context
+        .storage()
+        .session()
+        .await
+        .map_err(OrgError::storage)?
+        .get_org_work_item(item_id)
+        .await
+        .map_err(OrgError::storage)?
+        .filter(|item| item.workspace_id == workspace_id)
+        .map(map_item)
+        .ok_or_else(|| not_found("work item"))
+}
+
+pub async fn list_note_work_items(
+    context: &OrgContext,
+    note_id: &str,
+    query: &super::OrgReadQuery,
+) -> Result<super::OrgReadPage<OrgItemView>, OrgError> {
+    if note_id.trim().is_empty() || note_id != note_id.trim() {
+        return Err(OrgError::invalid_input("Org note ID must not be blank"));
+    }
+    let session = context
+        .storage()
+        .session()
+        .await
+        .map_err(OrgError::storage)?;
+    let allowed_workspaces = session
+        .list_org_workspaces(query.include_archived)
+        .await
+        .map_err(OrgError::storage)?
+        .into_iter()
+        .map(|workspace| workspace.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let items = session
+        .list_org_work_items_linking_note(note_id)
+        .await
+        .map_err(OrgError::storage)?
+        .into_iter()
+        .filter(|item| allowed_workspaces.contains(&item.workspace_id))
+        .map(map_item)
+        .collect();
+    super::paginate_read(
+        items,
+        query,
+        context.cursor_signer(),
+        "note_work_items",
+        Some(note_id),
+        |item| item.id.to_string(),
+    )
+}
 
 pub async fn get_item_context(
     context: &OrgContext,
@@ -120,41 +263,52 @@ pub(crate) async fn get_item_context_in_transaction(
     let attempts = transaction
         .list_org_attempts(item.id)
         .await
-        .map_err(OrgError::storage)?
-        .into_iter()
-        .map(map_attempt)
-        .collect();
+        .map_err(OrgError::storage)?;
     let history = transaction
         .list_org_global_subject_events("work_item", &item.id.to_string())
         .await
         .map_err(OrgError::storage)?;
     let origin = hydrate_origin(transaction, &history).await?;
     let history_segments = history_segments(history);
-    let lease = transaction
+    let lease_record = transaction
         .get_open_org_lease_internal(item.id)
         .await
-        .map_err(OrgError::storage)?
-        .map(|lease| OrgLeaseView {
-            id: lease.id,
-            workspace_id: lease.workspace_id,
-            work_item_id: lease.work_item_id,
-            attempt_id: lease.attempt_id,
-            kind: match lease.kind {
-                note_storage::OrgLeaseKind::Execution => "execution",
-                note_storage::OrgLeaseKind::Review => "review",
-            }
-            .into(),
-            actor_id: lease.actor_id,
-            acquired_at: lease.acquired_at,
-            last_heartbeat_at: lease.last_heartbeat_at,
-            expires_at: lease.expires_at,
-            status: if lease.expires_at > now {
-                "active"
-            } else {
-                "expired"
-            }
-            .into(),
-        });
+        .map_err(OrgError::storage)?;
+    let active_count = transaction
+        .count_active_org_leases(workspace_id, now)
+        .await
+        .map_err(OrgError::storage)?;
+    let operational = operational_context(
+        &workspace,
+        &item,
+        &dependencies,
+        &attempts,
+        lease_record.as_ref(),
+        active_count,
+        now,
+    );
+    let attempts = attempts.into_iter().map(map_attempt).collect();
+    let lease = lease_record.map(|lease| OrgLeaseView {
+        id: lease.id,
+        workspace_id: lease.workspace_id,
+        work_item_id: lease.work_item_id,
+        attempt_id: lease.attempt_id,
+        kind: match lease.kind {
+            note_storage::OrgLeaseKind::Execution => "execution",
+            note_storage::OrgLeaseKind::Review => "review",
+        }
+        .into(),
+        actor_id: lease.actor_id,
+        acquired_at: lease.acquired_at,
+        last_heartbeat_at: lease.last_heartbeat_at,
+        expires_at: lease.expires_at,
+        status: if lease.expires_at > now {
+            "active"
+        } else {
+            "expired"
+        }
+        .into(),
+    });
     Ok(OrgItemContext {
         workspace: OrgWorkspaceView {
             id: workspace.id,
@@ -182,7 +336,173 @@ pub(crate) async fn get_item_context_in_transaction(
         origin,
         history_segments,
         lease,
+        operational,
     })
+}
+
+fn operational_context(
+    workspace: &note_storage::OrgWorkspace,
+    item: &OrgProjectedWorkItem,
+    dependencies: &[OrgDependencyView],
+    attempts: &[OrgAttempt],
+    lease: Option<&note_storage::OrgLease>,
+    active_count: i64,
+    now: i64,
+) -> OrgOperationalContextView {
+    let lease_status = lease
+        .map(|lease| {
+            let kind = match lease.kind {
+                note_storage::OrgLeaseKind::Execution => LeaseKind::Execution,
+                note_storage::OrgLeaseKind::Review => LeaseKind::Review,
+            };
+            if lease.expires_at <= now {
+                LeaseStatus::Expired(kind)
+            } else {
+                LeaseStatus::Active(kind)
+            }
+        })
+        .unwrap_or(LeaseStatus::None);
+    let execution_attempt_count = u32::try_from(attempts.len()).unwrap_or(u32::MAX);
+    let domain_item = super::projected_to_domain(item);
+    let readiness_context = ReadinessContext {
+        now,
+        dependencies_satisfied: dependencies.iter().all(|value| value.satisfied),
+        workspace_active: workspace.archived_at.is_none(),
+        lease: lease_status,
+        capacity_available: active_count < workspace.policy.concurrency_limit as i64,
+        // Context reads have no requester identity. Assignment-sensitive
+        // readiness must therefore remain blocked instead of impersonating the
+        // item's assignee.
+        actor_id: None,
+        scheduled_at: item.scheduled.as_ref().map(|value| value.utc_timestamp),
+        queue: ClaimQueue::Execution,
+        execution_attempt_count,
+        current_attempt: attempts.last().map(|attempt| match attempt.status {
+            OrgAttemptStatus::Running => AttemptPhase::Running,
+            OrgAttemptStatus::Submitted => AttemptPhase::Submitted,
+            OrgAttemptStatus::Completed
+            | OrgAttemptStatus::Failed
+            | OrgAttemptStatus::Cancelled
+            | OrgAttemptStatus::Expired => AttemptPhase::Terminal,
+        }),
+    };
+    let readiness = evaluate_readiness(&domain_item, &workspace.policy, &readiness_context);
+    let ready_status = match &readiness {
+        Readiness::Ready => Some(OrgReadyStatus::Ready),
+        Readiness::RecoveryCandidate => Some(OrgReadyStatus::RecoveryCandidate),
+        Readiness::Blocked(_) => None,
+    };
+    let blockers = match &readiness {
+        Readiness::Blocked(blockers) => blockers
+            .iter()
+            .map(blocker_name)
+            .map(str::to_owned)
+            .collect(),
+        Readiness::Ready | Readiness::RecoveryCandidate => Vec::new(),
+    };
+    let state = item.state.as_deref();
+    let terminal = state.is_some_and(|state| workspace.policy.terminal_states.contains(state));
+    let mut classifications = Vec::new();
+    if ready_status.is_some() {
+        classifications.push(OperationalView::Ready);
+    }
+    if item.assignee.is_some() && !terminal {
+        classifications.push(OperationalView::Assigned);
+    }
+    if state == Some(workspace.policy.running_state.as_str()) {
+        classifications.push(OperationalView::Running);
+    }
+    if workspace.policy.states.contains("BLOCKED") && state == Some("BLOCKED") {
+        classifications.push(OperationalView::Blocked);
+    }
+    if state == Some(workspace.policy.review_state.as_str()) {
+        classifications.push(OperationalView::Review);
+    }
+    if item.scheduled.is_some() && !terminal {
+        classifications.push(OperationalView::Scheduled);
+    }
+    if item
+        .deadline
+        .as_ref()
+        .is_some_and(|deadline| deadline.utc_timestamp >= now)
+        && !terminal
+    {
+        classifications.push(OperationalView::UpcomingDeadline);
+    }
+    if state == Some(workspace.policy.failed_state.as_str()) {
+        classifications.push(OperationalView::Failed);
+    }
+    if lease.is_some_and(|lease| lease.expires_at <= now) {
+        classifications.push(OperationalView::ExpiredLease);
+    }
+    if state.is_some_and(|state| workspace.policy.successful_terminal_states.contains(state)) {
+        classifications.push(OperationalView::Completed);
+    }
+    let max_attempts = workspace.policy.max_attempts();
+    let remaining_attempts = max_attempts.saturating_sub(execution_attempt_count);
+    let recovery_candidate = ready_status == Some(OrgReadyStatus::RecoveryCandidate);
+    let (recovery_eligible, recovery_blockers) =
+        if state == Some(workspace.policy.failed_state.as_str()) {
+            match decide_claim(
+                &domain_item,
+                &workspace.policy,
+                &readiness_context,
+                ClaimRequest {
+                    lease_kind: LeaseKind::Execution,
+                    claim_kind: ClaimKind::Retry,
+                },
+            ) {
+                Ok(_) => (true, Vec::new()),
+                Err(ClaimDecisionError::Blocked(blockers)) => (
+                    false,
+                    blockers
+                        .iter()
+                        .map(blocker_name)
+                        .map(str::to_owned)
+                        .collect(),
+                ),
+                Err(ClaimDecisionError::Transition(_)) => {
+                    (false, vec!["invalid_recovery_transition".into()])
+                }
+            }
+        } else {
+            (recovery_candidate, blockers.clone())
+        };
+    OrgOperationalContextView {
+        classifications,
+        readiness: ready_status,
+        blockers: blockers.clone(),
+        attempt_budget: OrgAttemptBudgetView {
+            execution_attempt_count,
+            max_attempts,
+            remaining_attempts,
+            retry_exhausted: remaining_attempts == 0,
+        },
+        recovery: OrgRecoveryStatusView {
+            eligible: recovery_eligible,
+            candidate: recovery_candidate,
+            blockers: recovery_blockers,
+        },
+    }
+}
+
+fn blocker_name(blocker: &ReadinessBlocker) -> &'static str {
+    match blocker {
+        ReadinessBlocker::NonExecutableState => "non_executable_state",
+        ReadinessBlocker::DependenciesIncomplete => "dependencies_incomplete",
+        ReadinessBlocker::ScheduledForFuture => "scheduled_for_future",
+        ReadinessBlocker::WorkspaceArchived => "workspace_archived",
+        ReadinessBlocker::ActiveLease => "active_lease",
+        ReadinessBlocker::LeaseKindMismatch => "lease_kind_mismatch",
+        ReadinessBlocker::ConcurrencyLimit => "concurrency_limit",
+        ReadinessBlocker::RetryLimit => "retry_limit",
+        ReadinessBlocker::AttemptHistoryInconsistent => "attempt_history_inconsistent",
+        ReadinessBlocker::RunningAttemptRequired => "running_attempt_required",
+        ReadinessBlocker::SubmittedAttemptRequired => "submitted_attempt_required",
+        ReadinessBlocker::TerminalAttemptRequired => "terminal_attempt_required",
+        ReadinessBlocker::AssignmentRequired => "assignment_required",
+        ReadinessBlocker::AssignedToOtherActor => "assigned_to_other_actor",
+    }
 }
 
 async fn hydrate_origin(
@@ -305,6 +625,25 @@ fn map_item(item: OrgProjectedWorkItem) -> OrgItemView {
         requires_review: item.requires_review,
         created_at: item.created_at,
         tags: item.tags,
+    }
+}
+
+fn map_document(document: OrgDocument) -> OrgDocumentView {
+    OrgDocumentView {
+        id: document.id,
+        path: document.path,
+        revision: document.revision,
+    }
+}
+
+fn map_document_source(document: OrgDocument) -> super::OrgDocumentSourceView {
+    super::OrgDocumentSourceView {
+        id: document.id,
+        workspace_id: document.workspace_id,
+        path: document.path,
+        source: document.source,
+        content_hash: document.content_hash,
+        revision: document.revision,
     }
 }
 

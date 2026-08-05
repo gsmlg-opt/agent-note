@@ -9,7 +9,8 @@ use note_storage::{
     NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate,
     NoteUpdate, NotesRepository, OrgAttempt, OrgAttemptUpdate, OrgDocument,
     OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
-    OrgProjectedWorkItem, OrgRepository, OrgWorkspace, OrgWorkspaceUpdate, RetrievalRepository,
+    OrgLease, OrgOperationalQuery, OrgOperationalRow, OrgProjectedWorkItem, OrgRepository,
+    OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, RetrievalRepository,
     SettingsRepository, StorageBackend, StorageError, StorageErrorKind, StorageResult,
     StorageSession, StorageTransaction, StoredOrgOperation, TransactionMode, UpsertNoteChunk,
 };
@@ -33,6 +34,7 @@ pub struct EventStorageBackend {
     events: EventLog,
     fail_commit: Arc<AtomicBool>,
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
+    repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl EventStorageBackend {
@@ -42,6 +44,7 @@ impl EventStorageBackend {
             events,
             fail_commit: Arc::new(AtomicBool::new(false)),
             fail_repository_calls: Arc::new(Mutex::new(VecDeque::new())),
+            repository_call_counts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -55,6 +58,15 @@ impl EventStorageBackend {
             .unwrap()
             .push_back(name.to_string());
     }
+
+    pub fn repository_call_count(&self, name: &str) -> usize {
+        self.repository_call_counts
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 struct EventTransaction {
@@ -62,10 +74,17 @@ struct EventTransaction {
     events: EventLog,
     fail_commit: Arc<AtomicBool>,
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
+    repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl EventTransaction {
     fn fail_if_requested(&self, name: &str) -> StorageResult<()> {
+        *self
+            .repository_call_counts
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_default() += 1;
         let mut failures = self.fail_repository_calls.lock().unwrap();
         if failures.front().is_some_and(|failure| failure == name) {
             failures.pop_front();
@@ -92,6 +111,7 @@ impl StorageBackend for EventStorageBackend {
             events: self.events.clone(),
             fail_commit: self.fail_commit.clone(),
             fail_repository_calls: self.fail_repository_calls.clone(),
+            repository_call_counts: self.repository_call_counts.clone(),
         }))
     }
 
@@ -311,6 +331,20 @@ impl_forward_repository! {
         fn update_org_attempt(
             update: OrgAttemptUpdate<'_>,
         ) -> ConditionalUpdate<OrgAttempt>;
+        fn get_open_org_lease_internal(
+            work_item_id: note_org::WorkItemId,
+        ) -> Option<OrgLease>;
+        fn count_active_org_leases(
+            workspace_id: note_org::WorkspaceId,
+            now: i64,
+        ) -> i64;
+        fn query_org_operational(
+            query: OrgOperationalQuery<'_>,
+        ) -> Vec<OrgOperationalRow>;
+        fn get_org_workspace_operational_summary(
+            workspace_id: note_org::WorkspaceId,
+            now: i64,
+        ) -> Option<OrgWorkspaceOperationalSummary>;
         fn insert_org_operation(operation: &StoredOrgOperation) -> ();
         fn get_org_operation(
             workspace_id: note_org::WorkspaceId,
@@ -327,6 +361,7 @@ impl StorageTransaction for EventTransaction {
             events,
             fail_commit,
             fail_repository_calls: _,
+            repository_call_counts: _,
         } = *self;
         if fail_commit.swap(false, Ordering::SeqCst) {
             inner.rollback().await?;
@@ -347,6 +382,7 @@ impl StorageTransaction for EventTransaction {
             events,
             fail_commit: _,
             fail_repository_calls: _,
+            repository_call_counts: _,
         } = *self;
         inner.rollback().await?;
         events.lock().unwrap().push("rollback".into());
