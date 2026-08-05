@@ -15,6 +15,7 @@ use note_embedding::{
     ProcessWorkerRuntime, StubEmbedder, WorkerConfig,
 };
 use note_pipelines::{
+    org::{OrgContext, SystemOrgClock, SystemOrgTokenSource},
     Context, EmbeddingJobNotifier, FingerprintReconciliation, ProcessEmbeddingJobStatus,
 };
 use note_server::config::{AttachmentConfig, DatabaseConfig, EmbeddingConfig, RuntimeConfig};
@@ -33,6 +34,51 @@ use tokio::sync::{watch, Notify};
 use utoipa::openapi::OpenApi;
 
 const DEFAULT_EMBEDDING_POLL_MS: u64 = 1000;
+
+struct ProductionOrgRuntime {
+    context: Arc<OrgContext>,
+    #[allow(
+        dead_code,
+        reason = "retains and proves production dependency ownership"
+    )]
+    storage: Arc<dyn StorageBackend>,
+    #[allow(
+        dead_code,
+        reason = "retains and proves production dependency ownership"
+    )]
+    clock: Arc<SystemOrgClock>,
+    #[allow(
+        dead_code,
+        reason = "retains and proves production dependency ownership"
+    )]
+    token_source: Arc<SystemOrgTokenSource>,
+}
+
+struct McpContexts {
+    note: Arc<Context>,
+    org: Arc<OrgContext>,
+}
+
+fn production_org_runtime(storage: Arc<dyn StorageBackend>) -> ProductionOrgRuntime {
+    let clock = Arc::new(SystemOrgClock);
+    let token_source = Arc::new(SystemOrgTokenSource);
+    let context = Arc::new(
+        OrgContext::new(storage.clone(), clock.clone()).with_token_source(token_source.clone()),
+    );
+    ProductionOrgRuntime {
+        context,
+        storage,
+        clock,
+        token_source,
+    }
+}
+
+fn compose_mcp_contexts(note: Arc<Context>, org_runtime: &ProductionOrgRuntime) -> McpContexts {
+    McpContexts {
+        note,
+        org: org_runtime.context.clone(),
+    }
+}
 const TRASH_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const DEV_FRONTEND_URL: &str = "http://0.0.0.0:6221";
 
@@ -434,6 +480,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let org_runtime = production_org_runtime(storage.clone());
+
     if stdio_mode {
         let mut embedding = start_embedding_runtime(&config.embedding).await?;
         reconcile_started_embedding(storage.as_ref(), &mut embedding).await?;
@@ -457,7 +505,8 @@ async fn main() -> anyhow::Result<()> {
             embedding.wake.clone(),
             scheduler_shutdown_rx,
         ));
-        let run_result = note_mcp::run_stdio(ctx).await;
+        let mcp_contexts = compose_mcp_contexts(ctx, &org_runtime);
+        let run_result = note_mcp::run_stdio(mcp_contexts.note, mcp_contexts.org).await;
         let _ = scheduler_shutdown_tx.send(true);
         let _ = scheduler.await;
         let _ = trash_retention.await;
@@ -490,9 +539,10 @@ async fn main() -> anyhow::Result<()> {
         let (rest, openapi) = openapi::rest_router();
         let rest = rest.with_state(ctx.clone());
         let max_request_bytes = env_u64("NOTE_MAX_REQUEST_BYTES", 512 * 1024 * 1024);
+        let mcp_contexts = compose_mcp_contexts(ctx.clone(), &org_runtime);
         let mut app = compose_transport_router(
             rest,
-            note_mcp::mcp_router(ctx),
+            note_mcp::mcp_router(mcp_contexts.note, mcp_contexts.org),
             openapi,
             max_request_bytes as usize,
         );
@@ -672,6 +722,29 @@ mod tests {
             .unwrap()
             .to_ascii_lowercase()
             .contains("\"/mcp"));
+    }
+
+    #[test]
+    fn production_mcp_composition_keeps_one_org_context_and_shared_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(FailingReconciliationBackend);
+        let note = Arc::new(Context::new(
+            storage.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("attachments"),
+            )),
+        ));
+        let org_runtime = production_org_runtime(storage.clone());
+        let contexts = compose_mcp_contexts(note.clone(), &org_runtime);
+
+        assert!(Arc::ptr_eq(&contexts.note, &note));
+        assert!(Arc::ptr_eq(&contexts.org, &org_runtime.context));
+        assert!(Arc::ptr_eq(&org_runtime.storage, &storage));
+        assert_eq!(Arc::strong_count(&org_runtime.clock), 2);
+        assert_eq!(Arc::strong_count(&org_runtime.token_source), 2);
+        assert!(Arc::strong_count(&storage) >= 4);
+        assert!(org_runtime.context.clock().now() > 0);
     }
 
     #[tokio::test]

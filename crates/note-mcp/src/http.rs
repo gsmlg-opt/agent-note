@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use note_pipelines::Context;
+use note_pipelines::{org::OrgContext, Context};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
@@ -32,7 +32,7 @@ use crate::NoteMcpServer;
 /// without first performing the `initialize` handshake and carrying an `Mcp-Session-Id`
 /// header on every follow-up. In the default stateful mode, a first POST that isn't an
 /// `initialize` request is rejected with `HTTP 422 "Unexpected message, expect initialize
-/// request"` — which is what non-session-tracking clients hit. Our two tools are plain
+/// request"` — which is what non-session-tracking clients hit. Our tools are plain
 /// request/response with no server-initiated streaming, so sessions buy us nothing here.
 /// `with_json_response(true)` returns `application/json` directly instead of an SSE stream,
 /// dropping the framing overhead (allowed by the MCP Streamable HTTP spec, 2025-06-18).
@@ -42,13 +42,13 @@ use crate::NoteMcpServer;
 /// This app is meant to be served behind a reverse proxy (e.g. Caddy at `notes.web-dev.zdns.cn`)
 /// that forwards a real public `Host` and owns access control / TLS; keeping the allowlist here
 /// would reject every proxied `/mcp` request. Host/origin gating is delegated to the proxy.
-pub fn mcp_router(ctx: Arc<Context>) -> Router {
+pub fn mcp_router(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> Router {
     let config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
         .with_json_response(true)
         .disable_allowed_hosts();
     let service = StreamableHttpService::new(
-        move || Ok(NoteMcpServer::new(ctx.clone())),
+        move || Ok(NoteMcpServer::new(ctx.clone(), org_ctx.clone())),
         Arc::new(LocalSessionManager::default()),
         config,
     );
@@ -85,8 +85,12 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_router_builds() {
-        let (ctx, _backend, _dir) = test_context().await;
+        let (ctx, backend, _dir) = test_context().await;
+        let org_ctx = Arc::new(OrgContext::new(
+            backend,
+            Arc::new(note_pipelines::org::SystemOrgClock),
+        ));
         // Building the router must not panic; the type asserts it is an axum::Router.
-        let _router: Router = mcp_router(Arc::new(ctx));
+        let _router: Router = mcp_router(Arc::new(ctx), org_ctx);
     }
 }

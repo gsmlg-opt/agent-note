@@ -6,7 +6,8 @@
 use std::{borrow::Cow, sync::Arc};
 
 use note_pipelines::{
-    normalized_list_limit, normalized_list_offset, AttachmentMutationError, Context,
+    normalized_list_limit, normalized_list_offset, org::OrgContext, AttachmentMutationError,
+    Context,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Json, wrapper::Parameters},
@@ -569,15 +570,26 @@ pub struct DeleteNoteAttachmentResponse {
 #[derive(Clone)]
 pub struct NoteMcpServer {
     ctx: Arc<Context>,
+    org_ctx: Arc<OrgContext>,
     tool_router: ToolRouter<Self>,
 }
 
 impl NoteMcpServer {
-    pub fn new(ctx: Arc<Context>) -> Self {
+    pub fn new(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> Self {
         Self {
             ctx,
-            tool_router: Self::tool_router(),
+            org_ctx,
+            tool_router: crate::org::checked_tool_router(Self::tool_router())
+                .expect("static MCP tool names are unique"),
         }
+    }
+
+    pub fn registered_tools(&self) -> Vec<rmcp::model::Tool> {
+        self.tool_router.list_all().to_vec()
+    }
+
+    pub(crate) fn org_context(&self) -> &OrgContext {
+        self.org_ctx.as_ref()
     }
 }
 
@@ -775,7 +787,7 @@ impl ServerHandler for NoteMcpServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
         info.instructions = Some(
-            "Note server exposing note CRUD, summary/list/search, tagged line editing, and standalone attachment put/get/delete tools over MCP."
+            "Agent Note and Org orchestration server. Org actor_id values are caller-asserted audit metadata only; they are not authenticated identities."
                 .to_string(),
         );
         info
@@ -818,8 +830,8 @@ fn to_put_error_data(error: anyhow::Error) -> ErrorData {
     to_error_data(error)
 }
 
-pub async fn run_stdio(ctx: Arc<Context>) -> anyhow::Result<()> {
-    let server = NoteMcpServer::new(ctx);
+pub async fn run_stdio(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> anyhow::Result<()> {
+    let server = NoteMcpServer::new(ctx, org_ctx);
     let running = server.serve(stdio()).await?;
     running.waiting().await?;
     Ok(())
@@ -851,6 +863,14 @@ mod tests {
             )),
         );
         (ctx, backend, dir)
+    }
+
+    fn test_server(ctx: Context, backend: Arc<dyn StorageBackend>) -> NoteMcpServer {
+        let org_ctx = Arc::new(OrgContext::new(
+            backend,
+            Arc::new(note_pipelines::org::SystemOrgClock),
+        ));
+        NoteMcpServer::new(Arc::new(ctx), org_ctx)
     }
 
     async fn seed_summary_notes(backend: &dyn note_storage::StorageBackend, count: usize) {
@@ -1014,32 +1034,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_builds_and_lists_exactly_eleven_tools() {
-        let (ctx, _backend, _dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
+    async fn server_builds_and_lists_all_note_and_org_tools() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
         let mut names = server
             .tool_router
             .list_all()
             .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
+        assert_eq!(names.len(), 47);
         names.sort();
+        for name in crate::org::NOTE_TOOL_NAMES {
+            assert!(names.iter().any(|registered| registered == name));
+        }
         assert_eq!(
-            names,
-            vec![
-                "delete_note",
-                "delete_note_attachment",
-                "edit_note",
-                "get_note",
-                "get_note_attachment_content",
-                "list_notes",
-                "put_note_attachment",
-                "read_note_lines",
-                "save_note",
-                "semantic_search",
-                "update_note",
-            ]
+            names.iter().filter(|name| name.starts_with("org_")).count(),
+            36
         );
+    }
+
+    #[tokio::test]
+    async fn server_keeps_the_exact_injected_context_arcs() {
+        let (ctx, backend, _dir) = test_context().await;
+        let note_ctx = Arc::new(ctx);
+        let org_ctx = Arc::new(OrgContext::new(
+            backend,
+            Arc::new(note_pipelines::org::SystemOrgClock),
+        ));
+        let server = NoteMcpServer::new(note_ctx.clone(), org_ctx.clone());
+
+        assert!(Arc::ptr_eq(&server.ctx, &note_ctx));
+        assert!(Arc::ptr_eq(&server.org_ctx, &org_ctx));
     }
 
     #[test]
@@ -1059,7 +1085,7 @@ mod tests {
     async fn list_notes_defaults_to_ten() {
         let (ctx, backend, _dir) = test_context().await;
         seed_summary_notes(backend.as_ref(), 12).await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
+        let server = test_server(ctx, backend.clone());
 
         let response = server
             .list_notes(Parameters(ListNotesRequest {
@@ -1080,7 +1106,7 @@ mod tests {
     async fn list_notes_honors_zero_limit_and_explicit_offset() {
         let (ctx, backend, _dir) = test_context().await;
         seed_summary_notes(backend.as_ref(), 4).await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
+        let server = test_server(ctx, backend.clone());
 
         let empty = server
             .list_notes(Parameters(ListNotesRequest {
@@ -1113,8 +1139,8 @@ mod tests {
 
     #[tokio::test]
     async fn advertised_schemas_are_bounded_and_keep_nullable_filters() {
-        let (ctx, _backend, _dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
 
         let save_input = tool_schema(&server, "save_note", false);
         assert_exact_closed_object(&save_input, &save_input, &["content", "labels", "title"]);
@@ -1352,8 +1378,8 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_handlers_use_metadata_and_exclusive_content_shapes() {
-        let (ctx, _backend, dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
+        let (ctx, backend, dir) = test_context().await;
+        let server = test_server(ctx, backend);
         let saved = server
             .save_note(Parameters(SaveNoteRequest {
                 title: "Standalone".into(),
@@ -1566,8 +1592,8 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_attachment_inputs_are_invalid_params_without_writes() {
-        let (ctx, _backend, dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
+        let (ctx, backend, dir) = test_context().await;
+        let server = test_server(ctx, backend);
         let saved = server
             .save_note(Parameters(SaveNoteRequest {
                 title: "Rejected".into(),
@@ -1607,8 +1633,8 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_faults_and_missing_attachments_have_precise_errors() {
-        let (ctx, _backend, _dir) = test_context().await;
-        let server = NoteMcpServer::new(Arc::new(ctx));
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
         let saved = server
             .save_note(Parameters(SaveNoteRequest {
                 title: "Faults".into(),
