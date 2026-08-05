@@ -12,6 +12,7 @@ use note_storage::{
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use subtle::ConstantTimeEq;
 
 pub(crate) struct LeaseGuardResult {
     pub active: BTreeMap<note_org::WorkItemId, SanitizedOrgLease>,
@@ -112,7 +113,7 @@ pub(crate) async fn inspect_touched_lease_proofs_except(
         if lease.id != proof.lease_id
             || lease.workspace_id != workspace.id
             || lease.work_item_id != *item_id
-            || lease.fencing_token_hash != digest
+            || !constant_time_hash_eq(&lease.fencing_token_hash, &digest)
             || lease.kind != storage_kind(proof.kind)
             || lease.actor_id != actor_id
         {
@@ -423,4 +424,47 @@ fn policy_item_error(error: note_org::PolicyError) -> OrgError {
         json!({"reason": error.to_string()}),
         false,
     )
+}
+
+fn constant_time_hash_eq(expected: &str, candidate: &str) -> bool {
+    let (Some(expected), Some(candidate)) = (decode_sha256(expected), decode_sha256(candidate))
+    else {
+        return false;
+    };
+    bool::from(expected.ct_eq(&candidate))
+}
+
+fn decode_sha256(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        decoded[index] = (decode_hex_digit(pair[0])? << 4) | decode_hex_digit(pair[1])?;
+    }
+    Some(decoded)
+}
+
+fn decode_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_hash_eq;
+
+    #[test]
+    fn lease_hash_comparison_accepts_only_the_exact_fixed_length_digest() {
+        let digest = "ab".repeat(32);
+
+        assert!(constant_time_hash_eq(&digest, &digest));
+        assert!(!constant_time_hash_eq(&digest, &"ac".repeat(32)));
+        assert!(!constant_time_hash_eq(&digest, "ab"));
+        assert!(!constant_time_hash_eq(&digest, &"zz".repeat(32)));
+    }
 }

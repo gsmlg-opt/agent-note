@@ -115,6 +115,31 @@ fn lease_records_keep_only_the_token_hash() {
 }
 
 #[test]
+fn org_lease_debug_redacts_the_token_hash() {
+    let token_hash = "secret-verifier".repeat(4);
+    let lease = OrgLease {
+        id: "lease-redacted".into(),
+        workspace_id: WorkspaceId::from_str("11111111-1111-4111-8111-111111111111").unwrap(),
+        work_item_id: WorkItemId::from_str("22222222-2222-4222-8222-222222222222").unwrap(),
+        attempt_id: "attempt-redacted".into(),
+        kind: OrgLeaseKind::Execution,
+        actor_id: "agent-a".into(),
+        fencing_token_hash: token_hash.clone(),
+        acquired_at: 10,
+        last_heartbeat_at: 10,
+        expires_at: 20,
+        ended_at: None,
+        end_reason: None,
+        expiry_event_id: None,
+    };
+
+    let debug = format!("{lease:?}");
+
+    assert!(!debug.contains(&token_hash));
+    assert!(debug.contains("[REDACTED]"));
+}
+
+#[test]
 fn stored_org_operation_debug_redacts_the_persisted_result() {
     let raw_token = "raw-claim-token";
     let token_hash = "a".repeat(64);

@@ -350,7 +350,7 @@ pub enum OrgLeaseEndReason {
     Reassignment,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OrgLease {
     pub id: String,
     pub workspace_id: note_org::WorkspaceId,
@@ -365,6 +365,27 @@ pub struct OrgLease {
     pub ended_at: Option<i64>,
     pub end_reason: Option<OrgLeaseEndReason>,
     pub expiry_event_id: Option<String>,
+}
+
+impl fmt::Debug for OrgLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OrgLease")
+            .field("id", &self.id)
+            .field("workspace_id", &self.workspace_id)
+            .field("work_item_id", &self.work_item_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("kind", &self.kind)
+            .field("actor_id", &self.actor_id)
+            .field("fencing_token_hash", &"[REDACTED]")
+            .field("acquired_at", &self.acquired_at)
+            .field("last_heartbeat_at", &self.last_heartbeat_at)
+            .field("expires_at", &self.expires_at)
+            .field("ended_at", &self.ended_at)
+            .field("end_reason", &self.end_reason)
+            .field("expiry_event_id", &self.expiry_event_id)
+            .finish()
+    }
 }
 
 pub struct NewOrgLease<'a> {
