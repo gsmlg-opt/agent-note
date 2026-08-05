@@ -1494,10 +1494,16 @@ fn move_fingerprint(request: &MoveDocumentRequest) -> serde_json::Value {
 }
 
 fn parse_error(error: note_org::OrgError) -> OrgError {
+    let details = match error {
+        note_org::OrgError::Parse { line, .. } => {
+            json!({"reason": "invalid Org input", "line": line})
+        }
+        _ => json!({"reason": "invalid Org input"}),
+    };
     OrgError::new(
         OrgErrorCode::InvalidInput,
         "Org document is invalid",
-        json!({"reason": error.to_string()}),
+        details,
         false,
     )
 }
