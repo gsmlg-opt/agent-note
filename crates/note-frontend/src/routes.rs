@@ -2,7 +2,7 @@ use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::pages::{
-    DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage,
+    DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage, OrgItemPage,
     OrgWorkspacePage, OrgWorkspacesPage, SystemPage, TrashPage,
 };
 
@@ -65,9 +65,7 @@ pub fn switch(route: Route) -> Html {
         Route::OrgItem {
             workspace_id,
             item_id,
-        } => html! {
-            <p>{ format!("Org item {item_id} in workspace {workspace_id}") }</p>
-        },
+        } => html! { <OrgItemPage {workspace_id} {item_id} /> },
         Route::NewNote => html! { <NewNotePage /> },
         Route::NoteShow { id } => html! { <NoteShowPage {id} /> },
         Route::NoteEdit { id } => html! { <NoteEditPage {id} /> },

@@ -1948,6 +1948,315 @@ a.dashboard-metric-detail:hover {
     font-weight: 800;
 }
 
+/* --- Org work-item context and audit ledger --- */
+.org-item {
+    gap: 1rem;
+}
+
+.org-item-head {
+    align-items: flex-end;
+    border-bottom: 2px solid var(--color-on-surface, #1b1b1f);
+    padding-bottom: 0.85rem;
+}
+
+.org-item-ready {
+    display: grid;
+    gap: 1rem;
+}
+
+.org-context-section {
+    min-width: 0;
+    border-top: 1px solid var(--color-outline-variant, #c7c5d0);
+    padding-top: 0.85rem;
+}
+
+.org-context-overview {
+    border-top: 0;
+    padding-top: 0;
+}
+
+.org-section-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.7rem;
+}
+
+.org-section-head h3,
+.org-relationship-grid h4 {
+    margin: 0;
+}
+
+.org-section-head h3 {
+    font-size: 1rem;
+}
+
+.org-section-head > span {
+    color: var(--color-on-surface-variant, #46464f);
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 0.72rem;
+}
+
+.org-context-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin: 0;
+    border-top: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-left: 1px solid var(--color-outline-variant, #c7c5d0);
+}
+
+.org-context-grid > div {
+    min-width: 0;
+    border-right: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-bottom: 1px solid var(--color-outline-variant, #c7c5d0);
+    padding: 0.65rem 0.75rem;
+}
+
+.org-context-grid dt {
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.66rem;
+    font-weight: 800;
+    letter-spacing: 0.045em;
+    text-transform: uppercase;
+}
+
+.org-context-grid dd {
+    margin: 0.28rem 0 0;
+    overflow-wrap: anywhere;
+    font-size: 0.8rem;
+    font-weight: 650;
+    line-height: 1.35;
+}
+
+.org-relationship-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.8rem;
+}
+
+.org-relationship-grid > div {
+    min-width: 0;
+}
+
+.org-relationship-grid h4 {
+    margin-bottom: 0.4rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.7rem;
+    letter-spacing: 0.045em;
+    text-transform: uppercase;
+}
+
+.org-relationship-list,
+.org-note-links,
+.org-artifacts {
+    display: grid;
+    gap: 0;
+    margin: 0;
+    padding: 0;
+    border-top: 1px solid var(--color-outline-variant, #c7c5d0);
+    list-style: none;
+}
+
+.org-relationship-list li,
+.org-note-links li,
+.org-artifacts li {
+    min-width: 0;
+    border-right: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-bottom: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-left: 3px solid var(--color-outline, #777680);
+    padding: 0.65rem 0.75rem;
+}
+
+.org-relationship-list li.is-satisfied {
+    border-left-color: var(--color-primary, #6750a4);
+}
+
+.org-relationship-list li,
+.org-note-links li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.8rem;
+}
+
+.org-relationship-list a,
+.org-note-links a {
+    min-width: 0;
+    display: grid;
+    gap: 0.2rem;
+    color: inherit;
+    text-decoration: none;
+}
+
+.org-relationship-list a:hover strong,
+.org-note-links a:hover {
+    color: var(--color-primary, #6750a4);
+    text-decoration: underline;
+}
+
+.org-relationship-list code,
+.org-note-links code,
+.org-artifacts code,
+.org-attempt code {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.7rem;
+}
+
+.org-note-links > li > div,
+.org-artifacts li {
+    min-width: 0;
+    display: grid;
+    gap: 0.18rem;
+}
+
+.org-note-links li.is-unavailable {
+    border-left-color: var(--color-error, #ba1a1a);
+    background: color-mix(in srgb, var(--color-error, #ba1a1a) 4%, transparent);
+}
+
+.org-unavailable {
+    color: var(--color-error, #ba1a1a);
+    font-size: 0.75rem;
+    font-weight: 800;
+}
+
+.org-empty-inline,
+.org-inline-ledger {
+    margin: 0;
+    border-left: 3px solid var(--color-outline, #777680);
+    padding: 0.6rem 0.75rem;
+    background: var(--color-surface-container-low, #f3f0f9);
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.78rem;
+}
+
+.org-inline-ledger {
+    margin-top: 0.6rem;
+}
+
+.org-lease-ledger {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    margin-top: 0.75rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+}
+
+.org-lease-ledger > * {
+    min-width: 0;
+    padding: 0.62rem 0.7rem;
+    border-left: 1px solid var(--color-outline-variant, #c7c5d0);
+    overflow-wrap: anywhere;
+    font-size: 0.73rem;
+}
+
+.org-lease-ledger > *:first-child {
+    border-left: 3px solid var(--color-tertiary, #7d5260);
+}
+
+.org-attempts {
+    display: grid;
+    gap: 0.75rem;
+}
+
+.org-attempt {
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    background: var(--color-surface, #faf8ff);
+}
+
+.org-attempt > header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.62rem 0.75rem;
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.org-attempt .org-context-grid {
+    border-left: 0;
+}
+
+.org-attempt .org-artifacts,
+.org-attempt .org-inline-ledger,
+.org-attempt .org-event-metadata {
+    margin: 0.7rem 0.75rem;
+}
+
+.org-event-ledger {
+    min-width: 90rem;
+}
+
+.org-lineage-segments {
+    display: grid;
+    gap: 0.8rem;
+}
+
+.org-lineage-segment {
+    min-width: 0;
+}
+
+.org-lineage-segment h4 {
+    margin: 0 0 0.4rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 0.72rem;
+}
+
+.org-event-ledger thead th:first-child,
+.org-event-ledger tbody th:first-child {
+    min-width: 5.5rem;
+}
+
+.org-sequence {
+    text-align: right !important;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+}
+
+.org-monospace {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.org-event-summary {
+    max-width: 28rem;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+
+.org-event-metadata summary {
+    margin-top: 0.35rem;
+    color: var(--color-primary, #6750a4);
+    cursor: pointer;
+    font-size: 0.72rem;
+    font-weight: 750;
+}
+
+.org-event-metadata pre {
+    max-width: 40rem;
+    max-height: 18rem;
+    margin: 0.45rem 0 0;
+    overflow: auto;
+    padding: 0.65rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    background: var(--color-surface-container-lowest, #fff);
+    color: var(--color-on-surface, #1b1b1f);
+    font-size: 0.7rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.org-item a:focus-visible,
+.org-item button:focus-visible,
+.org-item details > summary:focus-visible,
+.org-events-scroll:focus-visible {
+    outline: 3px solid var(--color-primary, #6750a4);
+    outline-offset: 2px;
+}
+
 @media (max-width: 900px) {
     .org-view-tabs {
         grid-template-columns: repeat(2, minmax(8rem, 1fr));
@@ -1956,11 +2265,21 @@ a.dashboard-metric-detail:hover {
     .org-triage-filters {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+
+    .org-context-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .org-lease-ledger {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
 }
 
 @media (max-width: 620px) {
     .org-directory-head,
     .org-workspace-head,
+    .org-item-head,
+    .org-section-head,
     .org-directory-controls,
     .org-cursor-nav {
         align-items: stretch;
@@ -1974,8 +2293,25 @@ a.dashboard-metric-detail:hover {
     }
 
     .org-view-tabs,
-    .org-triage-filters {
+    .org-triage-filters,
+    .org-context-grid,
+    .org-relationship-grid,
+    .org-lease-ledger {
         grid-template-columns: 1fr;
+    }
+
+    .org-item-head,
+    .org-section-head {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .org-item-head .btn,
+    .org-relationship-list li,
+    .org-note-links li {
+        width: 100%;
+        align-items: flex-start;
+        flex-direction: column;
     }
 }
 
