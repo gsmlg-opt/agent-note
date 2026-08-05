@@ -22,6 +22,7 @@ report() {
 
 command -v "$DEVTOOLS" >/dev/null 2>&1 || fail "chrome-devtools CLI is unavailable"
 command -v jq >/dev/null 2>&1 || fail "jq is unavailable"
+command -v curl >/dev/null 2>&1 || fail "curl is unavailable"
 
 if [[ -n "$WORKSPACE_ID" && -z "$ITEM_ID" ]] || [[ -z "$WORKSPACE_ID" && -n "$ITEM_ID" ]]; then
     fail "set both ORG_CONSOLE_WORKSPACE_ID and ORG_CONSOLE_ITEM_ID, or neither for directory-only mode"
@@ -36,6 +37,52 @@ else
     mode="directory-only"
 fi
 report "mode=$mode (directory-only is partial remote evidence)"
+
+assert_spa_route() {
+    local url="$1"
+    local body_file status
+    body_file="$(mktemp)"
+    status="$(curl --show-error --silent --output "$body_file" --write-out '%{http_code}' "$url")" || {
+        rm -f "$body_file"
+        fail "direct route request failed: $url"
+    }
+    [[ "$status" == "200" ]] || {
+        rm -f "$body_file"
+        fail "direct route returned HTTP $status instead of 200: $url"
+    }
+    grep -Eiq '<!doctype[[:space:]]+html|<html([[:space:]>])' "$body_file" || {
+        rm -f "$body_file"
+        fail "direct route did not return the frontend index: $url"
+    }
+    rm -f "$body_file"
+}
+
+assert_rest_owns_api() {
+    local body_file status
+    body_file="$(mktemp)"
+    status="$(curl --show-error --silent --output "$body_file" --write-out '%{http_code}' \
+        "$base/api/org/workspaces?limit=1")" || {
+        rm -f "$body_file"
+        fail "/api/org workspace list request failed"
+    }
+    [[ "$status" == "200" ]] || {
+        rm -f "$body_file"
+        fail "/api/org workspace list returned HTTP $status instead of 200"
+    }
+    local body
+    body="$(<"$body_file")"
+    rm -f "$body_file"
+    jq -e 'type == "object" and (.items | type == "array")' <<<"$body" >/dev/null ||
+        fail "/api/org was not claimed by the REST router"
+}
+
+assert_spa_route "$base/org?include_archived=false&limit=50"
+assert_rest_owns_api
+if [[ "$mode" == "full" ]]; then
+    assert_spa_route "$base/org/$WORKSPACE_ID?view=ready&limit=50"
+    assert_spa_route "$base/org/$WORKSPACE_ID/items/$ITEM_ID?return_view=ready&return_limit=50"
+fi
+report "direct-route SPA fallback and /api/org REST ownership verified"
 
 urlencode() {
     jq -rn --arg value "$1" '$value | @uri'
@@ -247,10 +294,32 @@ assert_common_page_contract() {
     assert_eval "() => {
         const heading = document.querySelector('main h2');
         const orgPage = document.querySelector('[data-testid^=org-][data-testid$=-page]');
-        return heading && orgPage ? 'ORG_OK:' + heading.textContent.trim() : 'ORG_FAIL:missing heading/page landmark';
-    }" "Org page heading or readiness landmark is missing"
+        const expectedTitle = location.pathname.includes('/items/')
+            ? 'Org item '
+            : location.pathname === '/org'
+                ? 'Org | agent-note'
+                : 'Org workspace ';
+        return heading && orgPage && document.title.startsWith(expectedTitle)
+            ? 'ORG_OK:' + heading.textContent.trim()
+            : 'ORG_FAIL:missing heading/page landmark or route-specific title';
+    }" "Org page heading, readiness landmark, or route-specific title is missing"
     assert_no_sensitive_text
     assert_console_clean
+}
+
+assert_mobile_navigation_visible() {
+    assert_eval "() => {
+        const expected = ['Home', 'Notes', 'Org', 'New note', 'Labels', 'Trash', 'System'];
+        const links = [...document.querySelectorAll('nav[aria-label=\"Primary navigation\"] a')];
+        const visible = expected.every((label) => {
+            const link = links.find((candidate) => candidate.textContent.trim() === label);
+            if (!link || !link.getAttribute('href')) return false;
+            const rect = link.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && rect.left >= 0 && rect.right <= innerWidth;
+        });
+        const noOverflow = document.documentElement.scrollWidth <= document.documentElement.clientWidth;
+        return visible && noOverflow ? 'ORG_OK:mobile navigation' : 'ORG_FAIL:mobile navigation';
+    }" "mobile primary navigation is clipped, unreachable, or causes viewport overflow"
 }
 
 directory_url="$base/org?include_archived=false&limit=50"
@@ -269,6 +338,7 @@ if [[ "$mode" == "directory-only" ]]; then
     "$DEVTOOLS" resize_page 1440 900 >/dev/null
     "$DEVTOOLS" take_screenshot --fullPage=true --filePath=/tmp/org-console-directory-desktop.png >/dev/null
     "$DEVTOOLS" resize_page 390 844 >/dev/null
+    assert_mobile_navigation_visible
     "$DEVTOOLS" take_screenshot --fullPage=true --filePath=/tmp/org-console-directory-mobile.png >/dev/null
     "$DEVTOOLS" take_snapshot --verbose=true --filePath=/tmp/org-console-directory.snapshot.txt >/dev/null
     report "PASS: directory-only partial evidence; screenshots and accessibility snapshot are in /tmp"
@@ -380,6 +450,7 @@ assert_no_polling
 "$DEVTOOLS" resize_page 1440 900 >/dev/null
 "$DEVTOOLS" take_screenshot --fullPage=true --filePath=/tmp/org-console-desktop.png >/dev/null
 "$DEVTOOLS" resize_page 390 844 >/dev/null
+assert_mobile_navigation_visible
 "$DEVTOOLS" take_screenshot --fullPage=true --filePath=/tmp/org-console-mobile.png >/dev/null
 "$DEVTOOLS" take_snapshot --verbose=true --filePath=/tmp/org-console-mobile.snapshot.txt >/dev/null
 assert_console_clean
