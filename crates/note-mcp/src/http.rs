@@ -1,11 +1,11 @@
-//! MCP server exposing the two note tools over rmcp's Streamable HTTP transport.
+//! MCP server exposing Note and Org tools over rmcp's Streamable HTTP transport.
 //!
 //! This reuses the transport-independent [`NoteMcpServer`] from [`crate::stdio`]
 //! verbatim — the tools and server logic live there; here we only wrap that
 //! server in rmcp's [`StreamableHttpService`] and expose it as an Axum
-//! [`Router`] nested at `/mcp`. A single `/mcp` endpoint handles POST + GET with
-//! an optional per-response SSE upgrade (docs/design.md §8); the legacy
-//! two-endpoint HTTP+SSE transport is intentionally not implemented.
+//! [`Router`] nested at `/mcp`. The endpoint is POST-only, stateless, and always
+//! returns JSON. It creates no MCP sessions, SSE streams, authentication layer,
+//! or Host allowlist; those deployment concerns belong to the front proxy.
 //!
 //! note-server (Task 23) merges the returned router into its Axum app alongside
 //! the REST routes.
@@ -15,17 +15,17 @@ use std::sync::Arc;
 use axum::Router;
 use note_pipelines::{org::OrgContext, Context};
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
 use crate::NoteMcpServer;
 
 /// Build an Axum [`Router`] serving the MCP protocol over Streamable HTTP at
-/// `/mcp`, backed by a fresh [`NoteMcpServer`] per session built from `ctx`.
+/// `/mcp`, backed by a fresh [`NoteMcpServer`] per request built from `ctx`.
 ///
 /// The service factory clones the shared [`Context`] (cheap — it is an `Arc`)
-/// into a new `NoteMcpServer` for each session, so all sessions share the same
-/// underlying storage and embedder while remaining independent MCP connections.
+/// into a new `NoteMcpServer` for each request, so all requests share the same
+/// underlying storage and embedder without creating transport sessions.
 ///
 /// Runs the transport in **stateless mode** (`with_stateful_mode(false)`): every POST
 /// is a self-contained request/response, so clients can call `tools/list`/`tools/call`
@@ -49,7 +49,7 @@ pub fn mcp_router(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> Router {
         .disable_allowed_hosts();
     let service = StreamableHttpService::new(
         move || Ok(NoteMcpServer::new(ctx.clone(), org_ctx.clone())),
-        Arc::new(LocalSessionManager::default()),
+        Arc::new(NeverSessionManager::default()),
         config,
     );
     Router::new().nest_service("/mcp", service)

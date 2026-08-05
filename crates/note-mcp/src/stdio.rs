@@ -13,8 +13,8 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Json, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
-    transport::io::stdio,
-    ErrorData, ServerHandler, ServiceExt,
+    transport::{io::stdio, IntoTransport},
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -830,11 +830,23 @@ fn to_put_error_data(error: anyhow::Error) -> ErrorData {
     to_error_data(error)
 }
 
-pub async fn run_stdio(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> anyhow::Result<()> {
+pub async fn serve_stdio_transport<T, E, A>(
+    ctx: Arc<Context>,
+    org_ctx: Arc<OrgContext>,
+    transport: T,
+) -> anyhow::Result<()>
+where
+    T: IntoTransport<RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let server = NoteMcpServer::new(ctx, org_ctx);
-    let running = server.serve(stdio()).await?;
+    let running = server.serve(transport).await?;
     running.waiting().await?;
     Ok(())
+}
+
+pub async fn run_stdio(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> anyhow::Result<()> {
+    serve_stdio_transport(ctx, org_ctx, stdio()).await
 }
 
 #[cfg(test)]
