@@ -1,5 +1,10 @@
-use note_org::WorkspaceId;
-use note_pipelines::org::{CommandEnvelope, OrgError, OrgReadQuery};
+use std::collections::BTreeMap;
+
+use note_org::{DocumentId, WorkItemId, WorkspaceId};
+use note_pipelines::org::{
+    CommandEnvelope, DocumentImport, ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest,
+    MoveItemRequest, OrgClaimKind, OrgError, OrgReadQuery, PutDocumentRequest,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -29,7 +34,7 @@ impl OrgMutationEnvelope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, ToSchema, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 pub struct OrgPageQuery {
     /// Opaque cursor returned by the preceding page; clients must not inspect or modify it.
@@ -50,6 +55,418 @@ impl From<OrgPageQuery> for OrgReadQuery {
             include_archived: value.include_archived,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePath {
+    pub workspace_id: String,
+}
+
+impl WorkspacePath {
+    pub fn parse(self) -> Result<WorkspaceId, OrgError> {
+        parse_id(self.workspace_id, "workspace_id")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentPath {
+    pub document_id: String,
+}
+
+impl DocumentPath {
+    pub fn parse(self) -> Result<DocumentId, OrgError> {
+        parse_id(self.document_id, "document_id")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ItemPath {
+    pub item_id: String,
+}
+
+impl ItemPath {
+    pub fn parse(self) -> Result<WorkItemId, OrgError> {
+        parse_id(self.item_id, "item_id")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentReadQuery {
+    pub workspace_id: String,
+}
+
+impl DocumentReadQuery {
+    pub fn parse(self) -> Result<WorkspaceId, OrgError> {
+        parse_id(self.workspace_id, "workspace_id")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePolicyInput {
+    pub allow_cross_workspace_agenda: bool,
+    pub allowed_types: Vec<String>,
+    pub states: Vec<String>,
+    pub transitions: Vec<(String, String)>,
+    pub initial_state: String,
+    pub running_state: String,
+    pub executable_states: Vec<String>,
+    pub review_state: String,
+    pub failed_state: String,
+    pub cancelled_state: String,
+    pub successful_terminal_states: Vec<String>,
+    pub terminal_states: Vec<String>,
+    pub release_state: String,
+    pub review_rejection_state: String,
+    pub lease_expiry_recovery_state: String,
+    pub review_required_types: Vec<String>,
+    pub claim_policy: String,
+    pub lease_duration_secs: u64,
+    pub retry_limit: u32,
+    pub concurrency_limit: usize,
+    pub tag_rules: BTreeMap<String, TagRuleInput>,
+}
+
+impl WorkspacePolicyInput {
+    fn into_pipeline(self) -> Result<note_org::WorkspacePolicy, OrgError> {
+        adapt_input(self, "workspace policy")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TagRuleInput {
+    pub allowed: Vec<String>,
+    pub required: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateWorkspaceBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub timezone: String,
+    pub policy_schema_version: i64,
+    pub policy: WorkspacePolicyInput,
+}
+
+impl CreateWorkspaceBody {
+    pub fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::CreateWorkspaceRequest), OrgError> {
+        let workspace_id = self
+            .workspace_id
+            .parse::<WorkspaceId>()
+            .map_err(|_| OrgError::invalid_input("workspace_id must be a valid UUID"))?;
+        let policy = self.policy.into_pipeline()?;
+        let command = self.command.into_pipeline(&workspace_id.to_string())?;
+        Ok((
+            command,
+            note_pipelines::org::CreateWorkspaceRequest {
+                slug: self.slug,
+                display_name: self.display_name,
+                description: self.description,
+                timezone: self.timezone,
+                policy_schema_version: self.policy_schema_version,
+                policy,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWorkspaceBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub expected_revision: i64,
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub timezone: String,
+    pub policy_schema_version: i64,
+    pub policy: WorkspacePolicyInput,
+}
+
+impl UpdateWorkspaceBody {
+    pub fn into_pipeline(
+        self,
+        workspace_id: WorkspaceId,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::UpdateWorkspaceRequest), OrgError> {
+        let policy = self.policy.into_pipeline()?;
+        let command = self.command.into_pipeline(&workspace_id.to_string())?;
+        Ok((
+            command,
+            note_pipelines::org::UpdateWorkspaceRequest {
+                expected_revision: self.expected_revision,
+                slug: self.slug,
+                display_name: self.display_name,
+                description: self.description,
+                timezone: self.timezone,
+                policy_schema_version: self.policy_schema_version,
+                policy,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveWorkspaceBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub expected_revision: i64,
+}
+
+impl ArchiveWorkspaceBody {
+    pub fn into_pipeline(
+        self,
+        workspace_id: WorkspaceId,
+    ) -> Result<
+        (
+            CommandEnvelope,
+            note_pipelines::org::ArchiveWorkspaceRequest,
+        ),
+        OrgError,
+    > {
+        Ok((
+            self.command.into_pipeline(&workspace_id.to_string())?,
+            note_pipelines::org::ArchiveWorkspaceRequest {
+                expected_revision: self.expected_revision,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseProofBody {
+    pub lease_id: String,
+    pub kind: ClaimKindBody,
+    /// Sensitive raw fencing token; never returned by read operations.
+    pub fencing_token: String,
+}
+
+impl From<LeaseProofBody> for LeaseProofInput {
+    fn from(value: LeaseProofBody) -> Self {
+        Self {
+            lease_id: value.lease_id,
+            kind: value.kind.into(),
+            fencing_token: value.fencing_token,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimKindBody {
+    Execution,
+    Review,
+}
+
+impl From<ClaimKindBody> for OrgClaimKind {
+    fn from(value: ClaimKindBody) -> Self {
+        match value {
+            ClaimKindBody::Execution => Self::Execution,
+            ClaimKindBody::Review => Self::Review,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PutDocumentBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub path: String,
+    pub source: String,
+    pub expected_revision: Option<i64>,
+    pub lease_proofs: BTreeMap<String, LeaseProofBody>,
+}
+
+impl PutDocumentBody {
+    pub fn into_pipeline(
+        self,
+        document_id: DocumentId,
+    ) -> Result<(CommandEnvelope, PutDocumentRequest), OrgError> {
+        let command = self.command.into_pipeline(&self.workspace_id)?;
+        Ok((
+            command,
+            PutDocumentRequest {
+                document_id,
+                path: self.path,
+                source: self.source,
+                expected_revision: self.expected_revision,
+                lease_proofs: adapt_id_map(self.lease_proofs, "work_item_id")?,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MoveDocumentBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub target_workspace_id: String,
+    pub expected_document_revision: i64,
+    pub expected_source_workspace_revision: i64,
+    pub expected_target_workspace_revision: i64,
+    pub lease_proofs: BTreeMap<String, LeaseProofBody>,
+}
+
+impl MoveDocumentBody {
+    pub fn into_pipeline(
+        self,
+        document_id: DocumentId,
+    ) -> Result<(CommandEnvelope, MoveDocumentRequest), OrgError> {
+        let command = self.command.into_pipeline(&self.workspace_id)?;
+        Ok((
+            command,
+            MoveDocumentRequest {
+                document_id,
+                target_workspace_id: parse_id(self.target_workspace_id, "target_workspace_id")?,
+                expected_document_revision: self.expected_document_revision,
+                expected_source_workspace_revision: self.expected_source_workspace_revision,
+                expected_target_workspace_revision: self.expected_target_workspace_revision,
+                lease_proofs: adapt_id_map(self.lease_proofs, "work_item_id")?,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MoveItemBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub source_document_id: String,
+    pub target_document_id: String,
+    pub target_parent_id: Option<String>,
+    pub expected_revisions: BTreeMap<String, i64>,
+    pub lease_proofs: BTreeMap<String, LeaseProofBody>,
+}
+
+impl MoveItemBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, MoveItemRequest), OrgError> {
+        let command = self.command.into_pipeline(&self.workspace_id)?;
+        Ok((
+            command,
+            MoveItemRequest {
+                item_id,
+                source_document_id: parse_id(self.source_document_id, "source_document_id")?,
+                target_document_id: parse_id(self.target_document_id, "target_document_id")?,
+                target_parent_id: self
+                    .target_parent_id
+                    .map(|id| parse_id(id, "target_parent_id"))
+                    .transpose()?,
+                expected_revisions: adapt_id_map(self.expected_revisions, "document_id")?,
+                lease_proofs: adapt_id_map(self.lease_proofs, "work_item_id")?,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentImportBody {
+    pub document_id: String,
+    pub path: String,
+    pub source: String,
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImportWorkspaceBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub documents: Vec<DocumentImportBody>,
+    pub expected_revisions: BTreeMap<String, i64>,
+    pub lease_proofs: BTreeMap<String, LeaseProofBody>,
+}
+
+impl ImportWorkspaceBody {
+    pub fn into_pipeline(
+        self,
+        workspace_id: WorkspaceId,
+    ) -> Result<(CommandEnvelope, ImportDocumentsRequest), OrgError> {
+        let documents = self
+            .documents
+            .into_iter()
+            .map(|document| {
+                Ok(DocumentImport {
+                    document_id: parse_id(document.document_id, "document_id")?,
+                    path: document.path,
+                    source: document.source,
+                })
+            })
+            .collect::<Result<Vec<_>, OrgError>>()?;
+        Ok((
+            self.command.into_pipeline(&workspace_id.to_string())?,
+            ImportDocumentsRequest {
+                documents,
+                expected_revisions: adapt_id_map(self.expected_revisions, "document_id")?,
+                lease_proofs: adapt_id_map(self.lease_proofs, "work_item_id")?,
+            },
+        ))
+    }
+}
+
+fn parse_id<T>(value: String, name: &str) -> Result<T, OrgError>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse()
+        .map_err(|_| OrgError::invalid_input(format!("{name} must be a valid UUID")))
+}
+
+fn adapt_input<T, U>(value: T, name: &str) -> Result<U, OrgError>
+where
+    T: Serialize,
+    U: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(
+        serde_json::to_value(value)
+            .map_err(|_| OrgError::invalid_input(format!("invalid {name}")))?,
+    )
+    .map_err(|_| OrgError::invalid_input(format!("invalid {name}")))
+}
+
+fn adapt_id_map<K, V, U>(
+    values: BTreeMap<String, V>,
+    key_name: &str,
+) -> Result<BTreeMap<K, U>, OrgError>
+where
+    K: Ord + std::str::FromStr,
+    U: From<V>,
+{
+    let mut adapted = BTreeMap::new();
+    for (id, value) in values {
+        if adapted
+            .insert(parse_id(id, key_name)?, value.into())
+            .is_some()
+        {
+            return Err(OrgError::invalid_input(format!(
+                "{key_name} keys must be unique UUIDs"
+            )));
+        }
+    }
+    Ok(adapted)
 }
 
 #[cfg(test)]
@@ -90,5 +507,17 @@ mod tests {
         assert_eq!(pipeline.cursor.as_deref(), Some("opaque-cursor"));
         assert_eq!(pipeline.limit, Some(50));
         assert!(!pipeline.include_archived);
+    }
+
+    #[test]
+    fn id_maps_reject_distinct_spellings_that_normalize_to_one_uuid() {
+        let mut values = BTreeMap::new();
+        values.insert("20000000-0000-4000-8000-00000000000a".to_owned(), 1_i64);
+        values.insert("20000000-0000-4000-8000-00000000000A".to_owned(), 2_i64);
+
+        let error = adapt_id_map::<DocumentId, _, i64>(values, "document_id").unwrap_err();
+
+        assert_eq!(error.code, note_pipelines::org::OrgErrorCode::InvalidInput);
+        assert_eq!(error.message, "document_id keys must be unique UUIDs");
     }
 }

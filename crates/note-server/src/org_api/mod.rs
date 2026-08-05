@@ -1,5 +1,7 @@
+mod documents;
 pub mod dto;
 pub mod error;
+mod workspaces;
 
 use axum::{extract::State, Json};
 use note_pipelines::org::{OrgContext, OrgError, OrgErrorCode};
@@ -60,78 +62,6 @@ macro_rules! org_mutation_route {
     };
 }
 
-org_read_route!(
-    list_workspaces,
-    get,
-    "/api/org/workspaces",
-    "org_list_workspaces"
-);
-org_mutation_route!(
-    create_workspace,
-    post,
-    "/api/org/workspaces",
-    "org_create_workspace"
-);
-org_read_route!(
-    get_workspace,
-    get,
-    "/api/org/workspaces/{workspace_id}",
-    "org_get_workspace"
-);
-org_mutation_route!(
-    update_workspace,
-    patch,
-    "/api/org/workspaces/{workspace_id}",
-    "org_update_workspace"
-);
-org_mutation_route!(
-    archive_workspace,
-    post,
-    "/api/org/workspaces/{workspace_id}/archive",
-    "org_archive_workspace"
-);
-org_read_route!(
-    list_documents,
-    get,
-    "/api/org/workspaces/{workspace_id}/documents",
-    "org_list_documents"
-);
-org_read_route!(
-    get_document,
-    get,
-    "/api/org/documents/{document_id}",
-    "org_get_document"
-);
-org_mutation_route!(
-    put_document,
-    put,
-    "/api/org/documents/{document_id}",
-    "org_put_document"
-);
-org_mutation_route!(
-    move_document,
-    post,
-    "/api/org/documents/{document_id}/move",
-    "org_move_document"
-);
-org_mutation_route!(
-    move_item,
-    post,
-    "/api/org/items/{item_id}/move",
-    "org_move_item"
-);
-org_mutation_route!(
-    import_workspace,
-    post,
-    "/api/org/workspaces/{workspace_id}/import",
-    "org_import_workspace"
-);
-org_read_route!(
-    export_workspace,
-    get,
-    "/api/org/workspaces/{workspace_id}/export",
-    "org_export_workspace"
-);
 org_mutation_route!(
     create_item,
     post,
@@ -268,15 +198,8 @@ struct OrgApiSchemas;
 
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(OrgApiSchemas::openapi())
-        .routes(routes!(list_workspaces, create_workspace))
-        .routes(routes!(get_workspace, update_workspace))
-        .routes(routes!(archive_workspace))
-        .routes(routes!(list_documents))
-        .routes(routes!(get_document, put_document))
-        .routes(routes!(move_document))
-        .routes(routes!(move_item))
-        .routes(routes!(import_workspace))
-        .routes(routes!(export_workspace))
+        .merge(workspaces::router())
+        .merge(documents::router())
         .routes(routes!(create_item))
         .routes(routes!(get_item))
         .routes(routes!(get_item_context))
