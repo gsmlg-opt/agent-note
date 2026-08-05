@@ -20,9 +20,9 @@ implementation details are left to the builder.
 
 ```
       ┌─────────────┐        ┌──────────────────────┐
-      │ stdio entry │        │ Axum: /api/notes      │
-      │ (subprocess)│        │ Axum: /mcp (Streamable│
-      └──────┬──────┘        │        HTTP)           │
+      │ stdio entry │        │ Axum: /api/notes,      │
+      │ (subprocess)│        │ /api/org, /mcp         │
+      └──────┬──────┘        │ (Streamable HTTP)      │
              │                └──────────┬────────────┘
              └───────────┬────────────────┘
                           ▼
@@ -418,7 +418,76 @@ those exact contexts into stdio or HTTP. Stdio uses JSON-RPC over process stdin/
 stderr. Streamable HTTP is stateless JSON POST at the single `/mcp` endpoint; it has no GET/SSE
 transport, MCP sessions, authentication middleware, or legacy two-endpoint HTTP+SSE path.
 
-### 8.1 Org Offline Interfaces
+### 8.1 Org REST/OpenAPI Interface
+
+The Axum server exposes every Org pipeline operation under `/api/org`. The generated OpenAPI 3.1
+document is available at `/api/openapi.json` and interactive Swagger UI at `/api/docs`; `/mcp` is
+not part of that document. Each REST operation has the exact corresponding MCP tool name as its
+unique `operationId`:
+
+| Method and path | `operationId` |
+| --- | --- |
+| `GET /api/org/workspaces` | `org_list_workspaces` |
+| `POST /api/org/workspaces` | `org_create_workspace` |
+| `GET /api/org/workspaces/{workspace_id}` | `org_get_workspace` |
+| `PATCH /api/org/workspaces/{workspace_id}` | `org_update_workspace` |
+| `POST /api/org/workspaces/{workspace_id}/archive` | `org_archive_workspace` |
+| `GET /api/org/workspaces/{workspace_id}/documents` | `org_list_documents` |
+| `GET /api/org/documents/{document_id}` | `org_get_document` |
+| `PUT /api/org/documents/{document_id}` | `org_put_document` |
+| `POST /api/org/documents/{document_id}/move` | `org_move_document` |
+| `POST /api/org/items/{item_id}/move` | `org_move_item` |
+| `POST /api/org/workspaces/{workspace_id}/import` | `org_import_workspace` |
+| `GET /api/org/workspaces/{workspace_id}/export` | `org_export_workspace` |
+| `POST /api/org/workspaces/{workspace_id}/items` | `org_create_item` |
+| `GET /api/org/items/{item_id}` | `org_get_item` |
+| `GET /api/org/items/{item_id}/context` | `org_get_item_context` |
+| `POST /api/org/items/{item_id}/follow-ups` | `org_create_follow_up` |
+| `POST /api/org/items/{item_id}/assignment` | `org_assign_item` |
+| `POST /api/org/items/{item_id}/schedule` | `org_schedule_item` |
+| `GET /api/org/queue` | `org_query_queue` |
+| `GET /api/org/agenda` | `org_query_agenda` |
+| `POST /api/org/items/{item_id}/claim` | `org_claim_item` |
+| `POST /api/org/items/{item_id}/claim/heartbeat` | `org_heartbeat_claim` |
+| `POST /api/org/items/{item_id}/claim/release` | `org_release_claim` |
+| `POST /api/org/items/{item_id}/progress` | `org_report_progress` |
+| `POST /api/org/items/{item_id}/result` | `org_submit_result` |
+| `POST /api/org/items/{item_id}/transition` | `org_transition_item` |
+| `POST /api/org/items/{item_id}/retry` | `org_retry_item` |
+| `POST /api/org/items/{item_id}/review/request` | `org_request_review` |
+| `POST /api/org/items/{item_id}/review/approve` | `org_approve_item` |
+| `POST /api/org/items/{item_id}/review/reject` | `org_reject_item` |
+| `POST /api/org/items/{item_id}/dependencies` | `org_add_dependency` |
+| `DELETE /api/org/items/{item_id}/dependencies/{dependency_item_id}` | `org_remove_dependency` |
+| `POST /api/org/items/{item_id}/note-links` | `org_link_note` |
+| `DELETE /api/org/items/{item_id}/note-links` | `org_unlink_note` |
+| `GET /api/org/notes/{note_id}/work-items` | `org_list_note_work_items` |
+| `GET /api/org/workspaces/{workspace_id}/events` | `org_list_events` |
+
+Reads use path/query extraction. Every mutation, including `DELETE`, uses a JSON envelope with
+`schema_version`, client-asserted `actor_id`, idempotent `operation_id`, workspace identity, and
+operation-specific action, revision, or lease fields. IDs supplied by the path and body must
+match. `actor_id` is audit attribution, not an authenticated identity. An identical operation
+replay returns its durable original result, including after restart; a divergent reuse returns
+`idempotency_conflict` without applying effects.
+
+REST success JSON and MCP structured content serialize the same pipeline DTO. Every REST failure
+is `{code, message, details, retryable}` JSON. Invalid input maps to 400, missing requested
+resources to 404, workflow/revision/idempotency/lease conflicts to 409, concurrency limits to 429,
+and safe storage failures to 500. HTTP status and JSON-RPC framing are transport metadata; semantic
+result and error fields remain equal.
+
+Raw fencing tokens are sensitive ownership proofs. Only successful claim and retry/reclaim results
+return them, and only lease-bound mutation bodies accept them. General reads, errors, events,
+queues, context, exports, logs, and OpenAPI examples must never disclose a raw token or its hash;
+token-bearing request schema fields are documented as sensitive.
+
+Agent Note implements no authentication, authorization, session, trusted proxy-identity-header,
+or workspace ACL behavior. OpenAPI intentionally defines no security scheme. The front proxy owns
+TLS, authentication, access control, Host/origin policy, and network restriction. Direct untrusted
+exposure of Agent Note is unsupported.
+
+### 8.2 Org Offline Interfaces
 
 The storage-only command surface is:
 
@@ -497,9 +566,10 @@ workspace with any active lease and accepts no ownership proof. Raw import may c
 leased item only when it supplies and validates that item's exact current proof. Import reuses the
 same lifecycle decisions and typed events as structured commands rather than bypassing fencing.
 
-Delivery Slice 5 exposes Org only through the 36 MCP tools and four storage-only offline commands.
-It intentionally has no `/api/org` REST/OpenAPI route, Org Web/frontend route, browser control,
-session, or polling behavior. Actor IDs are asserted audit attribution, not authenticated identity.
+Delivery Slice 6 exposes Org through 36 matching MCP and REST/OpenAPI operations plus four
+storage-only offline commands where applicable. It intentionally has no Org Web/frontend route,
+browser control, session, or polling behavior. Actor IDs are asserted audit attribution, not
+authenticated identity.
 Agent Note implements no inbound authentication, authorization, trusted proxy-identity protocol,
 or workspace ACL. A front proxy owns TLS, authentication, authorization, Host/origin validation,
 and network restriction; direct exposure of the service to an untrusted network is unsupported.

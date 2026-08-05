@@ -73,27 +73,36 @@ impl OrgTokenSource for DeterministicTokens {
     }
 }
 
+struct RejectingTokens;
+
+impl OrgTokenSource for RejectingTokens {
+    fn generate_token(&self) -> Result<String, OrgError> {
+        Err(OrgError::invalid_input(
+            "restart replay must not generate a replacement token",
+        ))
+    }
+}
+
 struct TransportSide {
     rest: Router,
     mcp: Router,
     clock: Arc<AdjustableClock>,
+    database_path: std::path::PathBuf,
+    attachments_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
 impl TransportSide {
     async fn new(name: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn StorageBackend> = Arc::new(
-            TursoStorage::open(dir.path().join(format!("{name}.db")))
-                .await
-                .unwrap(),
-        );
+        let database_path = dir.path().join(format!("{name}.db"));
+        let attachments_path = dir.path().join("attachments");
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(&database_path).await.unwrap());
         let note = Arc::new(Context::new(
             storage.clone(),
             Arc::new(StubEmbedder),
-            Arc::new(FilesystemAttachmentStore::new(
-                dir.path().join("attachments"),
-            )),
+            Arc::new(FilesystemAttachmentStore::new(attachments_path.clone())),
         ));
         let clock = Arc::new(AdjustableClock::new(NOW));
         let org = Arc::new(
@@ -112,7 +121,46 @@ impl TransportSide {
             rest,
             mcp,
             clock,
+            database_path,
+            attachments_path,
             _dir: dir,
+        }
+    }
+
+    async fn reopen(self) -> Self {
+        let Self {
+            rest,
+            mcp,
+            clock,
+            database_path,
+            attachments_path,
+            _dir,
+        } = self;
+        drop(rest);
+        drop(mcp);
+
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(&database_path).await.unwrap());
+        let note = Arc::new(Context::new(
+            storage.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(attachments_path.clone())),
+        ));
+        let org = Arc::new(
+            OrgContext::new(storage, clock.clone()).with_token_source(Arc::new(RejectingTokens)),
+        );
+        let state = AppState::new(note.clone(), org.clone());
+        assert!(Arc::ptr_eq(&state.org, &org));
+        let (rest, _) = rest_router();
+        let rest = rest.with_state(state);
+        let mcp = note_mcp::mcp_router(note, org);
+        Self {
+            rest,
+            mcp,
+            clock,
+            database_path,
+            attachments_path,
+            _dir,
         }
     }
 
@@ -259,6 +307,15 @@ impl Pair {
         align_generated_ids(&rest, &mut mcp, &mut self.rest_to_mcp_ids);
         assert_eq!(rest, mcp, "semantic transport mismatch for {name}");
         rest
+    }
+
+    async fn reopen(self) -> Self {
+        Self {
+            rest: self.rest.reopen().await,
+            mcp: self.mcp.reopen().await,
+            next_id: self.next_id,
+            rest_to_mcp_ids: self.rest_to_mcp_ids,
+        }
     }
 
     async fn call_success(
@@ -911,4 +968,118 @@ async fn streamable_http_mcp_and_rest_preserve_org_semantics() {
         None,
     )
     .await;
+}
+
+#[tokio::test]
+async fn restart_preserves_claim_idempotency_across_mcp_and_rest() {
+    let mut pair = Pair::new().await;
+
+    let create = merge(
+        command("seed", "restart-create-workspace"),
+        json!({
+            "slug": "restart-conformance",
+            "display_name": "Restart Conformance",
+            "description": "durable transport idempotency",
+            "timezone": "UTC",
+            "policy_schema_version": 1,
+            "policy": policy()
+        }),
+    );
+    pair.call_success(
+        "org_create_workspace",
+        create.clone(),
+        Method::POST,
+        "/api/org/workspaces",
+        Some(create),
+    )
+    .await;
+
+    let put = merge(
+        command("seed", "restart-put-document"),
+        json!({
+            "document_id": DOCUMENT,
+            "path": "restart.org",
+            "source": "#+TITLE: Restart\n",
+            "expected_revision": null,
+            "lease_proofs": {}
+        }),
+    );
+    pair.call_success(
+        "org_put_document",
+        put.clone(),
+        Method::PUT,
+        &format!("/api/org/documents/{DOCUMENT}"),
+        Some(without(put, &["document_id"])),
+    )
+    .await;
+    create_item(&mut pair, ITEM_A, "Restart claim", false).await;
+
+    let claim_input = merge(
+        command("restart-agent", "restart-claim"),
+        json!({
+            "work_item_id": ITEM_A,
+            "document_id": DOCUMENT,
+            "expected_document_revision": document_revision(&mut pair).await,
+            "kind": "execution"
+        }),
+    );
+    let claimed = pair
+        .call_success(
+            "org_claim_item",
+            claim_input.clone(),
+            Method::POST,
+            &format!("/api/org/items/{ITEM_A}/claim"),
+            Some(without(claim_input.clone(), &["work_item_id"])),
+        )
+        .await;
+    let context_before = pair
+        .call_success(
+            "org_get_item_context",
+            json!({"workspace_id": WORKSPACE, "item_id": ITEM_A}),
+            Method::GET,
+            &format!("/api/org/items/{ITEM_A}/context?workspace_id={WORKSPACE}"),
+            None,
+        )
+        .await;
+
+    let mut pair = pair.reopen().await;
+    let replayed = pair
+        .call_success(
+            "org_claim_item",
+            claim_input.clone(),
+            Method::POST,
+            &format!("/api/org/items/{ITEM_A}/claim"),
+            Some(without(claim_input.clone(), &["work_item_id"])),
+        )
+        .await;
+    assert_eq!(
+        replayed, claimed,
+        "restart changed the durable claim result"
+    );
+
+    let mut divergent = claim_input;
+    divergent["actor_id"] = json!("different-restart-agent");
+    pair.call_error(
+        "idempotency_conflict",
+        "org_claim_item",
+        divergent.clone(),
+        Method::POST,
+        &format!("/api/org/items/{ITEM_A}/claim"),
+        Some(without(divergent, &["work_item_id"])),
+    )
+    .await;
+
+    let context_after = pair
+        .call_success(
+            "org_get_item_context",
+            json!({"workspace_id": WORKSPACE, "item_id": ITEM_A}),
+            Method::GET,
+            &format!("/api/org/items/{ITEM_A}/context?workspace_id={WORKSPACE}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        context_after, context_before,
+        "restart replay duplicated attempts, leases, events, or revisions"
+    );
 }

@@ -45,7 +45,7 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
                      append-only audit reads, and recovery-context assembly
    ▲
    ├── note-mcp     11 Markdown-note + 36 Org tools over stdio and Streamable HTTP (one registry)
-   └── note-server  Axum REST (/api/notes, /api/labels) + /mcp, plus storage-only Org commands
+   └── note-server  Axum REST (/api/notes, /api/labels, /api/org) + /mcp
                         ▲
                    note-frontend   Yew MVU (AppState + pure reducer) → talks to note-server over REST
 ```
@@ -77,9 +77,10 @@ counts active execution and review leases and is checked in the same transaction
 idempotent operation replay returns the original result without duplicate attempts, events, state
 changes, or tokens. Actor IDs are client-asserted audit data, not trusted identities.
 
-Delivery Slice 5 exposes Org orchestration through MCP and four storage-only offline commands.
-It deliberately adds no Org REST/OpenAPI route and no Org Web/frontend behavior. Later slices must
-call the same pipeline boundary rather than duplicate its policy or lease logic.
+Delivery Slice 6 exposes the same 36 Org operations through REST/OpenAPI, MCP, and four
+storage-only offline commands where applicable. REST and MCP call the same pipeline boundary and
+share the same `Arc<OrgContext>`; no transport duplicates policy, revision, idempotency, or lease
+logic. This slice adds no Org Web/frontend behavior.
 Agent Note implements no inbound authentication, authorization, proxy-identity-header, or workspace
 ACL behavior. A front proxy owns TLS, authentication, authorization, and network access; direct
 exposure to an untrusted network is unsupported.
@@ -166,6 +167,88 @@ The OpenAPI document covers the REST API only. `/mcp` remains outside the docume
 own MCP protocol discovery and schemas. Swagger UI has **Try it out** enabled, including for
 destructive operations, and the HTTP API is unauthenticated. Use it only on a trusted network or
 behind an authenticating reverse proxy.
+
+### Org REST API
+
+The Org REST surface has exact one-to-one parity with the 36 `org_*` MCP tools. Each generated
+OpenAPI `operationId` is the matching MCP tool name:
+
+| Method | Path | `operationId` |
+| --- | --- | --- |
+| `GET` | `/api/org/workspaces` | `org_list_workspaces` |
+| `POST` | `/api/org/workspaces` | `org_create_workspace` |
+| `GET` | `/api/org/workspaces/{workspace_id}` | `org_get_workspace` |
+| `PATCH` | `/api/org/workspaces/{workspace_id}` | `org_update_workspace` |
+| `POST` | `/api/org/workspaces/{workspace_id}/archive` | `org_archive_workspace` |
+| `GET` | `/api/org/workspaces/{workspace_id}/documents` | `org_list_documents` |
+| `GET` | `/api/org/documents/{document_id}` | `org_get_document` |
+| `PUT` | `/api/org/documents/{document_id}` | `org_put_document` |
+| `POST` | `/api/org/documents/{document_id}/move` | `org_move_document` |
+| `POST` | `/api/org/items/{item_id}/move` | `org_move_item` |
+| `POST` | `/api/org/workspaces/{workspace_id}/import` | `org_import_workspace` |
+| `GET` | `/api/org/workspaces/{workspace_id}/export` | `org_export_workspace` |
+| `POST` | `/api/org/workspaces/{workspace_id}/items` | `org_create_item` |
+| `GET` | `/api/org/items/{item_id}` | `org_get_item` |
+| `GET` | `/api/org/items/{item_id}/context` | `org_get_item_context` |
+| `POST` | `/api/org/items/{item_id}/follow-ups` | `org_create_follow_up` |
+| `POST` | `/api/org/items/{item_id}/assignment` | `org_assign_item` |
+| `POST` | `/api/org/items/{item_id}/schedule` | `org_schedule_item` |
+| `GET` | `/api/org/queue` | `org_query_queue` |
+| `GET` | `/api/org/agenda` | `org_query_agenda` |
+| `POST` | `/api/org/items/{item_id}/claim` | `org_claim_item` |
+| `POST` | `/api/org/items/{item_id}/claim/heartbeat` | `org_heartbeat_claim` |
+| `POST` | `/api/org/items/{item_id}/claim/release` | `org_release_claim` |
+| `POST` | `/api/org/items/{item_id}/progress` | `org_report_progress` |
+| `POST` | `/api/org/items/{item_id}/result` | `org_submit_result` |
+| `POST` | `/api/org/items/{item_id}/transition` | `org_transition_item` |
+| `POST` | `/api/org/items/{item_id}/retry` | `org_retry_item` |
+| `POST` | `/api/org/items/{item_id}/review/request` | `org_request_review` |
+| `POST` | `/api/org/items/{item_id}/review/approve` | `org_approve_item` |
+| `POST` | `/api/org/items/{item_id}/review/reject` | `org_reject_item` |
+| `POST` | `/api/org/items/{item_id}/dependencies` | `org_add_dependency` |
+| `DELETE` | `/api/org/items/{item_id}/dependencies/{dependency_item_id}` | `org_remove_dependency` |
+| `POST` | `/api/org/items/{item_id}/note-links` | `org_link_note` |
+| `DELETE` | `/api/org/items/{item_id}/note-links` | `org_unlink_note` |
+| `GET` | `/api/org/notes/{note_id}/work-items` | `org_list_note_work_items` |
+| `GET` | `/api/org/workspaces/{workspace_id}/events` | `org_list_events` |
+
+Read inputs use path and query parameters. Mutations, including both `DELETE` operations, use a
+JSON envelope containing `schema_version`, `workspace_id` when it is not supplied by the path,
+client-asserted `actor_id`, idempotent `operation_id`, and operation-specific revision, lease, and
+action fields. A path ID is authoritative; any duplicated ID in a body must match it. `actor_id`
+is audit attribution supplied by the caller, not a verified identity or authorization decision.
+An identical operation replay returns its original result, including after restart; reusing the
+operation ID for different input returns `idempotency_conflict`.
+
+REST success bodies serialize the same pipeline DTOs returned as MCP structured content. REST
+errors are always JSON with this common shape:
+
+```json
+{
+  "code": "active_lease",
+  "message": "work item already has an active lease",
+  "details": {},
+  "retryable": false
+}
+```
+
+`invalid_input` and `unsupported_semantic_edit` map to HTTP 400; missing requested resources map to
+404; workflow, revision, idempotency, dependency, review, lease, and retry conflicts map to 409;
+`concurrency_limit` maps to 429 with `retryable: true`; and storage failures map to 500 with a safe
+generic message. Protocol framing and HTTP status are transport metadata; result fields and the
+four error fields have MCP/REST parity.
+
+Raw fencing tokens are sensitive ownership proofs. Only successful claim and retry/reclaim
+responses return them, and only lease-bound mutation requests accept them. They must not be logged
+or copied into errors, events, queues, context, source documents, exports, or general application
+state. OpenAPI marks token-bearing request fields as sensitive and contains no token-bearing read
+schemas or examples.
+
+Agent Note deliberately implements no authentication, authorization, session, or workspace ACL
+behavior. It does not consume a trusted proxy-identity header and the OpenAPI document defines no
+security scheme. A front proxy must own TLS, authentication, and access control, as well as the
+deployment's Host/origin and network restrictions. Direct exposure to an untrusted network is
+unsupported.
 
 ## Runtime configuration
 
@@ -445,8 +528,8 @@ Opaque fencing tokens are sensitive ownership proofs: only successful claim and 
 results return them. Do not log them or expose them through general reads, errors, events, or
 exports. Agent Note has no inbound authentication, authorization, sessions, or trusted
 proxy-identity-header contract; a front proxy is responsible for TLS, authentication,
-authorization, Host/origin, and network restrictions. Slice 5 adds no `/api/org` REST/OpenAPI
-operations and no Org frontend or browser controls.
+authorization, Host/origin, and network restrictions. The exact same 36 operation names are REST
+`operationId`s under `/api/org`; this slice adds no Org frontend or browser controls.
 
 ### Org offline commands
 
