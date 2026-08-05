@@ -3,12 +3,12 @@ use std::collections::BTreeMap;
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId};
 use note_pipelines::org::{
     ApproveItemRequest, AssignItemRequest, CommandEnvelope, CreateFollowUpRequest,
-    CreateItemRequest, DocumentImport, FollowUpOrigin, HeartbeatClaimRequest,
-    ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest, MoveItemRequest,
-    OperationalQuery, OperationalView, OrgClaimKind, OrgClaimResult, OrgError, OrgFieldPatch,
-    OrgReadQuery, PutDocumentRequest, RejectItemRequest, ReleaseClaimRequest,
+    CreateItemRequest, DependencyRequest, DocumentImport, FollowUpOrigin, HeartbeatClaimRequest,
+    ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest, MoveItemRequest, NoteLinkRequest,
+    OperationalQuery, OperationalView, OrgClaimKind, OrgClaimResult, OrgError, OrgEventQuery,
+    OrgFieldPatch, OrgReadQuery, PutDocumentRequest, RejectItemRequest, ReleaseClaimRequest,
     ReportProgressRequest, RequestReviewRequest, RetryItemRequest, ScheduleItemRequest,
-    StartClaimRequest, SubmitResultRequest, TransitionItemRequest,
+    StartClaimRequest, SubmitResultRequest, TransitionItemRequest, UnlinkNoteRequest,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -442,6 +442,178 @@ operational_query_body!(AgendaQueryBody, AgendaViewBody);
 impl ItemPath {
     pub fn parse(self) -> Result<WorkItemId, OrgError> {
         parse_id(self.item_id, "item_id")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyPath {
+    pub item_id: String,
+    pub dependency_item_id: String,
+}
+
+impl DependencyPath {
+    pub fn parse(self) -> Result<(WorkItemId, WorkItemId), OrgError> {
+        Ok((
+            parse_id(self.item_id, "item_id")?,
+            parse_id(self.dependency_item_id, "dependency_item_id")?,
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AddDependencyBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub dependency_id: String,
+    pub document_id: String,
+    pub expected_revisions: BTreeMap<String, i64>,
+    pub lease: Option<LeaseProofBody>,
+}
+
+impl AddDependencyBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, DependencyRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            DependencyRequest {
+                item_id,
+                dependency_id: parse_id(self.dependency_id, "dependency_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_revisions: adapt_id_map(self.expected_revisions, "document_id")?,
+                lease: self.lease.map(Into::into),
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveDependencyBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub expected_revisions: BTreeMap<String, i64>,
+    pub lease: Option<LeaseProofBody>,
+}
+
+impl RemoveDependencyBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+        dependency_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, DependencyRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            DependencyRequest {
+                item_id,
+                dependency_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_revisions: adapt_id_map(self.expected_revisions, "document_id")?,
+                lease: self.lease.map(Into::into),
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LinkNoteBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub purpose: String,
+    pub note_id: String,
+    pub description: String,
+    pub expected_revisions: BTreeMap<String, i64>,
+    pub lease: Option<LeaseProofBody>,
+}
+
+impl LinkNoteBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, NoteLinkRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            NoteLinkRequest {
+                item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                purpose: self.purpose,
+                note_id: parse_id(self.note_id, "note_id")?,
+                description: self.description,
+                expected_revisions: adapt_id_map(self.expected_revisions, "document_id")?,
+                lease: self.lease.map(Into::into),
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UnlinkNoteBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub purpose: String,
+    pub note_id: String,
+    pub expected_revisions: BTreeMap<String, i64>,
+    pub lease: Option<LeaseProofBody>,
+}
+
+impl UnlinkNoteBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, UnlinkNoteRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            UnlinkNoteRequest {
+                item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                purpose: self.purpose,
+                note_id: parse_id(self.note_id, "note_id")?,
+                expected_revisions: adapt_id_map(self.expected_revisions, "document_id")?,
+                lease: self.lease.map(Into::into),
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NotePath {
+    pub note_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema, utoipa::IntoParams)]
+#[serde(deny_unknown_fields)]
+pub struct EventQueryBody {
+    pub subject_kind: Option<String>,
+    pub subject_id: Option<String>,
+    /// Opaque sequence cursor bound to workspace and subject filters.
+    pub cursor: Option<String>,
+    #[serde(default = "default_limit")]
+    #[schema(default = 50, minimum = 1, maximum = 200)]
+    pub limit: u16,
+}
+
+impl EventQueryBody {
+    pub fn into_pipeline(self, workspace_id: WorkspaceId) -> OrgEventQuery {
+        OrgEventQuery {
+            workspace_id,
+            subject_kind: self.subject_kind,
+            subject_id: self.subject_id,
+            cursor: self.cursor,
+            limit: Some(usize::from(self.limit)),
+        }
     }
 }
 
