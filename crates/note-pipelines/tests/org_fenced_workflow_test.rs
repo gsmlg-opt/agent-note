@@ -15,6 +15,7 @@ use note_storage::{
     OrgEventType, OrgLeaseEndReason, OrgProjectedWorkItem, OrgWorkspaceUpdate, SanitizedOrgLease,
     StorageBackend,
 };
+use sha2::{Digest, Sha256};
 use std::str::FromStr as _;
 use std::sync::Arc;
 use support::{DeterministicTokenSource, FailOnceAtWorkflowPhase};
@@ -421,6 +422,13 @@ async fn progress_is_proof_only_event_and_replays_without_touching_execution_sta
         .await
         .unwrap()
         .unwrap();
+    let metadata = serde_json::json!({
+        "percent": 50,
+        "checkpoint": {
+            "stage": "compile",
+            "labels": ["green", {"verified": true}]
+        }
+    });
     let request = ReportProgressRequest {
         schema_version: 1,
         work_item_id: item_id(),
@@ -428,7 +436,7 @@ async fn progress_is_proof_only_event_and_replays_without_touching_execution_sta
         kind: OrgClaimKind::Execution,
         fencing_token,
         summary: "halfway".into(),
-        metadata: serde_json::json!({"percent": 50}),
+        metadata: metadata.clone(),
     };
 
     let result = report_progress(&context, &envelope("agent", "progress-1"), &request)
@@ -471,7 +479,7 @@ async fn progress_is_proof_only_event_and_replays_without_touching_execution_sta
     );
     let progress = events.last().unwrap();
     assert_eq!(progress.summary, "halfway");
-    assert_eq!(progress.metadata["percent"], 50);
+    assert_eq!(progress.metadata, metadata);
 
     let mut stale = request;
     stale.fencing_token = " ".into();
@@ -482,6 +490,77 @@ async fn progress_is_proof_only_event_and_replays_without_touching_execution_sta
             .code,
         OrgErrorCode::StaleLease
     );
+}
+
+#[tokio::test]
+async fn progress_rejects_fencing_material_in_public_payload_without_side_effects() {
+    let raw_token = "public-payload-progress-token";
+    let token_digest = format!("{:x}", Sha256::digest(raw_token.as_bytes()));
+    let (context, backend, _dir, lease_id, fencing_token) =
+        claimed_execution_fixture(false, raw_token).await;
+    assert_eq!(fencing_token, raw_token);
+    let before = workflow_snapshot(&backend).await;
+
+    let payloads = [
+        (
+            "progress-raw-summary",
+            format!("still working with {raw_token}"),
+            serde_json::json!({"percent": 25}),
+        ),
+        (
+            "progress-digest-metadata",
+            "still working".into(),
+            serde_json::json!({"nested": [{"value": format!("digest={token_digest}")}]}),
+        ),
+        (
+            "progress-token-key",
+            "still working".into(),
+            serde_json::json!({"nested": {"fencingtoken": "redacted"}}),
+        ),
+        (
+            "progress-digest-key",
+            "still working".into(),
+            serde_json::json!({"nested": {"fencing_token_digest": "redacted"}}),
+        ),
+        (
+            "progress-hash-key",
+            "still working".into(),
+            serde_json::json!({"nested": {"hash_value": "redacted"}}),
+        ),
+    ];
+
+    for (operation_id, summary, metadata) in payloads {
+        let error = report_progress(
+            &context,
+            &envelope("agent", operation_id),
+            &ReportProgressRequest {
+                schema_version: 1,
+                work_item_id: item_id(),
+                lease_id: lease_id.clone(),
+                kind: OrgClaimKind::Execution,
+                fencing_token: fencing_token.clone(),
+                summary,
+                metadata,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, OrgErrorCode::InvalidInput);
+        assert_eq!(
+            error.message,
+            "Org workflow public payload contains reserved fencing material"
+        );
+        assert_eq!(error.details, serde_json::json!({}));
+        assert!(backend
+            .session()
+            .await
+            .unwrap()
+            .get_org_operation(workspace_id(), operation_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(workflow_snapshot(&backend).await, before);
+    }
 }
 
 #[tokio::test]
@@ -1109,6 +1188,87 @@ async fn submit_result_completes_direct_work_and_persists_the_attempt_payload() 
 }
 
 #[tokio::test]
+async fn submit_result_rejects_fencing_material_in_every_attempt_payload_field() {
+    let raw_token = "public-payload-result-token";
+    let token_digest = format!("{:x}", Sha256::digest(raw_token.as_bytes()));
+    let (context, backend, _dir, lease_id, fencing_token) =
+        claimed_execution_fixture(false, raw_token).await;
+    let before = workflow_snapshot(&backend).await;
+    let payloads = vec![
+        (
+            "result-summary",
+            format!("finished with {raw_token}"),
+            Vec::new(),
+            Vec::new(),
+            serde_json::json!({"quality": "verified"}),
+        ),
+        (
+            "result-note-ref",
+            "finished".into(),
+            vec![OrgAttemptNoteReference {
+                purpose: "evidence".into(),
+                note_id: "note-1".into(),
+                description: format!("contains {token_digest}"),
+            }],
+            Vec::new(),
+            serde_json::json!({"quality": "verified"}),
+        ),
+        (
+            "result-artifact",
+            "finished".into(),
+            Vec::new(),
+            vec![OrgArtifactReference {
+                uri: format!("artifact://{raw_token}"),
+                media_type: "text/plain".into(),
+                name: "output".into(),
+                description: "result artifact".into(),
+            }],
+            serde_json::json!({"quality": "verified"}),
+        ),
+        (
+            "result-metadata-key",
+            "finished".into(),
+            Vec::new(),
+            Vec::new(),
+            serde_json::json!({"nested": {"token_hash": "redacted"}}),
+        ),
+    ];
+
+    for (suffix, result_summary, note_refs, artifacts, metadata) in payloads {
+        let operation_id = format!("reject-{suffix}");
+        let error = submit_result(
+            &context,
+            &envelope("agent", &operation_id),
+            &SubmitResultRequest {
+                schema_version: 1,
+                work_item_id: item_id(),
+                document_id: document_id(),
+                expected_document_revision: 2,
+                lease_id: lease_id.clone(),
+                fencing_token: fencing_token.clone(),
+                result_summary,
+                note_refs,
+                artifacts,
+                metadata,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, OrgErrorCode::InvalidInput);
+        assert_eq!(error.details, serde_json::json!({}));
+        assert!(backend
+            .session()
+            .await
+            .unwrap()
+            .get_org_operation(workspace_id(), &operation_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(workflow_snapshot(&backend).await, before);
+    }
+}
+
+#[tokio::test]
 async fn submit_and_approve_reject_missing_or_ambiguous_success_targets() {
     for ambiguous in [false, true] {
         let (context, backend, _dir, lease_id, fencing_token) = claimed_execution().await;
@@ -1354,6 +1514,46 @@ async fn explicit_request_review_closes_execution_with_optional_partial_result()
 }
 
 #[tokio::test]
+async fn request_review_rejects_fencing_material_before_closing_execution() {
+    let raw_token = "public-payload-review-request-token";
+    let (context, backend, _dir, lease_id, fencing_token) =
+        claimed_execution_fixture(false, raw_token).await;
+    let before = workflow_snapshot(&backend).await;
+    let operation_id = "reject-review-request-payload";
+
+    let error = request_review(
+        &context,
+        &envelope("agent", operation_id),
+        &RequestReviewRequest {
+            schema_version: 1,
+            work_item_id: item_id(),
+            document_id: document_id(),
+            expected_document_revision: 2,
+            lease_id,
+            fencing_token,
+            result_summary: Some(format!("partial result includes {raw_token}")),
+            note_refs: Vec::new(),
+            artifacts: Vec::new(),
+            metadata: serde_json::json!({"partial": true}),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, OrgErrorCode::InvalidInput);
+    assert_eq!(error.details, serde_json::json!({}));
+    assert_eq!(workflow_snapshot(&backend).await, before);
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(workspace_id(), operation_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn approval_completes_the_submitted_attempt_and_preserves_result_context() {
     let (context, backend, _dir, lease_id, fencing_token) = submitted_review_claim().await;
     let request = ApproveItemRequest {
@@ -1407,6 +1607,44 @@ async fn approval_completes_the_submitted_attempt_and_preserves_result_context()
         .unwrap();
     assert_eq!(events[events.len() - 2].event_type, OrgEventType::Approval);
     assert_eq!(events.last().unwrap().event_type, OrgEventType::Completion);
+}
+
+#[tokio::test]
+async fn approval_rejects_fencing_digest_before_review_updates() {
+    let (context, backend, _dir, lease_id, fencing_token) = submitted_review_claim().await;
+    let token_digest = format!("{:x}", Sha256::digest(fencing_token.as_bytes()));
+    let before = workflow_snapshot(&backend).await;
+    let operation_id = "reject-approval-payload";
+
+    let error = approve_item(
+        &context,
+        &envelope("reviewer", operation_id),
+        &ApproveItemRequest {
+            schema_version: 1,
+            work_item_id: item_id(),
+            document_id: document_id(),
+            expected_document_revision: 3,
+            lease_id,
+            fencing_token,
+            metadata: serde_json::json!({
+                "review": {"comment": format!("digest={token_digest}")}
+            }),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, OrgErrorCode::InvalidInput);
+    assert_eq!(error.details, serde_json::json!({}));
+    assert_eq!(workflow_snapshot(&backend).await, before);
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(workspace_id(), operation_id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -1472,6 +1710,43 @@ async fn rejection_returns_to_recovery_and_fails_the_submitted_attempt() {
             .event_type,
         OrgEventType::Rejection
     );
+}
+
+#[tokio::test]
+async fn rejection_rejects_fencing_material_before_recording_reason() {
+    let (context, backend, _dir, lease_id, fencing_token) = submitted_review_claim().await;
+    let raw_token = fencing_token.clone();
+    let before = workflow_snapshot(&backend).await;
+    let operation_id = "reject-rejection-payload";
+
+    let error = reject_item(
+        &context,
+        &envelope("reviewer", operation_id),
+        &RejectItemRequest {
+            schema_version: 1,
+            work_item_id: item_id(),
+            document_id: document_id(),
+            expected_document_revision: 3,
+            lease_id,
+            fencing_token,
+            reason: format!("needs changes; leaked {raw_token}"),
+            metadata: serde_json::json!({"line": 12}),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, OrgErrorCode::InvalidInput);
+    assert_eq!(error.details, serde_json::json!({}));
+    assert_eq!(workflow_snapshot(&backend).await, before);
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(workspace_id(), operation_id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -1596,6 +1871,48 @@ async fn execution_transition_classifies_block_cancel_and_custom_nonterminal() {
             expected_event
         );
     }
+}
+
+#[tokio::test]
+async fn leased_transition_rejects_fencing_material_before_attempt_or_event_updates() {
+    let raw_token = "public-payload-transition-token";
+    let (context, backend, _dir, lease_id, fencing_token) =
+        claimed_execution_fixture(false, raw_token).await;
+    let before = workflow_snapshot(&backend).await;
+    let operation_id = "reject-transition-payload";
+
+    let error = transition_item(
+        &context,
+        &envelope("agent", operation_id),
+        &TransitionItemRequest {
+            schema_version: 1,
+            work_item_id: item_id(),
+            document_id: document_id(),
+            expected_document_revision: 2,
+            target_state: "FAILED".into(),
+            lease: Some(TransitionLeaseProof {
+                lease_id,
+                kind: OrgClaimKind::Execution,
+                fencing_token,
+            }),
+            error: Some(format!("failure exposed {raw_token}")),
+            metadata: serde_json::json!({"phase": "execution"}),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, OrgErrorCode::InvalidInput);
+    assert_eq!(error.details, serde_json::json!({}));
+    assert_eq!(workflow_snapshot(&backend).await, before);
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(workspace_id(), operation_id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

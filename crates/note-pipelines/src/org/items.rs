@@ -1,8 +1,8 @@
 use super::{
     bookkeep_expired_lease_with_phases, execute_idempotent, inspect_touched_lease_proofs_except,
     resolve_lease_update, resolve_update, stale_lease, storage_kind, token_hash,
-    validate_lease_input, validate_touched_lease_proofs, CommandEnvelope, LeaseProofInput,
-    OrgCommandKind, OrgCommandResult, OrgContext, OrgError, OrgErrorCode,
+    validate_lease_input, validate_public_payload, validate_touched_lease_proofs, CommandEnvelope,
+    LeaseProofInput, OrgCommandKind, OrgCommandResult, OrgContext, OrgError, OrgErrorCode,
     ORG_COMMAND_SCHEMA_VERSION,
 };
 use note_org::{
@@ -697,6 +697,16 @@ pub async fn link_note(
     envelope: &CommandEnvelope,
     request: &NoteLinkRequest,
 ) -> Result<OrgCommandResult, OrgError> {
+    if let Some(proof) = &request.lease {
+        validate_lease_input(&proof.lease_id, &proof.fencing_token)?;
+        validate_public_payload(
+            &proof.fencing_token,
+            &json!({
+                "purpose": request.purpose,
+                "description": request.description,
+            }),
+        )?;
+    }
     let fingerprint = json!({
         "item_id": request.item_id,
         "document_id": request.document_id,

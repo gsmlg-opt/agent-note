@@ -14,7 +14,11 @@ use note_pipelines::org::{
     RetryItemRequest, ScheduleItemRequest, StartClaimRequest, SubmitResultRequest,
     TransitionItemRequest, UpdateWorkspaceRequest,
 };
-use note_storage::{NewNote, OrgAttemptStatus, OrgLeaseEndReason, StorageBackend};
+use note_storage::{
+    NewNote, OrgAttempt, OrgAttemptStatus, OrgDocument, OrgEvent, OrgLeaseEndReason,
+    OrgProjectedWorkItem, SanitizedOrgLease, StorageBackend,
+};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -44,6 +48,36 @@ fn envelope(
         workspace_id,
         actor_id: actor_id.into(),
         operation_id: operation_id.into(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicPayloadSnapshot {
+    document: OrgDocument,
+    item: OrgProjectedWorkItem,
+    attempts: Vec<OrgAttempt>,
+    leases: Vec<SanitizedOrgLease>,
+    events: Vec<OrgEvent>,
+}
+
+async fn public_payload_snapshot(
+    backend: &Arc<dyn StorageBackend>,
+    workspace_id: WorkspaceId,
+) -> PublicPayloadSnapshot {
+    let session = backend.session().await.unwrap();
+    PublicPayloadSnapshot {
+        document: session
+            .get_org_document(document_id())
+            .await
+            .unwrap()
+            .unwrap(),
+        item: session.get_org_work_item(item_id()).await.unwrap().unwrap(),
+        attempts: session.list_org_attempts(item_id()).await.unwrap(),
+        leases: session.list_org_lease_history(item_id()).await.unwrap(),
+        events: session
+            .list_org_events(workspace_id, None, 200)
+            .await
+            .unwrap(),
     }
 }
 
@@ -1523,6 +1557,77 @@ async fn active_dependency_and_note_link_require_missing_stale_and_current_proof
 }
 
 #[tokio::test]
+async fn active_note_link_rejects_fencing_material_before_source_or_event_writes() {
+    let (context, backend, _dir, workspace_id, claim) = claimed_item().await;
+    let note_id = "78000000-0000-4000-8000-000000000021";
+    backend
+        .session()
+        .await
+        .unwrap()
+        .insert_note(NewNote {
+            id: note_id,
+            title: "Public payload guard",
+            content: "context",
+            attachments: &[],
+            created_at: NOW,
+            updated_at: NOW,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    let digest = format!("{:x}", Sha256::digest(claim.fencing_token.as_bytes()));
+    let before = public_payload_snapshot(&backend, workspace_id).await;
+
+    for (operation_id, purpose, description) in [
+        (
+            "reject-note-link-purpose",
+            format!("design-{}", claim.fencing_token),
+            "Design context".into(),
+        ),
+        (
+            "reject-note-link-description",
+            "design".into(),
+            format!("Design digest {digest}"),
+        ),
+    ] {
+        let error = link_note(
+            &context,
+            &envelope(workspace_id, "agent", operation_id),
+            &NoteLinkRequest {
+                item_id: item_id(),
+                document_id: document_id(),
+                purpose,
+                note_id: note_id.parse().unwrap(),
+                description,
+                expected_revisions: BTreeMap::from([(document_id(), 2)]),
+                lease: Some(LeaseProofInput {
+                    lease_id: claim.lease_id.clone(),
+                    kind: OrgClaimKind::Execution,
+                    fencing_token: claim.fencing_token.clone(),
+                }),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, OrgErrorCode::InvalidInput);
+        assert_eq!(error.details, serde_json::json!({}));
+        assert_eq!(
+            public_payload_snapshot(&backend, workspace_id).await,
+            before
+        );
+        assert!(backend
+            .session()
+            .await
+            .unwrap()
+            .get_org_operation(workspace_id, operation_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
 async fn raw_opaque_only_diff_needs_no_proof_and_preserves_ownership() {
     let (context, backend, _dir, workspace_id, _claim) = claimed_item().await;
     let current = backend
@@ -1563,6 +1668,93 @@ async fn raw_opaque_only_diff_needs_no_proof_and_preserves_ownership() {
         .unwrap()
         .unwrap();
     assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn raw_put_and_import_reject_fencing_material_before_fingerprint_or_writes() {
+    let (context, backend, _dir, workspace_id, claim) = claimed_item().await;
+    let current = backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_document(document_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let digest = format!("{:x}", Sha256::digest(claim.fencing_token.as_bytes()));
+    let proof = LeaseProofInput {
+        lease_id: claim.lease_id.clone(),
+        kind: OrgClaimKind::Execution,
+        fencing_token: claim.fencing_token.clone(),
+    };
+    let before = public_payload_snapshot(&backend, workspace_id).await;
+
+    let put_operation = "reject-raw-put-payload";
+    let put_error = put_document(
+        &context,
+        &envelope(workspace_id, "agent", put_operation),
+        &PutDocumentRequest {
+            document_id: document_id(),
+            path: format!("guarded-{}.org", claim.fencing_token),
+            source: current.source.replace("Guarded", "Put renamed"),
+            expected_revision: Some(2),
+            lease_proofs: BTreeMap::from([(item_id(), proof.clone())]),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(put_error.code, OrgErrorCode::InvalidInput);
+    assert_eq!(
+        put_error.message,
+        "Org workflow public payload contains reserved fencing material"
+    );
+    assert_eq!(put_error.details, serde_json::json!({}));
+    assert_eq!(
+        public_payload_snapshot(&backend, workspace_id).await,
+        before
+    );
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(workspace_id, put_operation)
+        .await
+        .unwrap()
+        .is_none());
+
+    let import_operation = "reject-raw-import-payload";
+    let import_error = import_documents(
+        &context,
+        &envelope(workspace_id, "agent", import_operation),
+        &ImportDocumentsRequest {
+            documents: vec![DocumentImport {
+                document_id: document_id(),
+                path: current.path,
+                source: format!(
+                    "{}\r\nOpaque digest {digest}.\r\n",
+                    current.source.replace("Guarded", "Import renamed")
+                ),
+            }],
+            expected_revisions: BTreeMap::from([(document_id(), 2)]),
+            lease_proofs: BTreeMap::from([(item_id(), proof)]),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(import_error.code, OrgErrorCode::InvalidInput);
+    assert_eq!(import_error.details, serde_json::json!({}));
+    assert_eq!(
+        public_payload_snapshot(&backend, workspace_id).await,
+        before
+    );
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(workspace_id, import_operation)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

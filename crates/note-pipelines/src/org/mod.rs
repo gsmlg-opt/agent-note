@@ -14,6 +14,7 @@ mod mutation;
 mod mutation_test;
 mod operational;
 mod projection;
+mod public_payload;
 mod reviews;
 mod workspaces;
 
@@ -30,5 +31,6 @@ pub use items::*;
 pub(crate) use mutation::*;
 pub use operational::*;
 pub(crate) use projection::*;
+pub(crate) use public_payload::*;
 pub use reviews::*;
 pub use workspaces::*;
