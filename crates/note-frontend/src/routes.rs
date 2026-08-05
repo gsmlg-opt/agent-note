@@ -2,8 +2,8 @@ use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::pages::{
-    DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage, SystemPage,
-    TrashPage,
+    DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage,
+    OrgWorkspacesPage, SystemPage, TrashPage,
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -22,12 +22,16 @@ impl NotesQueryParams {
     }
 }
 
-#[derive(Clone, Routable, PartialEq)]
+#[derive(Clone, Debug, Routable, PartialEq)]
 pub enum Route {
     #[at("/")]
     Home,
     #[at("/notes")]
     Notes,
+    #[at("/org")]
+    Org,
+    #[at("/org/:workspace_id")]
+    OrgWorkspace { workspace_id: String },
     #[at("/new")]
     NewNote,
     #[at("/notes/:id/show")]
@@ -49,6 +53,10 @@ pub fn switch(route: Route) -> Html {
     match route {
         Route::Home => html! { <DashboardPage /> },
         Route::Notes => html! { <NotesPage /> },
+        Route::Org => html! { <OrgWorkspacesPage /> },
+        Route::OrgWorkspace { workspace_id } => {
+            html! { <p>{ format!("Org workspace {workspace_id}") }</p> }
+        }
         Route::NewNote => html! { <NewNotePage /> },
         Route::NoteShow { id } => html! { <NoteShowPage {id} /> },
         Route::NoteEdit { id } => html! { <NoteEditPage {id} /> },
@@ -61,7 +69,14 @@ pub fn switch(route: Route) -> Html {
 
 #[cfg(test)]
 mod tests {
-    use super::NotesQueryParams;
+    use super::{NotesQueryParams, Route};
+    use yew_router::Routable;
+
+    #[test]
+    fn recognizes_org_directory_as_a_first_class_route() {
+        assert_eq!(Route::recognize("/org"), Some(Route::Org));
+        assert_eq!(Route::Org.to_path(), "/org");
+    }
 
     #[test]
     fn rejects_semantically_invalid_notes_return_context() {

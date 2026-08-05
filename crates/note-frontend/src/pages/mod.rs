@@ -4,6 +4,7 @@ pub mod new_note;
 pub mod note_edit;
 pub mod note_show;
 pub mod notes;
+pub mod org_workspaces;
 pub mod system;
 pub mod trash;
 
@@ -13,5 +14,6 @@ pub use new_note::NewNotePage;
 pub use note_edit::NoteEditPage;
 pub use note_show::NoteShowPage;
 pub use notes::NotesPage;
+pub use org_workspaces::OrgWorkspacesPage;
 pub use system::SystemPage;
 pub use trash::TrashPage;

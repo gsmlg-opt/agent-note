@@ -1521,6 +1521,231 @@ a.dashboard-metric-detail:hover {
     }
 }
 
+/* --- Org operations directory --- */
+.org-directory {
+    gap: 1rem;
+}
+
+.org-directory-head {
+    align-items: flex-end;
+    border-bottom: 2px solid var(--color-on-surface, #1b1b1f);
+    padding-bottom: 0.85rem;
+}
+
+.org-kicker {
+    margin: 0 0 0.3rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+}
+
+.org-directory-controls,
+.org-cursor-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    min-height: 2.75rem;
+    border-bottom: 1px solid var(--color-outline-variant, #c7c5d0);
+    padding: 0.25rem 0 0.75rem;
+}
+
+.org-checkbox,
+.org-page-size {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.84rem;
+    font-weight: 700;
+}
+
+.org-checkbox input {
+    width: 1rem;
+    height: 1rem;
+    accent-color: var(--color-primary, #6750a4);
+}
+
+.org-page-size .input {
+    width: 5.25rem;
+}
+
+.org-live-status {
+    min-height: 1.15rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.75rem;
+}
+
+.org-ledger-scroll {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    background: var(--color-surface, #faf8ff);
+    scrollbar-gutter: stable;
+}
+
+.org-ledger-scroll:focus-visible,
+.org-checkbox input:focus-visible,
+.org-directory .btn:focus-visible,
+.org-directory .input:focus-visible,
+.org-workspace-link:focus-visible {
+    outline: 3px solid var(--color-primary, #6750a4);
+    outline-offset: 2px;
+}
+
+.org-ledger {
+    width: 100%;
+    min-width: 94rem;
+    border-collapse: collapse;
+    font-variant-numeric: tabular-nums;
+}
+
+.org-ledger caption {
+    padding: 0.65rem 0.8rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-align: left;
+}
+
+.org-ledger th,
+.org-ledger td {
+    border-top: 1px solid var(--color-outline-variant, #c7c5d0);
+    padding: 0.68rem 0.75rem;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.org-ledger thead th {
+    background: var(--color-surface-container-low, #f3f0f9);
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.68rem;
+    font-weight: 800;
+    letter-spacing: 0.045em;
+    text-transform: uppercase;
+}
+
+.org-ledger tbody th {
+    font-weight: 600;
+}
+
+.org-ledger thead th:first-child,
+.org-ledger tbody th:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    min-width: 15rem;
+    border-right: 1px solid var(--color-outline-variant, #c7c5d0);
+    background: var(--color-surface, #faf8ff);
+}
+
+.org-ledger thead th:first-child {
+    z-index: 2;
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.org-workspace-row:hover td,
+.org-workspace-row:hover th:first-child {
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.org-workspace-row.is-archived td,
+.org-workspace-row.is-archived th:first-child {
+    background: var(--color-surface-container-high, #ece7f2);
+    color: var(--color-on-surface-variant, #46464f);
+}
+
+.org-workspace-link {
+    display: grid;
+    gap: 0.2rem;
+    color: inherit;
+    text-decoration: none;
+}
+
+.org-workspace-link strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.org-workspace-link span {
+    color: var(--color-on-surface-variant, #46464f);
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 0.73rem;
+    font-weight: 500;
+}
+
+.org-workspace-link:hover strong {
+    color: var(--color-primary, #6750a4);
+    text-decoration: underline;
+    text-underline-offset: 0.18rem;
+}
+
+.org-state {
+    display: inline-block;
+    border-left: 3px solid var(--color-primary, #6750a4);
+    padding-left: 0.45rem;
+    font-size: 0.76rem;
+    font-weight: 800;
+}
+
+.org-state.is-archived {
+    border-left-color: var(--color-outline, #777680);
+}
+
+.org-ledger-number {
+    min-width: 4.25rem;
+    text-align: right !important;
+}
+
+.org-directory-message {
+    border-left: 4px solid var(--color-outline, #777680);
+    padding: 1.1rem 1.2rem;
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.org-directory-message.is-error {
+    border-left-color: var(--color-error, #ba1a1a);
+}
+
+.org-directory-message strong,
+.org-directory-message p {
+    display: block;
+    margin: 0 0 0.35rem;
+}
+
+.org-directory-message code,
+.org-directory-message span {
+    margin-right: 0.65rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.76rem;
+}
+
+.org-cursor-nav {
+    justify-content: flex-end;
+    border-top: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-bottom: 0;
+    padding: 0.75rem 0 0;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.8rem;
+}
+
+@media (max-width: 620px) {
+    .org-directory-head,
+    .org-directory-controls,
+    .org-cursor-nav {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .org-directory-head .btn,
+    .org-cursor-nav .btn {
+        width: 100%;
+    }
+}
+
 /* Space the form controls a touch inside the duskmoon cards. */
 .stack {
     display: flex;
