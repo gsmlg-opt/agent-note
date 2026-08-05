@@ -2,10 +2,13 @@ use std::collections::BTreeMap;
 
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId};
 use note_pipelines::org::{
-    AssignItemRequest, CommandEnvelope, CreateFollowUpRequest, CreateItemRequest, DocumentImport,
-    FollowUpOrigin, ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest, MoveItemRequest,
-    OperationalQuery, OperationalView, OrgClaimKind, OrgError, OrgFieldPatch, OrgReadQuery,
-    PutDocumentRequest, ScheduleItemRequest,
+    ApproveItemRequest, AssignItemRequest, CommandEnvelope, CreateFollowUpRequest,
+    CreateItemRequest, DocumentImport, FollowUpOrigin, HeartbeatClaimRequest,
+    ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest, MoveItemRequest,
+    OperationalQuery, OperationalView, OrgClaimKind, OrgClaimResult, OrgError, OrgFieldPatch,
+    OrgReadQuery, PutDocumentRequest, RejectItemRequest, ReleaseClaimRequest,
+    ReportProgressRequest, RequestReviewRequest, RetryItemRequest, ScheduleItemRequest,
+    StartClaimRequest, SubmitResultRequest, TransitionItemRequest,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -628,6 +631,405 @@ impl From<ClaimKindBody> for OrgClaimKind {
             ClaimKindBody::Review => Self::Review,
         }
     }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimItemBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub expected_document_revision: i64,
+    pub kind: ClaimKindBody,
+}
+
+impl ClaimItemBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, StartClaimRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            StartClaimRequest {
+                work_item_id: item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                kind: self.kind.into(),
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResultBody {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub operation_id: String,
+    pub lease_id: String,
+    /// Sensitive raw fencing token. Store securely and send only in lease-bound mutation bodies.
+    pub fencing_token: String,
+    pub expires_at: i64,
+    pub event_ids: Vec<String>,
+    pub context: serde_json::Value,
+}
+
+impl TryFrom<OrgClaimResult> for ClaimResultBody {
+    type Error = OrgError;
+
+    fn try_from(value: OrgClaimResult) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema_version: value.schema_version,
+            workspace_id: value.workspace_id.to_string(),
+            operation_id: value.operation_id,
+            lease_id: value.lease_id,
+            fencing_token: value.fencing_token,
+            expires_at: value.expires_at,
+            event_ids: value.event_ids,
+            context: safe_json(value.context)?,
+        })
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HeartbeatClaimBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub lease_id: String,
+    pub kind: ClaimKindBody,
+    /// Sensitive raw fencing token obtained from a successful claim or retry.
+    pub fencing_token: String,
+}
+
+impl HeartbeatClaimBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, HeartbeatClaimRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            HeartbeatClaimRequest {
+                work_item_id: item_id,
+                lease_id: self.lease_id,
+                kind: self.kind.into(),
+                fencing_token: self.fencing_token,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseClaimBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    pub kind: ClaimKindBody,
+    /// Sensitive raw fencing token obtained from a successful claim or retry.
+    pub fencing_token: String,
+    pub target_state: Option<String>,
+}
+
+impl ReleaseClaimBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, ReleaseClaimRequest), OrgError> {
+        let schema_version = self.command.schema_version;
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            ReleaseClaimRequest {
+                schema_version,
+                work_item_id: item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                kind: self.kind.into(),
+                fencing_token: self.fencing_token,
+                target_state: self.target_state,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportProgressBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub lease_id: String,
+    pub kind: ClaimKindBody,
+    /// Sensitive raw fencing token obtained from a successful claim or retry.
+    pub fencing_token: String,
+    pub summary: String,
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl ReportProgressBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, ReportProgressRequest), OrgError> {
+        let schema_version = self.command.schema_version;
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            ReportProgressRequest {
+                schema_version,
+                work_item_id: item_id,
+                lease_id: self.lease_id,
+                kind: self.kind.into(),
+                fencing_token: self.fencing_token,
+                summary: self.summary,
+                metadata: metadata_value(self.metadata),
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptNoteBody {
+    pub purpose: String,
+    pub note_id: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactBody {
+    pub uri: String,
+    pub media_type: String,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitResultBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    /// Sensitive raw fencing token obtained from a successful execution claim.
+    pub fencing_token: String,
+    pub result_summary: String,
+    pub note_refs: Vec<AttemptNoteBody>,
+    pub artifacts: Vec<ArtifactBody>,
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl SubmitResultBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, SubmitResultRequest), OrgError> {
+        let schema_version = self.command.schema_version;
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            SubmitResultRequest {
+                schema_version,
+                work_item_id: item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                fencing_token: self.fencing_token,
+                result_summary: self.result_summary,
+                note_refs: adapt_input(self.note_refs, "attempt note references")?,
+                artifacts: adapt_input(self.artifacts, "artifact references")?,
+                metadata: metadata_value(self.metadata),
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionItemBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub expected_document_revision: i64,
+    pub target_state: String,
+    pub lease: Option<LeaseProofBody>,
+    pub error: Option<String>,
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl TransitionItemBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, TransitionItemRequest), OrgError> {
+        let schema_version = self.command.schema_version;
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            TransitionItemRequest {
+                schema_version,
+                work_item_id: item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                target_state: self.target_state,
+                lease: self.lease.map(Into::into),
+                error: self.error,
+                metadata: metadata_value(self.metadata),
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetryItemBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub expected_document_revision: i64,
+}
+
+impl RetryItemBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, RetryItemRequest), OrgError> {
+        let schema_version = self.command.schema_version;
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            RetryItemRequest {
+                schema_version,
+                work_item_id: item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestReviewBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    /// Sensitive raw fencing token obtained from a successful execution claim.
+    pub fencing_token: String,
+    pub result_summary: Option<String>,
+    pub note_refs: Vec<AttemptNoteBody>,
+    pub artifacts: Vec<ArtifactBody>,
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl RequestReviewBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, RequestReviewRequest), OrgError> {
+        let schema_version = self.command.schema_version;
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            RequestReviewRequest {
+                schema_version,
+                work_item_id: item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                fencing_token: self.fencing_token,
+                result_summary: self.result_summary,
+                note_refs: adapt_input(self.note_refs, "attempt note references")?,
+                artifacts: adapt_input(self.artifacts, "artifact references")?,
+                metadata: metadata_value(self.metadata),
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApproveItemBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    /// Sensitive raw fencing token obtained from a successful review claim.
+    pub fencing_token: String,
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl ApproveItemBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, ApproveItemRequest), OrgError> {
+        let schema_version = self.command.schema_version;
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            ApproveItemRequest {
+                schema_version,
+                work_item_id: item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                fencing_token: self.fencing_token,
+                metadata: metadata_value(self.metadata),
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RejectItemBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub expected_document_revision: i64,
+    pub lease_id: String,
+    /// Sensitive raw fencing token obtained from a successful review claim.
+    pub fencing_token: String,
+    pub reason: String,
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl RejectItemBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, RejectItemRequest), OrgError> {
+        let schema_version = self.command.schema_version;
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            RejectItemRequest {
+                schema_version,
+                work_item_id: item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                fencing_token: self.fencing_token,
+                reason: self.reason,
+                metadata: metadata_value(self.metadata),
+            },
+        ))
+    }
+}
+
+fn metadata_value(values: BTreeMap<String, serde_json::Value>) -> serde_json::Value {
+    serde_json::Value::Object(values.into_iter().collect())
 }
 
 #[derive(Clone, Deserialize, ToSchema)]

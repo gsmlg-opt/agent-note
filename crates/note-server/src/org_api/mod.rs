@@ -1,8 +1,10 @@
 mod documents;
 pub mod dto;
 pub mod error;
+mod execution;
 mod items;
 mod operational;
+mod review;
 mod workspaces;
 
 use axum::{extract::State, Json};
@@ -65,66 +67,6 @@ macro_rules! org_mutation_route {
 }
 
 org_mutation_route!(
-    claim_item,
-    post,
-    "/api/org/items/{item_id}/claim",
-    "org_claim_item"
-);
-org_mutation_route!(
-    heartbeat_claim,
-    post,
-    "/api/org/items/{item_id}/claim/heartbeat",
-    "org_heartbeat_claim"
-);
-org_mutation_route!(
-    release_claim,
-    post,
-    "/api/org/items/{item_id}/claim/release",
-    "org_release_claim"
-);
-org_mutation_route!(
-    report_progress,
-    post,
-    "/api/org/items/{item_id}/progress",
-    "org_report_progress"
-);
-org_mutation_route!(
-    submit_result,
-    post,
-    "/api/org/items/{item_id}/result",
-    "org_submit_result"
-);
-org_mutation_route!(
-    transition_item,
-    post,
-    "/api/org/items/{item_id}/transition",
-    "org_transition_item"
-);
-org_mutation_route!(
-    retry_item,
-    post,
-    "/api/org/items/{item_id}/retry",
-    "org_retry_item"
-);
-org_mutation_route!(
-    request_review,
-    post,
-    "/api/org/items/{item_id}/review/request",
-    "org_request_review"
-);
-org_mutation_route!(
-    approve_item,
-    post,
-    "/api/org/items/{item_id}/review/approve",
-    "org_approve_item"
-);
-org_mutation_route!(
-    reject_item,
-    post,
-    "/api/org/items/{item_id}/review/reject",
-    "org_reject_item"
-);
-org_mutation_route!(
     add_dependency,
     post,
     "/api/org/items/{item_id}/dependencies",
@@ -171,16 +113,8 @@ pub fn router() -> OpenApiRouter<AppState> {
         .merge(documents::router())
         .merge(items::router())
         .merge(operational::router())
-        .routes(routes!(claim_item))
-        .routes(routes!(heartbeat_claim))
-        .routes(routes!(release_claim))
-        .routes(routes!(report_progress))
-        .routes(routes!(submit_result))
-        .routes(routes!(transition_item))
-        .routes(routes!(retry_item))
-        .routes(routes!(request_review))
-        .routes(routes!(approve_item))
-        .routes(routes!(reject_item))
+        .merge(execution::router())
+        .merge(review::router())
         .routes(routes!(add_dependency))
         .routes(routes!(remove_dependency))
         .routes(routes!(link_note, unlink_note))
