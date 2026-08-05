@@ -1,8 +1,12 @@
 use axum::Router;
 use utoipa::{
     openapi::{
-        schema::{Array, ArrayBuilder, Object, ObjectBuilder, Schema, Type},
-        Info, KnownFormat, OpenApi, OpenApiBuilder, RefOr, SchemaFormat, Tag,
+        path::ParameterIn,
+        schema::{
+            AnyOfBuilder, Array, ArrayBuilder, Object, ObjectBuilder, OneOfBuilder, Schema,
+            SchemaType, Type,
+        },
+        Info, KnownFormat, OpenApi, OpenApiBuilder, Ref, RefOr, Required, SchemaFormat, Tag,
     },
     PartialSchema, ToSchema,
 };
@@ -126,12 +130,890 @@ pub fn rest_router() -> (Router<crate::AppState>, OpenApi) {
         ]))
         .build();
 
-    OpenApiRouter::with_openapi(openapi)
+    let (router, openapi) = OpenApiRouter::with_openapi(openapi)
         .merge(crate::notes_api::notes_router::<crate::AppState>())
         .merge(crate::labels_api::labels_router::<crate::AppState>())
         .merge(crate::system_api::system_router::<crate::AppState>())
         .merge(crate::org_api::router())
-        .split_for_parts()
+        .split_for_parts();
+    (
+        router,
+        normalize_org_success_schemas(normalize_org_query_parameters(openapi)),
+    )
+}
+
+fn scalar(kind: Type) -> RefOr<Schema> {
+    Schema::Object(ObjectBuilder::new().schema_type(kind).build()).into()
+}
+
+fn nullable_scalar(kind: Type) -> RefOr<Schema> {
+    Schema::Object(
+        ObjectBuilder::new()
+            .schema_type([kind, Type::Null].into_iter().collect::<SchemaType>())
+            .build(),
+    )
+    .into()
+}
+
+fn schema_ref(name: &str) -> RefOr<Schema> {
+    Ref::from_schema_name(name).into()
+}
+
+fn nullable_ref(name: &str) -> RefOr<Schema> {
+    Schema::OneOf(
+        OneOfBuilder::new()
+            .item(Ref::from_schema_name(name))
+            .item(ObjectBuilder::new().schema_type(Type::Null))
+            .build(),
+    )
+    .into()
+}
+
+fn enum_string(values: &[&str]) -> RefOr<Schema> {
+    Schema::Object(
+        ObjectBuilder::new()
+            .schema_type(Type::String)
+            .enum_values(Some(values.iter().copied()))
+            .build(),
+    )
+    .into()
+}
+
+fn array_of(schema: RefOr<Schema>) -> RefOr<Schema> {
+    Schema::Array(Array::new(schema)).into()
+}
+
+fn typed_object(fields: Vec<(&str, RefOr<Schema>, bool)>) -> RefOr<Schema> {
+    let mut schema = ObjectBuilder::new().schema_type(Type::Object);
+    for (name, field, required) in fields {
+        schema = schema.property(name, field);
+        if required {
+            schema = schema.required(name);
+        }
+    }
+    Schema::Object(schema.build()).into()
+}
+
+fn command_schema(data_schema: &str) -> RefOr<Schema> {
+    typed_object(vec![
+        ("schema_version", scalar(Type::Integer), true),
+        ("workspace_id", scalar(Type::String), true),
+        ("operation_id", scalar(Type::String), true),
+        ("event_ids", array_of(scalar(Type::String)), true),
+        ("workspace_revision", nullable_scalar(Type::Integer), true),
+        (
+            "document_revisions",
+            Schema::Object(
+                ObjectBuilder::new()
+                    .schema_type(Type::Object)
+                    .additional_properties(Some(ObjectBuilder::new().schema_type(Type::Integer)))
+                    .build(),
+            )
+            .into(),
+            true,
+        ),
+        ("data", schema_ref(data_schema), true),
+    ])
+}
+
+fn page_schema(item_schema: &str) -> RefOr<Schema> {
+    typed_object(vec![
+        ("items", array_of(schema_ref(item_schema)), true),
+        ("next_cursor", nullable_scalar(Type::String), true),
+    ])
+}
+
+fn org_success_schema_name(operation_id: &str) -> &'static str {
+    match operation_id {
+        "org_list_workspaces" => "OrgWorkspacePageResult",
+        "org_create_workspace" | "org_update_workspace" => "OrgWorkspaceCommandResult",
+        "org_get_workspace" => "OrgWorkspaceResult",
+        "org_archive_workspace" => "OrgArchiveCommandResult",
+        "org_list_documents" => "OrgDocumentPageResult",
+        "org_get_document" => "OrgDocumentSourceResult",
+        "org_put_document" | "org_import_workspace" => "OrgDocumentCountCommandResult",
+        "org_move_document" => "OrgMoveDocumentCommandResult",
+        "org_move_item" => "OrgMoveItemCommandResult",
+        "org_export_workspace" => "OrgWorkspaceExportResult",
+        "org_create_item"
+        | "org_create_follow_up"
+        | "org_assign_item"
+        | "org_schedule_item"
+        | "org_add_dependency"
+        | "org_remove_dependency"
+        | "org_link_note"
+        | "org_unlink_note" => "OrgItemCommandResult",
+        "org_get_item" => "OrgItemResult",
+        "org_get_item_context" => "OrgItemContextResult",
+        "org_query_queue" | "org_query_agenda" => "OrgOperationalPageResult",
+        "org_claim_item" | "org_retry_item" => "OrgClaimResult",
+        "org_heartbeat_claim" => "OrgHeartbeatCommandResult",
+        "org_release_claim"
+        | "org_report_progress"
+        | "org_submit_result"
+        | "org_transition_item"
+        | "org_request_review"
+        | "org_approve_item"
+        | "org_reject_item" => "OrgContextCommandResult",
+        "org_list_note_work_items" => "OrgItemPageResult",
+        "org_list_events" => "OrgEventPageResult",
+        _ => panic!("unknown Org operation {operation_id}"),
+    }
+}
+
+fn normalize_org_success_schemas(mut openapi: OpenApi) -> OpenApi {
+    let components = openapi
+        .components
+        .as_mut()
+        .expect("generated OpenAPI components");
+    let string = || scalar(Type::String);
+    let integer = || scalar(Type::Integer);
+    let boolean = || scalar(Type::Boolean);
+    let json = || schema_ref("OrgJsonValue");
+    let add = |components: &mut utoipa::openapi::schema::Components,
+               name: &str,
+               schema: RefOr<Schema>| {
+        components.schemas.insert(name.to_owned(), schema);
+    };
+
+    add(
+        components,
+        "OrgJsonValue",
+        Schema::AnyOf(
+            AnyOfBuilder::new()
+                .item(ObjectBuilder::new().schema_type(Type::Null))
+                .item(ObjectBuilder::new().schema_type(Type::Boolean))
+                .item(ObjectBuilder::new().schema_type(Type::Number))
+                .item(ObjectBuilder::new().schema_type(Type::String))
+                .item(ArrayBuilder::new().items(Ref::from_schema_name("OrgJsonValue")))
+                .item(
+                    ObjectBuilder::new()
+                        .schema_type(Type::Object)
+                        .additional_properties(Some(Ref::from_schema_name("OrgJsonValue"))),
+                )
+                .build(),
+        )
+        .into(),
+    );
+    add(
+        components,
+        "OrgTagRule",
+        typed_object(vec![
+            ("allowed", array_of(string()), true),
+            ("required", array_of(string()), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgWorkspacePolicy",
+        typed_object(vec![
+            ("allow_cross_workspace_agenda", boolean(), true),
+            ("allowed_types", array_of(string()), true),
+            ("states", array_of(string()), true),
+            ("transitions", array_of(array_of(string())), true),
+            ("initial_state", string(), true),
+            ("running_state", string(), true),
+            ("executable_states", array_of(string()), true),
+            ("review_state", string(), true),
+            ("failed_state", string(), true),
+            ("cancelled_state", string(), true),
+            ("successful_terminal_states", array_of(string()), true),
+            ("terminal_states", array_of(string()), true),
+            ("release_state", string(), true),
+            ("review_rejection_state", string(), true),
+            ("lease_expiry_recovery_state", string(), true),
+            ("review_required_types", array_of(string()), true),
+            ("claim_policy", string(), true),
+            ("lease_duration_secs", integer(), true),
+            ("retry_limit", integer(), true),
+            ("concurrency_limit", integer(), true),
+            (
+                "tag_rules",
+                Schema::Object(
+                    ObjectBuilder::new()
+                        .schema_type(Type::Object)
+                        .additional_properties(Some(Ref::from_schema_name("OrgTagRule")))
+                        .build(),
+                )
+                .into(),
+                true,
+            ),
+        ]),
+    );
+    add(
+        components,
+        "OrgCounts",
+        typed_object(
+            [
+                "ready",
+                "assigned",
+                "running",
+                "blocked",
+                "review",
+                "scheduled",
+                "upcoming_deadline",
+                "failed",
+                "expired_lease",
+                "completed",
+            ]
+            .into_iter()
+            .map(|name| (name, integer(), true))
+            .collect(),
+        ),
+    );
+    add(
+        components,
+        "OrgTimestamp",
+        typed_object(vec![
+            ("raw", string(), true),
+            ("local", string(), true),
+            ("timezone", string(), true),
+            ("utc_timestamp", integer(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgLease",
+        typed_object(vec![
+            ("id", string(), true),
+            ("workspace_id", string(), true),
+            ("work_item_id", string(), true),
+            ("attempt_id", string(), true),
+            ("kind", string(), true),
+            ("actor_id", string(), true),
+            ("acquired_at", integer(), true),
+            ("last_heartbeat_at", integer(), true),
+            ("expires_at", integer(), true),
+            ("status", string(), true),
+        ]),
+    );
+
+    add(
+        components,
+        "OrgWorkspaceResult",
+        typed_object(vec![
+            ("id", string(), true),
+            ("slug", string(), true),
+            ("display_name", string(), true),
+            ("description", string(), true),
+            ("timezone", string(), true),
+            ("policy_schema_version", integer(), true),
+            ("policy", schema_ref("OrgWorkspacePolicy"), true),
+            ("revision", integer(), true),
+            ("archived_at", nullable_scalar(Type::Integer), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgWorkspaceSummary",
+        typed_object(vec![
+            ("workspace_id", string(), true),
+            ("slug", string(), true),
+            ("display_name", string(), true),
+            ("description", string(), true),
+            ("timezone", string(), true),
+            ("archived_at", nullable_scalar(Type::Integer), true),
+            ("workspace_revision", integer(), true),
+            ("evaluated_at", integer(), true),
+            ("counts", schema_ref("OrgCounts"), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgDocumentResult",
+        typed_object(vec![
+            ("id", string(), true),
+            ("path", string(), true),
+            ("revision", integer(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgDocumentSourceResult",
+        typed_object(vec![
+            ("id", string(), true),
+            ("workspace_id", string(), true),
+            ("path", string(), true),
+            ("source", string(), true),
+            ("content_hash", string(), true),
+            ("revision", integer(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgItemResult",
+        typed_object(vec![
+            ("id", string(), true),
+            ("workspace_id", string(), true),
+            ("document_id", string(), true),
+            ("parent_id", nullable_scalar(Type::String), true),
+            ("item_type", string(), true),
+            ("title", string(), true),
+            ("state", nullable_scalar(Type::String), true),
+            ("priority", nullable_scalar(Type::String), true),
+            ("scheduled", nullable_ref("OrgTimestamp"), true),
+            ("deadline", nullable_ref("OrgTimestamp"), true),
+            ("assignee", nullable_scalar(Type::String), true),
+            ("requires_review", boolean(), true),
+            ("created_at", integer(), true),
+            ("tags", array_of(string()), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgEventResult",
+        typed_object(vec![
+            ("id", string(), true),
+            ("workspace_id", string(), true),
+            ("sequence", integer(), true),
+            ("subject_kind", string(), true),
+            ("subject_id", string(), true),
+            ("actor_id", string(), true),
+            ("attempt_id", nullable_scalar(Type::String), true),
+            ("event_type", string(), true),
+            ("occurred_at", integer(), true),
+            ("summary", string(), true),
+            ("metadata", json(), true),
+            ("previous_state", nullable_scalar(Type::String), true),
+            ("resulting_state", nullable_scalar(Type::String), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgDependency",
+        typed_object(vec![
+            ("item", schema_ref("OrgItemResult"), true),
+            ("satisfied", boolean(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgNoteLink",
+        typed_object(vec![
+            ("purpose", string(), true),
+            ("note_id", string(), true),
+            ("description", string(), true),
+            ("available", boolean(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgAttemptNote",
+        typed_object(vec![
+            ("purpose", string(), true),
+            ("note_id", string(), true),
+            ("description", string(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgArtifact",
+        typed_object(vec![
+            ("uri", string(), true),
+            ("media_type", string(), true),
+            ("name", string(), true),
+            ("description", string(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgAttempt",
+        typed_object(vec![
+            ("id", string(), true),
+            ("workspace_id", string(), true),
+            ("work_item_id", string(), true),
+            ("attempt_number", integer(), true),
+            ("actor_id", string(), true),
+            ("status", string(), true),
+            ("started_at", integer(), true),
+            ("ended_at", nullable_scalar(Type::Integer), true),
+            ("error", nullable_scalar(Type::String), true),
+            ("result_summary", nullable_scalar(Type::String), true),
+            ("review_outcome", nullable_scalar(Type::String), true),
+            ("note_refs", array_of(schema_ref("OrgAttemptNote")), true),
+            ("artifacts", array_of(schema_ref("OrgArtifact")), true),
+            ("metadata", json(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgOriginWorkItem",
+        typed_object(vec![
+            ("kind", enum_string(&["work_item"]), true),
+            ("work_item_id", string(), true),
+            ("item", nullable_ref("OrgItemResult"), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgOriginEvent",
+        typed_object(vec![
+            ("kind", enum_string(&["event"]), true),
+            ("event_id", string(), true),
+            ("event", nullable_ref("OrgEventResult"), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgOrigin",
+        Schema::OneOf(
+            OneOfBuilder::new()
+                .item(Ref::from_schema_name("OrgOriginWorkItem"))
+                .item(Ref::from_schema_name("OrgOriginEvent"))
+                .build(),
+        )
+        .into(),
+    );
+    add(
+        components,
+        "OrgHistorySegment",
+        typed_object(vec![
+            ("workspace_id", string(), true),
+            ("events", array_of(schema_ref("OrgEventResult")), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgAttemptBudget",
+        typed_object(vec![
+            ("execution_attempt_count", integer(), true),
+            ("max_attempts", integer(), true),
+            ("remaining_attempts", integer(), true),
+            ("retry_exhausted", boolean(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgRecovery",
+        typed_object(vec![
+            ("eligible", boolean(), true),
+            ("candidate", boolean(), true),
+            ("blockers", array_of(string()), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgOperationalContext",
+        typed_object(vec![
+            ("classifications", array_of(string()), true),
+            ("readiness", nullable_scalar(Type::String), true),
+            ("blockers", array_of(string()), true),
+            ("attempt_budget", schema_ref("OrgAttemptBudget"), true),
+            ("recovery", schema_ref("OrgRecovery"), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgItemContextResult",
+        typed_object(vec![
+            ("workspace", schema_ref("OrgWorkspaceResult"), true),
+            ("workspace_revision", integer(), true),
+            ("document", schema_ref("OrgDocumentResult"), true),
+            ("item", schema_ref("OrgItemResult"), true),
+            ("parent", nullable_ref("OrgItemResult"), true),
+            ("children", array_of(schema_ref("OrgItemResult")), true),
+            ("dependencies", array_of(schema_ref("OrgDependency")), true),
+            ("note_links", array_of(schema_ref("OrgNoteLink")), true),
+            ("attempts", array_of(schema_ref("OrgAttempt")), true),
+            ("origin", nullable_ref("OrgOrigin"), true),
+            (
+                "history_segments",
+                array_of(schema_ref("OrgHistorySegment")),
+                true,
+            ),
+            ("lease", nullable_ref("OrgLease"), true),
+            ("operational", schema_ref("OrgOperationalContext"), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgOperationalItem",
+        typed_object(vec![
+            ("item", schema_ref("OrgItemResult"), true),
+            ("attempt_count", integer(), true),
+            (
+                "current_attempt_status",
+                nullable_scalar(Type::String),
+                true,
+            ),
+            ("retry_exhausted", boolean(), true),
+            ("ready_status", nullable_scalar(Type::String), true),
+            ("review_lease_status", nullable_scalar(Type::String), true),
+            ("lease", nullable_ref("OrgLease"), true),
+            ("completion_at", nullable_scalar(Type::Integer), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgWorkspaceRevisionData",
+        typed_object(vec![
+            ("workspace_id", string(), true),
+            ("revision", integer(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgArchiveData",
+        typed_object(vec![
+            ("workspace_id", string(), true),
+            ("archived_at", integer(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgDocumentCountData",
+        typed_object(vec![("document_count", integer(), true)]),
+    );
+    add(
+        components,
+        "OrgMoveDocumentData",
+        typed_object(vec![
+            ("document_id", string(), true),
+            ("source_workspace_id", string(), true),
+            ("target_workspace_id", string(), true),
+            ("source_workspace_revision", integer(), true),
+            ("target_workspace_revision", integer(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgResultingNoteLink",
+        typed_object(vec![
+            ("purpose", string(), true),
+            ("note_id", string(), true),
+            ("description", string(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgResultingItem",
+        typed_object(vec![
+            ("id", string(), true),
+            ("workspace_id", string(), true),
+            ("document_id", string(), true),
+            ("parent_id", nullable_scalar(Type::String), true),
+            ("item_type", string(), true),
+            ("title", string(), true),
+            ("state", nullable_scalar(Type::String), true),
+            ("priority", nullable_scalar(Type::String), true),
+            ("scheduled", nullable_scalar(Type::String), true),
+            ("deadline", nullable_scalar(Type::String), true),
+            ("assignee", nullable_scalar(Type::String), true),
+            ("requires_review", boolean(), true),
+            ("created_at", integer(), true),
+            ("tags", array_of(string()), true),
+            ("dependencies", array_of(string()), true),
+            (
+                "note_links",
+                array_of(schema_ref("OrgResultingNoteLink")),
+                true,
+            ),
+        ]),
+    );
+    add(
+        components,
+        "OrgFollowUpOriginWorkItem",
+        typed_object(vec![
+            ("kind", enum_string(&["work_item"]), true),
+            ("schema_version", integer(), true),
+            ("work_item_id", string(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgFollowUpOriginEvent",
+        typed_object(vec![
+            ("kind", enum_string(&["event"]), true),
+            ("schema_version", integer(), true),
+            ("event_id", string(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgFollowUpOrigin",
+        Schema::OneOf(
+            OneOfBuilder::new()
+                .item(Ref::from_schema_name("OrgFollowUpOriginWorkItem"))
+                .item(Ref::from_schema_name("OrgFollowUpOriginEvent"))
+                .build(),
+        )
+        .into(),
+    );
+    add(
+        components,
+        "OrgCreateItemOperation",
+        typed_object(vec![
+            ("schema_version", integer(), true),
+            ("document_id", string(), true),
+            ("parent_id", nullable_scalar(Type::String), true),
+            ("origin", nullable_ref("OrgFollowUpOrigin"), true),
+            ("initial_state", string(), true),
+            ("item_type", string(), true),
+            ("title", string(), true),
+            ("priority", nullable_scalar(Type::String), true),
+            ("tags", array_of(string()), true),
+            ("requires_review", boolean(), true),
+            ("initial_assignee", nullable_scalar(Type::String), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgAssignmentOperation",
+        typed_object(vec![
+            ("previous_assignee", nullable_scalar(Type::String), true),
+            ("resulting_assignee", nullable_scalar(Type::String), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgScheduleOperation",
+        typed_object(vec![
+            ("previous_scheduled", nullable_scalar(Type::String), true),
+            ("resulting_scheduled", nullable_scalar(Type::String), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgDeadlineOperation",
+        typed_object(vec![
+            ("previous_deadline", nullable_scalar(Type::String), true),
+            ("resulting_deadline", nullable_scalar(Type::String), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgDependencyOperation",
+        typed_object(vec![
+            ("dependency_id", string(), true),
+            ("action", enum_string(&["add", "remove"]), true),
+            ("previous_dependencies", array_of(string()), true),
+            ("resulting_dependencies", array_of(string()), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgNoteLinkOperation",
+        typed_object(vec![
+            ("action", enum_string(&["link", "unlink"]), true),
+            ("purpose", string(), true),
+            ("note_id", string(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgItemOperation",
+        Schema::OneOf(
+            OneOfBuilder::new()
+                .item(Ref::from_schema_name("OrgCreateItemOperation"))
+                .item(Ref::from_schema_name("OrgAssignmentOperation"))
+                .item(Ref::from_schema_name("OrgScheduleOperation"))
+                .item(Ref::from_schema_name("OrgDeadlineOperation"))
+                .item(Ref::from_schema_name("OrgDependencyOperation"))
+                .item(Ref::from_schema_name("OrgNoteLinkOperation"))
+                .build(),
+        )
+        .into(),
+    );
+    add(
+        components,
+        "OrgMoveItemOperation",
+        typed_object(vec![
+            ("source_document_id", string(), true),
+            ("target_document_id", string(), true),
+            ("previous_parent_id", nullable_scalar(Type::String), true),
+            ("resulting_parent_id", nullable_scalar(Type::String), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgItemMutationData",
+        typed_object(vec![
+            ("affected_document_count", integer(), true),
+            (
+                "resulting_items",
+                array_of(schema_ref("OrgResultingItem")),
+                true,
+            ),
+            ("operation", schema_ref("OrgItemOperation"), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgMoveItemData",
+        typed_object(vec![
+            ("affected_document_count", integer(), true),
+            (
+                "resulting_items",
+                array_of(schema_ref("OrgResultingItem")),
+                true,
+            ),
+            ("operation", schema_ref("OrgMoveItemOperation"), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgContextData",
+        typed_object(vec![("context", schema_ref("OrgItemContextResult"), true)]),
+    );
+    add(
+        components,
+        "OrgHeartbeatData",
+        typed_object(vec![
+            ("lease", schema_ref("OrgLease"), true),
+            ("context", schema_ref("OrgItemContextResult"), true),
+        ]),
+    );
+
+    for (name, schema) in [
+        ("OrgWorkspacePageResult", page_schema("OrgWorkspaceSummary")),
+        (
+            "OrgWorkspaceCommandResult",
+            command_schema("OrgWorkspaceRevisionData"),
+        ),
+        ("OrgArchiveCommandResult", command_schema("OrgArchiveData")),
+        ("OrgDocumentPageResult", page_schema("OrgDocumentResult")),
+        (
+            "OrgDocumentCountCommandResult",
+            command_schema("OrgDocumentCountData"),
+        ),
+        (
+            "OrgMoveDocumentCommandResult",
+            command_schema("OrgMoveDocumentData"),
+        ),
+        (
+            "OrgMoveItemCommandResult",
+            command_schema("OrgMoveItemData"),
+        ),
+        (
+            "OrgItemCommandResult",
+            command_schema("OrgItemMutationData"),
+        ),
+        ("OrgContextCommandResult", command_schema("OrgContextData")),
+        (
+            "OrgHeartbeatCommandResult",
+            command_schema("OrgHeartbeatData"),
+        ),
+        ("OrgItemPageResult", page_schema("OrgItemResult")),
+        ("OrgEventPageResult", page_schema("OrgEventResult")),
+    ] {
+        add(components, name, schema);
+    }
+    add(
+        components,
+        "OrgWorkspaceExportResult",
+        typed_object(vec![
+            ("workspace", schema_ref("OrgWorkspaceResult"), true),
+            (
+                "documents",
+                array_of(schema_ref("OrgDocumentSourceResult")),
+                true,
+            ),
+        ]),
+    );
+    add(
+        components,
+        "OrgOperationalPageResult",
+        typed_object(vec![
+            ("items", array_of(schema_ref("OrgOperationalItem")), true),
+            ("next_cursor", nullable_scalar(Type::String), true),
+            ("evaluated_at", integer(), true),
+        ]),
+    );
+    add(
+        components,
+        "OrgClaimResult",
+        typed_object(vec![
+            ("schema_version", integer(), true),
+            ("workspace_id", string(), true),
+            ("operation_id", string(), true),
+            ("lease_id", string(), true),
+            ("fencing_token", string(), true),
+            ("expires_at", integer(), true),
+            ("event_ids", array_of(string()), true),
+            ("context", schema_ref("OrgItemContextResult"), true),
+        ]),
+    );
+
+    for path_item in openapi
+        .paths
+        .paths
+        .iter_mut()
+        .filter(|(path, _)| path.starts_with("/api/org"))
+        .map(|(_, item)| item)
+    {
+        for operation in [
+            &mut path_item.get,
+            &mut path_item.put,
+            &mut path_item.post,
+            &mut path_item.delete,
+            &mut path_item.patch,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let operation_id = operation.operation_id.as_deref().expect("Org operation id");
+            let schema_name = org_success_schema_name(operation_id);
+            for (status, response) in &mut operation.responses.responses {
+                if !status.starts_with('2') {
+                    continue;
+                }
+                if let RefOr::T(response) = response {
+                    response
+                        .content
+                        .get_mut("application/json")
+                        .expect("Org JSON success response")
+                        .schema = Some(Ref::from_schema_name(schema_name).into());
+                }
+            }
+        }
+    }
+    openapi
+}
+
+fn normalize_org_query_parameters(mut openapi: OpenApi) -> OpenApi {
+    for (path, path_item) in &mut openapi.paths.paths {
+        if !path.starts_with("/api/org") {
+            continue;
+        }
+        let Some(operation) = &mut path_item.get else {
+            continue;
+        };
+        let Some(parameters) = &mut operation.parameters else {
+            continue;
+        };
+        for parameter in parameters {
+            let name = parameter.name.clone();
+            if path.contains(&format!("{{{name}}}")) {
+                continue;
+            }
+            parameter.parameter_in = ParameterIn::Query;
+            match name.as_str() {
+                "cursor" => {
+                    parameter.required = Required::False;
+                    parameter.description = Some(
+                        "Opaque cursor returned by the preceding page; clients must not inspect or modify it."
+                            .to_owned(),
+                    );
+                }
+                "limit" => {
+                    parameter.required = Required::False;
+                    if let Some(RefOr::T(Schema::Object(schema))) = &mut parameter.schema {
+                        schema.default = Some(serde_json::json!(50));
+                        schema.minimum = Some(1usize.into());
+                        schema.maximum = Some(200usize.into());
+                    }
+                }
+                "include_archived" => {
+                    parameter.required = Required::False;
+                    if let Some(RefOr::T(Schema::Object(schema))) = &mut parameter.schema {
+                        schema.default = Some(serde_json::json!(false));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    openapi
 }
 
 pub fn swagger_router(openapi: OpenApi) -> Router {
