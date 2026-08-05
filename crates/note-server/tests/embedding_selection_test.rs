@@ -1,3 +1,6 @@
+use note_server::org_offline::{ManifestDocument, ManifestWorkspace, WorkspaceManifest};
+use note_storage::StorageBackend;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::{Output, Stdio};
 use std::time::Duration;
@@ -58,9 +61,13 @@ async fn finish_reader(mut reader: JoinHandle<std::io::Result<Vec<u8>>>) -> Vec<
 }
 
 async fn run_offline_mode(dir: &Path, config_path: &Path, mode: &str, input: &[u8]) -> Output {
+    run_offline_args(dir, config_path, &[mode], input).await
+}
+
+async fn run_offline_args(dir: &Path, config_path: &Path, args: &[&str], input: &[u8]) -> Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_note-server"));
     command
-        .arg(mode)
+        .args(args)
         .current_dir(dir)
         .env("NOTE_CONFIG_PATH", config_path)
         .env_remove("UNSET_FOR_TEST")
@@ -94,6 +101,51 @@ async fn run_offline_mode(dir: &Path, config_path: &Path, mode: &str, input: &[u
         stdout: finish_reader(stdout_reader).await,
         stderr: finish_reader(stderr_reader).await,
     }
+}
+
+fn snapshot_hash(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn write_org_snapshot(dir: &Path) -> std::path::PathBuf {
+    const WORKSPACE_ID: &str = "10000000-0000-4000-8000-000000000001";
+    const DOCUMENT_ID: &str = "20000000-0000-4000-8000-000000000001";
+    let snapshot = dir.join("snapshot");
+    std::fs::create_dir(&snapshot).unwrap();
+    std::fs::create_dir(snapshot.join("documents")).unwrap();
+    let source = b"#+TITLE: Storage only\r\nOpaque syntax.\r\n";
+    std::fs::write(
+        snapshot.join(format!("documents/{DOCUMENT_ID}.org")),
+        source,
+    )
+    .unwrap();
+    let manifest = WorkspaceManifest {
+        format_version: 1,
+        workspace: ManifestWorkspace {
+            id: WORKSPACE_ID.parse().unwrap(),
+            slug: "storage-only".into(),
+            display_name: "Storage only".into(),
+            description: "No embedding or attachment startup".into(),
+            timezone: "UTC".into(),
+            policy_schema_version: 1,
+            policy: note_org::WorkspacePolicy::engineering_default(),
+            revision: 1,
+            archived_at: None,
+        },
+        documents: vec![ManifestDocument {
+            id: DOCUMENT_ID.parse().unwrap(),
+            path: "main.org".into(),
+            revision: 1,
+            content_hash: snapshot_hash(source),
+            file: format!("documents/{DOCUMENT_ID}.org"),
+        }],
+    };
+    std::fs::write(
+        snapshot.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    snapshot
 }
 
 #[tokio::test]
@@ -148,4 +200,115 @@ async fn export_does_not_resolve_embedding_secret_or_contact_remote_endpoint() {
     assert_eq!(export["label_keys"], serde_json::json!([]));
     assert_eq!(export["notes"], serde_json::json!([]));
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn all_four_org_offline_modes_are_storage_only() {
+    const WORKSPACE_ID: &str = "10000000-0000-4000-8000-000000000001";
+    const DOCUMENT_ID: &str = "20000000-0000-4000-8000-000000000001";
+    const SECOND_DOCUMENT_ID: &str = "20000000-0000-4000-8000-000000000002";
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = write_remote_config(dir.path(), &server);
+    let snapshot = write_org_snapshot(dir.path());
+
+    let import_workspace = run_offline_args(
+        dir.path(),
+        &config_path,
+        &[
+            "org",
+            "import-workspace",
+            "--input",
+            snapshot.to_str().unwrap(),
+            "--mode",
+            "create",
+            "--actor-id",
+            "offline-test",
+            "--operation-id",
+            "create-workspace",
+        ],
+        &[],
+    )
+    .await;
+    assert!(
+        import_workspace.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&import_workspace.stderr)
+    );
+
+    let exported = dir.path().join("exported");
+    let export_workspace = run_offline_args(
+        dir.path(),
+        &config_path,
+        &[
+            "org",
+            "export-workspace",
+            "--workspace-id",
+            WORKSPACE_ID,
+            "--output",
+            exported.to_str().unwrap(),
+        ],
+        &[],
+    )
+    .await;
+    assert!(export_workspace.status.success());
+
+    let exported_document = dir.path().join("exported-document.org");
+    let export_document = run_offline_args(
+        dir.path(),
+        &config_path,
+        &[
+            "org",
+            "export-document",
+            "--document-id",
+            DOCUMENT_ID,
+            "--output",
+            exported_document.to_str().unwrap(),
+        ],
+        &[],
+    )
+    .await;
+    assert!(export_document.status.success());
+
+    let second = dir.path().join("second.org");
+    std::fs::write(&second, b"#+TITLE: Second\nOpaque.\n").unwrap();
+    let import_document = run_offline_args(
+        dir.path(),
+        &config_path,
+        &[
+            "org",
+            "import-document",
+            "--workspace-id",
+            WORKSPACE_ID,
+            "--document-id",
+            SECOND_DOCUMENT_ID,
+            "--path",
+            "second.org",
+            "--input",
+            second.to_str().unwrap(),
+            "--mode",
+            "create",
+            "--actor-id",
+            "offline-test",
+            "--operation-id",
+            "create-document",
+        ],
+        &[],
+    )
+    .await;
+    assert!(import_document.status.success());
+
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(!dir.path().join("attachments").exists());
+    let storage = note_storage_turso::TursoStorage::open(dir.path().join("notes.db"))
+        .await
+        .unwrap();
+    assert!(storage
+        .session()
+        .await
+        .unwrap()
+        .list_notes(&[], None, None)
+        .await
+        .unwrap()
+        .is_empty());
 }
