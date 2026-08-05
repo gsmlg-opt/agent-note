@@ -54,6 +54,27 @@ pub enum Route {
     NotFound,
 }
 
+impl Route {
+    pub fn document_title(&self) -> String {
+        match self {
+            Self::Home => "Home | agent-note".to_owned(),
+            Self::Notes => "Notes | agent-note".to_owned(),
+            Self::Org => "Org | agent-note".to_owned(),
+            Self::OrgWorkspace { workspace_id } => {
+                format!("Org workspace {workspace_id} | agent-note")
+            }
+            Self::OrgItem { item_id, .. } => format!("Org item {item_id} | agent-note"),
+            Self::NewNote => "New note | agent-note".to_owned(),
+            Self::NoteShow { id } => format!("Note {id} | agent-note"),
+            Self::NoteEdit { id } => format!("Edit note {id} | agent-note"),
+            Self::Labels => "Labels | agent-note".to_owned(),
+            Self::Trash => "Trash | agent-note".to_owned(),
+            Self::System => "System | agent-note".to_owned(),
+            Self::NotFound => "Page not found | agent-note".to_owned(),
+        }
+    }
+}
+
 pub fn switch(route: Route) -> Html {
     match route {
         Route::Home => html! { <DashboardPage /> },
@@ -102,6 +123,27 @@ mod tests {
                 item_id: "item-1".into(),
             })
         );
+    }
+
+    #[test]
+    fn maps_org_routes_to_specific_document_titles() {
+        assert_eq!(Route::Org.document_title(), "Org | agent-note");
+        assert_eq!(
+            Route::OrgWorkspace {
+                workspace_id: "release-ops".into(),
+            }
+            .document_title(),
+            "Org workspace release-ops | agent-note"
+        );
+        assert_eq!(
+            Route::OrgItem {
+                workspace_id: "release-ops".into(),
+                item_id: "ship-console".into(),
+            }
+            .document_title(),
+            "Org item ship-console | agent-note"
+        );
+        assert_eq!(Route::Notes.document_title(), "Notes | agent-note");
     }
 
     #[test]
