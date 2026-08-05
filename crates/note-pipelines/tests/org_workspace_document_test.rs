@@ -905,6 +905,70 @@ async fn complete_dependency_graph_and_new_note_targets_are_validated_before_wri
 }
 
 #[tokio::test]
+async fn document_parse_errors_do_not_expose_untrusted_source_or_parser_text() {
+    const ATTACKER_VALUE: &str = "private-secret-token-value";
+    const PARSER_TEXT: &str = "unsupported work item type";
+
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-000000000062");
+    create_test_workspace(
+        &context,
+        workspace,
+        "create-sanitized-error-workspace",
+        "UTC",
+    )
+    .await;
+    let document = document_id("20000000-0000-4000-8000-000000000062");
+    let before = workspace_snapshot(backend.as_ref(), workspace).await;
+    let candidate = format!(
+        "* READY Sensitive parser input\r\n:PROPERTIES:\r\n:ID: 30000000-0000-4000-8000-000000000062\r\n:AGENT_NOTE_TYPE: {ATTACKER_VALUE}\r\n:END:\r\n"
+    );
+
+    let error = put_document(
+        &context,
+        &envelope(workspace, "reject-sensitive-parser-input"),
+        &PutDocumentRequest {
+            document_id: document,
+            path: "sensitive-invalid.org".into(),
+            source: candidate,
+            expected_revision: None,
+            lease_proofs: BTreeMap::new(),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.code, OrgErrorCode::InvalidInput);
+    assert_eq!(error.message, "Org document is invalid");
+    assert_eq!(
+        error.details,
+        serde_json::json!({"reason": "invalid Org input", "line": 4})
+    );
+    assert!(!error.retryable);
+
+    for exposed_surface in [
+        error.message.clone(),
+        error.details.to_string(),
+        format!("{error:?}"),
+        serde_json::to_string(&error).unwrap(),
+    ] {
+        assert!(!exposed_surface.contains(ATTACKER_VALUE));
+        assert!(!exposed_surface.contains(PARSER_TEXT));
+    }
+
+    let session = backend.session().await.unwrap();
+    assert!(session.get_org_document(document).await.unwrap().is_none());
+    assert!(session
+        .get_org_operation(workspace, "reject-sensitive-parser-input")
+        .await
+        .unwrap()
+        .is_none());
+    let after = workspace_snapshot(backend.as_ref(), workspace).await;
+    assert_eq!(after.events.len(), before.events.len());
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
 async fn raw_import_keeps_existing_weak_links_but_rejects_new_links_to_soft_deleted_notes() {
     let (context, backend, _dir) = empty_context(NOW).await;
     let workspace = workspace_id("10000000-0000-4000-8000-000000000065");
