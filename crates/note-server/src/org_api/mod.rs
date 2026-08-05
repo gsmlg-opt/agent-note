@@ -1,6 +1,8 @@
 mod documents;
 pub mod dto;
 pub mod error;
+mod items;
+mod operational;
 mod workspaces;
 
 use axum::{extract::State, Json};
@@ -62,39 +64,6 @@ macro_rules! org_mutation_route {
     };
 }
 
-org_mutation_route!(
-    create_item,
-    post,
-    "/api/org/workspaces/{workspace_id}/items",
-    "org_create_item"
-);
-org_read_route!(get_item, get, "/api/org/items/{item_id}", "org_get_item");
-org_read_route!(
-    get_item_context,
-    get,
-    "/api/org/items/{item_id}/context",
-    "org_get_item_context"
-);
-org_mutation_route!(
-    create_follow_up,
-    post,
-    "/api/org/items/{item_id}/follow-ups",
-    "org_create_follow_up"
-);
-org_mutation_route!(
-    assign_item,
-    post,
-    "/api/org/items/{item_id}/assignment",
-    "org_assign_item"
-);
-org_mutation_route!(
-    schedule_item,
-    post,
-    "/api/org/items/{item_id}/schedule",
-    "org_schedule_item"
-);
-org_read_route!(query_queue, get, "/api/org/queue", "org_query_queue");
-org_read_route!(query_agenda, get, "/api/org/agenda", "org_query_agenda");
 org_mutation_route!(
     claim_item,
     post,
@@ -200,14 +169,8 @@ pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(OrgApiSchemas::openapi())
         .merge(workspaces::router())
         .merge(documents::router())
-        .routes(routes!(create_item))
-        .routes(routes!(get_item))
-        .routes(routes!(get_item_context))
-        .routes(routes!(create_follow_up))
-        .routes(routes!(assign_item))
-        .routes(routes!(schedule_item))
-        .routes(routes!(query_queue))
-        .routes(routes!(query_agenda))
+        .merge(items::router())
+        .merge(operational::router())
         .routes(routes!(claim_item))
         .routes(routes!(heartbeat_claim))
         .routes(routes!(release_claim))

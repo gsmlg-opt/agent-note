@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 
-use note_org::{DocumentId, WorkItemId, WorkspaceId};
+use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId};
 use note_pipelines::org::{
-    CommandEnvelope, DocumentImport, ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest,
-    MoveItemRequest, OrgClaimKind, OrgError, OrgReadQuery, PutDocumentRequest,
+    AssignItemRequest, CommandEnvelope, CreateFollowUpRequest, CreateItemRequest, DocumentImport,
+    FollowUpOrigin, ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest, MoveItemRequest,
+    OperationalQuery, OperationalView, OrgClaimKind, OrgError, OrgFieldPatch, OrgReadQuery,
+    PutDocumentRequest, ScheduleItemRequest,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -86,6 +88,353 @@ impl DocumentPath {
 pub struct ItemPath {
     pub item_id: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ItemReadQuery {
+    pub workspace_id: String,
+}
+
+impl ItemReadQuery {
+    pub fn parse(self) -> Result<WorkspaceId, OrgError> {
+        parse_id(self.workspace_id, "workspace_id")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkItemTypeBody {
+    Project,
+    Epic,
+    Issue,
+    Task,
+    Subtask,
+    Review,
+    Approval,
+    Incident,
+    Milestone,
+}
+
+impl WorkItemTypeBody {
+    fn into_pipeline(self) -> Result<WorkItemType, OrgError> {
+        adapt_input(self, "item type")
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateItemPayloadBody {
+    pub document_id: String,
+    pub parent_id: Option<String>,
+    pub item_id: String,
+    pub item_type: WorkItemTypeBody,
+    pub title: String,
+    pub initial_state: Option<String>,
+    pub priority: Option<char>,
+    pub tags: Vec<String>,
+    pub assignee: Option<String>,
+    pub requires_review: bool,
+    pub expected_revisions: BTreeMap<String, i64>,
+}
+
+impl CreateItemPayloadBody {
+    fn into_pipeline(self) -> Result<CreateItemRequest, OrgError> {
+        Ok(CreateItemRequest {
+            document_id: parse_id(self.document_id, "document_id")?,
+            parent_id: self
+                .parent_id
+                .map(|id| parse_id(id, "parent_id"))
+                .transpose()?,
+            item_id: parse_id(self.item_id, "item_id")?,
+            item_type: self.item_type.into_pipeline()?,
+            title: self.title,
+            initial_state: self.initial_state,
+            priority: self.priority,
+            tags: self.tags.into_iter().collect(),
+            assignee: self.assignee,
+            requires_review: self.requires_review,
+            expected_revisions: adapt_id_map(self.expected_revisions, "document_id")?,
+        })
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateItemBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    #[serde(flatten)]
+    pub item: CreateItemPayloadBody,
+}
+
+impl CreateItemBody {
+    pub fn into_pipeline(
+        self,
+        workspace_id: WorkspaceId,
+    ) -> Result<(CommandEnvelope, CreateItemRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&workspace_id.to_string())?,
+            self.item.into_pipeline()?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
+pub enum FollowUpOriginBody {
+    WorkItem { id: String },
+    Event { id: String },
+}
+
+impl FollowUpOriginBody {
+    fn into_pipeline(self) -> Result<FollowUpOrigin, OrgError> {
+        match self {
+            Self::WorkItem { id } => Ok(FollowUpOrigin::WorkItem(parse_id(id, "origin.id")?)),
+            Self::Event { id } => Ok(FollowUpOrigin::Event(id)),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateFollowUpBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub item: CreateItemPayloadBody,
+    pub origin: FollowUpOriginBody,
+}
+
+impl CreateFollowUpBody {
+    pub fn into_pipeline(
+        self,
+        path_item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, CreateFollowUpRequest), OrgError> {
+        let item = self.item.into_pipeline()?;
+        if item.item_id != path_item_id {
+            return Err(OrgError::invalid_input(
+                "path item_id must match the new follow-up item_id",
+            ));
+        }
+        let origin = self.origin.into_pipeline()?;
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            CreateFollowUpRequest { item, origin },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssignItemBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub assignee: Option<String>,
+    pub expected_revisions: BTreeMap<String, i64>,
+    pub lease: Option<LeaseProofBody>,
+}
+
+impl AssignItemBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, AssignItemRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            AssignItemRequest {
+                item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                assignee: self.assignee,
+                expected_revisions: adapt_id_map(self.expected_revisions, "document_id")?,
+                lease: self.lease.map(Into::into),
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "snake_case",
+    tag = "action",
+    content = "value"
+)]
+pub enum FieldPatchBody {
+    Unchanged,
+    Set(String),
+    Clear,
+}
+
+impl From<FieldPatchBody> for OrgFieldPatch<String> {
+    fn from(value: FieldPatchBody) -> Self {
+        match value {
+            FieldPatchBody::Unchanged => Self::Unchanged,
+            FieldPatchBody::Set(value) => Self::Set(value),
+            FieldPatchBody::Clear => Self::Clear,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleItemBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub scheduled: FieldPatchBody,
+    pub deadline: FieldPatchBody,
+    pub expected_revisions: BTreeMap<String, i64>,
+    pub lease: Option<LeaseProofBody>,
+}
+
+impl ScheduleItemBody {
+    pub fn into_pipeline(
+        self,
+        item_id: WorkItemId,
+    ) -> Result<(CommandEnvelope, ScheduleItemRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            ScheduleItemRequest {
+                item_id,
+                document_id: parse_id(self.document_id, "document_id")?,
+                scheduled: self.scheduled.into(),
+                deadline: self.deadline.into(),
+                expected_revisions: adapt_id_map(self.expected_revisions, "document_id")?,
+                lease: self.lease.map(Into::into),
+            },
+        ))
+    }
+}
+
+pub trait IntoOperationalView {
+    fn into_pipeline(self) -> OperationalView;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueViewBody {
+    Ready,
+    Assigned,
+    Running,
+    Blocked,
+    Review,
+    Failed,
+    ExpiredLease,
+    Completed,
+}
+
+impl IntoOperationalView for QueueViewBody {
+    fn into_pipeline(self) -> OperationalView {
+        match self {
+            Self::Ready => OperationalView::Ready,
+            Self::Assigned => OperationalView::Assigned,
+            Self::Running => OperationalView::Running,
+            Self::Blocked => OperationalView::Blocked,
+            Self::Review => OperationalView::Review,
+            Self::Failed => OperationalView::Failed,
+            Self::ExpiredLease => OperationalView::ExpiredLease,
+            Self::Completed => OperationalView::Completed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgendaViewBody {
+    Scheduled,
+    UpcomingDeadline,
+}
+
+impl IntoOperationalView for AgendaViewBody {
+    fn into_pipeline(self) -> OperationalView {
+        match self {
+            Self::Scheduled => OperationalView::Scheduled,
+            Self::UpcomingDeadline => OperationalView::UpcomingDeadline,
+        }
+    }
+}
+
+macro_rules! operational_query_body {
+    ($name:ident, $view:ty) => {
+        #[derive(Debug, Clone, Deserialize, ToSchema, utoipa::IntoParams)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            /// Comma-separated workspace UUIDs. Multiple workspaces require every selected policy to opt in.
+            pub workspace_ids: String,
+            pub view: $view,
+            pub item_type: Option<WorkItemTypeBody>,
+            pub state: Option<String>,
+            pub priority: Option<char>,
+            /// Comma-separated tag intersection filter.
+            pub tags: Option<String>,
+            pub assignee: Option<String>,
+            pub scheduled_from: Option<i64>,
+            pub scheduled_to: Option<i64>,
+            pub deadline_from: Option<i64>,
+            pub deadline_to: Option<i64>,
+            pub completed_from: Option<i64>,
+            pub completed_to: Option<i64>,
+            pub from: Option<i64>,
+            pub to: Option<i64>,
+            #[serde(default)]
+            #[schema(default = false)]
+            pub include_archived: bool,
+            /// Opaque cursor returned by the preceding page; clients must not inspect or modify it.
+            pub cursor: Option<String>,
+            #[serde(default = "default_limit")]
+            #[schema(default = 50, minimum = 1, maximum = 200)]
+            pub limit: u16,
+        }
+
+        impl $name {
+            pub fn into_pipeline(self) -> Result<OperationalQuery, OrgError> {
+                let mut workspace_ids = Vec::new();
+                let mut canonical_ids = std::collections::BTreeSet::new();
+                for id in self.workspace_ids.split(',') {
+                    let parsed = parse_id(id.to_owned(), "workspace_id")?;
+                    if !canonical_ids.insert(parsed) {
+                        return Err(OrgError::invalid_input(
+                            "workspace_ids must contain unique UUIDs",
+                        ));
+                    }
+                    workspace_ids.push(parsed);
+                }
+                Ok(OperationalQuery {
+                    workspace_ids,
+                    view: self.view.into_pipeline(),
+                    item_type: self
+                        .item_type
+                        .map(WorkItemTypeBody::into_pipeline)
+                        .transpose()?,
+                    state: self.state,
+                    priority: self.priority,
+                    tags: self
+                        .tags
+                        .map(|tags| tags.split(',').map(str::to_owned).collect())
+                        .unwrap_or_default(),
+                    assignee: self.assignee,
+                    scheduled_from: self.scheduled_from,
+                    scheduled_to: self.scheduled_to,
+                    deadline_from: self.deadline_from,
+                    deadline_to: self.deadline_to,
+                    completed_from: self.completed_from,
+                    completed_to: self.completed_to,
+                    from: self.from,
+                    to: self.to,
+                    include_archived: self.include_archived,
+                    cursor: self.cursor,
+                    limit: Some(usize::from(self.limit)),
+                })
+            }
+        }
+    };
+}
+
+operational_query_body!(QueueQueryBody, QueueViewBody);
+operational_query_body!(AgendaQueryBody, AgendaViewBody);
 
 impl ItemPath {
     pub fn parse(self) -> Result<WorkItemId, OrgError> {
@@ -467,6 +816,68 @@ where
         }
     }
     Ok(adapted)
+}
+
+pub fn safe_json<T: Serialize>(value: T) -> Result<serde_json::Value, OrgError> {
+    let mut value = serde_json::to_value(value).map_err(|_| {
+        OrgError::new(
+            note_pipelines::org::OrgErrorCode::StorageFailure,
+            "Org pipeline returned an incompatible response",
+            serde_json::json!({}),
+            false,
+        )
+    })?;
+    redact_sensitive_values(&mut value);
+    Ok(value)
+}
+
+fn redact_sensitive_values(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_sensitive_values(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if is_sensitive_key(key) {
+                    *value = serde_json::Value::String("[REDACTED]".to_owned());
+                } else {
+                    redact_sensitive_values(value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let mut normalized = String::new();
+    let mut previous_was_lower_or_digit = false;
+    for character in key.chars() {
+        if character.is_ascii_alphanumeric() {
+            if character.is_ascii_uppercase() && previous_was_lower_or_digit {
+                normalized.push('_');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            previous_was_lower_or_digit =
+                character.is_ascii_lowercase() || character.is_ascii_digit();
+        } else if !normalized.ends_with('_') && !normalized.is_empty() {
+            normalized.push('_');
+            previous_was_lower_or_digit = false;
+        }
+    }
+    let normalized = normalized.trim_matches('_');
+    let compact = normalized.replace('_', "");
+    normalized.split('_').any(|word| {
+        matches!(
+            word,
+            "token" | "hash" | "secret" | "password" | "authentication" | "authorization"
+        )
+    }) || matches!(compact.as_str(), "apikey" | "accesstoken")
+        || ["token", "hash", "secret", "password"]
+            .iter()
+            .any(|suffix| compact.ends_with(suffix))
 }
 
 #[cfg(test)]
