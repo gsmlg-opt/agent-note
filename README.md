@@ -51,25 +51,38 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
 ```
 
 **Org canonical persistence.** `note-org` supplies the pure Org domain and workspace-time behavior.
-Storage schema v4 persists canonical Org workspaces and documents, durable execution-attempt
-records, richer append-only events, idempotent operation results, and derived, rebuildable work-item
-projections. The embedded Turso adapter atomically upgrades marked v2 or v3 databases to v4;
-PostgreSQL applies the ordered `0002_org_canonical.sql` and `0003_org_workflow_audit.sql`
-migrations. Markdown notes and their storage remain unchanged. Projection rebuilds preserve
-attempts, events, and operation results.
+Storage schema v5 persists canonical Org workspaces and documents, durable execution attempts,
+exclusive leases, richer append-only events, idempotent operation results, and derived, rebuildable
+work-item projections. The embedded Turso adapter atomically upgrades marked v2, v3, or v4
+databases to v5; PostgreSQL applies the ordered `0002_org_canonical.sql`,
+`0003_org_workflow_audit.sql`, and `0004_org_claims_operational_views.sql` migrations. Markdown
+notes and their storage remain unchanged. Projection rebuilds preserve attempts, events, leases,
+and operation results.
 
 The transport-free `note_pipelines::org` boundary provides atomic, revision-safe commands for
 workspace and document management and for item creation, follow-ups, movement, reparenting,
 assignment, scheduling, dependencies, and Markdown-note links. It also provides workspace-sequenced
 audit pages and recovery context assembled from canonical document revisions, projections,
 dependencies, weak-note availability, attempts, artifacts, origins, and cross-workspace event
-lineage. Archived workspaces remain readable and auditable while rejecting new mutations.
+lineage. It also provides deterministic, cursor-paged ready, assigned, running, blocked, review,
+scheduled, upcoming-deadline, failed, expired-lease, and completed operational views. Archived
+workspaces remain readable and auditable while rejecting new mutations.
 
-This is a Rust pipeline foundation only: Org operations are not registered with MCP, REST, CLI, or
-the Web UI yet. Lease ownership is intentionally absent, and no claim, progress, result, review,
-failure, completion, retry, or state-transition mutation is exposed. Delivery Slice 4 must add
-authoritative leases and mandatory fencing-token validation before those ownership-sensitive
-commands—and archive or existing-document import while work is actively leased—can be enabled.
+Org execution and review ownership use exclusive leases with opaque fencing tokens. A claim creates
+the token. Heartbeats, releases, progress, results, review actions, and ownership-sensitive state
+transitions validate the current unexpired token. Reclaim atomically expires the old ownership,
+records recovery, creates a new attempt and lease, and permanently invalidates stale tokens. Retry
+can claim only closed failed work within its retry budget. The shared workspace concurrency limit
+counts active execution and review leases and is checked in the same transaction as its effects;
+idempotent operation replay returns the original result without duplicate attempts, events, state
+changes, or tokens. Actor IDs are client-asserted audit data, not trusted identities.
+
+At the end of Delivery Slice 4 this remains a Rust pipeline foundation: Org operations are not yet
+registered with MCP, REST, offline commands, or the Web UI. Those transports are separate later
+slices and must call the same pipeline boundary rather than duplicate its policy or lease logic.
+Agent Note implements no inbound authentication, authorization, proxy-identity-header, or workspace
+ACL behavior. A front proxy owns TLS, authentication, authorization, and network access; direct
+exposure to an untrusted network is unsupported.
 
 **One core, two front doors.** REST and both MCP transports call the exact same `note-pipelines`
 functions — no business logic is duplicated per transport (design.md §1–2). **Hybrid retrieval**

@@ -393,11 +393,69 @@ REST/UI-only.
 
 **Transports**: stdio (subprocess, JSON-RPC over stdin/stdout, stderr for logs) and Streamable HTTP (single `/mcp` endpoint, POST+GET, optional SSE upgrade per-response for long calls). Do not implement legacy two-endpoint HTTP+SSE — it's deprecated protocol-side; add only if a specific client requires it, as a documented exception.
 
-## 9. Open Decisions (resolve during implementation, not before)
+## 9. Org Orchestration Pipeline
+
+Org is a separate subsystem from canonical Markdown notes. Org source documents and workspace
+policy are canonical, while ordered events, execution attempts, leases, and idempotent operation
+results are durable runtime data. Work-item projections are derived and rebuildable from canonical
+Org documents without discarding that runtime history. A weak note link may refer to an existing
+Markdown note without changing the note storage contract. Turso schema v5 and PostgreSQL migration
+`0004_org_claims_operational_views.sql` add the lease and operational-query data needed by this
+pipeline.
+
+All Org commands execute through `note_pipelines::org` with explicit command envelopes, a
+controllable clock, and storage transactions. Source- and workspace-mutating commands also carry
+expected revisions; lease-only heartbeat and event-only progress do not change document revision.
+The client supplies `actor_id` for audit attribution and `operation_id` for idempotency. Actor IDs
+are assertions, not authenticated or authorized identities. Once an operation result commits, an
+identical replay returns the original result and cross-command or different-input reuse is an
+idempotency conflict. Rejected or rolled-back calls generally do not reserve the operation ID.
+Revision, policy, dependency, assignment, schedule, retry, archive, and workspace-capacity checks
+keep the primary command effects atomic. The explicit exception is expired-lease observation: a
+command may atomically persist independently idempotent expiry bookkeeping before returning
+`stale_lease`, without applying the requested mutation.
+
+Execution and review claims create exclusive leases and return an opaque, unguessable fencing token
+only in the claim result (and its exact idempotent replay). Storage persists the token hash rather
+than the raw token. Heartbeat, release, progress, result submission, ownership-sensitive
+transitions, review, failure, and completion require the current unexpired token. General
+reads, context, queues, events, errors, and logs never expose a raw token or token hash. Expiry,
+release, reassignment, unassignment, reclaim, and terminal transitions permanently invalidate the
+old token.
+
+Heartbeat changes lease state without changing the Org document revision. Voluntary execution
+release closes the active attempt and returns the item to the configured recovery state; default
+review release closes only the review lease and preserves the submitted execution attempt.
+Reclaiming expired running work atomically records expiry, closes the old attempt and lease, passes
+through the configured recovery state, and creates a new attempt and token. Failure marks the
+attempt failed; review rejection marks the attempt failed and returns the item to its configured
+review-rejection state. A later retry/readiness decision is budget-gated. One shared workspace
+concurrency limit counts all unexpired execution and review leases and is enforced atomically,
+including claim/claim and move-to-target/claim races.
+
+The read boundary provides workspace/document reads and export, item context, note-to-item lookup,
+and ten deterministic operational views: ready, assigned, running, blocked, review, scheduled,
+upcoming deadline, failed, expired lease, and completed. Queue and agenda predicates share one
+fixed evaluation time per cursor chain. Cursors are opaque, query-bound, HMAC-protected,
+process-scoped continuation tokens carrying the last scanned tuple; pages overfetch in bounded
+batches and never derive eligibility in a transport.
+
+Archived workspaces remain readable and auditable but reject mutation. Archive always rejects a
+workspace with any active lease and accepts no ownership proof. Raw import may change an actively
+leased item only when it supplies and validates that item's exact current proof. Import reuses the
+same lifecycle decisions and typed events as structured commands rather than bypassing fencing.
+
+Delivery Slice 4 intentionally has no Org MCP tools, REST routes, offline commands, or Web UI. Later
+slices expose the same pipeline results and structured errors without moving policy into transports.
+Agent Note implements no inbound authentication, authorization, proxy identity protocol, or
+workspace ACL. A front proxy owns TLS, authentication, authorization, and access restriction;
+direct exposure of the service to an untrusted network is unsupported.
+
+## 10. Open Decisions (resolve during implementation, not before)
 
 - Storage-session concurrency sizing for Axum's concurrent path.
 
-## 10. Future Extensions
+## 11. Future Extensions
 
 - **Structured references**: external links currently live in Markdown content. A dedicated
   reference model with its own metadata remains deferred until a concrete use case requires it.
