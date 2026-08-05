@@ -28,10 +28,80 @@ fn contains_fencing_material(value: &Value, raw_token: &str, token_digest: &str)
 }
 
 fn is_reserved_key(key: &str) -> bool {
-    let normalized = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    normalized.contains("token") || normalized.contains("hash")
+    let mut normalized = String::new();
+    let mut previous_was_lower_or_digit = false;
+    for character in key.chars() {
+        if character.is_ascii_alphanumeric() {
+            if character.is_ascii_uppercase() && previous_was_lower_or_digit {
+                normalized.push('_');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            previous_was_lower_or_digit =
+                character.is_ascii_lowercase() || character.is_ascii_digit();
+        } else if !normalized.ends_with('_') && !normalized.is_empty() {
+            normalized.push('_');
+            previous_was_lower_or_digit = false;
+        }
+    }
+    let normalized = normalized.trim_matches('_');
+    if normalized
+        .split('_')
+        .any(|word| matches!(word, "token" | "hash"))
+    {
+        return true;
+    }
+    matches!(
+        normalized.replace('_', "").as_str(),
+        "fencingtoken"
+            | "fencingtokendigest"
+            | "fencingtokenhash"
+            | "leasetoken"
+            | "leasetokenhash"
+            | "leasehash"
+            | "leasehashdigest"
+            | "tokenhash"
+            | "tokendigest"
+            | "hashvalue"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reserved_key_matching_catches_fencing_forms_without_false_positives() {
+        for key in [
+            "token_hash",
+            "leaseToken",
+            "fencingtoken",
+            "fencingTokenDigest",
+            "hash_value",
+            "token-digest",
+        ] {
+            assert!(is_reserved_key(key), "missed {key}");
+        }
+        for key in [
+            "tokenized_count",
+            "hashmap_size",
+            "secretary",
+            "passwordless",
+        ] {
+            assert!(!is_reserved_key(key), "rejected {key}");
+        }
+    }
+
+    #[test]
+    fn legal_structured_payloads_are_preserved() {
+        validate_public_payload(
+            "opaque-fencing-material",
+            &json!({
+                "tokenized_count": 2,
+                "hashmap_size": 3,
+                "nested": {"secretary": "available", "passwordless": true}
+            }),
+        )
+        .unwrap();
+    }
 }

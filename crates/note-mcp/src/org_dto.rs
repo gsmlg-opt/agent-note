@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use note_pipelines::org::{
     CommandEnvelope, CreateWorkspaceRequest, OrgClaimResult, OrgCommandResult,
-    OrgDocumentSourceView, OrgDocumentView, OrgError, OrgEventView, OrgItemContext, OrgItemView,
-    OrgLeaseView, OrgOperationalPage, OrgReadPage, OrgReadQuery, OrgTimestampView,
+    OrgDocumentSourceView, OrgDocumentView, OrgError, OrgEventPage, OrgEventView, OrgItemContext,
+    OrgItemView, OrgLeaseView, OrgOperationalPage, OrgReadPage, OrgReadQuery, OrgTimestampView,
     OrgWorkspaceExport, OrgWorkspaceView, WorkspaceSummary,
 };
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
@@ -139,6 +139,19 @@ pub(crate) struct NoteItemsInput {
     pub limit: u16,
     #[serde(default)]
     pub include_archived: bool,
+}
+
+impl NoteItemsInput {
+    pub(crate) fn into_pipeline(self) -> (String, OrgReadQuery) {
+        (
+            self.note_id,
+            OrgReadQuery {
+                cursor: self.cursor,
+                limit: Some(usize::from(self.limit)),
+                include_archived: self.include_archived,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -282,6 +295,18 @@ pub(crate) struct EventListInput {
     #[serde(default = "default_limit")]
     #[schemars(default = "default_limit", range(min = 1, max = 200))]
     pub limit: u16,
+}
+
+impl EventListInput {
+    pub(crate) fn into_pipeline(self) -> Result<note_pipelines::org::OrgEventQuery, OrgError> {
+        Ok(note_pipelines::org::OrgEventQuery {
+            workspace_id: parse_id(self.workspace_id, "workspace_id")?,
+            subject_kind: self.subject_kind,
+            subject_id: self.subject_id,
+            cursor: self.cursor,
+            limit: Some(usize::from(self.limit)),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -882,7 +907,39 @@ pub(crate) struct ClaimInput {
     pub work_item_id: String,
     pub document_id: String,
     pub expected_document_revision: i64,
-    pub kind: String,
+    pub kind: ClaimKindInput,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClaimKindInput {
+    Execution,
+    Review,
+}
+
+fn claim_kind(value: ClaimKindInput) -> Result<note_pipelines::org::OrgClaimKind, OrgError> {
+    adapt_input(value, "claim kind")
+}
+
+impl ClaimInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::StartClaimRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::StartClaimRequest {
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                kind: claim_kind(self.kind)?,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -895,8 +952,29 @@ pub(crate) struct HeartbeatClaimInput {
     pub operation_id: String,
     pub work_item_id: String,
     pub lease_id: String,
-    pub kind: String,
+    pub kind: ClaimKindInput,
     pub fencing_token: String,
+}
+
+impl HeartbeatClaimInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::HeartbeatClaimRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::HeartbeatClaimRequest {
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                lease_id: self.lease_id,
+                kind: claim_kind(self.kind)?,
+                fencing_token: self.fencing_token,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -911,9 +989,34 @@ pub(crate) struct ReleaseClaimInput {
     pub document_id: String,
     pub expected_document_revision: i64,
     pub lease_id: String,
-    pub kind: String,
+    pub kind: ClaimKindInput,
     pub fencing_token: String,
     pub target_state: Option<String>,
+}
+
+impl ReleaseClaimInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::ReleaseClaimRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::ReleaseClaimRequest {
+                schema_version: self.schema_version,
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                kind: claim_kind(self.kind)?,
+                fencing_token: self.fencing_token,
+                target_state: self.target_state,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -926,13 +1029,38 @@ pub(crate) struct ProgressInput {
     pub operation_id: String,
     pub work_item_id: String,
     pub lease_id: String,
-    pub kind: String,
+    pub kind: ClaimKindInput,
     pub fencing_token: String,
     pub summary: String,
-    pub metadata: serde_json::Value,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+impl ProgressInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::ReportProgressRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::ReportProgressRequest {
+                schema_version: self.schema_version,
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                lease_id: self.lease_id,
+                kind: claim_kind(self.kind)?,
+                fencing_token: self.fencing_token,
+                summary: self.summary,
+                metadata: serde_json::Value::Object(self.metadata.into_iter().collect()),
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub(crate) struct AttemptNoteInput {
@@ -941,7 +1069,7 @@ pub(crate) struct AttemptNoteInput {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub(crate) struct ArtifactInput {
@@ -967,7 +1095,35 @@ pub(crate) struct SubmitResultInput {
     pub result_summary: String,
     pub note_refs: Vec<AttemptNoteInput>,
     pub artifacts: Vec<ArtifactInput>,
-    pub metadata: serde_json::Value,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl SubmitResultInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::SubmitResultRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::SubmitResultRequest {
+                schema_version: self.schema_version,
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                fencing_token: self.fencing_token,
+                result_summary: self.result_summary,
+                note_refs: adapt_input(self.note_refs, "attempt note references")?,
+                artifacts: adapt_input(self.artifacts, "artifact references")?,
+                metadata: serde_json::Value::Object(self.metadata.into_iter().collect()),
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -984,7 +1140,36 @@ pub(crate) struct TransitionInput {
     pub target_state: String,
     pub lease: Option<LeaseProofInput>,
     pub error: Option<String>,
-    pub metadata: serde_json::Value,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl TransitionInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::TransitionItemRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::TransitionItemRequest {
+                schema_version: self.schema_version,
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                target_state: self.target_state,
+                lease: self
+                    .lease
+                    .map(|lease| adapt_input(lease, "lease proof"))
+                    .transpose()?,
+                error: self.error,
+                metadata: serde_json::Value::Object(self.metadata.into_iter().collect()),
+            },
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -998,6 +1183,27 @@ pub(crate) struct RetryInput {
     pub work_item_id: String,
     pub document_id: String,
     pub expected_document_revision: i64,
+}
+
+impl RetryInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::RetryItemRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::RetryItemRequest {
+                schema_version: self.schema_version,
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -1016,7 +1222,35 @@ pub(crate) struct RequestReviewInput {
     pub result_summary: Option<String>,
     pub note_refs: Vec<AttemptNoteInput>,
     pub artifacts: Vec<ArtifactInput>,
-    pub metadata: serde_json::Value,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl RequestReviewInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::RequestReviewRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::RequestReviewRequest {
+                schema_version: self.schema_version,
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                fencing_token: self.fencing_token,
+                result_summary: self.result_summary,
+                note_refs: adapt_input(self.note_refs, "attempt note references")?,
+                artifacts: adapt_input(self.artifacts, "artifact references")?,
+                metadata: serde_json::Value::Object(self.metadata.into_iter().collect()),
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -1032,7 +1266,32 @@ pub(crate) struct ApproveInput {
     pub expected_document_revision: i64,
     pub lease_id: String,
     pub fencing_token: String,
-    pub metadata: serde_json::Value,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl ApproveInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::ApproveItemRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::ApproveItemRequest {
+                schema_version: self.schema_version,
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                fencing_token: self.fencing_token,
+                metadata: serde_json::Value::Object(self.metadata.into_iter().collect()),
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -1049,7 +1308,62 @@ pub(crate) struct RejectInput {
     pub lease_id: String,
     pub fencing_token: String,
     pub reason: String,
-    pub metadata: serde_json::Value,
+    #[schemars(with = "BTreeMap<String, serde_json::Value>")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl RejectInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::RejectItemRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::RejectItemRequest {
+                schema_version: self.schema_version,
+                work_item_id: parse_id(self.work_item_id, "work_item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_document_revision: self.expected_document_revision,
+                lease_id: self.lease_id,
+                fencing_token: self.fencing_token,
+                reason: self.reason,
+                metadata: serde_json::Value::Object(self.metadata.into_iter().collect()),
+            },
+        ))
+    }
+}
+
+impl DependencyInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::DependencyRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::DependencyRequest {
+                item_id: parse_id(self.item_id, "item_id")?,
+                dependency_id: parse_id(self.dependency_id, "dependency_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_revisions: adapt_id_map(
+                    self.expected_revisions,
+                    "document_id",
+                    "document revision",
+                )?,
+                lease: self
+                    .lease
+                    .map(|lease| adapt_input(lease, "lease proof"))
+                    .transpose()?,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -1084,6 +1398,37 @@ pub(crate) struct NoteLinkInput {
     pub lease: Option<LeaseProofInput>,
 }
 
+impl NoteLinkInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::NoteLinkRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::NoteLinkRequest {
+                item_id: parse_id(self.item_id, "item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                purpose: self.purpose,
+                note_id: parse_id(self.note_id, "note_id")?,
+                description: self.description,
+                expected_revisions: adapt_id_map(
+                    self.expected_revisions,
+                    "document_id",
+                    "document revision",
+                )?,
+                lease: self
+                    .lease
+                    .map(|lease| adapt_input(lease, "lease proof"))
+                    .transpose()?,
+            },
+        ))
+    }
+}
+
 #[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -1100,12 +1445,42 @@ pub(crate) struct NoteUnlinkInput {
     pub lease: Option<LeaseProofInput>,
 }
 
+impl NoteUnlinkInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::UnlinkNoteRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::UnlinkNoteRequest {
+                item_id: parse_id(self.item_id, "item_id")?,
+                document_id: parse_id(self.document_id, "document_id")?,
+                purpose: self.purpose,
+                note_id: parse_id(self.note_id, "note_id")?,
+                expected_revisions: adapt_id_map(
+                    self.expected_revisions,
+                    "document_id",
+                    "document revision",
+                )?,
+                lease: self
+                    .lease
+                    .map(|lease| adapt_input(lease, "lease proof"))
+                    .transpose()?,
+            },
+        ))
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub(crate) struct LeaseProofInput {
     pub lease_id: String,
-    pub kind: String,
+    pub kind: ClaimKindInput,
     pub fencing_token: String,
 }
 
@@ -1283,7 +1658,7 @@ pub(crate) struct EventOutput {
     pub resulting_state: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
 pub(crate) struct SafeJsonOutput(serde_json::Value);
 
@@ -1523,6 +1898,8 @@ pub(crate) enum ItemOperationData {
     Assignment(AssignmentOperationData),
     Schedule(ScheduleOperationData),
     Deadline(DeadlineOperationData),
+    Dependency(DependencyOperationData),
+    NoteLink(NoteLinkOperationData),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -1600,6 +1977,39 @@ pub(crate) struct DeadlineOperationData {
     pub resulting_deadline: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct DependencyOperationData {
+    pub dependency_id: String,
+    pub action: DependencyAction,
+    pub previous_dependencies: Vec<String>,
+    pub resulting_dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DependencyAction {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct NoteLinkOperationData {
+    pub action: NoteLinkAction,
+    pub purpose: String,
+    pub note_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NoteLinkAction {
+    Link,
+    Unlink,
+}
+
 fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1608,12 +2018,17 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
-#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
-pub(crate) struct LeaseCommandData {
-    pub context: Option<ItemContextOutput>,
-    pub released: Option<bool>,
-    pub review_outcome: Option<String>,
+pub(crate) struct ContextCommandData {
+    pub context: ItemContextOutput,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct HeartbeatCommandData {
+    pub lease: LeaseOutput,
+    pub context: ItemContextOutput,
 }
 
 #[derive(Clone, Serialize, JsonSchema)]
@@ -1758,6 +2173,78 @@ where
         document_revisions: value.document_revisions,
         data,
     })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineContextData {
+    context: OrgItemContext,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineHeartbeatData {
+    lease: OrgLeaseView,
+    context: OrgItemContext,
+}
+
+fn command_parts<T>(value: OrgCommandResult, data: T) -> CommandOutput<T> {
+    CommandOutput {
+        schema_version: value.schema_version,
+        workspace_id: value.workspace_id.to_string(),
+        operation_id: value.operation_id,
+        event_ids: value.event_ids,
+        workspace_revision: value.workspace_revision,
+        document_revisions: value.document_revisions,
+        data,
+    }
+}
+
+pub(crate) fn context_command_output(
+    mut value: OrgCommandResult,
+) -> Result<CommandOutput<ContextCommandData>, OrgError> {
+    let data: PipelineContextData = serde_json::from_value(std::mem::take(&mut value.data))
+        .map_err(|_| adapter_error("workflow command result"))?;
+    Ok(command_parts(
+        value,
+        ContextCommandData {
+            context: data.context.try_into()?,
+        },
+    ))
+}
+
+pub(crate) fn heartbeat_command_output(
+    mut value: OrgCommandResult,
+) -> Result<CommandOutput<HeartbeatCommandData>, OrgError> {
+    let data: PipelineHeartbeatData = serde_json::from_value(std::mem::take(&mut value.data))
+        .map_err(|_| adapter_error("heartbeat command result"))?;
+    Ok(command_parts(
+        value,
+        HeartbeatCommandData {
+            lease: data.lease.into(),
+            context: data.context.try_into()?,
+        },
+    ))
+}
+
+pub(crate) fn item_page_output(
+    value: OrgReadPage<OrgItemView>,
+) -> Result<PageOutput<ItemOutput>, OrgError> {
+    Ok(PageOutput {
+        items: value
+            .items
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?,
+        next_cursor: value.next_cursor,
+    })
+}
+
+pub(crate) fn event_page_output(value: OrgEventPage) -> PageOutput<EventOutput> {
+    PageOutput {
+        items: value.events.into_iter().map(Into::into).collect(),
+        next_cursor: value.next_cursor,
+    }
 }
 
 impl From<OrgTimestampView> for TimestampOutput {
@@ -2168,6 +2655,18 @@ mod tests {
     }
 
     #[test]
+    fn safe_metadata_cannot_bypass_redaction_through_deserialization() {
+        trait AmbiguousIfDeserialize<Marker> {
+            fn assert_not_deserializable() {}
+        }
+
+        impl<T: ?Sized> AmbiguousIfDeserialize<()> for T {}
+        impl<T: ?Sized + for<'de> Deserialize<'de>> AmbiguousIfDeserialize<u8> for T {}
+
+        <SafeJsonOutput as AmbiguousIfDeserialize<_>>::assert_not_deserializable();
+    }
+
+    #[test]
     fn sensitive_metadata_matching_redacts_exact_or_suffix_tokens_without_false_positives() {
         let source = json!({
             "token": "one",
@@ -2241,7 +2740,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_metadata_accepts_array_and_scalar_json() {
+    fn workflow_metadata_requires_a_json_object() {
         let base = json!({
             "schema_version": 1,
             "workspace_id": "workspace",
@@ -2255,10 +2754,17 @@ mod tests {
         });
         for metadata in [json!([1, "two"]), json!(7), json!(true)] {
             let mut request = base.clone();
-            request["metadata"] = metadata.clone();
-            let parsed: ProgressInput = serde_json::from_value(request).unwrap();
-            assert_eq!(parsed.metadata, metadata);
+            request["metadata"] = metadata;
+            assert!(serde_json::from_value::<ProgressInput>(request).is_err());
         }
+        let mut request = base;
+        request["metadata"] = json!({"phase": "build"});
+        assert_eq!(
+            serde_json::from_value::<ProgressInput>(request)
+                .unwrap()
+                .metadata["phase"],
+            "build"
+        );
     }
 
     #[test]

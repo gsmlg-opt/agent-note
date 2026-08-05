@@ -979,6 +979,7 @@ async fn item_context_is_complete_ordered_and_redacts_nested_sensitive_metadata(
     )
     .await
     .unwrap();
+    let attempt_id = claim.context.attempts.last().unwrap().id.clone();
     report_progress(
         &mcp.org,
         &envelope("progress-child"),
@@ -989,14 +990,31 @@ async fn item_context_is_complete_ordered_and_redacts_nested_sensitive_metadata(
             kind: OrgClaimKind::Execution,
             fencing_token: claim.fencing_token,
             summary: "working".into(),
-            metadata: json!({
-                "nested": {"lease_token": "raw-lease-token", "lease_hash": "raw-hash"},
-                "fencingToken": "raw-fencing-token", "secretary": "kept", "passwordless": "kept-too"
-            }),
+            metadata: json!({"phase": "build"}),
         },
     )
     .await
     .unwrap();
+    session
+        .append_org_event(NewOrgEvent {
+            id: "legacy-sensitive-progress",
+            workspace_id: WORKSPACE_ID.parse().unwrap(),
+            subject_kind: "work_item",
+            subject_id: FOLLOW_UP_ID,
+            actor_id: "legacy-agent",
+            attempt_id: Some(&attempt_id),
+            event_type: OrgEventType::Progress,
+            occurred_at: NOW,
+            summary: "legacy sensitive metadata",
+            metadata: &json!({
+                "nested": {"lease_token": "raw-lease-token", "lease_hash": "raw-hash"},
+                "fencingToken": "raw-fencing-token", "secretary": "kept", "passwordless": "kept-too"
+            }),
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .unwrap();
 
     let context = mcp
         .call(
@@ -1042,7 +1060,7 @@ async fn item_context_is_complete_ordered_and_redacts_nested_sensitive_metadata(
         .all(|pair| pair[0]["sequence"].as_i64() < pair[1]["sequence"].as_i64()));
     let progress = events
         .iter()
-        .find(|event| event["summary"] == "working")
+        .find(|event| event["summary"] == "legacy sensitive metadata")
         .unwrap();
     assert_eq!(progress["metadata"]["nested"]["lease_token"], "[REDACTED]");
     assert_eq!(progress["metadata"]["nested"]["lease_hash"], "[REDACTED]");

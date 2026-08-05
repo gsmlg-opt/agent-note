@@ -13,16 +13,17 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::{
     org_dto::{
         AgendaViewInput, ApproveInput, AssignItemInput, ClaimInput, ClaimOutput, CommandOutput,
-        CreateFollowUpInput, CreateItemInput, DependencyInput, DocumentCountData, DocumentOutput,
-        DocumentReadInput, DocumentSourceOutput, EventListInput, EventOutput, HeartbeatClaimInput,
-        ImportWorkspaceInput, ItemCommandData, ItemContextOutput, ItemOutput, ItemReadInput,
-        LeaseCommandData, ListInput, MoveDocumentData, MoveDocumentInput, MoveItemData,
-        MoveItemInput, NoteItemsInput, NoteLinkInput, NoteUnlinkInput, OperationalPageOutput,
-        OperationalQueryInput, PageOutput, ProgressInput, PutDocumentInput, QueueViewInput,
-        RejectInput, ReleaseClaimInput, RequestReviewInput, RetryInput, ScheduleItemInput,
-        SubmitResultInput, TransitionInput, WorkspaceArchiveData, WorkspaceArchiveInput,
-        WorkspaceCreateInput, WorkspaceExportOutput, WorkspaceListInput, WorkspaceOutput,
-        WorkspaceReadInput, WorkspaceRevisionData, WorkspaceSummaryOutput, WorkspaceUpdateInput,
+        ContextCommandData, CreateFollowUpInput, CreateItemInput, DependencyInput,
+        DocumentCountData, DocumentOutput, DocumentReadInput, DocumentSourceOutput, EventListInput,
+        EventOutput, HeartbeatClaimInput, HeartbeatCommandData, ImportWorkspaceInput,
+        ItemCommandData, ItemContextOutput, ItemOutput, ItemReadInput, ListInput, MoveDocumentData,
+        MoveDocumentInput, MoveItemData, MoveItemInput, NoteItemsInput, NoteLinkInput,
+        NoteUnlinkInput, OperationalPageOutput, OperationalQueryInput, PageOutput, ProgressInput,
+        PutDocumentInput, QueueViewInput, RejectInput, ReleaseClaimInput, RequestReviewInput,
+        RetryInput, ScheduleItemInput, SubmitResultInput, TransitionInput, WorkspaceArchiveData,
+        WorkspaceArchiveInput, WorkspaceCreateInput, WorkspaceExportOutput, WorkspaceListInput,
+        WorkspaceOutput, WorkspaceReadInput, WorkspaceRevisionData, WorkspaceSummaryOutput,
+        WorkspaceUpdateInput,
     },
     NoteMcpServer,
 };
@@ -86,7 +87,8 @@ type DocumentCountOutput = CommandOutput<DocumentCountData>;
 type MoveDocumentOutput = CommandOutput<MoveDocumentData>;
 type ItemMutationOutput = CommandOutput<ItemCommandData>;
 type MoveItemOutput = CommandOutput<MoveItemData>;
-type LeaseMutationOutput = CommandOutput<LeaseCommandData>;
+type ContextMutationOutput = CommandOutput<ContextCommandData>;
+type HeartbeatMutationOutput = CommandOutput<HeartbeatCommandData>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRegistrationError {
@@ -274,77 +276,101 @@ pub(crate) fn org_tool_router() -> ToolRouter<NoteMcpServer> {
         "Query the Org agenda",
         query_agenda_handler,
     );
-    add::<ClaimInput, ClaimOutput>(&mut router, ORG_TOOL_NAMES[20], "Claim an Org item");
-    add::<HeartbeatClaimInput, LeaseMutationOutput>(
+    add_handler::<ClaimInput, ClaimOutput, _, _>(
+        &mut router,
+        ORG_TOOL_NAMES[20],
+        "Claim an Org item",
+        claim_item_handler,
+    );
+    add_handler::<HeartbeatClaimInput, HeartbeatMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[21],
         "Heartbeat an active Org claim",
+        heartbeat_claim_handler,
     );
-    add::<ReleaseClaimInput, LeaseMutationOutput>(
+    add_handler::<ReleaseClaimInput, ContextMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[22],
         "Release an active Org claim",
+        release_claim_handler,
     );
-    add::<ProgressInput, LeaseMutationOutput>(
+    add_handler::<ProgressInput, ContextMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[23],
         "Report progress on an active Org claim",
+        progress_handler,
     );
-    add::<SubmitResultInput, LeaseMutationOutput>(
+    add_handler::<SubmitResultInput, ContextMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[24],
         "Submit an Org result",
+        submit_result_handler,
     );
-    add::<TransitionInput, LeaseMutationOutput>(
+    add_handler::<TransitionInput, ContextMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[25],
         "Transition an Org item",
+        transition_item_handler,
     );
-    add::<RetryInput, ClaimOutput>(
+    add_handler::<RetryInput, ClaimOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[26],
         "Retry and reclaim an Org item",
+        retry_item_handler,
     );
-    add::<RequestReviewInput, LeaseMutationOutput>(
+    add_handler::<RequestReviewInput, ContextMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[27],
         "Request Org review",
+        request_review_handler,
     );
-    add::<ApproveInput, LeaseMutationOutput>(
+    add_handler::<ApproveInput, ContextMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[28],
         "Approve an Org item",
+        approve_item_handler,
     );
-    add::<RejectInput, LeaseMutationOutput>(&mut router, ORG_TOOL_NAMES[29], "Reject an Org item");
-    add::<DependencyInput, ItemMutationOutput>(
+    add_handler::<RejectInput, ContextMutationOutput, _, _>(
+        &mut router,
+        ORG_TOOL_NAMES[29],
+        "Reject an Org item",
+        reject_item_handler,
+    );
+    add_handler::<DependencyInput, ItemMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[30],
         "Add an Org dependency",
+        add_dependency_handler,
     );
-    add::<DependencyInput, ItemMutationOutput>(
+    add_handler::<DependencyInput, ItemMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[31],
         "Remove an Org dependency",
+        remove_dependency_handler,
     );
-    add::<NoteLinkInput, ItemMutationOutput>(
+    add_handler::<NoteLinkInput, ItemMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[32],
         "Link a note to an Org item",
+        link_note_handler,
     );
-    add::<NoteUnlinkInput, ItemMutationOutput>(
+    add_handler::<NoteUnlinkInput, ItemMutationOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[33],
         "Unlink a note from an Org item",
+        unlink_note_handler,
     );
-    add::<NoteItemsInput, PageOutput<ItemOutput>>(
+    add_handler::<NoteItemsInput, PageOutput<ItemOutput>, _, _>(
         &mut router,
         ORG_TOOL_NAMES[34],
         "List Org work items linked to a note",
+        list_note_work_items_handler,
     );
-    add::<EventListInput, PageOutput<EventOutput>>(
+    add_handler::<EventListInput, PageOutput<EventOutput>, _, _>(
         &mut router,
         ORG_TOOL_NAMES[35],
         "List Org event history",
+        list_events_handler,
     );
     router
 }
@@ -538,6 +564,153 @@ async fn query_agenda_handler(
         .try_into()
 }
 
+async fn claim_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: ClaimInput,
+) -> Result<ClaimOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    note_pipelines::org::claim_item(&context, &envelope, &request)
+        .await?
+        .try_into()
+}
+
+async fn heartbeat_claim_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: HeartbeatClaimInput,
+) -> Result<HeartbeatMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::heartbeat_claim(&context, &envelope, &request).await?;
+    crate::org_dto::heartbeat_command_output(result)
+}
+
+async fn release_claim_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: ReleaseClaimInput,
+) -> Result<ContextMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::release_claim(&context, &envelope, &request).await?;
+    crate::org_dto::context_command_output(result)
+}
+
+async fn progress_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: ProgressInput,
+) -> Result<ContextMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::report_progress(&context, &envelope, &request).await?;
+    crate::org_dto::context_command_output(result)
+}
+
+async fn submit_result_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: SubmitResultInput,
+) -> Result<ContextMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::submit_result(&context, &envelope, &request).await?;
+    crate::org_dto::context_command_output(result)
+}
+
+async fn transition_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: TransitionInput,
+) -> Result<ContextMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::transition_item(&context, &envelope, &request).await?;
+    crate::org_dto::context_command_output(result)
+}
+
+async fn retry_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: RetryInput,
+) -> Result<ClaimOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    note_pipelines::org::retry_item(&context, &envelope, &request)
+        .await?
+        .try_into()
+}
+
+async fn request_review_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: RequestReviewInput,
+) -> Result<ContextMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::request_review(&context, &envelope, &request).await?;
+    crate::org_dto::context_command_output(result)
+}
+
+async fn approve_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: ApproveInput,
+) -> Result<ContextMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::approve_item(&context, &envelope, &request).await?;
+    crate::org_dto::context_command_output(result)
+}
+
+async fn reject_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: RejectInput,
+) -> Result<ContextMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::reject_item(&context, &envelope, &request).await?;
+    crate::org_dto::context_command_output(result)
+}
+
+async fn add_dependency_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: DependencyInput,
+) -> Result<ItemMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::add_dependency(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn remove_dependency_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: DependencyInput,
+) -> Result<ItemMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::remove_dependency(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn link_note_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: NoteLinkInput,
+) -> Result<ItemMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::link_note(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn unlink_note_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: NoteUnlinkInput,
+) -> Result<ItemMutationOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::unlink_note(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn list_note_work_items_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: NoteItemsInput,
+) -> Result<PageOutput<ItemOutput>, note_pipelines::org::OrgError> {
+    let (note_id, query) = input.into_pipeline();
+    let page = note_pipelines::org::list_note_work_items(&context, &note_id, &query).await?;
+    crate::org_dto::item_page_output(page)
+}
+
+async fn list_events_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: EventListInput,
+) -> Result<PageOutput<EventOutput>, note_pipelines::org::OrgError> {
+    let query = input.into_pipeline()?;
+    note_pipelines::org::list_event_history(&context, &query)
+        .await
+        .map(crate::org_dto::event_page_output)
+}
+
 fn add_handler<I, O, F, Fut>(
     router: &mut ToolRouter<NoteMcpServer>,
     name: &'static str,
@@ -556,6 +729,9 @@ fn add_handler<I, O, F, Fut>(
         move |context: ToolCallContext<'_, NoteMcpServer>| {
             let org_context = context.service.org_context().clone();
             let arguments = context.arguments.unwrap_or_default();
+            if has_incomplete_lease_proof(name, &arguments) {
+                return Box::pin(async move { Err(stale_lease_tool_error()) });
+            }
             let input = match serde_json::from_value::<I>(serde_json::Value::Object(arguments)) {
                 Ok(input) => input,
                 Err(_) => return Box::pin(async move { Err(invalid_org_tool_input()) }),
@@ -572,34 +748,59 @@ fn add_handler<I, O, F, Fut>(
     ));
 }
 
-fn add<I: JsonSchema + DeserializeOwned, O: JsonSchema>(
-    router: &mut ToolRouter<NoteMcpServer>,
-    name: &'static str,
-    description: &'static str,
-) {
-    let _error_adapter: fn(note_pipelines::org::OrgError) -> ErrorData =
-        crate::org_error::to_error_data;
-    let tool =
-        Tool::new(name, description, schema::<I>()).with_raw_output_schema(Arc::new(schema::<O>()));
-    router.add_route(ToolRoute::new_dyn(
-        tool,
-        |context: ToolCallContext<'_, NoteMcpServer>| {
-            let arguments = context.arguments.unwrap_or_default();
-            if serde_json::from_value::<I>(serde_json::Value::Object(arguments)).is_err() {
-                return Box::pin(async move { Err(invalid_org_tool_input()) });
-            }
-            Box::pin(async {
-                Err(crate::org_error::to_error_data(
-                    note_pipelines::org::OrgError::new(
-                        note_pipelines::org::OrgErrorCode::UnsupportedSemanticEdit,
-                        "Org tool handler is not implemented in this delivery task",
-                        serde_json::json!({}),
-                        false,
-                    ),
-                ))
-            })
-        },
-    ));
+fn has_incomplete_lease_proof(
+    name: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let requires_top_level_lease = matches!(
+        name,
+        "org_heartbeat_claim"
+            | "org_release_claim"
+            | "org_report_progress"
+            | "org_submit_result"
+            | "org_request_review"
+            | "org_approve_item"
+            | "org_reject_item"
+    );
+    if requires_top_level_lease
+        && (!arguments.contains_key("lease_id") || !arguments.contains_key("fencing_token"))
+    {
+        return true;
+    }
+    if matches!(
+        name,
+        "org_heartbeat_claim" | "org_release_claim" | "org_report_progress"
+    ) && !arguments.contains_key("kind")
+    {
+        return true;
+    }
+    if matches!(
+        name,
+        "org_transition_item"
+            | "org_add_dependency"
+            | "org_remove_dependency"
+            | "org_link_note"
+            | "org_unlink_note"
+    ) {
+        return arguments
+            .get("lease")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|lease| {
+                !lease.contains_key("lease_id")
+                    || !lease.contains_key("kind")
+                    || !lease.contains_key("fencing_token")
+            });
+    }
+    false
+}
+
+fn stale_lease_tool_error() -> ErrorData {
+    crate::org_error::to_error_data(note_pipelines::org::OrgError::new(
+        note_pipelines::org::OrgErrorCode::StaleLease,
+        "Org lease proof is stale or invalid",
+        serde_json::json!({}),
+        true,
+    ))
 }
 
 fn invalid_org_tool_input() -> ErrorData {
