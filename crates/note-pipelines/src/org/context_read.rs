@@ -71,6 +71,24 @@ pub async fn get_document(
         .ok_or_else(|| not_found("document"))
 }
 
+/// Resolves document ownership inside the pipeline boundary for offline
+/// exports whose stable command contract accepts only a document ID.
+pub async fn export_document_by_id(
+    context: &OrgContext,
+    document_id: note_org::DocumentId,
+) -> Result<super::OrgDocumentSourceView, OrgError> {
+    context
+        .storage()
+        .session()
+        .await
+        .map_err(OrgError::storage)?
+        .get_org_document(document_id)
+        .await
+        .map_err(OrgError::storage)?
+        .map(map_document_source)
+        .ok_or_else(|| not_found("document"))
+}
+
 pub async fn export_workspace(
     context: &OrgContext,
     workspace_id: WorkspaceId,

@@ -526,7 +526,7 @@ pub async fn archive_workspace(
     .await
 }
 
-fn validate_workspace_fields(
+pub(crate) fn validate_workspace_fields(
     slug: &str,
     display_name: &str,
     timezone: &str,

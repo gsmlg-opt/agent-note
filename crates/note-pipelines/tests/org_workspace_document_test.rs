@@ -2,11 +2,13 @@ mod support;
 
 use note_org::{ClaimPolicy, DocumentId, WorkItemId, WorkspaceId, WorkspacePolicy};
 use note_pipelines::org::{
-    claim_item, create_workspace, import_documents, move_document, put_document, release_claim,
-    schedule_item, update_workspace, CommandEnvelope, CreateWorkspaceRequest, DocumentImport,
-    ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest, OrgClaimKind, OrgContext,
-    OrgErrorCode, OrgFieldPatch, OrgWorkflowPhase, PutDocumentRequest, ReleaseClaimRequest,
-    ScheduleItemRequest, StartClaimRequest, UpdateWorkspaceRequest,
+    claim_item, create_workspace, export_document_by_id, import_documents, import_offline_document,
+    import_offline_workspace_snapshot, import_workspace_snapshot, move_document, put_document,
+    release_claim, schedule_item, update_workspace, CommandEnvelope, CreateWorkspaceRequest,
+    DocumentImport, ImportDocumentsRequest, ImportWorkspaceSnapshotRequest, LeaseProofInput,
+    MoveDocumentRequest, OrgClaimKind, OrgContext, OrgErrorCode, OrgFieldPatch, OrgWorkflowPhase,
+    PutDocumentRequest, ReleaseClaimRequest, ScheduleItemRequest, StartClaimRequest,
+    UpdateWorkspaceRequest, WorkspaceImportMode, WorkspaceSnapshotMetadata,
 };
 use note_storage::{
     NewNote, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument, OrgEvent, OrgEventType,
@@ -28,6 +30,99 @@ struct WorkspaceSnapshot {
     documents: Vec<OrgDocument>,
     projection: Vec<OrgProjectedWorkItem>,
     events: Vec<OrgEvent>,
+}
+
+#[tokio::test]
+async fn offline_document_import_accepts_note_links_without_touching_note_storage() {
+    let (context, storage, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-000000000099");
+    create_test_workspace(&context, workspace, "offline-note-link-workspace", "UTC").await;
+    let missing_note = "40000000-0000-4000-8000-000000000099";
+    let document_id: DocumentId = "20000000-0000-4000-8000-000000000099".parse().unwrap();
+    let request = PutDocumentRequest {
+        document_id,
+        path: "offline/note-links.org".into(),
+        source: source(
+            work_item_id("30000000-0000-4000-8000-000000000099"),
+            "READY",
+            &format!("[[agent-note:design:{missing_note}][Missing note]]\n"),
+        ),
+        expected_revision: None,
+        lease_proofs: BTreeMap::new(),
+    };
+
+    let normal = put_document(
+        &context,
+        &envelope(workspace, "normal-note-link-import"),
+        &request,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(normal.code, OrgErrorCode::NoteUnavailable);
+
+    import_offline_document(
+        &context,
+        &envelope(workspace, "offline-note-link-import"),
+        &request,
+    )
+    .await
+    .unwrap();
+
+    let session = storage.session().await.unwrap();
+    assert!(session.list_all_notes().await.unwrap().is_empty());
+    assert!(session
+        .get_org_document(document_id)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn offline_workspace_snapshot_accepts_note_links_without_touching_note_storage() {
+    let (context, storage, _dir) = empty_context(NOW).await;
+    let workspace = "10000000-0000-4000-8000-000000000099".parse().unwrap();
+    let document_id: DocumentId = "20000000-0000-4000-8000-000000000098".parse().unwrap();
+    let missing_note = "40000000-0000-4000-8000-000000000098";
+    let request = ImportWorkspaceSnapshotRequest {
+        mode: WorkspaceImportMode::Create,
+        workspace: WorkspaceSnapshotMetadata {
+            slug: "offline-snapshot-links".into(),
+            display_name: "Offline snapshot links".into(),
+            description: String::new(),
+            timezone: "UTC".into(),
+            policy_schema_version: 1,
+            policy: WorkspacePolicy::engineering_default(),
+            revision: 1,
+            archived_at: None,
+        },
+        documents: vec![DocumentImport {
+            document_id,
+            path: "snapshot/note-links.org".into(),
+            source: source(
+                work_item_id("30000000-0000-4000-8000-000000000098"),
+                "READY",
+                &format!("[[agent-note:design:{missing_note}][Missing note]]\n"),
+            ),
+        }],
+        document_revisions: BTreeMap::from([(document_id, 1)]),
+        lease_proofs: BTreeMap::new(),
+    };
+
+    import_offline_workspace_snapshot(
+        &context,
+        &envelope(workspace, "offline-snapshot-note-links"),
+        &request,
+    )
+    .await
+    .unwrap();
+
+    let session = storage.session().await.unwrap();
+    assert!(session.list_all_notes().await.unwrap().is_empty());
+    assert!(session
+        .get_org_document(document_id)
+        .await
+        .unwrap()
+        .is_some());
 }
 
 async fn workspace_snapshot(
@@ -2276,4 +2371,316 @@ async fn failure_after_ownership_cas_rolls_back_both_workspaces_completely() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn workspace_snapshot_create_is_atomic_and_document_export_resolves_ownership() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-0000000000a1");
+    let valid_document = document_id("20000000-0000-4000-8000-0000000000a1");
+    let invalid_document = document_id("20000000-0000-4000-8000-0000000000a2");
+    let item = work_item_id("30000000-0000-4000-8000-0000000000a1");
+    let request = ImportWorkspaceSnapshotRequest {
+        mode: WorkspaceImportMode::Create,
+        workspace: WorkspaceSnapshotMetadata {
+            slug: "atomic-snapshot".into(),
+            display_name: "Atomic snapshot".into(),
+            description: "Must not partially restore".into(),
+            timezone: "UTC".into(),
+            policy_schema_version: 1,
+            policy: WorkspacePolicy::engineering_default(),
+            revision: 3,
+            archived_at: Some(NOW - 10),
+        },
+        documents: vec![
+            DocumentImport {
+                document_id: valid_document,
+                path: "valid.org".into(),
+                source: source(item, "READY", "Exact bytes.\r\n"),
+            },
+            DocumentImport {
+                document_id: invalid_document,
+                path: "invalid.org".into(),
+                source: source(item, "READY", "Duplicate identity.\r\n"),
+            },
+        ],
+        document_revisions: BTreeMap::from([(valid_document, 4), (invalid_document, 1)]),
+        lease_proofs: BTreeMap::new(),
+    };
+
+    let error = import_workspace_snapshot(
+        &context,
+        &envelope(workspace, "atomic-create-failure"),
+        &request,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, OrgErrorCode::InvalidInput);
+    let session = backend.session().await.unwrap();
+    assert!(session
+        .get_org_workspace(workspace)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(session
+        .get_org_document(valid_document)
+        .await
+        .unwrap()
+        .is_none());
+
+    let mut valid = request;
+    valid.documents.pop();
+    valid.document_revisions.remove(&invalid_document);
+    let created = import_workspace_snapshot(
+        &context,
+        &envelope(workspace, "atomic-create-success"),
+        &valid,
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.workspace_revision, Some(3));
+    assert_eq!(created.document_revisions[&valid_document.to_string()], 4);
+
+    let exported = export_document_by_id(&context, valid_document)
+        .await
+        .unwrap();
+    assert_eq!(exported.workspace_id, workspace);
+    assert_eq!(exported.id, valid_document);
+    assert_eq!(exported.path, "valid.org");
+    assert_eq!(exported.source, source(item, "READY", "Exact bytes.\r\n"));
+    assert_eq!(exported.revision, 4);
+    let restored_workspace = backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_workspace(workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_workspace.revision, 3);
+    assert_eq!(restored_workspace.archived_at, Some(NOW - 10));
+    assert!(export_document_by_id(
+        &context,
+        document_id("20000000-0000-4000-8000-0000000000ff")
+    )
+    .await
+    .is_err());
+
+    let excessive_workspace = workspace_id("10000000-0000-4000-8000-0000000000af");
+    let excessive = ImportWorkspaceSnapshotRequest {
+        mode: WorkspaceImportMode::Create,
+        workspace: WorkspaceSnapshotMetadata {
+            slug: "excessive-revision".into(),
+            display_name: "Excessive revision".into(),
+            description: String::new(),
+            timezone: "UTC".into(),
+            policy_schema_version: 1,
+            policy: WorkspacePolicy::engineering_default(),
+            revision: 1_001,
+            archived_at: None,
+        },
+        documents: Vec::new(),
+        document_revisions: BTreeMap::new(),
+        lease_proofs: BTreeMap::new(),
+    };
+    let error = import_workspace_snapshot(
+        &context,
+        &envelope(excessive_workspace, "excessive-revision"),
+        &excessive,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, OrgErrorCode::InvalidInput);
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_workspace(excessive_workspace)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn workspace_snapshot_update_checks_workspace_and_every_document_revision_atomically() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-0000000000b1");
+    let first = document_id("20000000-0000-4000-8000-0000000000b1");
+    let second = document_id("20000000-0000-4000-8000-0000000000b2");
+    let first_item = work_item_id("30000000-0000-4000-8000-0000000000b1");
+    let second_item = work_item_id("30000000-0000-4000-8000-0000000000b2");
+    let create = ImportWorkspaceSnapshotRequest {
+        mode: WorkspaceImportMode::Create,
+        workspace: WorkspaceSnapshotMetadata {
+            slug: "revision-snapshot".into(),
+            display_name: "Revision snapshot".into(),
+            description: "Before".into(),
+            timezone: "UTC".into(),
+            policy_schema_version: 1,
+            policy: WorkspacePolicy::engineering_default(),
+            revision: 1,
+            archived_at: None,
+        },
+        documents: vec![
+            DocumentImport {
+                document_id: first,
+                path: "first.org".into(),
+                source: source(first_item, "READY", "First.\r\n"),
+            },
+            DocumentImport {
+                document_id: second,
+                path: "second.org".into(),
+                source: source(second_item, "READY", "Second.\r\n"),
+            },
+        ],
+        document_revisions: BTreeMap::from([(first, 1), (second, 1)]),
+        lease_proofs: BTreeMap::new(),
+    };
+    import_workspace_snapshot(&context, &envelope(workspace, "snapshot-create"), &create)
+        .await
+        .unwrap();
+    let before = workspace_snapshot(backend.as_ref(), workspace).await;
+
+    let mut update = create;
+    update.mode = WorkspaceImportMode::Update;
+    update.workspace.description = "After".into();
+    update.documents[0].source = source(first_item, "READY", "Changed first.\r\n");
+    update.document_revisions = BTreeMap::from([(first, 1), (second, 99)]);
+    let stale =
+        import_workspace_snapshot(&context, &envelope(workspace, "snapshot-stale"), &update)
+            .await
+            .unwrap_err();
+    assert_eq!(stale.code, OrgErrorCode::StaleRevision);
+    assert_eq!(
+        workspace_snapshot(backend.as_ref(), workspace).await,
+        before
+    );
+
+    update.document_revisions.insert(second, 1);
+    let mut archived_update = update.clone();
+    archived_update.workspace.archived_at = Some(NOW);
+    let archived_error = import_workspace_snapshot(
+        &context,
+        &envelope(workspace, "snapshot-archive-update"),
+        &archived_update,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(archived_error.code, OrgErrorCode::ArchivedWorkspace);
+    assert_eq!(
+        workspace_snapshot(backend.as_ref(), workspace).await,
+        before
+    );
+
+    let updated =
+        import_workspace_snapshot(&context, &envelope(workspace, "snapshot-update"), &update)
+            .await
+            .unwrap();
+    assert_eq!(updated.workspace_revision, Some(2));
+    assert_eq!(updated.document_revisions[&first.to_string()], 2);
+    assert_eq!(updated.document_revisions[&second.to_string()], 2);
+    let stored = workspace_snapshot(backend.as_ref(), workspace).await;
+    assert_eq!(stored.workspace.description, "After");
+}
+
+#[tokio::test]
+async fn workspace_snapshot_command_kinds_replay_once_and_reject_divergent_payloads() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+
+    for (index, offline) in [false, true].into_iter().enumerate() {
+        let workspace = workspace_id(&format!("10000000-0000-4000-8000-0000000001{index:02x}"));
+        let document = document_id(&format!("20000000-0000-4000-8000-0000000001{index:02x}"));
+        let item = work_item_id(&format!("30000000-0000-4000-8000-0000000001{index:02x}"));
+        let request = ImportWorkspaceSnapshotRequest {
+            mode: WorkspaceImportMode::Create,
+            workspace: WorkspaceSnapshotMetadata {
+                slug: format!("idempotent-create-{index}"),
+                display_name: "Idempotent create".into(),
+                description: "Original".into(),
+                timezone: "UTC".into(),
+                policy_schema_version: 1,
+                policy: WorkspacePolicy::engineering_default(),
+                revision: 1,
+                archived_at: None,
+            },
+            documents: vec![DocumentImport {
+                document_id: document,
+                path: "idempotent.org".into(),
+                source: source(item, "READY", "Original.\r\n"),
+            }],
+            document_revisions: BTreeMap::from([(document, 1)]),
+            lease_proofs: BTreeMap::new(),
+        };
+        let command = envelope(workspace, "snapshot-idempotent-create");
+        let first = if offline {
+            import_offline_workspace_snapshot(&context, &command, &request).await
+        } else {
+            import_workspace_snapshot(&context, &command, &request).await
+        }
+        .unwrap();
+        let after_first = workspace_snapshot(backend.as_ref(), workspace).await;
+        let replay = if offline {
+            import_offline_workspace_snapshot(&context, &command, &request).await
+        } else {
+            import_workspace_snapshot(&context, &command, &request).await
+        }
+        .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(
+            workspace_snapshot(backend.as_ref(), workspace).await,
+            after_first
+        );
+
+        let mut divergent = request.clone();
+        divergent.workspace.description = "Divergent".into();
+        let error = if offline {
+            import_offline_workspace_snapshot(&context, &command, &divergent).await
+        } else {
+            import_workspace_snapshot(&context, &command, &divergent).await
+        }
+        .unwrap_err();
+        assert_eq!(error.code, OrgErrorCode::IdempotencyConflict);
+        assert_eq!(
+            workspace_snapshot(backend.as_ref(), workspace).await,
+            after_first
+        );
+
+        let mut update = request;
+        update.mode = WorkspaceImportMode::Update;
+        update.workspace.description = "Updated".into();
+        update.documents[0].source = source(item, "READY", "Updated.\r\n");
+        let update_command = envelope(workspace, "snapshot-idempotent-update");
+        let updated = if offline {
+            import_offline_workspace_snapshot(&context, &update_command, &update).await
+        } else {
+            import_workspace_snapshot(&context, &update_command, &update).await
+        }
+        .unwrap();
+        let after_update = workspace_snapshot(backend.as_ref(), workspace).await;
+        let update_replay = if offline {
+            import_offline_workspace_snapshot(&context, &update_command, &update).await
+        } else {
+            import_workspace_snapshot(&context, &update_command, &update).await
+        }
+        .unwrap();
+        assert_eq!(update_replay, updated);
+        assert_eq!(
+            workspace_snapshot(backend.as_ref(), workspace).await,
+            after_update
+        );
+
+        let mut divergent_update = update;
+        divergent_update.workspace.display_name = "Divergent update".into();
+        let error = if offline {
+            import_offline_workspace_snapshot(&context, &update_command, &divergent_update).await
+        } else {
+            import_workspace_snapshot(&context, &update_command, &divergent_update).await
+        }
+        .unwrap_err();
+        assert_eq!(error.code, OrgErrorCode::IdempotencyConflict);
+        assert_eq!(
+            workspace_snapshot(backend.as_ref(), workspace).await,
+            after_update
+        );
+    }
 }
