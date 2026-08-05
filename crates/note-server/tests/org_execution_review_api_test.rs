@@ -738,6 +738,11 @@ fn openapi_limits_raw_tokens_to_claim_retry_success_and_marks_request_tokens_sen
         .to_string()
         .to_ascii_lowercase()
         .contains("sensitive"));
+    assert!(
+        document["components"]["schemas"]["OrgClaimResult"]["properties"]
+            .get("fencing_token")
+            .is_some()
+    );
     assert!(!document["components"]["schemas"]["OrgApiError"]
         .to_string()
         .contains("fencing_token"));
@@ -747,9 +752,18 @@ fn openapi_limits_raw_tokens_to_claim_retry_success_and_marks_request_tokens_sen
         ("/api/org/items/{item_id}/retry", "org_retry_item"),
     ] {
         let response = &document["paths"][path]["post"]["responses"]["200"];
+        assert_eq!(
+            response["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/OrgClaimResult",
+            "{operation_id} must publish the transport-neutral claim schema"
+        );
         assert!(
-            response.to_string().contains("ClaimResultBody"),
-            "{operation_id}"
+            response["description"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("sensitive"),
+            "{operation_id} must identify its raw fencing token as sensitive"
         );
     }
     for path in [
@@ -765,9 +779,11 @@ fn openapi_limits_raw_tokens_to_claim_retry_success_and_marks_request_tokens_sen
         assert!(document["paths"][path]["post"]["requestBody"]
             .to_string()
             .contains("Body"));
-        assert!(!document["paths"][path]["post"]["responses"]["200"]
-            .to_string()
-            .contains("ClaimResultBody"));
+        assert_ne!(
+            document["paths"][path]["post"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/OrgClaimResult"
+        );
     }
 
     let schemas = document["components"]["schemas"].as_object().unwrap();
