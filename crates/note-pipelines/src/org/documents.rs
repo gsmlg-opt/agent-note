@@ -1,18 +1,18 @@
 use super::{
     capacity, classify_transition, closes_lease, concurrency_limit, execute_idempotent,
-    inspect_touched_lease_proofs_except, lifecycle_attempt, lifecycle_end_reason, lifecycle_events,
-    lifecycle_summary, resolve_lease_update, resolve_update, stale_lease, storage_kind, token_hash,
-    validate_item_transition, validate_lease_input, validate_public_payload,
-    validate_touched_lease_proofs_except, CommandEnvelope, LeaseProofInput, OrgCommandKind,
-    OrgCommandResult, OrgContext, OrgError, OrgErrorCode, OrgWorkflowPhase, TransitionLifecycle,
-    ORG_COMMAND_SCHEMA_VERSION,
+    execute_idempotent_create, inspect_touched_lease_proofs_except, lifecycle_attempt,
+    lifecycle_end_reason, lifecycle_events, lifecycle_summary, resolve_lease_update,
+    resolve_update, stale_lease, storage_kind, token_hash, validate_item_transition,
+    validate_lease_input, validate_public_payload, validate_touched_lease_proofs_except,
+    CommandEnvelope, LeaseProofInput, OrgCommandKind, OrgCommandResult, OrgContext, OrgError,
+    OrgErrorCode, OrgWorkflowPhase, TransitionLifecycle, ORG_COMMAND_SCHEMA_VERSION,
 };
-use note_org::{parse_document, ClaimPolicy, DocumentId, WorkspaceId};
+use note_org::{parse_document, ClaimPolicy, DocumentId, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    ConditionalUpdate, NewOrgDocument, NewOrgEvent, OrgDocument, OrgDocumentOwnershipMove,
-    OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType, OrgLeaseClosure,
-    OrgLeaseEndReason, OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof, OrgProjectedWorkItem,
-    OrgWorkspace, StorageTransaction,
+    ConditionalUpdate, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocument,
+    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
+    OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof,
+    OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceUpdate, StorageTransaction,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -20,8 +20,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const PUT_DOCUMENT: OrgCommandKind = OrgCommandKind::new("put_document", 1);
+const IMPORT_OFFLINE_DOCUMENT: OrgCommandKind = OrgCommandKind::new("import_offline_document", 1);
 const IMPORT_DOCUMENTS: OrgCommandKind = OrgCommandKind::new("import_documents", 1);
+const IMPORT_WORKSPACE_SNAPSHOT: OrgCommandKind =
+    OrgCommandKind::new("import_workspace_snapshot", 1);
+const IMPORT_OFFLINE_WORKSPACE_SNAPSHOT: OrgCommandKind =
+    OrgCommandKind::new("import_offline_workspace_snapshot", 1);
 const MOVE_DOCUMENT: OrgCommandKind = OrgCommandKind::new("move_document", 1);
+const MAX_SNAPSHOT_CREATE_REVISION: i64 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PutDocumentRequest {
@@ -46,6 +52,34 @@ pub struct ImportDocumentsRequest {
     pub lease_proofs: BTreeMap<note_org::WorkItemId, LeaseProofInput>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceImportMode {
+    Create,
+    Update,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSnapshotMetadata {
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub timezone: String,
+    pub policy_schema_version: i64,
+    pub policy: WorkspacePolicy,
+    pub revision: i64,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportWorkspaceSnapshotRequest {
+    pub mode: WorkspaceImportMode,
+    pub workspace: WorkspaceSnapshotMetadata,
+    pub documents: Vec<DocumentImport>,
+    pub document_revisions: BTreeMap<DocumentId, i64>,
+    pub lease_proofs: BTreeMap<note_org::WorkItemId, LeaseProofInput>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveDocumentRequest {
     pub document_id: DocumentId,
@@ -61,6 +95,26 @@ pub async fn put_document(
     envelope: &CommandEnvelope,
     request: &PutDocumentRequest,
 ) -> Result<OrgCommandResult, OrgError> {
+    put_document_with_mode(context, envelope, request, DocumentImportMode::Online).await
+}
+
+/// Imports one canonical Org document without consulting Markdown note storage.
+/// Offline snapshots are portable independently of the note database; their
+/// agent-note links remain weak references until resolved by a live service.
+pub async fn import_offline_document(
+    context: &OrgContext,
+    envelope: &CommandEnvelope,
+    request: &PutDocumentRequest,
+) -> Result<OrgCommandResult, OrgError> {
+    put_document_with_mode(context, envelope, request, DocumentImportMode::Offline).await
+}
+
+async fn put_document_with_mode(
+    context: &OrgContext,
+    envelope: &CommandEnvelope,
+    request: &PutDocumentRequest,
+    mode: DocumentImportMode,
+) -> Result<OrgCommandResult, OrgError> {
     let mut expected_revisions = BTreeMap::new();
     if let Some(revision) = request.expected_revision {
         expected_revisions.insert(request.document_id, revision);
@@ -74,7 +128,11 @@ pub async fn put_document(
         expected_revisions,
         lease_proofs: request.lease_proofs.clone(),
     };
-    execute_import(context, envelope, PUT_DOCUMENT, batch).await
+    let command_kind = match mode {
+        DocumentImportMode::Online => PUT_DOCUMENT,
+        DocumentImportMode::Offline => IMPORT_OFFLINE_DOCUMENT,
+    };
+    execute_import(context, envelope, command_kind, batch, mode).await
 }
 
 pub async fn import_documents(
@@ -82,7 +140,166 @@ pub async fn import_documents(
     envelope: &CommandEnvelope,
     request: &ImportDocumentsRequest,
 ) -> Result<OrgCommandResult, OrgError> {
-    execute_import(context, envelope, IMPORT_DOCUMENTS, request.clone()).await
+    execute_import(
+        context,
+        envelope,
+        IMPORT_DOCUMENTS,
+        request.clone(),
+        DocumentImportMode::Online,
+    )
+    .await
+}
+
+/// Restores a complete portable workspace snapshot through one transaction.
+/// This adapter intentionally reuses the normal raw-import preparation and
+/// lease/revision guards instead of implementing offline-specific policy.
+pub async fn import_workspace_snapshot(
+    context: &OrgContext,
+    envelope: &CommandEnvelope,
+    request: &ImportWorkspaceSnapshotRequest,
+) -> Result<OrgCommandResult, OrgError> {
+    import_workspace_snapshot_with_mode(context, envelope, request, DocumentImportMode::Online)
+        .await
+}
+
+/// Restores a portable Org snapshot without reading or writing Markdown notes.
+pub async fn import_offline_workspace_snapshot(
+    context: &OrgContext,
+    envelope: &CommandEnvelope,
+    request: &ImportWorkspaceSnapshotRequest,
+) -> Result<OrgCommandResult, OrgError> {
+    import_workspace_snapshot_with_mode(context, envelope, request, DocumentImportMode::Offline)
+        .await
+}
+
+async fn import_workspace_snapshot_with_mode(
+    context: &OrgContext,
+    envelope: &CommandEnvelope,
+    request: &ImportWorkspaceSnapshotRequest,
+    import_mode: DocumentImportMode,
+) -> Result<OrgCommandResult, OrgError> {
+    super::validate_workspace_fields(
+        &request.workspace.slug,
+        &request.workspace.display_name,
+        &request.workspace.timezone,
+        request.workspace.policy_schema_version,
+        &request.workspace.policy,
+    )?;
+    if request.workspace.revision < 1 {
+        return Err(OrgError::invalid_input(
+            "Snapshot workspace revision must be positive",
+        ));
+    }
+    let documents = ImportDocumentsRequest {
+        documents: request.documents.clone(),
+        expected_revisions: match request.mode {
+            WorkspaceImportMode::Create => BTreeMap::new(),
+            WorkspaceImportMode::Update => request.document_revisions.clone(),
+        },
+        lease_proofs: request.lease_proofs.clone(),
+    };
+    validate_import_shape_inner(&documents, true)?;
+    let document_ids = request
+        .documents
+        .iter()
+        .map(|document| document.document_id)
+        .collect::<BTreeSet<_>>();
+    if request
+        .document_revisions
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        != document_ids
+        || request
+            .document_revisions
+            .values()
+            .any(|revision| *revision < 1)
+    {
+        return Err(OrgError::invalid_input(
+            "Snapshot document revisions must exactly match every document",
+        ));
+    }
+    if request.mode == WorkspaceImportMode::Update && request.workspace.archived_at.is_some() {
+        return Err(OrgError::new(
+            OrgErrorCode::ArchivedWorkspace,
+            "Archived Org workspace snapshots can only be restored in create mode",
+            json!({"workspace_id": envelope.workspace_id}),
+            false,
+        ));
+    }
+    if request.workspace.archived_at.is_some() && request.workspace.revision < 2 {
+        return Err(OrgError::invalid_input(
+            "Archived snapshot workspace revision must be at least two",
+        ));
+    }
+    if request.mode == WorkspaceImportMode::Create
+        && (request.workspace.revision > MAX_SNAPSHOT_CREATE_REVISION
+            || request
+                .document_revisions
+                .values()
+                .any(|revision| *revision > MAX_SNAPSHOT_CREATE_REVISION))
+    {
+        return Err(OrgError::invalid_input(
+            "Snapshot create revision exceeds the supported restoration limit",
+        ));
+    }
+    let mode = request.mode;
+    let command_kind = match import_mode {
+        DocumentImportMode::Online => IMPORT_WORKSPACE_SNAPSHOT,
+        DocumentImportMode::Offline => IMPORT_OFFLINE_WORKSPACE_SNAPSHOT,
+    };
+    let request = request.clone();
+    let fingerprint = workspace_snapshot_fingerprint(&request);
+    match mode {
+        WorkspaceImportMode::Create => {
+            let command = envelope.clone();
+            let workflow_context = context.clone();
+            execute_idempotent_create(
+                context,
+                command_kind,
+                envelope,
+                &fingerprint,
+                move |transaction, now| {
+                    Box::pin(async move {
+                        apply_workspace_snapshot(
+                            transaction,
+                            &workflow_context,
+                            &command,
+                            &request,
+                            now,
+                            import_mode,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await
+        }
+        WorkspaceImportMode::Update => {
+            let command = envelope.clone();
+            let workflow_context = context.clone();
+            execute_idempotent(
+                context,
+                command_kind,
+                envelope,
+                &fingerprint,
+                move |transaction, now| {
+                    Box::pin(async move {
+                        apply_workspace_snapshot(
+                            transaction,
+                            &workflow_context,
+                            &command,
+                            &request,
+                            now,
+                            import_mode,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await
+        }
+    }
 }
 
 async fn execute_import(
@@ -90,6 +307,7 @@ async fn execute_import(
     envelope: &CommandEnvelope,
     command_kind: OrgCommandKind,
     request: ImportDocumentsRequest,
+    import_mode: DocumentImportMode,
 ) -> Result<OrgCommandResult, OrgError> {
     validate_import_shape(&request)?;
     let public_payload = json!({"documents": request.documents});
@@ -112,163 +330,477 @@ async fn execute_import(
                     .await
                     .map_err(OrgError::storage)?
                     .ok_or_else(|| not_found("workspace"))?;
-                let prepared = prepare_import(
-                    transaction,
-                    &workspace,
-                    &command_envelope.actor_id,
-                    &request,
-                    now,
-                )
-                .await?;
-                workflow_context.after_workflow_phase(OrgWorkflowPhase::Proof)?;
-                validate_prepared_revisions(&prepared, &request.expected_revisions)?;
-                apply_prepared_ownership_changes(
+                apply_document_import(
                     transaction,
                     &workflow_context,
                     &workspace,
-                    &command_envelope.actor_id,
-                    &prepared,
-                    &request.lease_proofs,
+                    &command_envelope,
+                    &request,
                     now,
+                    ApplyDocumentImportOptions {
+                        event_ids: Vec::new(),
+                        created_target_revisions: None,
+                        import_mode,
+                    },
                 )
-                .await?;
-                let mut revisions = BTreeMap::new();
-                for document in &prepared.documents {
-                    let revision = if let Some(existing) = &document.existing {
-                        let updated = super::resolve_cas(
-                            transaction
-                                .compare_and_swap_org_document(OrgDocumentUpdate {
-                                    id: document.input.document_id,
-                                    expected_revision: existing.revision,
-                                    path: &document.input.path,
-                                    source: &document.input.source,
-                                    content_hash: &content_hash(&document.input.source),
-                                    updated_at: now,
-                                })
-                                .await
-                                .map_err(OrgError::storage)?,
-                            "document",
-                        )?;
-                        updated.revision
-                    } else {
-                        transaction
-                            .insert_org_document(NewOrgDocument {
-                                id: document.input.document_id,
-                                workspace_id: command_envelope.workspace_id,
-                                path: &document.input.path,
-                                source: &document.input.source,
-                                content_hash: &content_hash(&document.input.source),
-                                now,
-                            })
-                            .await
-                            .map_err(OrgError::storage)?;
-                        1
-                    };
-                    revisions.insert(document.input.document_id.to_string(), revision);
-                    workflow_context.after_workflow_phase(OrgWorkflowPhase::SourceEdit)?;
-                }
-                transaction
-                    .rebuild_org_workspace_projection(
-                        command_envelope.workspace_id,
-                        &prepared.workspace_projection,
-                    )
-                    .await
-                    .map_err(OrgError::storage)?;
-                workflow_context.after_workflow_phase(OrgWorkflowPhase::ProjectionUpdate)?;
-
-                let mut event_ids = Vec::new();
-                for semantic in &prepared.semantic_events {
-                    let event = transaction
-                        .append_org_event(NewOrgEvent {
-                            id: &uuid::Uuid::new_v4().to_string(),
-                            workspace_id: workspace.id,
-                            subject_kind: "work_item",
-                            subject_id: &semantic.item_id.to_string(),
-                            actor_id: &command_envelope.actor_id,
-                            attempt_id: semantic.attempt_id.as_deref(),
-                            event_type: semantic.event_type.clone(),
-                            occurred_at: now,
-                            summary: semantic.summary,
-                            metadata: &semantic.metadata,
-                            previous_state: semantic.previous_state.as_deref(),
-                            resulting_state: semantic.resulting_state.as_deref(),
-                        })
-                        .await
-                        .map_err(OrgError::storage)?;
-                    event_ids.push(event.id);
-                    workflow_context.after_workflow_phase(OrgWorkflowPhase::Events)?;
-                }
-                for document in &prepared.documents {
-                    let metadata = json!({
-                        "document_id": document.input.document_id,
-                        "path": document.input.path,
-                        "revision": revisions[&document.input.document_id.to_string()],
-                        "created": document.existing.is_none(),
-                    });
-                    let event = transaction
-                        .append_org_event(NewOrgEvent {
-                            id: &uuid::Uuid::new_v4().to_string(),
-                            workspace_id: command_envelope.workspace_id,
-                            subject_kind: "document",
-                            subject_id: &document.input.document_id.to_string(),
-                            actor_id: &command_envelope.actor_id,
-                            attempt_id: None,
-                            event_type: if document.existing.is_some() {
-                                OrgEventType::DocumentImport
-                            } else {
-                                OrgEventType::Creation
-                            },
-                            occurred_at: now,
-                            summary: "Imported Org document",
-                            metadata: &metadata,
-                            previous_state: None,
-                            resulting_state: None,
-                        })
-                        .await
-                        .map_err(OrgError::storage)?;
-                    event_ids.push(event.id);
-                    workflow_context.after_workflow_phase(OrgWorkflowPhase::Events)?;
-                }
-                for moved_item in &prepared.moved_items {
-                    let metadata = json!({
-                        "source_document_id": moved_item.source_document_id,
-                        "target_document_id": moved_item.target_document_id,
-                        "source_parent_id": moved_item.source_parent_id,
-                        "target_parent_id": moved_item.target_parent_id,
-                    });
-                    let event = transaction
-                        .append_org_event(NewOrgEvent {
-                            id: &uuid::Uuid::new_v4().to_string(),
-                            workspace_id: command_envelope.workspace_id,
-                            subject_kind: "work_item",
-                            subject_id: &moved_item.item_id.to_string(),
-                            actor_id: &command_envelope.actor_id,
-                            attempt_id: moved_item.attempt_id.as_deref(),
-                            event_type: OrgEventType::ItemMove,
-                            occurred_at: now,
-                            summary: "Moved Org work item between documents",
-                            metadata: &metadata,
-                            previous_state: None,
-                            resulting_state: None,
-                        })
-                        .await
-                        .map_err(OrgError::storage)?;
-                    event_ids.push(event.id);
-                    workflow_context.after_workflow_phase(OrgWorkflowPhase::Events)?;
-                }
-                Ok(OrgCommandResult {
-                    schema_version: ORG_COMMAND_SCHEMA_VERSION,
-                    workspace_id: command_envelope.workspace_id,
-                    operation_id: command_envelope.operation_id,
-                    event_ids,
-                    workspace_revision: Some(workspace.revision),
-                    document_revisions: revisions,
-                    data: json!({"document_count": prepared.documents.len()}),
-                })
+                .await
             })
         },
     )
     .await
+}
+
+async fn apply_workspace_snapshot(
+    transaction: &dyn StorageTransaction,
+    context: &OrgContext,
+    envelope: &CommandEnvelope,
+    request: &ImportWorkspaceSnapshotRequest,
+    now: i64,
+    import_mode: DocumentImportMode,
+) -> Result<OrgCommandResult, OrgError> {
+    let current = transaction
+        .get_org_workspace(envelope.workspace_id)
+        .await
+        .map_err(OrgError::storage)?;
+    let event_ids = Vec::new();
+    let mut workspace = match request.mode {
+        WorkspaceImportMode::Create => {
+            if current.is_some() {
+                return Err(OrgError::new(
+                    OrgErrorCode::InvalidTransition,
+                    "Org workspace already exists",
+                    json!({"workspace_id": envelope.workspace_id}),
+                    false,
+                ));
+            }
+            transaction
+                .insert_org_workspace(NewOrgWorkspace {
+                    id: envelope.workspace_id,
+                    slug: &request.workspace.slug,
+                    display_name: &request.workspace.display_name,
+                    description: &request.workspace.description,
+                    timezone: &request.workspace.timezone,
+                    policy_schema_version: request.workspace.policy_schema_version,
+                    policy: &request.workspace.policy,
+                    now,
+                })
+                .await
+                .map_err(OrgError::storage)?;
+            let workspace = transaction
+                .get_org_workspace(envelope.workspace_id)
+                .await
+                .map_err(OrgError::storage)?
+                .ok_or_else(|| {
+                    OrgError::new(
+                        OrgErrorCode::StorageFailure,
+                        "Inserted Org workspace could not be read",
+                        json!({}),
+                        false,
+                    )
+                })?;
+            workspace
+        }
+        WorkspaceImportMode::Update => {
+            let current = current.ok_or_else(|| not_found("workspace"))?;
+            if current.revision != request.workspace.revision {
+                return Err(OrgError::new(
+                    OrgErrorCode::StaleRevision,
+                    "Org workspace revision is stale",
+                    json!({"current_revision": current.revision}),
+                    true,
+                ));
+            }
+            let current_items = transaction
+                .list_org_workspace_projection(envelope.workspace_id)
+                .await
+                .map_err(OrgError::storage)?;
+            super::validate_policy_role_compatibility(
+                &current.policy,
+                &request.workspace.policy,
+                &current_items,
+            )?;
+            OrgWorkspace {
+                id: current.id,
+                slug: request.workspace.slug.clone(),
+                display_name: request.workspace.display_name.clone(),
+                description: request.workspace.description.clone(),
+                timezone: request.workspace.timezone.clone(),
+                policy_schema_version: request.workspace.policy_schema_version,
+                policy: request.workspace.policy.clone(),
+                revision: current.revision + 1,
+                created_at: current.created_at,
+                updated_at: now,
+                archived_at: request.workspace.archived_at,
+            }
+        }
+    };
+
+    let existing_ids = transaction
+        .list_org_documents(envelope.workspace_id)
+        .await
+        .map_err(OrgError::storage)?
+        .into_iter()
+        .map(|document| document.id)
+        .collect::<BTreeSet<_>>();
+    let imported_ids = request
+        .documents
+        .iter()
+        .map(|document| document.document_id)
+        .collect::<BTreeSet<_>>();
+    if request.mode == WorkspaceImportMode::Update && existing_ids != imported_ids {
+        return Err(OrgError::invalid_input(
+            "Workspace snapshot must include exactly every existing document",
+        ));
+    }
+    let import = ImportDocumentsRequest {
+        documents: request.documents.clone(),
+        expected_revisions: match request.mode {
+            WorkspaceImportMode::Create => BTreeMap::new(),
+            WorkspaceImportMode::Update => request.document_revisions.clone(),
+        },
+        lease_proofs: request.lease_proofs.clone(),
+    };
+    let mut result = apply_document_import(
+        transaction,
+        context,
+        &workspace,
+        envelope,
+        &import,
+        now,
+        ApplyDocumentImportOptions {
+            event_ids,
+            created_target_revisions: (request.mode == WorkspaceImportMode::Create)
+                .then_some(&request.document_revisions),
+            import_mode,
+        },
+    )
+    .await?;
+
+    let (event_type, summary) = match request.mode {
+        WorkspaceImportMode::Create => {
+            workspace = restore_created_workspace_revision(
+                transaction,
+                &workspace,
+                &request.workspace,
+                now,
+            )
+            .await?;
+            (
+                OrgEventType::Creation,
+                "Created Org workspace from snapshot",
+            )
+        }
+        WorkspaceImportMode::Update => {
+            workspace = super::resolve_cas(
+                transaction
+                    .compare_and_swap_org_workspace(OrgWorkspaceUpdate {
+                        id: envelope.workspace_id,
+                        expected_revision: request.workspace.revision,
+                        slug: &request.workspace.slug,
+                        display_name: &request.workspace.display_name,
+                        description: &request.workspace.description,
+                        timezone: &request.workspace.timezone,
+                        policy_schema_version: request.workspace.policy_schema_version,
+                        policy: &request.workspace.policy,
+                        archived_at: request.workspace.archived_at,
+                        updated_at: now,
+                    })
+                    .await
+                    .map_err(OrgError::storage)?,
+                "workspace",
+            )?;
+            context.after_workflow_phase(OrgWorkflowPhase::SourceEdit)?;
+            if request.workspace.archived_at.is_some() {
+                (
+                    OrgEventType::WorkspaceArchive,
+                    "Imported archived Org workspace snapshot",
+                )
+            } else {
+                (
+                    OrgEventType::WorkspaceChange,
+                    "Updated Org workspace from snapshot",
+                )
+            }
+        }
+    };
+    result.event_ids.push(
+        append_workspace_snapshot_event(
+            transaction,
+            envelope,
+            &workspace,
+            event_type,
+            summary,
+            now,
+        )
+        .await?,
+    );
+    result.workspace_revision = Some(workspace.revision);
+    Ok(result)
+}
+
+async fn restore_created_workspace_revision(
+    transaction: &dyn StorageTransaction,
+    workspace: &OrgWorkspace,
+    snapshot: &WorkspaceSnapshotMetadata,
+    now: i64,
+) -> Result<OrgWorkspace, OrgError> {
+    let mut restored = workspace.clone();
+    while restored.revision < snapshot.revision {
+        let next_revision = restored.revision + 1;
+        restored = super::resolve_cas(
+            transaction
+                .compare_and_swap_org_workspace(OrgWorkspaceUpdate {
+                    id: restored.id,
+                    expected_revision: restored.revision,
+                    slug: &snapshot.slug,
+                    display_name: &snapshot.display_name,
+                    description: &snapshot.description,
+                    timezone: &snapshot.timezone,
+                    policy_schema_version: snapshot.policy_schema_version,
+                    policy: &snapshot.policy,
+                    archived_at: (next_revision == snapshot.revision)
+                        .then_some(snapshot.archived_at)
+                        .flatten(),
+                    updated_at: now,
+                })
+                .await
+                .map_err(OrgError::storage)?,
+            "workspace",
+        )?;
+    }
+    Ok(restored)
+}
+
+async fn append_workspace_snapshot_event(
+    transaction: &dyn StorageTransaction,
+    envelope: &CommandEnvelope,
+    workspace: &OrgWorkspace,
+    event_type: OrgEventType,
+    summary: &'static str,
+    now: i64,
+) -> Result<String, OrgError> {
+    let metadata = json!({
+        "revision": workspace.revision,
+        "slug": workspace.slug,
+        "timezone": workspace.timezone,
+        "policy_schema_version": workspace.policy_schema_version,
+        "archived_at": workspace.archived_at,
+    });
+    transaction
+        .append_org_event(NewOrgEvent {
+            id: &uuid::Uuid::new_v4().to_string(),
+            workspace_id: workspace.id,
+            subject_kind: "workspace",
+            subject_id: &workspace.id.to_string(),
+            actor_id: &envelope.actor_id,
+            attempt_id: None,
+            event_type,
+            occurred_at: now,
+            summary,
+            metadata: &metadata,
+            previous_state: None,
+            resulting_state: None,
+        })
+        .await
+        .map(|event| event.id)
+        .map_err(OrgError::storage)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentImportMode {
+    Online,
+    Offline,
+}
+
+struct ApplyDocumentImportOptions<'a> {
+    event_ids: Vec<String>,
+    created_target_revisions: Option<&'a BTreeMap<DocumentId, i64>>,
+    import_mode: DocumentImportMode,
+}
+
+async fn apply_document_import(
+    transaction: &dyn StorageTransaction,
+    context: &OrgContext,
+    workspace: &OrgWorkspace,
+    envelope: &CommandEnvelope,
+    request: &ImportDocumentsRequest,
+    now: i64,
+    options: ApplyDocumentImportOptions<'_>,
+) -> Result<OrgCommandResult, OrgError> {
+    let prepared = prepare_import(
+        transaction,
+        workspace,
+        &envelope.actor_id,
+        request,
+        now,
+        options.import_mode,
+    )
+    .await?;
+    let mut event_ids = options.event_ids;
+    context.after_workflow_phase(OrgWorkflowPhase::Proof)?;
+    validate_prepared_revisions(&prepared, &request.expected_revisions)?;
+    apply_prepared_ownership_changes(
+        transaction,
+        context,
+        workspace,
+        &envelope.actor_id,
+        &prepared,
+        &request.lease_proofs,
+        now,
+    )
+    .await?;
+    let mut revisions = BTreeMap::new();
+    for document in &prepared.documents {
+        let revision = if let Some(existing) = &document.existing {
+            super::resolve_cas(
+                transaction
+                    .compare_and_swap_org_document(OrgDocumentUpdate {
+                        id: document.input.document_id,
+                        expected_revision: existing.revision,
+                        path: &document.input.path,
+                        source: &document.input.source,
+                        content_hash: &content_hash(&document.input.source),
+                        updated_at: now,
+                    })
+                    .await
+                    .map_err(OrgError::storage)?,
+                "document",
+            )?
+            .revision
+        } else {
+            transaction
+                .insert_org_document(NewOrgDocument {
+                    id: document.input.document_id,
+                    workspace_id: envelope.workspace_id,
+                    path: &document.input.path,
+                    source: &document.input.source,
+                    content_hash: &content_hash(&document.input.source),
+                    now,
+                })
+                .await
+                .map_err(OrgError::storage)?;
+            let mut revision = 1;
+            let target_revision = options
+                .created_target_revisions
+                .and_then(|revisions| revisions.get(&document.input.document_id))
+                .copied()
+                .unwrap_or(1);
+            while revision < target_revision {
+                revision = super::resolve_cas(
+                    transaction
+                        .compare_and_swap_org_document(OrgDocumentUpdate {
+                            id: document.input.document_id,
+                            expected_revision: revision,
+                            path: &document.input.path,
+                            source: &document.input.source,
+                            content_hash: &content_hash(&document.input.source),
+                            updated_at: now,
+                        })
+                        .await
+                        .map_err(OrgError::storage)?,
+                    "document",
+                )?
+                .revision;
+            }
+            revision
+        };
+        revisions.insert(document.input.document_id.to_string(), revision);
+        context.after_workflow_phase(OrgWorkflowPhase::SourceEdit)?;
+    }
+    transaction
+        .rebuild_org_workspace_projection(envelope.workspace_id, &prepared.workspace_projection)
+        .await
+        .map_err(OrgError::storage)?;
+    context.after_workflow_phase(OrgWorkflowPhase::ProjectionUpdate)?;
+
+    for semantic in &prepared.semantic_events {
+        let event = transaction
+            .append_org_event(NewOrgEvent {
+                id: &uuid::Uuid::new_v4().to_string(),
+                workspace_id: workspace.id,
+                subject_kind: "work_item",
+                subject_id: &semantic.item_id.to_string(),
+                actor_id: &envelope.actor_id,
+                attempt_id: semantic.attempt_id.as_deref(),
+                event_type: semantic.event_type.clone(),
+                occurred_at: now,
+                summary: semantic.summary,
+                metadata: &semantic.metadata,
+                previous_state: semantic.previous_state.as_deref(),
+                resulting_state: semantic.resulting_state.as_deref(),
+            })
+            .await
+            .map_err(OrgError::storage)?;
+        event_ids.push(event.id);
+        context.after_workflow_phase(OrgWorkflowPhase::Events)?;
+    }
+    for document in &prepared.documents {
+        let metadata = json!({
+            "document_id": document.input.document_id,
+            "path": document.input.path,
+            "revision": revisions[&document.input.document_id.to_string()],
+            "created": document.existing.is_none(),
+        });
+        let event = transaction
+            .append_org_event(NewOrgEvent {
+                id: &uuid::Uuid::new_v4().to_string(),
+                workspace_id: envelope.workspace_id,
+                subject_kind: "document",
+                subject_id: &document.input.document_id.to_string(),
+                actor_id: &envelope.actor_id,
+                attempt_id: None,
+                event_type: if document.existing.is_some() {
+                    OrgEventType::DocumentImport
+                } else {
+                    OrgEventType::Creation
+                },
+                occurred_at: now,
+                summary: "Imported Org document",
+                metadata: &metadata,
+                previous_state: None,
+                resulting_state: None,
+            })
+            .await
+            .map_err(OrgError::storage)?;
+        event_ids.push(event.id);
+        context.after_workflow_phase(OrgWorkflowPhase::Events)?;
+    }
+    for moved_item in &prepared.moved_items {
+        let metadata = json!({
+            "source_document_id": moved_item.source_document_id,
+            "target_document_id": moved_item.target_document_id,
+            "source_parent_id": moved_item.source_parent_id,
+            "target_parent_id": moved_item.target_parent_id,
+        });
+        let event = transaction
+            .append_org_event(NewOrgEvent {
+                id: &uuid::Uuid::new_v4().to_string(),
+                workspace_id: envelope.workspace_id,
+                subject_kind: "work_item",
+                subject_id: &moved_item.item_id.to_string(),
+                actor_id: &envelope.actor_id,
+                attempt_id: moved_item.attempt_id.as_deref(),
+                event_type: OrgEventType::ItemMove,
+                occurred_at: now,
+                summary: "Moved Org work item between documents",
+                metadata: &metadata,
+                previous_state: None,
+                resulting_state: None,
+            })
+            .await
+            .map_err(OrgError::storage)?;
+        event_ids.push(event.id);
+        context.after_workflow_phase(OrgWorkflowPhase::Events)?;
+    }
+    Ok(OrgCommandResult {
+        schema_version: ORG_COMMAND_SCHEMA_VERSION,
+        workspace_id: envelope.workspace_id,
+        operation_id: envelope.operation_id.clone(),
+        event_ids,
+        workspace_revision: Some(workspace.revision),
+        document_revisions: revisions,
+        data: json!({"document_count": prepared.documents.len()}),
+    })
 }
 
 pub async fn move_document(
@@ -642,6 +1174,7 @@ async fn prepare_import(
     actor_id: &str,
     request: &ImportDocumentsRequest,
     now: i64,
+    import_mode: DocumentImportMode,
 ) -> Result<PreparedImport, OrgError> {
     let old_workspace_projection = transaction
         .list_org_workspace_projection(workspace.id)
@@ -778,12 +1311,14 @@ async fn prepare_import(
         &affected_old,
         &candidates_by_id,
     )?;
-    validate_new_note_targets(
-        transaction,
-        &old_workspace_projection,
-        &workspace_projection,
-    )
-    .await?;
+    if import_mode == DocumentImportMode::Online {
+        validate_new_note_targets(
+            transaction,
+            &old_workspace_projection,
+            &workspace_projection,
+        )
+        .await?;
+    }
 
     let mut touched = affected_old
         .iter()
@@ -1433,7 +1968,14 @@ async fn require_workspace(
 }
 
 fn validate_import_shape(request: &ImportDocumentsRequest) -> Result<(), OrgError> {
-    if request.documents.is_empty() {
+    validate_import_shape_inner(request, false)
+}
+
+fn validate_import_shape_inner(
+    request: &ImportDocumentsRequest,
+    allow_empty: bool,
+) -> Result<(), OrgError> {
+    if request.documents.is_empty() && !allow_empty {
         return Err(OrgError::invalid_input(
             "Org document import must contain at least one document",
         ));
@@ -1479,6 +2021,19 @@ fn import_fingerprint(request: &ImportDocumentsRequest) -> serde_json::Value {
                 "fencing_token_digest": super::token_hash(&proof.fencing_token),
             }))
         }).collect::<BTreeMap<_, _>>(),
+    })
+}
+
+fn workspace_snapshot_fingerprint(request: &ImportWorkspaceSnapshotRequest) -> serde_json::Value {
+    let documents = ImportDocumentsRequest {
+        documents: request.documents.clone(),
+        expected_revisions: request.document_revisions.clone(),
+        lease_proofs: request.lease_proofs.clone(),
+    };
+    json!({
+        "mode": request.mode,
+        "workspace": request.workspace,
+        "documents": import_fingerprint(&documents),
     })
 }
 
