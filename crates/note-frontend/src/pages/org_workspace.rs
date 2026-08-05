@@ -325,7 +325,7 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
     let location = use_location();
     let raw_location_query = location
         .as_ref()
-        .map(|location| location.query_str().to_owned())
+        .map(|location| location.query_str().trim_start_matches('?').to_owned())
         .unwrap_or_default();
     let query_state = WorkspaceQueryState::parse(&raw_location_query);
     let canonical_query = query_state.canonical_query();
@@ -556,7 +556,11 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
     };
 
     html! {
-        <section class="stack org-workspace" aria-labelledby="org-workspace-title">
+        <section
+            class="stack org-workspace"
+            aria-labelledby="org-workspace-title"
+            data-testid="org-workspace-page"
+        >
             { workspace_header(page_state.payload(), &query_state, &route, on_refresh, is_canonical) }
             { view_tabs(workspace_summary.as_ref(), &query_state, &route) }
             <form
@@ -564,21 +568,27 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
                 class="org-triage-filters"
                 aria-label="Operational filters"
                 onsubmit={on_filter_submit}
+                data-testid="org-workspace-filters"
             >
-                <label><span>{ "Type" }</span><input ref={item_type_ref} class="input" value={query_state.item_type.clone().unwrap_or_default()} placeholder="task" /></label>
-                <label><span>{ "State" }</span><input ref={state_ref} class="input" value={query_state.state.clone().unwrap_or_default()} placeholder="RUNNING" /></label>
+                <label><span>{ "Type" }</span><input ref={item_type_ref} class="input" name="item_type" value={query_state.item_type.clone().unwrap_or_default()} placeholder="task" data-testid="org-filter-type" /></label>
+                <label><span>{ "State" }</span><input ref={state_ref} class="input" name="state" value={query_state.state.clone().unwrap_or_default()} placeholder="RUNNING" data-testid="org-filter-state" /></label>
                 <label><span>{ "Priority" }</span>
-                    <select ref={priority_ref} class="input" value={query_state.priority.map(|value| value.as_query_value()).unwrap_or_default()}>
-                        <option value="">{ "Any" }</option>
-                        <option value="none">{ "None" }</option>
-                        { for ('A'..='Z').map(|priority| html! { <option value={priority.to_string()}>{ priority }</option> }) }
+                    <select ref={priority_ref} class="input" name="priority" value={query_state.priority.map(|value| value.as_query_value()).unwrap_or_default()} data-testid="org-filter-priority">
+                        <option value="" selected={query_state.priority.is_none()}>{ "Any" }</option>
+                        <option value="none" selected={matches!(query_state.priority, Some(PriorityFilter::None))}>{ "None" }</option>
+                        { for ('A'..='Z').map(|priority| html! {
+                            <option
+                                value={priority.to_string()}
+                                selected={matches!(query_state.priority, Some(PriorityFilter::Priority(value)) if value == priority)}
+                            >{ priority }</option>
+                        }) }
                     </select>
                 </label>
-                <label><span>{ "Tags" }</span><input ref={tags_ref} class="input" value={query_state.tags.join(",")} placeholder="ops,delivery" /></label>
-                <label><span>{ "Assignee" }</span><input ref={assignee_ref} class="input" value={query_state.assignee.clone().unwrap_or_default()} placeholder="agent-id" /></label>
-                <label><span>{ "From (UTC)" }</span><input ref={from_ref} class="input" value={query_state.from.clone().unwrap_or_default()} placeholder="2026-08-05T01:00:00Z" /></label>
-                <label><span>{ "To (UTC)" }</span><input ref={to_ref} class="input" value={query_state.to.clone().unwrap_or_default()} placeholder="2026-08-06T01:00:00Z" /></label>
-                <button type="submit" class="btn btn-outline">{ "Apply filters" }</button>
+                <label><span>{ "Tags" }</span><input ref={tags_ref} class="input" name="tags" value={query_state.tags.join(",")} placeholder="ops,delivery" data-testid="org-filter-tags" /></label>
+                <label><span>{ "Assignee" }</span><input ref={assignee_ref} class="input" name="assignee" value={query_state.assignee.clone().unwrap_or_default()} placeholder="agent-id" data-testid="org-filter-assignee" /></label>
+                <label><span>{ "From (UTC)" }</span><input ref={from_ref} class="input" name="from" value={query_state.from.clone().unwrap_or_default()} placeholder="2026-08-05T01:00:00Z" data-testid="org-filter-from" /></label>
+                <label><span>{ "To (UTC)" }</span><input ref={to_ref} class="input" name="to" value={query_state.to.clone().unwrap_or_default()} placeholder="2026-08-06T01:00:00Z" data-testid="org-filter-to" /></label>
+                <button type="submit" class="btn btn-outline" data-testid="org-filters-apply">{ "Apply filters" }</button>
             </form>
 
             <div class="org-live-status" aria-live="polite" aria-atomic="true">
@@ -591,7 +601,7 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
                 <nav class="org-cursor-nav" aria-label="Operational pages">
                     <label class="org-page-size">
                         <span>{ "Rows" }</span>
-                        <select class="input" value={query_state.limit.to_string()} onchange={on_limit}>
+                        <select class="input" name="limit" value={query_state.limit.to_string()} onchange={on_limit}>
                             { for ALLOWED_LIMITS.iter().map(|limit| html! {
                                 <option value={limit.to_string()} selected={*limit == query_state.limit}>{ limit }</option>
                             }) }
@@ -630,7 +640,7 @@ fn workspace_header(
                     </span>
                 }
             </div>
-            <button type="button" class="btn btn-outline" onclick={on_refresh} disabled={!is_canonical}>{ "Refresh" }</button>
+            <button type="button" class="btn btn-outline" onclick={on_refresh} disabled={!is_canonical} data-testid="org-workspace-refresh">{ "Refresh" }</button>
         </div>
     }
 }
@@ -658,6 +668,7 @@ fn view_tabs(
                         {href}
                         class={classes!("org-view-tab", active.then_some("is-active"))}
                         aria-current={active.then_some("page")}
+                        data-testid={format!("org-view-{}", spec.view)}
                     >
                         <span>{ spec.label }</span>
                         <strong>{ count.map_or_else(|| "—".to_owned(), |count| count.to_string()) }</strong>
@@ -688,10 +699,10 @@ fn workspace_content(
 ) -> Html {
     match &state.load {
         WorkspaceLoad::Loading => {
-            html! { <p class="loading">{ "Loading workspace operations..." }</p> }
+            html! { <p class="loading" data-testid="org-workspace-loading">{ "Loading workspace operations..." }</p> }
         }
         WorkspaceLoad::Failed(error) => html! {
-            <div class="org-directory-message is-error" role="alert">
+            <div class="org-directory-message is-error" role="alert" data-testid="org-workspace-error">
                 <strong>{ "Workspace operations unavailable" }</strong>
                 <p>{ error.message.clone() }</p>
                 <code>{ error.code.clone() }</code>
@@ -702,24 +713,26 @@ fn workspace_content(
             if payload.page.items.is_empty() && query_state.cursor.is_some() =>
         {
             html! {
-                <div class="org-directory-message">
+                <div class="org-directory-message" data-testid="org-workspace-cursor-end">
                     <strong>{ "End of operational results" }</strong>
                     <p>{ "This cursor page contains no additional work items. Use Previous page to return." }</p>
                 </div>
             }
         }
         WorkspaceLoad::Ready(payload) if payload.page.items.is_empty() => html! {
-            <div class="org-directory-message">
+            <div class="org-directory-message" data-testid="org-workspace-empty">
                 <strong>{ "No work items in this view" }</strong>
                 <p>{ "Try another operational view or adjust the URL-backed filters." }</p>
             </div>
         },
         WorkspaceLoad::Ready(payload) => html! {
-            <OrgTable
-                workspace_id={workspace_id.to_owned()}
-                rows={payload.page.items.clone()}
-                return_state={query_state.clone()}
-            />
+            <div class="org-workspace-ready" data-testid="org-workspace-ready">
+                <OrgTable
+                    workspace_id={workspace_id.to_owned()}
+                    rows={payload.page.items.clone()}
+                    return_state={query_state.clone()}
+                />
+            </div>
         },
     }
 }

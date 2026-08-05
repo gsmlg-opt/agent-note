@@ -159,7 +159,7 @@ pub fn org_workspaces_page() -> Html {
     let location = use_location();
     let raw_query = location
         .as_ref()
-        .map(|location| location.query_str().to_owned())
+        .map(|location| location.query_str().trim_start_matches('?').to_owned())
         .unwrap_or_default();
     let list_state = WorkspaceListState::parse(&raw_query);
     let canonical_query = list_state.canonical_query();
@@ -265,14 +265,24 @@ pub fn org_workspaces_page() -> Html {
     };
 
     html! {
-        <section class="stack org-directory" aria-labelledby="org-directory-title">
+        <section
+            class="stack org-directory"
+            aria-labelledby="org-directory-title"
+            data-testid="org-directory-page"
+        >
             <div class="page-head org-directory-head">
                 <div>
                     <p class="org-kicker">{ "Operations directory" }</p>
                     <h2 id="org-directory-title" class="page-title">{ "Org workspaces" }</h2>
                     <p class="page-hint">{ "Read-only delivery state, evaluated by the Org service." }</p>
                 </div>
-                <button type="button" class="btn btn-outline" onclick={on_refresh} disabled={!is_canonical}>
+                <button
+                    type="button"
+                    class="btn btn-outline"
+                    onclick={on_refresh}
+                    disabled={!is_canonical}
+                    data-testid="org-directory-refresh"
+                >
                     { "Refresh" }
                 </button>
             </div>
@@ -281,14 +291,22 @@ pub fn org_workspaces_page() -> Html {
                 <label class="org-checkbox">
                     <input
                         type="checkbox"
+                        name="include_archived"
                         checked={list_state.include_archived}
                         onchange={on_include_archived}
+                        data-testid="org-directory-include-archived"
                     />
                     <span>{ "Include archived" }</span>
                 </label>
                 <label class="org-page-size">
                     <span>{ "Rows" }</span>
-                    <select class="input" value={list_state.limit.to_string()} onchange={on_limit}>
+                    <select
+                        class="input"
+                        name="limit"
+                        value={list_state.limit.to_string()}
+                        onchange={on_limit}
+                        data-testid="org-directory-limit"
+                    >
                         { for ALLOWED_LIMITS.iter().map(|limit| html! {
                             <option value={limit.to_string()} selected={*limit == list_state.limit}>{ limit }</option>
                         }) }
@@ -329,9 +347,11 @@ pub fn org_workspaces_page() -> Html {
 
 fn directory_content(state: &DirectoryState) -> Html {
     match &state.load {
-        DirectoryLoad::Loading => html! { <p class="loading">{ "Loading workspaces..." }</p> },
+        DirectoryLoad::Loading => html! {
+            <p class="loading" data-testid="org-directory-loading">{ "Loading workspaces..." }</p>
+        },
         DirectoryLoad::Failed(error) => html! {
-            <div class="org-directory-message is-error" role="alert">
+            <div class="org-directory-message is-error" role="alert" data-testid="org-directory-error">
                 <strong>{ "Workspace directory unavailable" }</strong>
                 <p>{ error.message.clone() }</p>
                 <code>{ error.code.clone() }</code>
@@ -341,7 +361,7 @@ fn directory_content(state: &DirectoryState) -> Html {
             </div>
         },
         DirectoryLoad::Ready(page) if page.items.is_empty() => html! {
-            <div class="org-directory-message">
+            <div class="org-directory-message" data-testid="org-directory-empty">
                 <strong>{ "No Org workspaces" }</strong>
                 <p>{ "No workspaces match the current archive selection." }</p>
             </div>
@@ -352,8 +372,13 @@ fn directory_content(state: &DirectoryState) -> Html {
 
 fn workspace_table(workspaces: &[WorkspaceSummary]) -> Html {
     html! {
-        <div class="org-ledger-scroll" tabindex="0">
-            <table class="org-ledger org-workspace-ledger">
+        <div
+            class="org-ledger-scroll"
+            tabindex="0"
+            aria-label="Org workspace operational counts; scroll horizontally for all ten views"
+            data-testid="org-directory-ready"
+        >
+            <table class="org-ledger org-workspace-ledger" data-testid="org-directory-table">
                 <caption>{ "Org workspace operational counts" }</caption>
                 <thead>
                     <tr>

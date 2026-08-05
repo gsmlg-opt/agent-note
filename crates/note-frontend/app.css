@@ -1524,6 +1524,7 @@ a.dashboard-metric-detail:hover {
 /* --- Org operations directory --- */
 .org-directory {
     gap: 1rem;
+    min-width: 0;
 }
 
 .org-directory-head {
@@ -1582,8 +1583,19 @@ a.dashboard-metric-detail:hover {
     width: 100%;
     max-width: 100%;
     overflow-x: auto;
+    overscroll-behavior-inline: contain;
     border: 1px solid var(--color-outline-variant, #c7c5d0);
     background: var(--color-surface, #faf8ff);
+    background-image:
+        linear-gradient(90deg, var(--color-surface, #faf8ff) 30%, transparent),
+        linear-gradient(270deg, var(--color-surface, #faf8ff) 30%, transparent),
+        linear-gradient(90deg, color-mix(in srgb, var(--color-on-surface, #1b1b1f) 16%, transparent), transparent 70%),
+        linear-gradient(270deg, color-mix(in srgb, var(--color-on-surface, #1b1b1f) 16%, transparent), transparent 70%);
+    background-attachment: local, local, scroll, scroll;
+    background-position: left center, right center, left center, right center;
+    background-repeat: no-repeat;
+    background-size: 2.5rem 100%, 2.5rem 100%, 0.65rem 100%, 0.65rem 100%;
+    scrollbar-color: var(--color-outline, #777680) var(--color-surface-container-low, #f3f0f9);
     scrollbar-gutter: stable;
 }
 
@@ -1620,6 +1632,9 @@ a.dashboard-metric-detail:hover {
 }
 
 .org-ledger thead th {
+    position: sticky;
+    top: 0;
+    z-index: 3;
     background: var(--color-surface-container-low, #f3f0f9);
     color: var(--color-on-surface-variant, #46464f);
     font-size: 0.68rem;
@@ -1643,12 +1658,14 @@ a.dashboard-metric-detail:hover {
 }
 
 .org-ledger thead th:first-child {
-    z-index: 2;
+    z-index: 4;
     background: var(--color-surface-container-low, #f3f0f9);
 }
 
 .org-workspace-row:hover td,
-.org-workspace-row:hover th:first-child {
+.org-workspace-row:hover th:first-child,
+.org-workspace-row:focus-within td,
+.org-workspace-row:focus-within th:first-child {
     background: var(--color-surface-container-low, #f3f0f9);
 }
 
@@ -1684,15 +1701,21 @@ a.dashboard-metric-detail:hover {
 }
 
 .org-state {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.6rem;
     border-left: 3px solid var(--color-primary, #6750a4);
-    padding-left: 0.45rem;
+    padding: 0.15rem 0.5rem;
+    background: var(--color-primary-container, #eaddff);
+    color: var(--color-on-primary-container, #21005d);
     font-size: 0.76rem;
     font-weight: 800;
 }
 
 .org-state.is-archived {
     border-left-color: var(--color-outline, #777680);
+    background: var(--color-surface-container-high, #ece7f2);
+    color: var(--color-on-surface-variant, #46464f);
 }
 
 .org-ledger-number {
@@ -1735,6 +1758,7 @@ a.dashboard-metric-detail:hover {
 /* --- Org workspace operations ledger --- */
 .org-workspace {
     gap: 0.9rem;
+    min-width: 0;
 }
 
 .org-workspace-head {
@@ -1859,7 +1883,9 @@ a.dashboard-metric-detail:hover {
 }
 
 .org-operation-row:hover td,
-.org-operation-row:hover th:first-child {
+.org-operation-row:hover th:first-child,
+.org-operation-row:focus-within td,
+.org-operation-row:focus-within th:first-child {
     background: var(--color-surface-container-low, #f3f0f9);
 }
 
@@ -1938,12 +1964,19 @@ a.dashboard-metric-detail:hover {
     height: 1.55rem;
     place-items: center;
     border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-left: 3px solid var(--color-tertiary, #7d5260);
+    background: var(--color-tertiary-container, #ffd8e4);
+    color: var(--color-on-tertiary-container, #31111d);
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
     font-size: 0.73rem;
     font-weight: 850;
 }
 
 .org-recovery-marker {
+    display: inline-flex;
+    width: fit-content;
+    border-left: 3px solid var(--color-tertiary, #7d5260);
+    padding-left: 0.4rem;
     color: var(--color-tertiary, #7d5260);
     font-weight: 800;
 }
@@ -1951,6 +1984,7 @@ a.dashboard-metric-detail:hover {
 /* --- Org work-item context and audit ledger --- */
 .org-item {
     gap: 1rem;
+    min-width: 0;
 }
 
 .org-item-head {
@@ -2244,6 +2278,7 @@ a.dashboard-metric-detail:hover {
     background: var(--color-surface-container-lowest, #fff);
     color: var(--color-on-surface, #1b1b1f);
     font-size: 0.7rem;
+    font-variant-numeric: tabular-nums;
     line-height: 1.45;
     white-space: pre-wrap;
     word-break: break-word;
@@ -2312,6 +2347,43 @@ a.dashboard-metric-detail:hover {
         width: 100%;
         align-items: flex-start;
         flex-direction: column;
+    }
+
+    .org-ledger-scroll {
+        border-right: 3px solid var(--color-primary, #6750a4);
+        box-shadow: 0 0.35rem 0 var(--color-surface-container-low, #f3f0f9);
+    }
+
+    .org-ledger caption {
+        position: sticky;
+        left: 0;
+        max-width: calc(100vw - 3.5rem);
+        white-space: normal;
+    }
+
+    .org-workspace-ledger {
+        min-width: 88rem;
+    }
+
+    .org-operations-ledger {
+        min-width: 96rem;
+    }
+
+    .org-event-ledger {
+        min-width: 84rem;
+    }
+
+    .org-triage-filters .btn,
+    .org-triage-filters .input,
+    .org-directory-controls .input {
+        min-height: 2.75rem;
+    }
+
+    .org-context-grid dd,
+    .org-attempt code,
+    .org-monospace {
+        overflow-wrap: anywhere;
+        word-break: break-word;
     }
 }
 

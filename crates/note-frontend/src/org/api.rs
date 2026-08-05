@@ -331,4 +331,135 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn org_console_production_and_browser_gate_are_strictly_read_only() {
+        let production =
+            |source: &'static str| source.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let api = production(include_str!("api.rs"));
+        let model = production(include_str!("model.rs"));
+        let redaction = production(include_str!("../components/org_event_table.rs"));
+        let control_sources = [
+            production(include_str!("../pages/org_workspaces.rs")),
+            production(include_str!("../pages/org_workspace.rs")),
+            production(include_str!("../pages/org_item.rs")),
+            production(include_str!("../components/org_table.rs")),
+            production(include_str!("../routes.rs")),
+        ]
+        .join("\n");
+        let production_sources = [
+            api,
+            model,
+            production(include_str!("mod.rs")),
+            production(include_str!("url.rs")),
+            production(include_str!("time.rs")),
+            redaction,
+            control_sources.as_str(),
+        ]
+        .join("\n");
+
+        assert_eq!(production_sources.matches("Request::get").count(), 1);
+        assert_eq!(
+            control_sources.matches("trim_start_matches('?')").count(),
+            3
+        );
+        assert!(production_sources.contains("/api/org"));
+        for forbidden in [
+            "Request::post",
+            "Request::put",
+            "Request::patch",
+            "Request::delete",
+            "/mcp",
+            "fetch(",
+            "create_workspace",
+            "update_workspace",
+            "archive_workspace",
+            "put_document",
+            "import_workspace",
+            "create_item",
+            "claim_item",
+            "heartbeat_claim",
+            "release_claim",
+            "record_progress",
+            "record_result",
+            "transition_item",
+            "retry_item",
+            "request_review",
+            "approve_review",
+            "reject_review",
+            "add_dependency",
+            "move_item",
+            "set_interval",
+            "set_timeout",
+            "Interval::",
+            "Timeout::",
+            "gloo_timers",
+        ] {
+            assert!(
+                !production_sources.contains(forbidden),
+                "Org production frontend contains forbidden transport or timer surface: {forbidden}"
+            );
+        }
+        for forbidden in [
+            "type=\"password\"",
+            "Login",
+            "Sign in",
+            "Sign-in",
+            "Authorization",
+            "Credentials",
+            "local_storage",
+            "session_storage",
+            "LocalStorage",
+            "SessionStorage",
+            "identity-picker",
+            "actor-picker",
+            "actor-header",
+        ] {
+            assert!(
+                !control_sources.contains(forbidden),
+                "Org controls contain forbidden auth/session/identity surface: {forbidden}"
+            );
+        }
+        for forbidden in [
+            "fencing_token",
+            "fencingToken",
+            "lease_token",
+            "leaseToken",
+            "token_hash",
+            "tokenHash",
+            "auth_context",
+        ] {
+            assert!(
+                !api.contains(forbidden) && !model.contains(forbidden),
+                "Org transport/read model contains sensitive field: {forbidden}"
+            );
+        }
+        for required in [
+            "is_sensitive_metadata_key",
+            "is_sensitive_metadata_value",
+            "normalize_sensitive_name",
+            "safe_metadata",
+        ] {
+            assert!(
+                redaction.contains(required),
+                "redaction boundary missing {required}"
+            );
+        }
+
+        let browser_gate = include_str!("../../../../scripts/verify-org-console-browser.sh");
+        for required in [
+            "ORG_CONSOLE_BASE_URL",
+            "ORG_CONSOLE_WORKSPACE_ID",
+            "ORG_CONSOLE_ITEM_ID",
+            "directory-only",
+            "data-testid",
+            "list_network_requests",
+            "list_console_messages",
+        ] {
+            assert!(
+                browser_gate.contains(required),
+                "browser gate missing {required}"
+            );
+        }
+    }
 }

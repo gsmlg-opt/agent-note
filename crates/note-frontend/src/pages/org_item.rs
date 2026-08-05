@@ -195,7 +195,7 @@ pub fn org_item_page(props: &OrgItemPageProps) -> Html {
     let location = use_location();
     let raw_query = location
         .as_ref()
-        .map(|location| location.query_str().to_owned())
+        .map(|location| location.query_str().trim_start_matches('?').to_owned())
         .unwrap_or_default();
     let return_state = validated_return(&props.workspace_id, &raw_query);
     let canonical_query =
@@ -375,13 +375,18 @@ pub fn org_item_page(props: &OrgItemPageProps) -> Html {
     };
 
     html! {
-        <section class="stack org-item" aria-labelledby="org-item-title">
+        <section
+            class="stack org-item"
+            aria-labelledby="org-item-title"
+            data-testid="org-item-page"
+        >
             <div class="page-head org-item-head">
                 <div>
                     <a
                         href={return_href(&props.workspace_id, &raw_query)}
                         class="org-breadcrumb"
                         onclick={on_back}
+                        data-testid="org-item-back"
                     >{ format!("Back to {}", return_state.view) }</a>
                     <p class="org-kicker">{ "Work-item context ledger" }</p>
                     <h2 id="org-item-title" class="page-title">
@@ -389,7 +394,7 @@ pub fn org_item_page(props: &OrgItemPageProps) -> Html {
                     </h2>
                     <p class="page-hint org-monospace">{ props.item_id.clone() }</p>
                 </div>
-                <button type="button" class="btn btn-outline" onclick={on_refresh} disabled={!is_canonical}>{ "Refresh context and events" }</button>
+                <button type="button" class="btn btn-outline" onclick={on_refresh} disabled={!is_canonical} data-testid="org-item-refresh">{ "Refresh context and events" }</button>
             </div>
             <div class="org-live-status" aria-live="polite" aria-atomic="true">
                 { item_live_status(&context_state, &events_state) }
@@ -683,10 +688,14 @@ fn current_events_section(
         <section class="org-context-section" aria-labelledby="org-events-title">
             <div class="org-section-head"><div><p class="org-kicker">{ "Current workspace audit" }</p><h3 id="org-events-title">{ "Event history" }</h3></div><span>{ cursor.map_or("First page".to_owned(), |value| format!("Cursor · {value}")) }</span></div>
             { match &state.load {
-                EventsLoad::Loading => html! { <p class="loading">{ "Loading event history..." }</p> },
+                EventsLoad::Loading => html! { <p class="loading" data-testid="org-events-loading">{ "Loading event history..." }</p> },
                 EventsLoad::Failed(error) => structured_error("Event history unavailable", error),
-                EventsLoad::Ready(page) if page.items.is_empty() => html! { <p class="org-empty-inline">{ "No events on this page" }</p> },
-                EventsLoad::Ready(page) => html! { <OrgEventTable events={page.items.clone()} workspace_timezone={timezone.to_owned()} /> },
+                EventsLoad::Ready(page) if page.items.is_empty() => html! { <p class="org-empty-inline" data-testid="org-events-empty">{ "No events on this page" }</p> },
+                EventsLoad::Ready(page) => html! {
+                    <div class="org-events-ready" data-testid="org-events-ready">
+                        <OrgEventTable events={page.items.clone()} workspace_timezone={timezone.to_owned()} />
+                    </div>
+                },
             } }
             if let EventsLoad::Ready(page) = &state.load {
                 <nav class="org-cursor-nav" aria-label="Event history pages">
