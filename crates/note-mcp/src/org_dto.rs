@@ -1,17 +1,19 @@
 #![allow(
     dead_code,
-    reason = "Task 1 schema adapters are registered before Task 2 invokes their fields"
+    reason = "later delivery tasks register remaining Org schemas before invoking their fields"
 )]
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use note_pipelines::org::{
-    CommandEnvelope, OrgClaimResult, OrgDocumentView, OrgEventView, OrgItemContext, OrgItemView,
-    OrgLeaseView, OrgTimestampView, OrgWorkspaceView,
+    CommandEnvelope, CreateWorkspaceRequest, OrgClaimResult, OrgCommandResult,
+    OrgDocumentSourceView, OrgDocumentView, OrgError, OrgEventView, OrgItemContext, OrgItemView,
+    OrgLeaseView, OrgReadPage, OrgReadQuery, OrgTimestampView, OrgWorkspaceExport,
+    OrgWorkspaceView, WorkspaceSummary,
 };
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 fn default_limit() -> u16 {
     50
@@ -29,11 +31,30 @@ pub(crate) struct ListInput {
     pub include_archived: bool,
 }
 
+impl From<ListInput> for OrgReadQuery {
+    fn from(value: ListInput) -> Self {
+        Self {
+            cursor: value.cursor,
+            limit: Some(usize::from(value.limit)),
+            include_archived: value.include_archived,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub(crate) struct WorkspaceReadInput {
     pub workspace_id: String,
+}
+
+impl WorkspaceReadInput {
+    pub(crate) fn into_workspace_id<T>(self) -> Result<T, OrgError>
+    where
+        T: std::str::FromStr,
+    {
+        parse_id(self.workspace_id, "workspace_id")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -49,12 +70,41 @@ pub(crate) struct WorkspaceListInput {
     pub include_archived: bool,
 }
 
+impl WorkspaceListInput {
+    pub(crate) fn into_pipeline<T>(self) -> Result<(T, OrgReadQuery), OrgError>
+    where
+        T: std::str::FromStr,
+    {
+        Ok((
+            parse_id(self.workspace_id, "workspace_id")?,
+            OrgReadQuery {
+                cursor: self.cursor,
+                limit: Some(usize::from(self.limit)),
+                include_archived: self.include_archived,
+            },
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub(crate) struct DocumentReadInput {
     pub workspace_id: String,
     pub document_id: String,
+}
+
+impl DocumentReadInput {
+    pub(crate) fn into_pipeline<W, D>(self) -> Result<(W, D), OrgError>
+    where
+        W: std::str::FromStr,
+        D: std::str::FromStr,
+    {
+        Ok((
+            parse_id(self.workspace_id, "workspace_id")?,
+            parse_id(self.document_id, "document_id")?,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -122,33 +172,6 @@ pub(crate) struct EventListInput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
-pub(crate) struct MutationEnvelope {
-    pub schema_version: u32,
-    pub workspace_id: String,
-    pub actor_id: String,
-    pub operation_id: String,
-}
-
-impl TryFrom<MutationEnvelope> for CommandEnvelope {
-    type Error = note_pipelines::org::OrgError;
-
-    fn try_from(value: MutationEnvelope) -> Result<Self, Self::Error> {
-        let workspace_id = value
-            .workspace_id
-            .parse()
-            .map_err(|_| note_pipelines::org::OrgError::invalid_input("invalid workspace_id"))?;
-        Ok(Self {
-            schema_version: value.schema_version,
-            workspace_id,
-            actor_id: value.actor_id,
-            operation_id: value.operation_id,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
 pub(crate) struct WorkspaceCreateInput {
     pub schema_version: u32,
     pub workspace_id: String,
@@ -160,6 +183,30 @@ pub(crate) struct WorkspaceCreateInput {
     pub timezone: String,
     pub policy_schema_version: i64,
     pub policy: WorkspacePolicyInput,
+}
+
+impl WorkspaceCreateInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, CreateWorkspaceRequest), OrgError> {
+        let policy = adapt_input(self.policy, "workspace policy")?;
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            CreateWorkspaceRequest {
+                slug: self.slug,
+                display_name: self.display_name,
+                description: self.description,
+                timezone: self.timezone,
+                policy_schema_version: self.policy_schema_version,
+                policy,
+            },
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -214,6 +261,31 @@ pub(crate) struct WorkspaceUpdateInput {
     pub policy: WorkspacePolicyInput,
 }
 
+impl WorkspaceUpdateInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::UpdateWorkspaceRequest), OrgError> {
+        let policy = adapt_input(self.policy, "workspace policy")?;
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::UpdateWorkspaceRequest {
+                expected_revision: self.expected_revision,
+                slug: self.slug,
+                display_name: self.display_name,
+                description: self.description,
+                timezone: self.timezone,
+                policy_schema_version: self.policy_schema_version,
+                policy,
+            },
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -223,6 +295,30 @@ pub(crate) struct WorkspaceArchiveInput {
     pub actor_id: String,
     pub operation_id: String,
     pub expected_revision: i64,
+}
+
+impl WorkspaceArchiveInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<
+        (
+            CommandEnvelope,
+            note_pipelines::org::ArchiveWorkspaceRequest,
+        ),
+        OrgError,
+    > {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::ArchiveWorkspaceRequest {
+                expected_revision: self.expected_revision,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -238,6 +334,29 @@ pub(crate) struct PutDocumentInput {
     pub source: String,
     pub expected_revision: Option<i64>,
     pub lease_proofs: BTreeMap<String, LeaseProofInput>,
+}
+
+impl PutDocumentInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::PutDocumentRequest), OrgError> {
+        let lease_proofs = adapt_id_map(self.lease_proofs, "work_item_id", "lease proof")?;
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::PutDocumentRequest {
+                document_id: parse_id(self.document_id, "document_id")?,
+                path: self.path,
+                source: self.source,
+                expected_revision: self.expected_revision,
+                lease_proofs,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -256,6 +375,30 @@ pub(crate) struct MoveDocumentInput {
     pub lease_proofs: BTreeMap<String, LeaseProofInput>,
 }
 
+impl MoveDocumentInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::MoveDocumentRequest), OrgError> {
+        let lease_proofs = adapt_id_map(self.lease_proofs, "work_item_id", "lease proof")?;
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::MoveDocumentRequest {
+                document_id: parse_id(self.document_id, "document_id")?,
+                target_workspace_id: parse_id(self.target_workspace_id, "target_workspace_id")?,
+                expected_document_revision: self.expected_document_revision,
+                expected_source_workspace_revision: self.expected_source_workspace_revision,
+                expected_target_workspace_revision: self.expected_target_workspace_revision,
+                lease_proofs,
+            },
+        ))
+    }
+}
+
 #[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -267,6 +410,40 @@ pub(crate) struct ImportWorkspaceInput {
     pub documents: Vec<DocumentImportInput>,
     pub expected_revisions: BTreeMap<String, i64>,
     pub lease_proofs: BTreeMap<String, LeaseProofInput>,
+}
+
+impl ImportWorkspaceInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::ImportDocumentsRequest), OrgError> {
+        let documents = self
+            .documents
+            .into_iter()
+            .map(|document| {
+                Ok(note_pipelines::org::DocumentImport {
+                    document_id: parse_id(document.document_id, "document_id")?,
+                    path: document.path,
+                    source: document.source,
+                })
+            })
+            .collect::<Result<Vec<_>, OrgError>>()?;
+        let expected_revisions =
+            adapt_id_map(self.expected_revisions, "document_id", "document revision")?;
+        let lease_proofs = adapt_id_map(self.lease_proofs, "work_item_id", "lease proof")?;
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::ImportDocumentsRequest {
+                documents,
+                expected_revisions,
+                lease_proofs,
+            },
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -350,6 +527,35 @@ pub(crate) struct MoveItemInput {
     pub target_parent_id: Option<String>,
     pub expected_revisions: BTreeMap<String, i64>,
     pub lease_proofs: BTreeMap<String, LeaseProofInput>,
+}
+
+impl MoveItemInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::MoveItemRequest), OrgError> {
+        let expected_revisions =
+            adapt_id_map(self.expected_revisions, "document_id", "document revision")?;
+        let lease_proofs = adapt_id_map(self.lease_proofs, "work_item_id", "lease proof")?;
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::MoveItemRequest {
+                item_id: parse_id(self.item_id, "item_id")?,
+                source_document_id: parse_id(self.source_document_id, "source_document_id")?,
+                target_document_id: parse_id(self.target_document_id, "target_document_id")?,
+                target_parent_id: self
+                    .target_parent_id
+                    .map(|id| parse_id(id, "target_parent_id"))
+                    .transpose()?,
+                expected_revisions,
+                lease_proofs,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -620,7 +826,7 @@ pub(crate) struct NoteUnlinkInput {
     pub lease: Option<LeaseProofInput>,
 }
 
-#[derive(Clone, Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub(crate) struct LeaseProofInput {
@@ -943,23 +1149,88 @@ pub(crate) struct CommandOutput<T> {
     pub data: T,
 }
 
-#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
-pub(crate) struct WorkspaceCommandData {
+pub(crate) struct WorkspaceRevisionData {
     pub workspace_id: String,
     pub revision: i64,
-    pub archived_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
-pub(crate) struct DocumentCommandData {
-    pub document_count: Option<usize>,
-    pub document_id: Option<String>,
-    pub source_workspace_id: Option<String>,
-    pub target_workspace_id: Option<String>,
-    pub source_workspace_revision: Option<i64>,
-    pub target_workspace_revision: Option<i64>,
+pub(crate) struct WorkspaceArchiveData {
+    pub workspace_id: String,
+    pub archived_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct DocumentCountData {
+    pub document_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct MoveDocumentData {
+    pub document_id: String,
+    pub source_workspace_id: String,
+    pub target_workspace_id: String,
+    pub source_workspace_revision: i64,
+    pub target_workspace_revision: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct MoveItemData {
+    pub affected_document_count: usize,
+    pub resulting_items: Vec<ResultingItemData>,
+    pub operation: MoveItemOperationData,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct ResultingItemData {
+    pub id: String,
+    pub workspace_id: String,
+    pub document_id: String,
+    pub parent_id: Option<String>,
+    pub item_type: String,
+    pub title: String,
+    pub state: Option<String>,
+    pub priority: Option<char>,
+    pub scheduled: Option<String>,
+    pub deadline: Option<String>,
+    pub assignee: Option<String>,
+    pub requires_review: bool,
+    pub created_at: i64,
+    pub tags: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub note_links: Vec<ResultingNoteLinkData>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct ResultingNoteLinkData {
+    pub purpose: String,
+    pub note_id: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct MoveItemOperationData {
+    pub source_document_id: String,
+    pub target_document_id: String,
+    pub previous_parent_id: Option<String>,
+    pub resulting_parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
@@ -992,9 +1263,11 @@ pub(crate) struct ClaimOutput {
     pub context: ItemContextOutput,
 }
 
-impl From<OrgClaimResult> for ClaimOutput {
-    fn from(value: OrgClaimResult) -> Self {
-        Self {
+impl TryFrom<OrgClaimResult> for ClaimOutput {
+    type Error = OrgError;
+
+    fn try_from(value: OrgClaimResult) -> Result<Self, Self::Error> {
+        Ok(Self {
             schema_version: value.schema_version,
             workspace_id: value.workspace_id.to_string(),
             operation_id: value.operation_id,
@@ -1002,26 +1275,64 @@ impl From<OrgClaimResult> for ClaimOutput {
             fencing_token: value.fencing_token,
             expires_at: value.expires_at,
             event_ids: value.event_ids,
-            context: ItemContextOutput::from(value.context),
-        }
+            context: value.context.try_into()?,
+        })
     }
 }
 
-impl From<OrgWorkspaceView> for WorkspaceOutput {
-    fn from(value: OrgWorkspaceView) -> Self {
-        Self {
+impl TryFrom<OrgWorkspaceView> for WorkspaceOutput {
+    type Error = OrgError;
+
+    fn try_from(value: OrgWorkspaceView) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: value.id.to_string(),
             slug: value.slug,
             display_name: value.display_name,
             description: value.description,
             timezone: value.timezone,
             policy_schema_version: value.policy_schema_version,
-            policy: serde_json::from_value(
-                serde_json::to_value(value.policy).expect("workspace policy serializes"),
-            )
-            .expect("workspace policy wire adapter matches"),
+            policy: adapt_output(value.policy, "workspace policy")?,
             revision: value.revision,
             archived_at: value.archived_at,
+        })
+    }
+}
+
+impl From<WorkspaceSummary> for WorkspaceSummaryOutput {
+    fn from(value: WorkspaceSummary) -> Self {
+        Self {
+            workspace_id: value.workspace_id.to_string(),
+            slug: value.slug,
+            display_name: value.display_name,
+            description: value.description,
+            timezone: value.timezone,
+            archived_at: value.archived_at,
+            workspace_revision: value.workspace_revision,
+            evaluated_at: value.evaluated_at,
+            counts: CountsOutput {
+                ready: value.counts.ready,
+                assigned: value.counts.assigned,
+                running: value.counts.running,
+                blocked: value.counts.blocked,
+                review: value.counts.review,
+                scheduled: value.counts.scheduled,
+                upcoming_deadline: value.counts.upcoming_deadline,
+                failed: value.counts.failed,
+                expired_lease: value.counts.expired_lease,
+                completed: value.counts.completed,
+            },
+        }
+    }
+}
+
+impl<T, U> From<OrgReadPage<T>> for PageOutput<U>
+where
+    U: From<T>,
+{
+    fn from(value: OrgReadPage<T>) -> Self {
+        Self {
+            items: value.items.into_iter().map(Into::into).collect(),
+            next_cursor: value.next_cursor,
         }
     }
 }
@@ -1036,6 +1347,53 @@ impl From<OrgDocumentView> for DocumentOutput {
     }
 }
 
+impl From<OrgDocumentSourceView> for DocumentSourceOutput {
+    fn from(value: OrgDocumentSourceView) -> Self {
+        Self {
+            id: value.id.to_string(),
+            workspace_id: value.workspace_id.to_string(),
+            path: value.path,
+            source: value.source,
+            content_hash: value.content_hash,
+            revision: value.revision,
+        }
+    }
+}
+
+impl TryFrom<OrgWorkspaceExport> for WorkspaceExportOutput {
+    type Error = OrgError;
+
+    fn try_from(value: OrgWorkspaceExport) -> Result<Self, Self::Error> {
+        Ok(Self {
+            workspace: value.workspace.try_into()?,
+            documents: value.documents.into_iter().map(Into::into).collect(),
+        })
+    }
+}
+
+pub(crate) fn command_output<T>(value: OrgCommandResult) -> Result<CommandOutput<T>, OrgError>
+where
+    T: DeserializeOwned,
+{
+    let data = serde_json::from_value(value.data).map_err(|_| {
+        OrgError::new(
+            note_pipelines::org::OrgErrorCode::StorageFailure,
+            "Org pipeline returned an incompatible command result",
+            serde_json::json!({}),
+            false,
+        )
+    })?;
+    Ok(CommandOutput {
+        schema_version: value.schema_version,
+        workspace_id: value.workspace_id.to_string(),
+        operation_id: value.operation_id,
+        event_ids: value.event_ids,
+        workspace_revision: value.workspace_revision,
+        document_revisions: value.document_revisions,
+        data,
+    })
+}
+
 impl From<OrgTimestampView> for TimestampOutput {
     fn from(value: OrgTimestampView) -> Self {
         Self {
@@ -1047,14 +1405,16 @@ impl From<OrgTimestampView> for TimestampOutput {
     }
 }
 
-impl From<OrgItemView> for ItemOutput {
-    fn from(value: OrgItemView) -> Self {
-        Self {
+impl TryFrom<OrgItemView> for ItemOutput {
+    type Error = OrgError;
+
+    fn try_from(value: OrgItemView) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: value.id.to_string(),
             workspace_id: value.workspace_id.to_string(),
             document_id: value.document_id.to_string(),
             parent_id: value.parent_id.map(|id| id.to_string()),
-            item_type: wire_name(value.item_type),
+            item_type: wire_name(value.item_type)?,
             title: value.title,
             state: value.state,
             priority: value.priority,
@@ -1064,7 +1424,7 @@ impl From<OrgItemView> for ItemOutput {
             requires_review: value.requires_review,
             created_at: value.created_at,
             tags: value.tags,
-        }
+        })
     }
 }
 
@@ -1105,16 +1465,18 @@ impl From<OrgEventView> for EventOutput {
     }
 }
 
-impl From<OrgItemContext> for ItemContextOutput {
-    fn from(value: OrgItemContext) -> Self {
+impl TryFrom<OrgItemContext> for ItemContextOutput {
+    type Error = OrgError;
+
+    fn try_from(value: OrgItemContext) -> Result<Self, Self::Error> {
         let operational = OperationalContextOutput {
             classifications: value
                 .operational
                 .classifications
                 .into_iter()
                 .map(wire_name)
-                .collect(),
-            readiness: value.operational.readiness.map(wire_name),
+                .collect::<Result<Vec<_>, _>>()?,
+            readiness: value.operational.readiness.map(wire_name).transpose()?,
             blockers: value.operational.blockers,
             attempt_budget: AttemptBudgetOutput {
                 execution_attempt_count: value.operational.attempt_budget.execution_attempt_count,
@@ -1128,21 +1490,27 @@ impl From<OrgItemContext> for ItemContextOutput {
                 blockers: value.operational.recovery.blockers,
             },
         };
-        Self {
-            workspace: value.workspace.into(),
+        Ok(Self {
+            workspace: value.workspace.try_into()?,
             workspace_revision: value.workspace_revision,
             document: value.document.into(),
-            item: value.item.into(),
-            parent: value.parent.map(Into::into),
-            children: value.children.into_iter().map(Into::into).collect(),
+            item: value.item.try_into()?,
+            parent: value.parent.map(TryInto::try_into).transpose()?,
+            children: value
+                .children
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()?,
             dependencies: value
                 .dependencies
                 .into_iter()
-                .map(|dependency| DependencyOutput {
-                    item: dependency.item.into(),
-                    satisfied: dependency.satisfied,
+                .map(|dependency| {
+                    Ok(DependencyOutput {
+                        item: dependency.item.try_into()?,
+                        satisfied: dependency.satisfied,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, OrgError>>()?,
             note_links: value
                 .note_links
                 .into_iter()
@@ -1190,20 +1558,25 @@ impl From<OrgItemContext> for ItemContextOutput {
                     metadata: attempt.metadata.into(),
                 })
                 .collect(),
-            origin: value.origin.map(|origin| match origin {
-                note_pipelines::org::OrgOriginView::WorkItem { work_item_id, item } => {
-                    OriginOutput::WorkItem {
-                        work_item_id: work_item_id.to_string(),
-                        item: item.map(|item| Box::new((*item).into())),
+            origin: value
+                .origin
+                .map(|origin| match origin {
+                    note_pipelines::org::OrgOriginView::WorkItem { work_item_id, item } => {
+                        Ok(OriginOutput::WorkItem {
+                            work_item_id: work_item_id.to_string(),
+                            item: item
+                                .map(|item| (*item).try_into().map(Box::new))
+                                .transpose()?,
+                        })
                     }
-                }
-                note_pipelines::org::OrgOriginView::Event { event_id, event } => {
-                    OriginOutput::Event {
-                        event_id,
-                        event: event.map(|event| Box::new((*event).into())),
+                    note_pipelines::org::OrgOriginView::Event { event_id, event } => {
+                        Ok(OriginOutput::Event {
+                            event_id,
+                            event: event.map(|event| Box::new((*event).into())),
+                        })
                     }
-                }
-            }),
+                })
+                .transpose()?,
             history_segments: value
                 .history_segments
                 .into_iter()
@@ -1214,7 +1587,7 @@ impl From<OrgItemContext> for ItemContextOutput {
                 .collect(),
             lease: value.lease.map(Into::into),
             operational,
-        }
+        })
     }
 }
 
@@ -1264,12 +1637,90 @@ fn is_sensitive_metadata_key(key: &str) -> bool {
     .any(|forbidden| key.contains(forbidden))
 }
 
-fn wire_name<T: Serialize>(value: T) -> String {
+fn mutation_envelope(
+    schema_version: u32,
+    workspace_id: String,
+    actor_id: String,
+    operation_id: String,
+) -> Result<CommandEnvelope, OrgError> {
+    Ok(CommandEnvelope {
+        schema_version,
+        workspace_id: parse_id(workspace_id, "workspace_id")?,
+        actor_id,
+        operation_id,
+    })
+}
+
+fn parse_id<T>(value: String, field: &str) -> Result<T, OrgError>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse()
+        .map_err(|_| OrgError::invalid_input(format!("invalid {field}")))
+}
+
+fn adapt_input<T, S>(value: S, label: &str) -> Result<T, OrgError>
+where
+    T: DeserializeOwned,
+    S: Serialize,
+{
     serde_json::to_value(value)
-        .expect("wire enum serializes")
+        .map_err(|_| OrgError::invalid_input(format!("invalid {label}")))
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|_| OrgError::invalid_input(format!("invalid {label}")))
+        })
+}
+
+fn adapt_output<T, S>(value: S, label: &str) -> Result<T, OrgError>
+where
+    T: DeserializeOwned,
+    S: Serialize,
+{
+    serde_json::to_value(value)
+        .map_err(|_| adapter_error(label))
+        .and_then(|value| serde_json::from_value(value).map_err(|_| adapter_error(label)))
+}
+
+fn adapter_error(label: &str) -> OrgError {
+    OrgError::new(
+        note_pipelines::org::OrgErrorCode::StorageFailure,
+        format!("Org pipeline returned an incompatible {label}"),
+        serde_json::json!({}),
+        false,
+    )
+}
+
+fn adapt_id_map<K, V, S>(
+    values: BTreeMap<String, S>,
+    key_label: &str,
+    value_label: &str,
+) -> Result<BTreeMap<K, V>, OrgError>
+where
+    K: std::str::FromStr + Ord,
+    V: DeserializeOwned,
+    S: Serialize,
+{
+    let mut adapted = BTreeMap::new();
+    for (key, value) in values {
+        let key = parse_id(key, key_label)?;
+        if adapted.contains_key(&key) {
+            return Err(OrgError::invalid_input(format!(
+                "duplicate canonical {key_label}"
+            )));
+        }
+        adapted.insert(key, adapt_input(value, value_label)?);
+    }
+    Ok(adapted)
+}
+
+fn wire_name<T: Serialize>(value: T) -> Result<String, OrgError> {
+    serde_json::to_value(value)
+        .map_err(|_| adapter_error("wire enum"))?
         .as_str()
-        .expect("wire enum is a string")
-        .to_owned()
+        .map(str::to_owned)
+        .ok_or_else(|| adapter_error("wire enum"))
 }
 
 #[cfg(test)]
@@ -1348,5 +1799,76 @@ mod tests {
                     properties.contains_key("type") || properties.contains_key("value")
                 })
         }));
+    }
+
+    #[test]
+    fn move_item_operation_schema_is_required_and_non_nullable() {
+        fn resolve<'a>(
+            root: &'a serde_json::Value,
+            node: &'a serde_json::Value,
+        ) -> &'a serde_json::Value {
+            node.get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|reference| root.pointer(reference.strip_prefix('#').unwrap()))
+                .unwrap_or(node)
+        }
+
+        let schema =
+            serde_json::to_value(schemars::schema_for!(CommandOutput<MoveItemData>)).unwrap();
+        let data = resolve(&schema, &schema["properties"]["data"]);
+        assert!(data["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "operation"));
+        let operation = resolve(&schema, &data["properties"]["operation"]);
+        assert_eq!(operation["type"], "object");
+        assert!(operation.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn command_output_rejects_extra_fields_and_nullable_move_operation() {
+        let result = |data| OrgCommandResult {
+            schema_version: 1,
+            workspace_id: "10000000-0000-4000-8000-000000000001".parse().unwrap(),
+            operation_id: "move-item".into(),
+            event_ids: vec![],
+            workspace_revision: Some(1),
+            document_revisions: BTreeMap::new(),
+            data,
+        };
+        let valid_operation = json!({
+            "source_document_id": "source",
+            "target_document_id": "target",
+            "previous_parent_id": null,
+            "resulting_parent_id": null
+        });
+        for invalid in [
+            json!({
+                "affected_document_count": 2,
+                "resulting_items": [],
+                "operation": valid_operation,
+                "unexpected": true
+            }),
+            json!({
+                "affected_document_count": 2,
+                "resulting_items": [],
+                "operation": null
+            }),
+        ] {
+            let error = command_output::<MoveItemData>(result(invalid))
+                .err()
+                .expect("invalid pipeline data must be rejected");
+            assert_eq!(
+                error.code,
+                note_pipelines::org::OrgErrorCode::StorageFailure
+            );
+            assert_eq!(
+                error.message,
+                "Org pipeline returned an incompatible command result"
+            );
+            assert_eq!(error.details, json!({}));
+            assert!(!error.retryable);
+        }
     }
 }

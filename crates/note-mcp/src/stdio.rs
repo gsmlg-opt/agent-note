@@ -588,8 +588,8 @@ impl NoteMcpServer {
         self.tool_router.list_all().to_vec()
     }
 
-    pub(crate) fn org_context(&self) -> &OrgContext {
-        self.org_ctx.as_ref()
+    pub(crate) fn org_context(&self) -> &Arc<OrgContext> {
+        &self.org_ctx
     }
 }
 
@@ -1066,6 +1066,7 @@ mod tests {
 
         assert!(Arc::ptr_eq(&server.ctx, &note_ctx));
         assert!(Arc::ptr_eq(&server.org_ctx, &org_ctx));
+        assert!(Arc::ptr_eq(server.org_context(), &org_ctx));
     }
 
     #[test]

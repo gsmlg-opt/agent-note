@@ -1,27 +1,28 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, future::Future, sync::Arc};
 
 use rmcp::{
     handler::server::{
         router::tool::{ToolRoute, ToolRouter},
         tool::ToolCallContext,
     },
-    model::{ErrorData, JsonObject, Tool},
+    model::{CallToolResult, ErrorData, JsonObject, Tool},
 };
 use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     org_dto::{
         ApproveInput, AssignItemInput, ClaimInput, ClaimOutput, CommandOutput, CreateFollowUpInput,
-        CreateItemInput, DependencyInput, DocumentCommandData, DocumentOutput, DocumentReadInput,
+        CreateItemInput, DependencyInput, DocumentCountData, DocumentOutput, DocumentReadInput,
         DocumentSourceOutput, EventListInput, EventOutput, HeartbeatClaimInput,
         ImportWorkspaceInput, ItemCommandData, ItemContextOutput, ItemOutput, ItemReadInput,
-        LeaseCommandData, ListInput, MoveDocumentInput, MoveItemInput, NoteItemsInput,
-        NoteLinkInput, NoteUnlinkInput, OperationalPageOutput, OperationalQueryInput, PageOutput,
-        ProgressInput, PutDocumentInput, RejectInput, ReleaseClaimInput, RequestReviewInput,
-        RetryInput, ScheduleItemInput, SubmitResultInput, TransitionInput, WorkspaceArchiveInput,
-        WorkspaceCommandData, WorkspaceCreateInput, WorkspaceExportOutput, WorkspaceListInput,
-        WorkspaceOutput, WorkspaceReadInput, WorkspaceSummaryOutput, WorkspaceUpdateInput,
+        LeaseCommandData, ListInput, MoveDocumentData, MoveDocumentInput, MoveItemData,
+        MoveItemInput, NoteItemsInput, NoteLinkInput, NoteUnlinkInput, OperationalPageOutput,
+        OperationalQueryInput, PageOutput, ProgressInput, PutDocumentInput, RejectInput,
+        ReleaseClaimInput, RequestReviewInput, RetryInput, ScheduleItemInput, SubmitResultInput,
+        TransitionInput, WorkspaceArchiveData, WorkspaceArchiveInput, WorkspaceCreateInput,
+        WorkspaceExportOutput, WorkspaceListInput, WorkspaceOutput, WorkspaceReadInput,
+        WorkspaceRevisionData, WorkspaceSummaryOutput, WorkspaceUpdateInput,
     },
     NoteMcpServer,
 };
@@ -79,9 +80,12 @@ pub const NOTE_TOOL_NAMES: [&str; 11] = [
     "update_note",
 ];
 
-type WorkspaceMutationOutput = CommandOutput<WorkspaceCommandData>;
-type DocumentMutationOutput = CommandOutput<DocumentCommandData>;
+type WorkspaceRevisionOutput = CommandOutput<WorkspaceRevisionData>;
+type WorkspaceArchiveOutput = CommandOutput<WorkspaceArchiveData>;
+type DocumentCountOutput = CommandOutput<DocumentCountData>;
+type MoveDocumentOutput = CommandOutput<MoveDocumentData>;
 type ItemMutationOutput = CommandOutput<ItemCommandData>;
+type MoveItemOutput = CommandOutput<MoveItemData>;
 type LeaseMutationOutput = CommandOutput<LeaseCommandData>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,61 +154,77 @@ fn checked_merge(
 pub(crate) fn org_tool_router() -> ToolRouter<NoteMcpServer> {
     let mut router = ToolRouter::new();
 
-    add::<ListInput, PageOutput<WorkspaceSummaryOutput>>(
+    add_handler::<ListInput, PageOutput<WorkspaceSummaryOutput>, _, _>(
         &mut router,
         ORG_TOOL_NAMES[0],
         "List Org workspaces",
+        list_workspaces_handler,
     );
-    add::<WorkspaceCreateInput, WorkspaceMutationOutput>(
+    add_handler::<WorkspaceCreateInput, WorkspaceRevisionOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[1],
         "Create an Org workspace",
+        create_workspace_handler,
     );
-    add::<WorkspaceReadInput, WorkspaceOutput>(
+    add_handler::<WorkspaceReadInput, WorkspaceOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[2],
         "Get an Org workspace",
+        get_workspace_handler,
     );
-    add::<WorkspaceUpdateInput, WorkspaceMutationOutput>(
+    add_handler::<WorkspaceUpdateInput, WorkspaceRevisionOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[3],
         "Update an Org workspace",
+        update_workspace_handler,
     );
-    add::<WorkspaceArchiveInput, WorkspaceMutationOutput>(
+    add_handler::<WorkspaceArchiveInput, WorkspaceArchiveOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[4],
         "Archive an Org workspace",
+        archive_workspace_handler,
     );
-    add::<WorkspaceListInput, PageOutput<DocumentOutput>>(
+    add_handler::<WorkspaceListInput, PageOutput<DocumentOutput>, _, _>(
         &mut router,
         ORG_TOOL_NAMES[5],
         "List Org documents",
+        list_documents_handler,
     );
-    add::<DocumentReadInput, DocumentSourceOutput>(
+    add_handler::<DocumentReadInput, DocumentSourceOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[6],
         "Get an Org document",
+        get_document_handler,
     );
-    add::<PutDocumentInput, DocumentMutationOutput>(
+    add_handler::<PutDocumentInput, DocumentCountOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[7],
         "Put an Org document",
+        put_document_handler,
     );
-    add::<MoveDocumentInput, DocumentMutationOutput>(
+    add_handler::<MoveDocumentInput, MoveDocumentOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[8],
         "Move an Org document",
+        move_document_handler,
     );
-    add::<MoveItemInput, ItemMutationOutput>(&mut router, ORG_TOOL_NAMES[9], "Move an Org item");
-    add::<ImportWorkspaceInput, DocumentMutationOutput>(
+    add_handler::<MoveItemInput, MoveItemOutput, _, _>(
+        &mut router,
+        ORG_TOOL_NAMES[9],
+        "Move an Org item",
+        move_item_handler,
+    );
+    add_handler::<ImportWorkspaceInput, DocumentCountOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[10],
         "Import an Org workspace",
+        import_workspace_handler,
     );
-    add::<WorkspaceReadInput, WorkspaceExportOutput>(
+    add_handler::<WorkspaceReadInput, WorkspaceExportOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[11],
         "Export an Org workspace",
+        export_workspace_handler,
     );
     add::<CreateItemInput, ItemMutationOutput>(
         &mut router,
@@ -315,6 +335,153 @@ pub(crate) fn org_tool_router() -> ToolRouter<NoteMcpServer> {
         "List Org event history",
     );
     router
+}
+
+async fn list_workspaces_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: ListInput,
+) -> Result<PageOutput<WorkspaceSummaryOutput>, note_pipelines::org::OrgError> {
+    let query = input.into();
+    note_pipelines::org::list_workspaces(&context, &query)
+        .await
+        .map(Into::into)
+}
+
+async fn create_workspace_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: WorkspaceCreateInput,
+) -> Result<WorkspaceRevisionOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::create_workspace(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn get_workspace_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: WorkspaceReadInput,
+) -> Result<WorkspaceOutput, note_pipelines::org::OrgError> {
+    let workspace_id = input.into_workspace_id()?;
+    note_pipelines::org::get_workspace(&context, workspace_id)
+        .await?
+        .try_into()
+}
+
+async fn update_workspace_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: WorkspaceUpdateInput,
+) -> Result<WorkspaceRevisionOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::update_workspace(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn archive_workspace_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: WorkspaceArchiveInput,
+) -> Result<WorkspaceArchiveOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::archive_workspace(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn list_documents_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: WorkspaceListInput,
+) -> Result<PageOutput<DocumentOutput>, note_pipelines::org::OrgError> {
+    let (workspace_id, query) = input.into_pipeline()?;
+    note_pipelines::org::list_documents(&context, workspace_id, &query)
+        .await
+        .map(Into::into)
+}
+
+async fn get_document_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: DocumentReadInput,
+) -> Result<DocumentSourceOutput, note_pipelines::org::OrgError> {
+    let (workspace_id, document_id) = input.into_pipeline()?;
+    note_pipelines::org::get_document(&context, workspace_id, document_id)
+        .await
+        .map(Into::into)
+}
+
+async fn put_document_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: PutDocumentInput,
+) -> Result<DocumentCountOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::put_document(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn import_workspace_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: ImportWorkspaceInput,
+) -> Result<DocumentCountOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::import_documents(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn move_document_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: MoveDocumentInput,
+) -> Result<MoveDocumentOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::move_document(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn move_item_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: MoveItemInput,
+) -> Result<MoveItemOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::move_item(&context, &envelope, &request).await?;
+    crate::org_dto::command_output(result)
+}
+
+async fn export_workspace_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: WorkspaceReadInput,
+) -> Result<WorkspaceExportOutput, note_pipelines::org::OrgError> {
+    let workspace_id = input.into_workspace_id()?;
+    note_pipelines::org::export_workspace(&context, workspace_id)
+        .await?
+        .try_into()
+}
+
+fn add_handler<I, O, F, Fut>(
+    router: &mut ToolRouter<NoteMcpServer>,
+    name: &'static str,
+    description: &'static str,
+    handler: F,
+) where
+    I: JsonSchema + DeserializeOwned + 'static,
+    O: JsonSchema + Serialize + 'static,
+    F: Fn(Arc<note_pipelines::org::OrgContext>, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O, note_pipelines::org::OrgError>> + Send + 'static,
+{
+    let tool =
+        Tool::new(name, description, schema::<I>()).with_raw_output_schema(Arc::new(schema::<O>()));
+    router.add_route(ToolRoute::new_dyn(
+        tool,
+        move |context: ToolCallContext<'_, NoteMcpServer>| {
+            let org_context = context.service.org_context().clone();
+            let arguments = context.arguments.unwrap_or_default();
+            let input = match serde_json::from_value::<I>(serde_json::Value::Object(arguments)) {
+                Ok(input) => input,
+                Err(_) => return Box::pin(async move { Err(invalid_org_tool_input()) }),
+            };
+            let future = handler(org_context, input);
+            Box::pin(async move {
+                let output = future.await.map_err(crate::org_error::to_error_data)?;
+                let value = serde_json::to_value(output).map_err(|_| {
+                    ErrorData::internal_error("failed to serialize Org tool output", None)
+                })?;
+                Ok(CallToolResult::structured(value))
+            })
+        },
+    ));
 }
 
 fn add<I: JsonSchema + DeserializeOwned, O: JsonSchema>(
