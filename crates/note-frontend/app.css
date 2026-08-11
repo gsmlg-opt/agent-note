@@ -1764,6 +1764,40 @@ a.dashboard-metric-detail:hover {
     padding-bottom: 0.85rem;
 }
 
+.org-directory-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.org-workspace-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.org-workspace-archive-button,
+.btn-danger {
+    border-color: var(--color-error, #ba1a1a);
+    color: var(--color-error, #ba1a1a);
+}
+
+.btn-danger {
+    background: var(--color-error, #ba1a1a);
+    color: var(--color-on-error, #ffffff);
+}
+
+.org-workspace-archive-dialog label {
+    display: grid;
+    gap: 0.4rem;
+}
+
+.org-workspace-archive-dialog pre {
+    margin: 0;
+    overflow: auto;
+    white-space: pre-wrap;
+}
+
 .org-kicker {
     margin: 0 0 0.3rem;
     color: var(--color-on-surface-variant, #46464f);
@@ -2555,6 +2589,18 @@ a.dashboard-metric-detail:hover {
     .org-directory-head .btn,
     .org-workspace-head .btn,
     .org-cursor-nav .btn {
+        width: 100%;
+    }
+
+    .org-directory-head-actions {
+        align-items: stretch;
+        flex-direction: column;
+        width: 100%;
+    }
+
+    .org-workspace-head-actions {
+        align-items: stretch;
+        flex-direction: column;
         width: 100%;
     }
 

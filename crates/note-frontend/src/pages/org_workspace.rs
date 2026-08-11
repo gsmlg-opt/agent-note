@@ -5,7 +5,7 @@ use yew::prelude::*;
 use yew_router::{prelude::*, query::Raw};
 
 use crate::{
-    components::org_table::OrgTable,
+    components::{org_table::OrgTable, Modal},
     org::{
         api::{self as org_api, OrgApiError},
         model::{
@@ -15,6 +15,7 @@ use crate::{
             PriorityFilter, WorkspaceFilters, WorkspaceListState, WorkspaceQueryState,
             ALLOWED_LIMITS,
         },
+        workspace_management::{ArchiveWorkspaceBody, WorkspaceSubmission},
     },
     routes::Route,
 };
@@ -99,6 +100,43 @@ fn count_for(counts: &OperationalCounts, view: OperationalView) -> i64 {
 
 fn raw_query(state: &WorkspaceQueryState) -> Raw<String> {
     Raw(state.canonical_query())
+}
+
+fn archive_confirmation_matches(confirmation: &str, workspace_slug: &str) -> bool {
+    confirmation == workspace_slug
+}
+
+fn submit_archive(
+    workspace_id: String,
+    body: ArchiveWorkspaceBody,
+    busy: UseStateHandle<bool>,
+    error: UseStateHandle<Option<OrgApiError>>,
+    navigator: Option<Navigator>,
+) {
+    busy.set(true);
+    error.set(None);
+    wasm_bindgen_futures::spawn_local(async move {
+        match org_api::archive_workspace(&workspace_id, &body).await {
+            Ok(_) => {
+                busy.set(false);
+                if let Some(navigator) = navigator {
+                    let destination = WorkspaceListState {
+                        include_archived: true,
+                        cursor: None,
+                        limit: 50,
+                    };
+                    let _ = navigator.push_with_query(
+                        &Route::Org,
+                        Raw(destination.canonical_query()),
+                    );
+                }
+            }
+            Err(next_error) => {
+                busy.set(false);
+                error.set(Some(next_error));
+            }
+        }
+    });
 }
 
 fn view_state(current: &WorkspaceQueryState, view: OperationalView) -> WorkspaceQueryState {
@@ -321,6 +359,11 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
     let workspace_summary = use_state(|| None::<WorkspaceSummary>);
     let request_generation = use_mut_ref(|| 0_u64);
     let summary_generation = use_mut_ref(|| 0_u64);
+    let archive_open = use_state(|| false);
+    let archive_confirmation = use_state(String::new);
+    let archive_busy = use_state(|| false);
+    let archive_error = use_state(|| None::<OrgApiError>);
+    let pending_archive = use_state(|| None::<ArchiveWorkspaceBody>);
     let navigator = use_navigator();
     let location = use_location();
     let raw_location_query = location
@@ -554,6 +597,97 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
             }
         })
     };
+    let on_archive_open = {
+        let archive_open = archive_open.clone();
+        let archive_confirmation = archive_confirmation.clone();
+        let archive_error = archive_error.clone();
+        let pending_archive = pending_archive.clone();
+        Callback::from(move |_| {
+            archive_confirmation.set(String::new());
+            archive_error.set(None);
+            pending_archive.set(None);
+            archive_open.set(true);
+        })
+    };
+    let on_archive_close = {
+        let archive_open = archive_open.clone();
+        let archive_busy = archive_busy.clone();
+        Callback::from(move |(): ()| {
+            if !*archive_busy {
+                archive_open.set(false);
+            }
+        })
+    };
+    let on_archive_confirmation = {
+        let archive_confirmation = archive_confirmation.clone();
+        let archive_error = archive_error.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            archive_confirmation.set(input.value());
+            archive_error.set(None);
+        })
+    };
+    let archive_workspace = page_state
+        .payload()
+        .map(|payload| payload.workspace.clone());
+    let archive_can_submit = archive_workspace.as_ref().is_some_and(|workspace| {
+        workspace.archived_at.is_none()
+            && archive_confirmation_matches(&archive_confirmation, &workspace.slug)
+    });
+    let on_archive_submit = {
+        let archive_workspace = archive_workspace.clone();
+        let archive_confirmation = archive_confirmation.clone();
+        let archive_busy = archive_busy.clone();
+        let archive_error = archive_error.clone();
+        let pending_archive = pending_archive.clone();
+        let navigator = navigator.clone();
+        Callback::from(move |_| {
+            if *archive_busy {
+                return;
+            }
+            let Some(workspace) = &archive_workspace else {
+                return;
+            };
+            if !archive_confirmation_matches(&archive_confirmation, &workspace.slug) {
+                return;
+            }
+            let body = ArchiveWorkspaceBody::new(
+                WorkspaceSubmission::new().operation_id,
+                workspace.revision,
+            );
+            pending_archive.set(Some(body.clone()));
+            submit_archive(
+                workspace.id.clone(),
+                body,
+                archive_busy.clone(),
+                archive_error.clone(),
+                navigator.clone(),
+            );
+        })
+    };
+    let on_archive_retry = {
+        let archive_workspace = archive_workspace.clone();
+        let archive_busy = archive_busy.clone();
+        let archive_error = archive_error.clone();
+        let pending_archive = pending_archive.clone();
+        let navigator = navigator.clone();
+        Callback::from(move |_| {
+            if *archive_busy {
+                return;
+            }
+            if let (Some(workspace), Some(body)) =
+                (&archive_workspace, (*pending_archive).clone())
+            {
+                submit_archive(
+                    workspace.id.clone(),
+                    body,
+                    archive_busy.clone(),
+                    archive_error.clone(),
+                    navigator.clone(),
+                );
+            }
+        })
+    };
 
     html! {
         <section
@@ -561,7 +695,48 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
             aria-labelledby="org-workspace-title"
             data-testid="org-workspace-page"
         >
-            { workspace_header(page_state.payload(), &query_state, &route, on_refresh, is_canonical) }
+            { workspace_header(page_state.payload(), &query_state, &route, on_refresh, on_archive_open, is_canonical) }
+            if *archive_open {
+                if let Some(workspace) = archive_workspace {
+                    <Modal title="Archive workspace" on_close={on_archive_close.clone()}>
+                        <div class="stack org-workspace-archive-dialog" data-testid="org-workspace-archive-dialog">
+                            <p>
+                                { "Archiving is reversible at the storage level and preserves workspace history, but this UI does not provide restore or hard delete." }
+                            </p>
+                            <p>{ format!("Type {} to confirm.", workspace.slug) }</p>
+                            <label for="org-workspace-archive-confirmation">
+                                <span>{ "Workspace slug" }</span>
+                                <input
+                                    id="org-workspace-archive-confirmation"
+                                    class="input"
+                                    value={(*archive_confirmation).clone()}
+                                    oninput={on_archive_confirmation}
+                                    autocomplete="off"
+                                    disabled={*archive_busy}
+                                />
+                            </label>
+                            if let Some(error) = &*archive_error {
+                                <div class="org-workspace-form-errors" role="alert" data-testid="org-workspace-archive-error">
+                                    <strong>{ error.message.clone() }</strong>
+                                    <code>{ error.code.clone() }</code>
+                                    if error.details != serde_json::Value::Null {
+                                        <pre>{ serde_json::to_string_pretty(&error.details).unwrap_or_default() }</pre>
+                                    }
+                                </div>
+                            }
+                            <div class="org-workspace-form-actions">
+                                <button type="button" class="btn btn-outline" onclick={{ let callback = on_archive_close.clone(); Callback::from(move |_| callback.emit(())) }} disabled={*archive_busy}>{ "Cancel" }</button>
+                                if archive_error.as_ref().is_some_and(|error| error.retryable) && pending_archive.is_some() {
+                                    <button type="button" class="btn btn-outline" onclick={on_archive_retry.clone()} disabled={*archive_busy}>{ "Retry" }</button>
+                                }
+                                <button type="button" class="btn btn-danger" onclick={on_archive_submit} disabled={!archive_can_submit || *archive_busy}>
+                                    { if *archive_busy { "Archiving…" } else { "Archive workspace" } }
+                                </button>
+                            </div>
+                        </div>
+                    </Modal>
+                }
+            }
             { view_tabs(workspace_summary.as_ref(), &query_state, &route) }
             <form
                 key={canonical_query.clone()}
@@ -621,6 +796,7 @@ fn workspace_header(
     query_state: &WorkspaceQueryState,
     _route: &Route,
     on_refresh: Callback<MouseEvent>,
+    on_archive: Callback<MouseEvent>,
     is_canonical: bool,
 ) -> Html {
     html! {
@@ -640,7 +816,20 @@ fn workspace_header(
                     </span>
                 }
             </div>
-            <button type="button" class="btn btn-outline" onclick={on_refresh} disabled={!is_canonical} data-testid="org-workspace-refresh">{ "Refresh" }</button>
+            <div class="org-workspace-head-actions">
+                if let Some(payload) = payload {
+                    if payload.workspace.archived_at.is_none() {
+                        <Link<Route>
+                            to={Route::OrgWorkspaceSettings { workspace_id: payload.workspace.id.clone() }}
+                            classes={classes!("btn", "btn-primary")}
+                        >
+                            { "Edit workspace" }
+                        </Link<Route>>
+                        <button type="button" class="btn btn-outline org-workspace-archive-button" onclick={on_archive}>{ "Archive workspace" }</button>
+                    }
+                }
+                <button type="button" class="btn btn-outline" onclick={on_refresh} disabled={!is_canonical} data-testid="org-workspace-refresh">{ "Refresh" }</button>
+            </div>
         </div>
     }
 }
@@ -1003,6 +1192,34 @@ mod tests {
             archived.archived_at.is_some(),
         );
         assert!(url.contains("include_archived=true"));
+    }
+
+    #[test]
+    fn archive_confirmation_requires_the_exact_workspace_slug() {
+        assert!(archive_confirmation_matches("delivery", "delivery"));
+        assert!(!archive_confirmation_matches("Delivery", "delivery"));
+        assert!(!archive_confirmation_matches("delivery ", "delivery"));
+    }
+
+    #[test]
+    fn active_workspace_source_exposes_edit_and_reversible_archive_actions() {
+        let source = include_str!("org_workspace.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for required in [
+            "Route::OrgWorkspaceSettings",
+            "Edit workspace",
+            "Archive workspace",
+            "ArchiveWorkspaceBody::new",
+            "org_api::archive_workspace",
+            "include_archived: true",
+        ] {
+            assert!(source.contains(required), "missing source: {required}");
+        }
+        for forbidden in ["delete_workspace", "Restore workspace", "Hard delete"] {
+            assert!(!source.contains(forbidden), "forbidden source: {forbidden}");
+        }
     }
 
     #[test]
