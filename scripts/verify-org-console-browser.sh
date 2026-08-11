@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Black-box acceptance for the read-only Org console. Local fixture creation is
+# Black-box acceptance for the read-only Org content and operations routes. Local fixture creation is
 # deliberately outside this script: ORG_CONSOLE_WORKSPACE_ID and
 # ORG_CONSOLE_ITEM_ID must identify records prepared before the browser run.
 
@@ -455,5 +455,5 @@ assert_mobile_navigation_visible
 "$DEVTOOLS" take_snapshot --verbose=true --filePath=/tmp/org-console-mobile.snapshot.txt >/dev/null
 assert_console_clean
 assert_network_boundary "$(network_json)"
-report "PASS: all three routes, exact typed return, GET-only REST, manual refresh, and no polling"
+report "PASS: all three read-only routes, exact typed return, GET-only REST, manual refresh, and no polling"
 report "desktop/mobile screenshots and accessibility snapshot are in /tmp"

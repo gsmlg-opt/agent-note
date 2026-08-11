@@ -80,8 +80,10 @@ changes, or tokens. Actor IDs are client-asserted audit data, not trusted identi
 Delivery Slice 6 exposes the same 36 Org operations through REST/OpenAPI, MCP, and four
 storage-only offline commands where applicable. REST and MCP call the same pipeline boundary and
 share the same `Arc<OrgContext>`; no transport duplicates policy, revision, idempotency, or lease
-logic. Delivery Slice 7 adds a read-only Org Web operations console over the REST reads; it does
-not add browser mutations, polling, or an application authentication layer.
+logic. Delivery Slice 7 adds a read-only Org-content and operations console. The workspace
+management slice adds only create, complete structured update, and reversible archive over REST;
+Org source and workflow operations remain read-only. The browser adds no polling or application
+authentication layer.
 Agent Note implements no inbound authentication, authorization, proxy-identity-header, or workspace
 ACL behavior. A front proxy owns TLS, authentication, authorization, and network access; direct
 exposure to an untrusted network is unsupported.
@@ -169,12 +171,14 @@ own MCP protocol discovery and schemas. Swagger UI has **Try it out** enabled, i
 destructive operations, and the HTTP API is unauthenticated. Use it only on a trusted network or
 behind an authenticating reverse proxy.
 
-### Org Web operations console
+### Org Web operations console and workspace management
 
-The read-only Org console is available at three client-side routes:
+The Org console is available at five client-side routes:
 
 - `/org` — active/archived workspace directory with counts for all operational views;
+- `/org/new` — create a workspace from the structured engineering-default policy;
 - `/org/:workspace_id` — one workspace's server-computed operational ledger;
+- `/org/:workspace_id/settings` — edit the complete structured workspace policy;
 - `/org/:workspace_id/items/:item_id` — recovery context and subject-filtered event history.
 
 The workspace ledger exposes exactly ten views: `ready`, `assigned`, `running`, `blocked`,
@@ -190,14 +194,17 @@ is secondary. Invalid timestamps or timezones render as **Unavailable**, and wea
 links whose target is missing remain visible as unavailable rather than disappearing. Loading,
 empty, and structured error states are explicit.
 
-The browser uses only same-origin `GET /api/org/...` REST reads. It never calls MCP, sends a
-mutation, stores a fencing token, or renders claim/review/edit controls. Agent Note itself has no
+The browser uses same-origin REST. Its only mutations are `POST /api/org/workspaces`,
+`PATCH /api/org/workspaces/:workspace_id`, and
+`POST /api/org/workspaces/:workspace_id/archive`, attributed to `actor_id: "web-ui"` with generated
+idempotent operation IDs. Org documents, work items, claims, transitions, and reviews remain
+read-only. The browser never calls MCP or stores a fencing token. Agent Note itself has no
 authentication, session, trusted proxy-identity-header, or workspace ACL feature; the front proxy
 must own TLS, authentication, authorization, Host/origin policy, and network access.
 
 For local development, Trunk proxies `/api/` to `127.0.0.1:6222` while retaining `/org` routes for
 the Yew router. Packaged builds set `NOTE_STATIC_DIR`; any unclaimed direct load or refresh of the
-three routes returns the frontend `index.html` with HTTP 200, while `/api/org` remains claimed by
+five routes returns the frontend `index.html` with HTTP 200, while `/api/org` remains claimed by
 the REST router.
 
 ### Org REST API
@@ -561,8 +568,8 @@ results return them. Do not log them or expose them through general reads, error
 exports. Agent Note has no inbound authentication, authorization, sessions, or trusted
 proxy-identity-header contract; a front proxy is responsible for TLS, authentication,
 authorization, Host/origin, and network restrictions. The exact same 36 operation names are REST
-`operationId`s under `/api/org`; the read-only Org console consumes only the GET subset and adds no
-browser mutation or application-authentication behavior.
+`operationId`s under `/api/org`; the Org console consumes the GET subset plus only workspace
+create/update/archive and adds no application-authentication behavior.
 
 ### Org offline commands
 

@@ -513,13 +513,16 @@ an `Unsupported` publish error; imports remain supported. All modes emit structu
 and start storage only; they do not touch Markdown notes or construct attachment, embedding,
 worker, HTTP, or MCP runtime state.
 
-### 8.3 Org Web Operations Console
+### 8.3 Org Web Operations Console and Workspace Management
 
-The Yew frontend exposes a read-only operations console on three client-side routes:
+The Yew frontend exposes read-only Org content and operational views plus workspace lifecycle
+management on five client-side routes:
 
 ```text
 /org
+/org/new
 /org/:workspace_id
+/org/:workspace_id/settings
 /org/:workspace_id/items/:item_id
 ```
 
@@ -533,6 +536,15 @@ selection, cursor, and limit are URL state too. An item link encodes the complet
 workspace query under typed `return_` fields; malformed or cross-workspace return state falls back
 to the ready view, and a valid Back link restores the exact origin URL.
 
+Workspace configuration is not part of the read-only boundary. The browser may create a workspace
+from the complete engineering-default policy, update every structured workspace policy field using
+the loaded revision, and archive an active workspace after exact-slug confirmation. Those actions
+use only `POST /api/org/workspaces`, `PATCH /api/org/workspaces/{workspace_id}`, and
+`POST /api/org/workspaces/{workspace_id}/archive`. Requests use `actor_id: "web-ui"`, a generated
+idempotent operation UUID, and compare-and-swap revisions where applicable. Archived workspaces
+remain readable and expose no edit or archive controls; the UI provides neither restore nor hard
+delete.
+
 The item route displays the pipeline recovery context and subject-filtered workspace event page,
 including hierarchy, dependencies, readiness/blockers, attempts, sanitized lease status,
 artifacts, origins, weak note links, recovery data, and event sequence. A weak Markdown-note link
@@ -541,15 +553,17 @@ primary; browser-local time is secondary. Invalid timezones or timestamps are ex
 **Unavailable** values rather than silently using a different zone.
 
 Navigation performs one load and does not poll. Directory, workspace, and item pages have explicit
-manual Refresh controls plus loading, empty, and structured error states. The browser issues only
-same-origin `GET /api/org/...` requests: no MCP call, mutation, fencing-token storage/display,
-claim/review/edit action, or application authentication/session/ACL behavior is present. Agent
-Note trusts no proxy identity header. The front proxy owns TLS, authentication, authorization,
-Host/origin validation, and network restriction.
+manual Refresh controls plus loading, empty, and structured error states. Outside the three
+workspace lifecycle requests above, the browser issues only same-origin `GET /api/org/...`
+requests: no MCP call, Org source/document mutation, item/claim/transition/review action,
+fencing-token storage/display, or application authentication/session/ACL behavior is present.
+`actor_id` is audit attribution rather than authenticated identity. Agent Note trusts no proxy
+identity header. The front proxy owns TLS, authentication, authorization, Host/origin validation,
+and network restriction.
 
 In development, Trunk's `/api/` proxy forwards REST calls to `note-server` while `/org` remains a
 frontend route. In a packaged build, `NOTE_STATIC_DIR` enables the Axum SPA fallback: direct loads
-and refreshes of all three routes return `index.html` with HTTP 200, but the composed REST router
+and refreshes of all five routes return `index.html` with HTTP 200, but the composed REST router
 claims `/api/org` first and therefore cannot be shadowed by the fallback.
 
 ## 9. Org Orchestration Pipeline
@@ -606,9 +620,11 @@ leased item only when it supplies and validates that item's exact current proof.
 same lifecycle decisions and typed events as structured commands rather than bypassing fencing.
 
 Delivery Slice 6 exposes Org through 36 matching MCP and REST/OpenAPI operations plus four
-storage-only offline commands where applicable. Delivery Slice 7 adds the read-only Web console
-defined in §8.3, with explicit manual refresh and no browser mutation, session, or polling
-behavior. Actor IDs are asserted audit attribution, not authenticated identity.
+storage-only offline commands where applicable. Delivery Slice 7 adds the read-only Org-content
+and operations console defined in §8.3. The workspace-management slice adds only browser create,
+structured update, and reversible archive, with explicit manual refresh and no Org source/workflow
+mutation, session, or polling behavior. Actor IDs are asserted audit attribution, not authenticated
+identity.
 Agent Note implements no inbound authentication, authorization, trusted proxy-identity protocol,
 or workspace ACL. A front proxy owns TLS, authentication, authorization, Host/origin validation,
 and network restriction; direct exposure of the service to an untrusted network is unsupported.

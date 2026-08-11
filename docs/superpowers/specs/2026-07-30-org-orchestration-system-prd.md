@@ -580,7 +580,7 @@ administration controls remain deferred.
 4. Offline commands must load the normal storage configuration and must not
    start embedding workers or mutate Markdown note data.
 
-### Read-Only Web Operations Interface
+### Web Operations and Workspace Management Interface
 
 1. The frontend navigation must add an `Org` destination.
 2. `/org` must list workspace summaries and default to active workspaces, with
@@ -600,9 +600,20 @@ administration controls remain deferred.
    unavailable.
 8. The UI must provide explicit loading, empty, structured error, and manual
    refresh states.
-9. The first Web UI must not expose create, edit, claim, release, transition,
-   review, archive, import, or raw Org editing controls.
-10. The UI must not display fencing tokens or call MCP directly.
+9. `/org/new` must create a workspace from a complete structured engineering
+   default, and `/org/:workspace_id/settings` must edit every workspace policy
+   field using the loaded revision.
+10. Active workspace pages must expose edit and reversible archive controls.
+    Archive requires exact-slug confirmation; archived workspaces remain
+    readable and expose neither lifecycle control. Restore and hard delete are
+    not part of this UI.
+11. Browser mutations are limited to workspace create, update, and archive over
+    the matching REST endpoints. Org source/documents, work items, claims,
+    transitions, review, import, and raw Org editing remain read-only.
+12. Workspace mutation requests must use `actor_id: "web-ui"`, a generated
+    idempotent operation UUID, and an expected revision for update/archive.
+13. The UI must not display fencing tokens, call MCP directly, add polling, or
+    implement authentication/session behavior.
 
 ## Implementation Decisions
 
@@ -640,8 +651,9 @@ administration controls remain deferred.
 - Extend the existing server binary with offline Org import/export command
   modes and a complete Org REST surface. REST handlers call the same pipelines
   as MCP, and every operation is included in OpenAPI.
-- Extend the Yew frontend with a read-only, REST-backed Org operations console.
-  Do not add browser mutation controls in the first UI slice.
+- Extend the Yew frontend with a REST-backed Org operations console. Org source
+  and workflow operations remain read-only; workspace create, structured
+  update, and reversible archive are the only browser mutation controls.
 - Keep the embedding and attachment modules unchanged.
 
 ### Canonical Source and Projections
@@ -780,11 +792,11 @@ administration controls remain deferred.
    - REST equivalents for all 36 initial Org MCP operations;
    - shared DTO, validation, idempotency, result, and error semantics;
    - generated OpenAPI coverage and cross-transport conformance tests.
-7. **Read-only Web operations console**
-   - workspace directory, workspace operations, and work-item context routes;
+7. **Web operations console and workspace management**
+   - workspace directory, create, settings, operations, and work-item context routes;
    - URL-backed filters, pagination, and typed return context;
    - loading, empty, error, time, missing-note, and archived-workspace states;
-   - no browser mutations or raw Org editing.
+   - browser create/update/archive for workspaces only; no Org source or workflow mutation.
 
 ## Testing Decisions
 
@@ -952,9 +964,9 @@ administration controls remain deferred.
 - README, OpenAPI, configuration, and Web deployment documentation must state
   that Agent Note implements no authentication or authorization and must not be
   exposed directly to an untrusted network; a front proxy owns that boundary.
-- MCP and REST are complete peers at the application contract. The first Web UI
-  deliberately consumes only read operations even though REST also exposes
-  mutations.
+- MCP and REST are complete peers at the application contract. The Web UI
+  consumes reads plus the three workspace lifecycle operations; all other Org
+  mutations remain transport-only and are not exposed as browser controls.
 - Each delivery slice must receive a scoped implementation plan and scoped test
   commands before implementation begins.
 - The repository currently has no configured GitHub issue tracker or

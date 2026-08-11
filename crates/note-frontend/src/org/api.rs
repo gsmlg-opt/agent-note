@@ -8,6 +8,9 @@ use serde_json::Value;
 use super::{
     model::{Event, ItemContext, OperationalPage, Page, Workspace, WorkspaceSummary},
     url::{rfc3339_to_epoch, WorkspaceListState, WorkspaceQueryState},
+    workspace_management::{
+        ArchiveWorkspaceBody, CreateWorkspaceBody, UpdateWorkspaceBody, WorkspaceMutationResult,
+    },
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -56,6 +59,44 @@ pub async fn list_workspaces(
 
 pub async fn get_workspace(workspace_id: &str) -> Result<Workspace, OrgApiError> {
     get_json(&workspace_url(workspace_id)).await
+}
+
+pub async fn create_workspace(
+    body: &CreateWorkspaceBody,
+) -> Result<WorkspaceMutationResult, OrgApiError> {
+    let response = Request::post("/api/org/workspaces")
+        .json(body)
+        .map_err(|_| OrgApiError::transport("The workspace request could not be encoded"))?
+        .send()
+        .await
+        .map_err(|_| OrgApiError::transport("The Org service could not be reached"))?;
+    decode_response(response).await
+}
+
+pub async fn update_workspace(
+    workspace_id: &str,
+    body: &UpdateWorkspaceBody,
+) -> Result<WorkspaceMutationResult, OrgApiError> {
+    let response = Request::patch(&workspace_url(workspace_id))
+        .json(body)
+        .map_err(|_| OrgApiError::transport("The workspace request could not be encoded"))?
+        .send()
+        .await
+        .map_err(|_| OrgApiError::transport("The Org service could not be reached"))?;
+    decode_response(response).await
+}
+
+pub async fn archive_workspace(
+    workspace_id: &str,
+    body: &ArchiveWorkspaceBody,
+) -> Result<WorkspaceMutationResult, OrgApiError> {
+    let response = Request::post(&workspace_archive_url(workspace_id))
+        .json(body)
+        .map_err(|_| OrgApiError::transport("The workspace request could not be encoded"))?
+        .send()
+        .await
+        .map_err(|_| OrgApiError::transport("The Org service could not be reached"))?;
+    decode_response(response).await
 }
 
 pub async fn query_queue(
@@ -135,6 +176,10 @@ pub fn workspace_list_url(state: &WorkspaceListState) -> String {
 
 pub fn workspace_url(workspace_id: &str) -> String {
     format!("/api/org/workspaces/{}", encode(workspace_id))
+}
+
+pub fn workspace_archive_url(workspace_id: &str) -> String {
+    format!("{}/archive", workspace_url(workspace_id))
 }
 
 pub fn operational_url(
@@ -265,6 +310,10 @@ mod tests {
             workspace_url("workspace/one"),
             "/api/org/workspaces/workspace%2Fone"
         );
+        assert_eq!(
+            workspace_archive_url("workspace/one"),
+            "/api/org/workspaces/workspace%2Fone/archive"
+        );
 
         let state = WorkspaceQueryState {
             view: OperationalView::Failed,
@@ -310,18 +359,49 @@ mod tests {
     }
 
     #[test]
-    fn org_client_source_is_get_only_and_has_no_identity_or_token_inputs() {
+    fn workspace_mutation_clients_share_the_typed_result_contract() {
+        let _create = create_workspace;
+        let _update = update_workspace;
+        let _archive = archive_workspace;
+        let result: WorkspaceMutationResult = decode_body(
+            200,
+            &json!({
+                "schema_version": 1,
+                "workspace_id": "10000000-0000-4000-8000-000000000001",
+                "operation_id": "20000000-0000-4000-8000-000000000001",
+                "event_ids": ["30000000-0000-4000-8000-000000000001"],
+                "workspace_revision": 2,
+                "document_revisions": {},
+                "data": {"revision": 2}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(result.workspace_revision, Some(2));
+    }
+
+    #[test]
+    fn org_client_source_allows_only_workspace_lifecycle_mutations() {
         let source = include_str!("api.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(source.contains("Request::get"));
+        assert_eq!(source.matches("Request::get").count(), 1);
+        assert_eq!(source.matches("Request::post").count(), 2);
+        assert_eq!(source.matches("Request::patch").count(), 1);
+        for required in [
+            "create_workspace",
+            "update_workspace",
+            "archive_workspace",
+            "/archive",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing workspace mutation: {required}"
+            );
+        }
         for forbidden in [
-            "Request::post",
             "Request::put",
-            "Request::patch",
             "Request::delete",
             "/mcp",
             "fencing_token",
-            "operation_id",
-            "actor_id",
             "authorization",
             "session_storage",
         ] {
@@ -333,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn org_console_production_and_browser_gate_are_strictly_read_only() {
+    fn org_console_browser_mutation_boundary_allows_only_workspace_lifecycle() {
         let production =
             |source: &'static str| source.split("#[cfg(test)]\nmod tests").next().unwrap();
         let api = production(include_str!("api.rs"));
@@ -341,9 +421,12 @@ mod tests {
         let redaction = production(include_str!("../components/org_event_table.rs"));
         let control_sources = [
             production(include_str!("../pages/org_workspaces.rs")),
+            production(include_str!("../pages/org_workspace_new.rs")),
             production(include_str!("../pages/org_workspace.rs")),
+            production(include_str!("../pages/org_workspace_settings.rs")),
             production(include_str!("../pages/org_item.rs")),
             production(include_str!("../components/org_table.rs")),
+            production(include_str!("../components/org_workspace_form.rs")),
             production(include_str!("../routes.rs")),
         ]
         .join("\n");
@@ -353,27 +436,38 @@ mod tests {
             production(include_str!("mod.rs")),
             production(include_str!("url.rs")),
             production(include_str!("time.rs")),
+            production(include_str!("workspace_management.rs")),
             redaction,
             control_sources.as_str(),
         ]
         .join("\n");
 
         assert_eq!(production_sources.matches("Request::get").count(), 1);
+        assert_eq!(production_sources.matches("Request::post").count(), 2);
+        assert_eq!(production_sources.matches("Request::patch").count(), 1);
+        for required in [
+            "Request::post(\"/api/org/workspaces\")",
+            "Request::patch(&workspace_url(workspace_id))",
+            "Request::post(&workspace_archive_url(workspace_id))",
+            "org_api::create_workspace",
+            "org_api::update_workspace",
+            "org_api::archive_workspace",
+        ] {
+            assert!(
+                production_sources.contains(required),
+                "workspace lifecycle boundary missing {required}"
+            );
+        }
         assert_eq!(
             control_sources.matches("trim_start_matches('?')").count(),
             3
         );
         assert!(production_sources.contains("/api/org"));
         for forbidden in [
-            "Request::post",
             "Request::put",
-            "Request::patch",
             "Request::delete",
             "/mcp",
             "fetch(",
-            "create_workspace",
-            "update_workspace",
-            "archive_workspace",
             "put_document",
             "import_workspace",
             "create_item",
@@ -459,6 +553,22 @@ mod tests {
             assert!(
                 browser_gate.contains(required),
                 "browser gate missing {required}"
+            );
+        }
+        let management_gate =
+            include_str!("../../../../scripts/verify-org-workspace-management-browser.sh");
+        for required in [
+            "ORG_CONSOLE_BASE_URL",
+            "/org/new",
+            "stale_revision",
+            "workspace-concurrency-limit",
+            "org-workspace-archive-confirmation",
+            "list_network_requests",
+            "create/update/archive",
+        ] {
+            assert!(
+                management_gate.contains(required),
+                "workspace management browser gate missing {required}"
             );
         }
     }

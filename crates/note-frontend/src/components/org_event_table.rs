@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::{Map, Value};
 use yew::prelude::*;
 
@@ -79,8 +80,9 @@ pub(crate) fn safe_metadata(value: &Value) -> Value {
     }
 }
 
-pub(crate) fn safe_json_text(value: &Value) -> String {
-    serde_json::to_string_pretty(&safe_metadata(value))
+pub(crate) fn safe_json_text<T: Serialize>(value: &T) -> String {
+    let value = serde_json::to_value(value).unwrap_or(Value::Null);
+    serde_json::to_string_pretty(&safe_metadata(&value))
         .unwrap_or_else(|_| "Metadata unavailable".to_owned())
 }
 

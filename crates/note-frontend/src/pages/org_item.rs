@@ -825,7 +825,7 @@ mod tests {
                 description: "Delivery".into(),
                 timezone: "Asia/Shanghai".into(),
                 policy_schema_version: 2,
-                policy: json!({"max_attempts":3}),
+                policy: crate::org::workspace_management::WorkspacePolicy::engineering_default(),
                 revision: 9,
                 archived_at: None,
             },
