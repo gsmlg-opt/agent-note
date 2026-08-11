@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn org_console_production_and_browser_gate_are_strictly_read_only() {
+    fn org_console_browser_mutation_boundary_allows_only_workspace_lifecycle() {
         let production =
             |source: &'static str| source.split("#[cfg(test)]\nmod tests").next().unwrap();
         let api = production(include_str!("api.rs"));
@@ -421,9 +421,12 @@ mod tests {
         let redaction = production(include_str!("../components/org_event_table.rs"));
         let control_sources = [
             production(include_str!("../pages/org_workspaces.rs")),
+            production(include_str!("../pages/org_workspace_new.rs")),
             production(include_str!("../pages/org_workspace.rs")),
+            production(include_str!("../pages/org_workspace_settings.rs")),
             production(include_str!("../pages/org_item.rs")),
             production(include_str!("../components/org_table.rs")),
+            production(include_str!("../components/org_workspace_form.rs")),
             production(include_str!("../routes.rs")),
         ]
         .join("\n");
@@ -433,6 +436,7 @@ mod tests {
             production(include_str!("mod.rs")),
             production(include_str!("url.rs")),
             production(include_str!("time.rs")),
+            production(include_str!("workspace_management.rs")),
             redaction,
             control_sources.as_str(),
         ]
@@ -441,6 +445,19 @@ mod tests {
         assert_eq!(production_sources.matches("Request::get").count(), 1);
         assert_eq!(production_sources.matches("Request::post").count(), 2);
         assert_eq!(production_sources.matches("Request::patch").count(), 1);
+        for required in [
+            "Request::post(\"/api/org/workspaces\")",
+            "Request::patch(&workspace_url(workspace_id))",
+            "Request::post(&workspace_archive_url(workspace_id))",
+            "org_api::create_workspace",
+            "org_api::update_workspace",
+            "org_api::archive_workspace",
+        ] {
+            assert!(
+                production_sources.contains(required),
+                "workspace lifecycle boundary missing {required}"
+            );
+        }
         assert_eq!(
             control_sources.matches("trim_start_matches('?')").count(),
             3
