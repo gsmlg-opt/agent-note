@@ -347,6 +347,7 @@ impl WorkspaceSubmission {
         }
     }
 
+    #[cfg(test)]
     pub fn retry(&self) -> Self {
         self.clone()
     }

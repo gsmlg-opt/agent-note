@@ -8,6 +8,7 @@ use crate::org::{
     },
 };
 
+#[cfg(test)]
 pub const WORKSPACE_FORM_SECTIONS: [&str; 10] = [
     "Identity",
     "Work types",
@@ -374,7 +375,7 @@ pub fn org_workspace_form(props: &OrgWorkspaceFormProps) -> Html {
 
             <section class="org-workspace-form-section" aria-labelledby="workspace-limits-title" data-testid="org-workspace-form-limits">
                 <div class="org-workspace-form-section-head"><span>{ "09" }</span><div><h3 id="workspace-limits-title">{ "Limits" }</h3><p>{ "Lease, retry, and workspace concurrency controls." }</p></div></div>
-                <div class="org-workspace-form-grid"><label class="org-workspace-form-field"><span>{ "Lease duration (seconds)" }</span><input type="number" min="1" class="input" value={draft.policy.lease_duration_secs.to_string()} oninput={text_input(draft.clone(), props.on_change.clone(), |draft, value| draft.policy.lease_duration_secs = value.parse().unwrap_or(0))}/></label><label class="org-workspace-form-field"><span>{ "Retry limit" }</span><input type="number" min="0" class="input" value={draft.policy.retry_limit.to_string()} oninput={text_input(draft.clone(), props.on_change.clone(), |draft, value| draft.policy.retry_limit = value.parse().unwrap_or(0))}/></label><label class="org-workspace-form-field"><span>{ "Concurrency limit" }</span><input type="number" min="1" class="input" value={draft.policy.concurrency_limit.to_string()} oninput={text_input(draft.clone(), props.on_change.clone(), |draft, value| draft.policy.concurrency_limit = value.parse().unwrap_or(0))}/></label></div>
+                <div class="org-workspace-form-grid"><label class="org-workspace-form-field" for="workspace-lease-duration"><span>{ "Lease duration (seconds)" }</span><input id="workspace-lease-duration" type="number" min="1" class="input" value={draft.policy.lease_duration_secs.to_string()} oninput={text_input(draft.clone(), props.on_change.clone(), |draft, value| draft.policy.lease_duration_secs = value.parse().unwrap_or(0))}/></label><label class="org-workspace-form-field" for="workspace-retry-limit"><span>{ "Retry limit" }</span><input id="workspace-retry-limit" type="number" min="0" class="input" value={draft.policy.retry_limit.to_string()} oninput={text_input(draft.clone(), props.on_change.clone(), |draft, value| draft.policy.retry_limit = value.parse().unwrap_or(0))}/></label><label class="org-workspace-form-field" for="workspace-concurrency-limit"><span>{ "Concurrency limit" }</span><input id="workspace-concurrency-limit" type="number" min="1" class="input" value={draft.policy.concurrency_limit.to_string()} oninput={text_input(draft.clone(), props.on_change.clone(), |draft, value| draft.policy.concurrency_limit = value.parse().unwrap_or(0))}/></label></div>
             </section>
 
             <section class="org-workspace-form-section" aria-labelledby="workspace-tags-title" data-testid="org-workspace-form-tag-rules">

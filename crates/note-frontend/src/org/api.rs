@@ -555,5 +555,21 @@ mod tests {
                 "browser gate missing {required}"
             );
         }
+        let management_gate =
+            include_str!("../../../../scripts/verify-org-workspace-management-browser.sh");
+        for required in [
+            "ORG_CONSOLE_BASE_URL",
+            "/org/new",
+            "stale_revision",
+            "workspace-concurrency-limit",
+            "org-workspace-archive-confirmation",
+            "list_network_requests",
+            "create/update/archive",
+        ] {
+            assert!(
+                management_gate.contains(required),
+                "workspace management browser gate missing {required}"
+            );
+        }
     }
 }

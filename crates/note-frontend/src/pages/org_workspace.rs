@@ -125,10 +125,8 @@ fn submit_archive(
                         cursor: None,
                         limit: 50,
                     };
-                    let _ = navigator.push_with_query(
-                        &Route::Org,
-                        Raw(destination.canonical_query()),
-                    );
+                    let _ =
+                        navigator.push_with_query(&Route::Org, Raw(destination.canonical_query()));
                 }
             }
             Err(next_error) => {
@@ -675,8 +673,7 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
             if *archive_busy {
                 return;
             }
-            if let (Some(workspace), Some(body)) =
-                (&archive_workspace, (*pending_archive).clone())
+            if let (Some(workspace), Some(body)) = (&archive_workspace, (*pending_archive).clone())
             {
                 submit_archive(
                     workspace.id.clone(),
@@ -713,6 +710,7 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
                                     oninput={on_archive_confirmation}
                                     autocomplete="off"
                                     disabled={*archive_busy}
+                                    data-testid="org-workspace-archive-confirmation"
                                 />
                             </label>
                             if let Some(error) = &*archive_error {
@@ -729,7 +727,7 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
                                 if archive_error.as_ref().is_some_and(|error| error.retryable) && pending_archive.is_some() {
                                     <button type="button" class="btn btn-outline" onclick={on_archive_retry.clone()} disabled={*archive_busy}>{ "Retry" }</button>
                                 }
-                                <button type="button" class="btn btn-danger" onclick={on_archive_submit} disabled={!archive_can_submit || *archive_busy}>
+                                <button type="button" class="btn btn-danger" onclick={on_archive_submit} disabled={!archive_can_submit || *archive_busy} data-testid="org-workspace-archive-submit">
                                     { if *archive_busy { "Archiving…" } else { "Archive workspace" } }
                                 </button>
                             </div>
@@ -823,9 +821,9 @@ fn workspace_header(
                             to={Route::OrgWorkspaceSettings { workspace_id: payload.workspace.id.clone() }}
                             classes={classes!("btn", "btn-primary")}
                         >
-                            { "Edit workspace" }
+                            <span data-testid="org-workspace-edit">{ "Edit workspace" }</span>
                         </Link<Route>>
-                        <button type="button" class="btn btn-outline org-workspace-archive-button" onclick={on_archive}>{ "Archive workspace" }</button>
+                        <button type="button" class="btn btn-outline org-workspace-archive-button" onclick={on_archive} data-testid="org-workspace-archive-open">{ "Archive workspace" }</button>
                     }
                 }
                 <button type="button" class="btn btn-outline" onclick={on_refresh} disabled={!is_canonical} data-testid="org-workspace-refresh">{ "Refresh" }</button>
