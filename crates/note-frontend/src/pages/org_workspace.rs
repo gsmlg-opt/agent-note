@@ -762,7 +762,7 @@ mod tests {
             description: "Operations".into(),
             timezone: "Asia/Shanghai".into(),
             policy_schema_version: 1,
-            policy: json!({}),
+            policy: crate::org::workspace_management::WorkspacePolicy::engineering_default(),
             revision: 7,
             archived_at: archived.then_some(1),
         }

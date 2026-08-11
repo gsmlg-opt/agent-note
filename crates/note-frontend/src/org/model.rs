@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::workspace_management::WorkspacePolicy;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Page<T> {
@@ -46,7 +48,7 @@ pub struct Workspace {
     pub description: String,
     pub timezone: String,
     pub policy_schema_version: i64,
-    pub policy: Value,
+    pub policy: WorkspacePolicy,
     pub revision: i64,
     pub archived_at: Option<i64>,
 }
@@ -397,7 +399,7 @@ mod tests {
         let context: ItemContext = serde_json::from_value(json!({
             "workspace":{"id":"10000000-0000-4000-8000-000000000001","slug":"delivery",
                 "display_name":"Delivery","description":"Operations","timezone":"Asia/Shanghai",
-                "policy_schema_version":1,"policy":{},"revision":7,"archived_at":null},
+                "policy_schema_version":1,"policy":WorkspacePolicy::engineering_default(),"revision":7,"archived_at":null},
             "workspace_revision":7,"document":{"id":"20000000-0000-4000-8000-000000000001","path":"work.org","revision":4},
             "item":item(),"parent":null,"children":[child],
             "dependencies":[{"item":dependency,"satisfied":true}],
