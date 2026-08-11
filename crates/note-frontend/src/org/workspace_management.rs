@@ -25,6 +25,31 @@ pub enum ClaimPolicy {
     ExplicitlyDispatched,
 }
 
+impl ClaimPolicy {
+    pub const ALL: [Self; 3] = [
+        Self::Open,
+        Self::AssignmentRestricted,
+        Self::ExplicitlyDispatched,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::AssignmentRestricted => "assignment_restricted",
+            Self::ExplicitlyDispatched => "explicitly_dispatched",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "open" => Some(Self::Open),
+            "assignment_restricted" => Some(Self::AssignmentRestricted),
+            "explicitly_dispatched" => Some(Self::ExplicitlyDispatched),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TagRule {
@@ -154,6 +179,132 @@ impl WorkspaceDraft {
             timezone: workspace.timezone.clone(),
             policy_schema_version: workspace.policy_schema_version,
             policy: workspace.policy.clone(),
+        }
+    }
+
+    pub fn toggle_allowed_type(&mut self, item_type: &str, enabled: bool) {
+        if enabled {
+            if WORK_ITEM_TYPES.contains(&item_type)
+                && !self
+                    .policy
+                    .allowed_types
+                    .iter()
+                    .any(|value| value == item_type)
+            {
+                self.policy.allowed_types.push(item_type.into());
+                self.policy.allowed_types.sort_by_key(|value| {
+                    WORK_ITEM_TYPES
+                        .iter()
+                        .position(|candidate| candidate == value)
+                        .unwrap_or(usize::MAX)
+                });
+            }
+        } else {
+            self.policy.allowed_types.retain(|value| value != item_type);
+            self.policy
+                .review_required_types
+                .retain(|value| value != item_type);
+            self.policy.tag_rules.remove(item_type);
+        }
+    }
+
+    pub fn add_state(&mut self, state: &str) {
+        let state = state.trim();
+        if !state.is_empty() && !self.policy.states.iter().any(|value| value == state) {
+            self.policy.states.push(state.into());
+        }
+    }
+
+    pub fn set_state(&mut self, index: usize, state: String) {
+        if let Some(current) = self.policy.states.get_mut(index) {
+            let previous = std::mem::replace(current, state.clone());
+            for (from, to) in &mut self.policy.transitions {
+                if *from == previous {
+                    *from = state.clone();
+                }
+                if *to == previous {
+                    *to = state.clone();
+                }
+            }
+            for values in [
+                &mut self.policy.executable_states,
+                &mut self.policy.successful_terminal_states,
+                &mut self.policy.terminal_states,
+            ] {
+                for value in values {
+                    if *value == previous {
+                        *value = state.clone();
+                    }
+                }
+            }
+            for value in [
+                &mut self.policy.initial_state,
+                &mut self.policy.running_state,
+                &mut self.policy.review_state,
+                &mut self.policy.failed_state,
+                &mut self.policy.cancelled_state,
+                &mut self.policy.release_state,
+                &mut self.policy.review_rejection_state,
+                &mut self.policy.lease_expiry_recovery_state,
+            ] {
+                if *value == previous {
+                    *value = state.clone();
+                }
+            }
+        }
+    }
+
+    pub fn remove_state(&mut self, index: usize) {
+        if index >= self.policy.states.len() {
+            return;
+        }
+        let removed = self.policy.states.remove(index);
+        self.policy
+            .transitions
+            .retain(|(from, to)| from != &removed && to != &removed);
+        for values in [
+            &mut self.policy.executable_states,
+            &mut self.policy.successful_terminal_states,
+            &mut self.policy.terminal_states,
+        ] {
+            values.retain(|value| value != &removed);
+        }
+    }
+
+    pub fn add_transition(&mut self, from: &str, to: &str) {
+        let transition = (from.to_owned(), to.to_owned());
+        if !self.policy.transitions.contains(&transition) {
+            self.policy.transitions.push(transition);
+        }
+    }
+
+    pub fn set_transition(&mut self, index: usize, from: String, to: String) {
+        if let Some(transition) = self.policy.transitions.get_mut(index) {
+            *transition = (from, to);
+        }
+    }
+
+    pub fn remove_transition(&mut self, index: usize) {
+        if index < self.policy.transitions.len() {
+            self.policy.transitions.remove(index);
+        }
+    }
+
+    pub fn toggle_policy_value(values: &mut Vec<String>, value: &str, enabled: bool) {
+        if enabled && !values.iter().any(|current| current == value) {
+            values.push(value.into());
+        } else if !enabled {
+            values.retain(|current| current != value);
+        }
+    }
+
+    pub fn set_tag_rule(&mut self, item_type: &str, allowed: Vec<String>, required: Vec<String>) {
+        if allowed.is_empty() && required.is_empty() {
+            self.policy.tag_rules.remove(item_type);
+        } else {
+            self.policy
+                .tag_rules
+                .insert(item_type.into(), TagRule { allowed, required });
         }
     }
 
@@ -676,5 +827,36 @@ mod tests {
         assert_eq!(submission.retry(), submission);
         assert_ne!(WorkspaceSubmission::new(), submission);
         assert!(uuid::Uuid::parse_str(&new_workspace_id()).is_ok());
+    }
+
+    #[test]
+    fn structured_form_mutations_preserve_unrelated_policy_fields() {
+        let mut draft = valid_draft();
+        let original = draft.policy.clone();
+
+        draft.toggle_allowed_type("incident", false);
+        assert!(!draft.policy.allowed_types.contains(&"incident".into()));
+        assert_eq!(draft.policy.states, original.states);
+        assert_eq!(draft.policy.transitions, original.transitions);
+
+        draft.add_state("VERIFY");
+        draft.add_transition("REVIEW", "VERIFY");
+        assert!(draft.policy.states.contains(&"VERIFY".into()));
+        assert!(draft
+            .policy
+            .transitions
+            .contains(&("REVIEW".into(), "VERIFY".into())));
+
+        draft.set_tag_rule(
+            "task",
+            vec!["ops".into(), "release".into()],
+            vec!["release".into()],
+        );
+        assert_eq!(draft.policy.tag_rules["task"].required, ["release"]);
+        assert_eq!(
+            draft.policy.lease_duration_secs,
+            original.lease_duration_secs
+        );
+        assert_eq!(draft.policy.claim_policy, original.claim_policy);
     }
 }

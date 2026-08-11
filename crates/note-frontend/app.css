@@ -9,6 +9,234 @@ body {
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
+/* --- Org workspace configuration --- */
+.org-workspace-form {
+    --org-form-rule: var(--color-outline-variant, #c7c5d0);
+    max-width: 68rem;
+    margin: 0 auto;
+}
+
+.org-workspace-form-section {
+    border: 1px solid var(--org-form-rule);
+    border-radius: 0.85rem;
+    background: var(--color-surface-container-low, #f7f2fa);
+    overflow: hidden;
+}
+
+.org-workspace-form-section-head {
+    display: grid;
+    grid-template-columns: 3rem 1fr;
+    gap: 0.9rem;
+    align-items: start;
+    padding: 1rem 1.1rem;
+    border-bottom: 1px solid var(--org-form-rule);
+    background: linear-gradient(90deg, var(--color-surface-container-high, #ece7f2), transparent);
+}
+
+.org-workspace-form-section-head > span {
+    font-variant-numeric: tabular-nums;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    color: var(--color-primary, #6750a4);
+}
+
+.org-workspace-form-section-head h3,
+.org-workspace-form-section-head p {
+    margin: 0;
+}
+
+.org-workspace-form-section-head p {
+    margin-top: 0.25rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.9rem;
+}
+
+.org-workspace-form-grid,
+.org-workspace-form-checks,
+.org-workspace-form-rows,
+.org-workspace-form-tag-ledger {
+    padding: 1rem 1.1rem;
+}
+
+.org-workspace-form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1rem;
+}
+
+.org-workspace-form-wide {
+    grid-column: 1 / -1;
+}
+
+.org-workspace-form-field {
+    display: grid;
+    gap: 0.35rem;
+    align-content: start;
+    font-size: 0.86rem;
+    font-weight: 700;
+    color: var(--color-on-surface-variant, #46464f);
+}
+
+.org-workspace-form-field .input,
+.org-workspace-form-transition .input {
+    width: 100%;
+    min-height: 44px;
+    box-sizing: border-box;
+}
+
+.org-workspace-form-field textarea.input {
+    min-height: 7rem;
+    resize: vertical;
+}
+
+.org-workspace-form-field output {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    padding: 0 0.8rem;
+    border-left: 3px solid var(--color-primary, #6750a4);
+    background: var(--color-surface-container, #f3edf7);
+    font-variant-numeric: tabular-nums;
+}
+
+.org-workspace-form-checks {
+    border: 0;
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.55rem;
+}
+
+.org-workspace-form-checks legend,
+.org-workspace-form-tag-ledger legend {
+    padding: 0;
+    margin-bottom: 0.65rem;
+    font-weight: 800;
+}
+
+.org-workspace-form-check {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.35rem 0.65rem;
+    border: 1px solid var(--org-form-rule);
+    border-radius: 0.45rem;
+    background: var(--color-surface, #fffbfe);
+}
+
+.org-workspace-form-check input {
+    width: 1.05rem;
+    height: 1.05rem;
+    accent-color: var(--color-primary, #6750a4);
+}
+
+.org-workspace-form-toggle {
+    align-self: end;
+}
+
+.org-workspace-form-rows {
+    display: grid;
+    gap: 0.55rem;
+}
+
+.org-workspace-form-row,
+.org-workspace-form-transition {
+    display: grid;
+    gap: 0.55rem;
+    align-items: center;
+}
+
+.org-workspace-form-row {
+    grid-template-columns: 1fr auto;
+}
+
+.org-workspace-form-transition {
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+}
+
+.org-workspace-form-section > .btn {
+    margin: 0 1.1rem 1rem;
+}
+
+.org-workspace-form-tag-ledger {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.8rem;
+}
+
+.org-workspace-form-tag-ledger fieldset {
+    min-width: 0;
+    display: grid;
+    gap: 0.65rem;
+    margin: 0;
+    padding: 0.9rem;
+    border: 1px solid var(--org-form-rule);
+    border-radius: 0.55rem;
+}
+
+.org-workspace-form-errors {
+    display: grid;
+    gap: 0.55rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--color-error, #ba1a1a);
+    border-left-width: 5px;
+    border-radius: 0.6rem;
+    background: var(--color-error-container, #ffdad6);
+    color: var(--color-on-error-container, #410002);
+}
+
+.org-workspace-form-errors ul {
+    margin: 0;
+    padding-left: 1.3rem;
+}
+
+.org-workspace-form-inline-actions,
+.org-workspace-form-actions {
+    display: flex;
+    gap: 0.65rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.org-workspace-form-actions {
+    justify-content: flex-end;
+    position: sticky;
+    bottom: 0.75rem;
+    z-index: 2;
+    padding: 0.75rem;
+    border: 1px solid var(--org-form-rule);
+    border-radius: 0.75rem;
+    background: color-mix(in srgb, var(--color-surface, #fffbfe) 92%, transparent);
+    backdrop-filter: blur(12px);
+}
+
+.org-workspace-form :is(.input, .btn, input[type="checkbox"]):focus-visible {
+    outline: 3px solid var(--color-primary, #6750a4);
+    outline-offset: 2px;
+}
+
+@media (max-width: 720px) {
+    .org-workspace-form-grid,
+    .org-workspace-form-checks,
+    .org-workspace-form-tag-ledger {
+        grid-template-columns: 1fr;
+    }
+
+    .org-workspace-form-transition {
+        grid-template-columns: 1fr auto;
+    }
+
+    .org-workspace-form-transition > span {
+        display: none;
+    }
+
+    .org-workspace-form-actions .btn {
+        flex: 1 1 9rem;
+        min-height: 44px;
+    }
+}
+
 .app {
     max-width: 72rem; /* tailwind 6xl */
     margin: 0 auto;
