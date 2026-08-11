@@ -274,17 +274,27 @@ pub fn org_workspaces_page() -> Html {
                 <div>
                     <p class="org-kicker">{ "Operations directory" }</p>
                     <h2 id="org-directory-title" class="page-title">{ "Org workspaces" }</h2>
-                    <p class="page-hint">{ "Read-only delivery state, evaluated by the Org service." }</p>
+                    <p class="page-hint">
+                        { "Workspace configuration is managed here; Org content and delivery state remain read-only." }
+                    </p>
                 </div>
-                <button
-                    type="button"
-                    class="btn btn-outline"
-                    onclick={on_refresh}
-                    disabled={!is_canonical}
-                    data-testid="org-directory-refresh"
-                >
-                    { "Refresh" }
-                </button>
+                <div class="org-directory-head-actions">
+                    <Link<Route>
+                        to={Route::OrgWorkspaceNew}
+                        classes={classes!("btn", "btn-primary")}
+                    >
+                        { "Create workspace" }
+                    </Link<Route>>
+                    <button
+                        type="button"
+                        class="btn btn-outline"
+                        onclick={on_refresh}
+                        disabled={!is_canonical}
+                        data-testid="org-directory-refresh"
+                    >
+                        { "Refresh" }
+                    </button>
+                </div>
             </div>
 
             <div class="org-directory-controls" aria-label="Workspace directory controls">
@@ -568,6 +578,8 @@ mod tests {
             .unwrap();
         for required in [
             "Refresh",
+            "Create workspace",
+            "Route::OrgWorkspaceNew",
             "Include archived",
             "aria-live",
             "<caption>",

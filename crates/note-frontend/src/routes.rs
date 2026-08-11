@@ -3,7 +3,8 @@ use yew_router::prelude::*;
 
 use crate::pages::{
     DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage, OrgItemPage,
-    OrgWorkspacePage, OrgWorkspacesPage, SystemPage, TrashPage,
+    OrgWorkspaceNewPage, OrgWorkspacePage, OrgWorkspaceSettingsPage, OrgWorkspacesPage, SystemPage,
+    TrashPage,
 };
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -30,6 +31,10 @@ pub enum Route {
     Notes,
     #[at("/org")]
     Org,
+    #[at("/org/new")]
+    OrgWorkspaceNew,
+    #[at("/org/:workspace_id/settings")]
+    OrgWorkspaceSettings { workspace_id: String },
     #[at("/org/:workspace_id")]
     OrgWorkspace { workspace_id: String },
     #[at("/org/:workspace_id/items/:item_id")]
@@ -60,6 +65,10 @@ impl Route {
             Self::Home => "Home | agent-note".to_owned(),
             Self::Notes => "Notes | agent-note".to_owned(),
             Self::Org => "Org | agent-note".to_owned(),
+            Self::OrgWorkspaceNew => "Create Org workspace | agent-note".to_owned(),
+            Self::OrgWorkspaceSettings { workspace_id } => {
+                format!("Edit Org workspace {workspace_id} | agent-note")
+            }
             Self::OrgWorkspace { workspace_id } => {
                 format!("Org workspace {workspace_id} | agent-note")
             }
@@ -80,6 +89,10 @@ pub fn switch(route: Route) -> Html {
         Route::Home => html! { <DashboardPage /> },
         Route::Notes => html! { <NotesPage /> },
         Route::Org => html! { <OrgWorkspacesPage /> },
+        Route::OrgWorkspaceNew => html! { <OrgWorkspaceNewPage /> },
+        Route::OrgWorkspaceSettings { workspace_id } => {
+            html! { <OrgWorkspaceSettingsPage {workspace_id} /> }
+        }
         Route::OrgWorkspace { workspace_id } => {
             html! { <OrgWorkspacePage {workspace_id} /> }
         }
@@ -122,6 +135,25 @@ mod tests {
                 workspace_id: "workspace-a".into(),
                 item_id: "item-1".into(),
             })
+        );
+    }
+
+    #[test]
+    fn recognizes_org_workspace_management_routes() {
+        assert_eq!(Route::recognize("/org/new"), Some(Route::OrgWorkspaceNew));
+        assert_eq!(Route::OrgWorkspaceNew.to_path(), "/org/new");
+        assert_eq!(
+            Route::recognize("/org/workspace-a/settings"),
+            Some(Route::OrgWorkspaceSettings {
+                workspace_id: "workspace-a".into(),
+            })
+        );
+        assert_eq!(
+            Route::OrgWorkspaceSettings {
+                workspace_id: "workspace-a".into(),
+            }
+            .to_path(),
+            "/org/workspace-a/settings"
         );
     }
 
