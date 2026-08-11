@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+pub const WEB_ACTOR_ID: &str = "web-ui";
+pub const ORG_SCHEMA_VERSION: u32 = 1;
+
 pub const WORK_ITEM_TYPES: [&str; 9] = [
     "project",
     "epic",
@@ -179,6 +182,142 @@ impl WorkspaceDraft {
 pub struct WorkspaceValidationError {
     pub field: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceSubmission {
+    pub operation_id: String,
+}
+
+impl WorkspaceSubmission {
+    pub fn new() -> Self {
+        Self {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    pub fn retry(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl Default for WorkspaceSubmission {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn new_workspace_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MutationEnvelope {
+    schema_version: u32,
+    actor_id: &'static str,
+    operation_id: String,
+}
+
+impl MutationEnvelope {
+    fn new(operation_id: String) -> Self {
+        Self {
+            schema_version: ORG_SCHEMA_VERSION,
+            actor_id: WEB_ACTOR_ID,
+            operation_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateWorkspaceBody {
+    #[serde(flatten)]
+    command: MutationEnvelope,
+    pub workspace_id: String,
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub timezone: String,
+    pub policy_schema_version: i64,
+    pub policy: WorkspacePolicy,
+}
+
+impl CreateWorkspaceBody {
+    pub fn from_draft(workspace_id: String, operation_id: String, draft: &WorkspaceDraft) -> Self {
+        Self {
+            command: MutationEnvelope::new(operation_id),
+            workspace_id,
+            slug: draft.slug.clone(),
+            display_name: draft.display_name.clone(),
+            description: draft.description.clone(),
+            timezone: draft.timezone.clone(),
+            policy_schema_version: draft.policy_schema_version,
+            policy: draft.policy.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWorkspaceBody {
+    #[serde(flatten)]
+    command: MutationEnvelope,
+    pub expected_revision: i64,
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub timezone: String,
+    pub policy_schema_version: i64,
+    pub policy: WorkspacePolicy,
+}
+
+impl UpdateWorkspaceBody {
+    pub fn from_draft(
+        operation_id: String,
+        expected_revision: i64,
+        draft: &WorkspaceDraft,
+    ) -> Self {
+        Self {
+            command: MutationEnvelope::new(operation_id),
+            expected_revision,
+            slug: draft.slug.clone(),
+            display_name: draft.display_name.clone(),
+            description: draft.description.clone(),
+            timezone: draft.timezone.clone(),
+            policy_schema_version: draft.policy_schema_version,
+            policy: draft.policy.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveWorkspaceBody {
+    #[serde(flatten)]
+    command: MutationEnvelope,
+    pub expected_revision: i64,
+}
+
+impl ArchiveWorkspaceBody {
+    pub fn new(operation_id: String, expected_revision: i64) -> Self {
+        Self {
+            command: MutationEnvelope::new(operation_id),
+            expected_revision,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceMutationResult {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub operation_id: String,
+    pub event_ids: Vec<String>,
+    pub workspace_revision: Option<i64>,
+    pub document_revisions: BTreeMap<String, i64>,
+    pub data: serde_json::Value,
 }
 
 fn required(errors: &mut Vec<WorkspaceValidationError>, field: &str, value: &str) {
@@ -486,5 +625,56 @@ mod tests {
         assert_eq!(draft.timezone, workspace.timezone);
         assert_eq!(draft.policy_schema_version, 1);
         assert_eq!(draft.policy, policy);
+    }
+
+    #[test]
+    fn workspace_mutation_bodies_match_the_existing_rest_contract() {
+        let draft = valid_draft();
+        let create = CreateWorkspaceBody::from_draft(
+            "10000000-0000-4000-8000-000000000001".into(),
+            "20000000-0000-4000-8000-000000000001".into(),
+            &draft,
+        );
+        let update = UpdateWorkspaceBody::from_draft(
+            "20000000-0000-4000-8000-000000000002".into(),
+            7,
+            &draft,
+        );
+        let archive = ArchiveWorkspaceBody::new("20000000-0000-4000-8000-000000000003".into(), 8);
+
+        let create_json = serde_json::to_value(create).unwrap();
+        assert_eq!(create_json["schema_version"], 1);
+        assert_eq!(create_json["actor_id"], WEB_ACTOR_ID);
+        assert_eq!(
+            create_json["workspace_id"],
+            "10000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(create_json["slug"], draft.slug);
+        assert_eq!(
+            create_json["policy"],
+            serde_json::to_value(&draft.policy).unwrap()
+        );
+
+        let update_json = serde_json::to_value(update).unwrap();
+        assert_eq!(update_json["actor_id"], WEB_ACTOR_ID);
+        assert_eq!(update_json["expected_revision"], 7);
+        assert_eq!(
+            update_json["operation_id"],
+            "20000000-0000-4000-8000-000000000002"
+        );
+
+        let archive_json = serde_json::to_value(archive).unwrap();
+        assert_eq!(archive_json["actor_id"], WEB_ACTOR_ID);
+        assert_eq!(archive_json["expected_revision"], 8);
+        assert_eq!(archive_json.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn submission_identity_is_a_valid_uuid_and_is_reused_for_retry() {
+        let submission = WorkspaceSubmission::new();
+        assert!(uuid::Uuid::parse_str(&submission.operation_id).is_ok());
+        assert_eq!(submission.retry(), submission);
+        assert_ne!(WorkspaceSubmission::new(), submission);
+        assert!(uuid::Uuid::parse_str(&new_workspace_id()).is_ok());
     }
 }
