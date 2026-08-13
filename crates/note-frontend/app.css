@@ -531,7 +531,7 @@ a.dashboard-metric-detail:hover {
 
 .note-table {
     width: 100%;
-    min-width: 640px;
+    min-width: 60rem;
     max-width: 100%;
     box-sizing: border-box;
     table-layout: fixed;
@@ -619,18 +619,9 @@ a.dashboard-metric-detail:hover {
 }
 
 .note-label-filter-action {
-    position: relative;
-    display: inline-block;
     width: max-content;
-    z-index: auto;
     max-width: 100%;
     min-width: 0;
-    padding: 0;
-    background: transparent;
-    border: 0;
-    box-shadow: none;
-    opacity: 1;
-    visibility: visible;
 }
 
 .note-label-chip {
@@ -646,7 +637,8 @@ a.dashboard-metric-detail:hover {
     vertical-align: middle;
 }
 
-.note-label-popover .popover-content {
+.note-label-tooltip .tooltip-content {
+    min-width: min(12rem, calc(100vw - 2rem));
     max-width: min(42rem, calc(100vw - 2rem));
     white-space: normal;
     overflow-wrap: anywhere;

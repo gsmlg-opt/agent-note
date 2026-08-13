@@ -847,17 +847,16 @@ fn label_chip(key: &str, value: &str, on_quick_add_filter: Callback<(String, Str
     // WORKAROUND(upstream): duskmoon-dev/yew-duskmoon-ui#10 renders a native action trigger
     // until Popover supports consumer click handlers and ARIA customization.
     html! {
-        <div class="popover popover-primary popover-bottom popover-hover note-label-popover note-label-filter-action">
+        <div class="tooltip tooltip-primary tooltip-bottom tooltip-rich note-label-tooltip note-label-filter-action">
             <button
                 type="button"
                 class="chip chip-primary note-label-chip"
-                aria-label={title.clone()}
-                title={title}
+                aria-label={title}
                 onclick={on_click}
             >
                 { label }
             </button>
-            <div class="popover-content" role="tooltip">
+            <div class="tooltip-content" role="tooltip">
                 <dl class="note-label-popover-body">
                     <div class="note-label-popover-row">
                         <dt>{ "name" }</dt>
@@ -868,7 +867,6 @@ fn label_chip(key: &str, value: &str, on_quick_add_filter: Callback<(String, Str
                         <dd>{ value.to_string() }</dd>
                     </div>
                 </dl>
-                <span class="popover-arrow" aria-hidden="true"></span>
             </div>
         </div>
     }
@@ -917,6 +915,62 @@ fn search_results_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yew::virtual_dom::VNode;
+
+    fn attribute<'a>(node: &'a VNode, name: &str) -> Option<&'a str> {
+        let VNode::VTag(tag) = node else {
+            panic!("expected an element node");
+        };
+        tag.attributes
+            .iter()
+            .find_map(|(key, value)| (key == name).then_some(value))
+    }
+
+    fn element_children(node: &VNode) -> Vec<&VNode> {
+        let VNode::VTag(tag) = node else {
+            panic!("expected an element node");
+        };
+        match tag.children().expect("element should have children") {
+            VNode::VList(children) => children.iter().collect(),
+            child => vec![child],
+        }
+    }
+
+    #[test]
+    fn label_chip_uses_tooltip_container_without_popover_positioning() {
+        let chip = label_chip("operation", "home/dgx-spark", Callback::noop());
+        let classes = attribute(&chip, "class").expect("label wrapper should have classes");
+
+        assert!(classes.split_whitespace().any(|class| class == "tooltip"));
+        assert!(!classes.split_whitespace().any(|class| class == "popover"));
+    }
+
+    #[test]
+    fn label_chip_does_not_render_a_duplicate_native_title_tooltip() {
+        let chip = label_chip("operation", "home/dgx-spark", Callback::noop());
+        let button = element_children(&chip)
+            .into_iter()
+            .find(|child| matches!(child, VNode::VTag(tag) if tag.tag() == "button"))
+            .expect("label wrapper should contain a button");
+
+        assert_eq!(attribute(button, "title"), None);
+    }
+
+    #[test]
+    fn label_tooltip_keeps_rich_details_at_a_readable_width() {
+        let app_css = include_str!("../../app.css");
+
+        assert!(app_css.contains(
+            ".note-label-tooltip .tooltip-content {\n    min-width: min(12rem, calc(100vw - 2rem));"
+        ));
+    }
+
+    #[test]
+    fn note_table_reserves_space_for_label_actions() {
+        let app_css = include_str!("../../app.css");
+
+        assert!(app_css.contains(".note-table {\n    width: 100%;\n    min-width: 60rem;"));
+    }
 
     #[test]
     fn retrieval_copy_names_title_and_content() {
