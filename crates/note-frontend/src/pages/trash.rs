@@ -6,7 +6,9 @@ use yew_duskmoon::Alert;
 
 use crate::api;
 use crate::components::{icons, Modal};
-use crate::state::{stale_retry_blocked, DeletedNoteSummary};
+use crate::state::{
+    next_stale_revision_blocked, stale_retry_blocked, DeletedNoteSummary, StaleRevisionEvent,
+};
 
 #[derive(Clone, PartialEq)]
 enum RestoreTarget {
@@ -162,6 +164,7 @@ pub fn trash_page() -> Html {
     let deleting = use_state(|| false);
     let restoring = use_state(|| false);
     let batch_delete_error = use_state(|| None::<String>);
+    let stale_revision_blocked = use_state(|| false);
     let refresh_tick = use_state(|| 0usize);
     let select_all_ref = use_node_ref();
 
@@ -170,6 +173,8 @@ pub fn trash_page() -> Html {
         let selected = selected.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let batch_delete_error = batch_delete_error.clone();
+        let stale_revision_blocked = stale_revision_blocked.clone();
         use_effect_with(*refresh_tick, move |_| {
             loading.set(true);
             error.set(None);
@@ -182,8 +187,20 @@ pub fn trash_page() -> Html {
                             .collect::<HashSet<_>>();
                         selected.dispatch(SelectionAction::RetainVisible(visible));
                         notes.set(next);
+                        error.set(None);
+                        batch_delete_error.set(None);
+                        stale_revision_blocked.set(next_stale_revision_blocked(
+                            *stale_revision_blocked,
+                            StaleRevisionEvent::RefreshSucceeded,
+                        ));
                     }
-                    Err(message) => error.set(Some(message)),
+                    Err(message) => {
+                        stale_revision_blocked.set(next_stale_revision_blocked(
+                            *stale_revision_blocked,
+                            StaleRevisionEvent::RefreshFailed,
+                        ));
+                        error.set(Some(message));
+                    }
                 }
                 loading.set(false);
             });
@@ -234,7 +251,11 @@ pub fn trash_page() -> Html {
         let notes = notes.clone();
         let selected = selected.clone();
         let restore_target = restore_target.clone();
+        let stale_revision_blocked = stale_revision_blocked.clone();
         Callback::from(move |_| {
+            if *stale_revision_blocked {
+                return;
+            }
             let ids = notes
                 .iter()
                 .filter(|note| selected.contains(&note.id))
@@ -252,7 +273,11 @@ pub fn trash_page() -> Html {
         let delete_target = delete_target.clone();
         let error = error.clone();
         let batch_delete_error = batch_delete_error.clone();
+        let stale_revision_blocked = stale_revision_blocked.clone();
         Callback::from(move |_| {
+            if *stale_revision_blocked {
+                return;
+            }
             let ids = selected_note_ids(&notes, &selected);
             error.set(None);
             batch_delete_error.set(None);
@@ -281,18 +306,28 @@ pub fn trash_page() -> Html {
             let on_close = {
                 let restore_target = restore_target.clone();
                 let restoring = restoring.clone();
+                let stale_revision_blocked = stale_revision_blocked.clone();
                 Callback::from(move |_: ()| {
                     if !*restoring {
                         restore_target.set(None);
+                        stale_revision_blocked.set(next_stale_revision_blocked(
+                            *stale_revision_blocked,
+                            StaleRevisionEvent::Dismiss,
+                        ));
                     }
                 })
             };
             let on_cancel = {
                 let restore_target = restore_target.clone();
                 let restoring = restoring.clone();
+                let stale_revision_blocked = stale_revision_blocked.clone();
                 Callback::from(move |_| {
                     if !*restoring {
                         restore_target.set(None);
+                        stale_revision_blocked.set(next_stale_revision_blocked(
+                            *stale_revision_blocked,
+                            StaleRevisionEvent::Dismiss,
+                        ));
                     }
                 })
             };
@@ -303,8 +338,9 @@ pub fn trash_page() -> Html {
                 let error = error.clone();
                 let refresh_tick = refresh_tick.clone();
                 let notes = notes.clone();
+                let stale_revision_blocked = stale_revision_blocked.clone();
                 Callback::from(move |_| {
-                    if stale_retry_blocked(*restoring, error.is_some()) {
+                    if stale_retry_blocked(*restoring, *stale_revision_blocked) {
                         return;
                     }
                     restoring.set(true);
@@ -315,6 +351,7 @@ pub fn trash_page() -> Html {
                     let refresh_tick = refresh_tick.clone();
                     let ids = ids.clone();
                     let notes = notes.clone();
+                    let stale_revision_blocked = stale_revision_blocked.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         let selected_notes = ids
                             .iter()
@@ -326,7 +363,15 @@ pub fn trash_page() -> Html {
                                 restore_target.set(None);
                                 refresh_tick.set((*refresh_tick).saturating_add(1));
                             }
-                            Err(message) => error.set(Some(message.to_string())),
+                            Err(message) => {
+                                if message.is_stale_revision() {
+                                    stale_revision_blocked.set(next_stale_revision_blocked(
+                                        *stale_revision_blocked,
+                                        StaleRevisionEvent::Conflict,
+                                    ));
+                                }
+                                error.set(Some(message.to_string()));
+                            }
                         }
                         restoring.set(false);
                     });
@@ -335,10 +380,8 @@ pub fn trash_page() -> Html {
             let on_reload = {
                 let restore_target = restore_target.clone();
                 let refresh_tick = refresh_tick.clone();
-                let error = error.clone();
                 Callback::from(move |_| {
                     restore_target.set(None);
-                    error.set(None);
                     refresh_tick.set((*refresh_tick).saturating_add(1));
                 })
             };
@@ -346,13 +389,13 @@ pub fn trash_page() -> Html {
                 <Modal title={modal_title} on_close={on_close}>
                     <p>{ message }</p>
                     <div class="app-modal-actions">
-                        if error.is_some() {
+                        if error.is_some() || *stale_revision_blocked {
                             <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload Trash" }</button>
                         }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*restoring}>
                             { "Cancel" }
                         </button>
-                        <button type="button" class="btn btn-primary" onclick={on_confirm} disabled={stale_retry_blocked(*restoring, error.is_some())}>
+                        <button type="button" class="btn btn-primary" onclick={on_confirm} disabled={stale_retry_blocked(*restoring, *stale_revision_blocked)}>
                             { if *restoring { "Restoring...".to_string() } else { confirm_label } }
                         </button>
                     </div>
@@ -370,18 +413,28 @@ pub fn trash_page() -> Html {
             let on_close = {
                 let delete_target = delete_target.clone();
                 let deleting = deleting.clone();
+                let stale_revision_blocked = stale_revision_blocked.clone();
                 Callback::from(move |_: ()| {
                     if !*deleting {
                         delete_target.set(None);
+                        stale_revision_blocked.set(next_stale_revision_blocked(
+                            *stale_revision_blocked,
+                            StaleRevisionEvent::Dismiss,
+                        ));
                     }
                 })
             };
             let on_cancel = {
                 let delete_target = delete_target.clone();
                 let deleting = deleting.clone();
+                let stale_revision_blocked = stale_revision_blocked.clone();
                 Callback::from(move |_| {
                     if !*deleting {
                         delete_target.set(None);
+                        stale_revision_blocked.set(next_stale_revision_blocked(
+                            *stale_revision_blocked,
+                            StaleRevisionEvent::Dismiss,
+                        ));
                     }
                 })
             };
@@ -393,8 +446,9 @@ pub fn trash_page() -> Html {
                 let selected = selected.clone();
                 let refresh_tick = refresh_tick.clone();
                 let notes = notes.clone();
+                let stale_revision_blocked = stale_revision_blocked.clone();
                 Callback::from(move |_| {
-                    if *deleting || error.is_some() || batch_delete_error.is_some() {
+                    if *deleting || *stale_revision_blocked {
                         return;
                     }
                     deleting.set(true);
@@ -406,6 +460,7 @@ pub fn trash_page() -> Html {
                     let refresh_tick = refresh_tick.clone();
                     let ids = ids.clone();
                     let notes = notes.clone();
+                    let stale_revision_blocked = stale_revision_blocked.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         if is_batch {
                             let mut failed = HashSet::new();
@@ -441,6 +496,12 @@ pub fn trash_page() -> Html {
                             } else {
                                 batch_delete_failure_message(ids.len(), failed_count)
                             });
+                            if conflict {
+                                stale_revision_blocked.set(next_stale_revision_blocked(
+                                    *stale_revision_blocked,
+                                    StaleRevisionEvent::Conflict,
+                                ));
+                            }
                             if failed_count == 0 {
                                 delete_target.set(None);
                             } else {
@@ -462,7 +523,15 @@ pub fn trash_page() -> Html {
                                     delete_target.set(None);
                                     refresh_tick.set((*refresh_tick).saturating_add(1));
                                 }
-                                Err(message) => error.set(Some(message.to_string())),
+                                Err(message) => {
+                                    if message.is_stale_revision() {
+                                        stale_revision_blocked.set(next_stale_revision_blocked(
+                                            *stale_revision_blocked,
+                                            StaleRevisionEvent::Conflict,
+                                        ));
+                                    }
+                                    error.set(Some(message.to_string()));
+                                }
                             }
                             deleting.set(false);
                         }
@@ -472,12 +541,8 @@ pub fn trash_page() -> Html {
             let on_reload = {
                 let delete_target = delete_target.clone();
                 let refresh_tick = refresh_tick.clone();
-                let error = error.clone();
-                let batch_delete_error = batch_delete_error.clone();
                 Callback::from(move |_| {
                     delete_target.set(None);
-                    error.set(None);
-                    batch_delete_error.set(None);
                     refresh_tick.set((*refresh_tick).saturating_add(1));
                 })
             };
@@ -485,13 +550,13 @@ pub fn trash_page() -> Html {
                 <Modal title={modal_title} on_close={on_close}>
                     <p>{ message }</p>
                     <div class="app-modal-actions">
-                        if error.is_some() || batch_delete_error.is_some() {
+                        if error.is_some() || batch_delete_error.is_some() || *stale_revision_blocked {
                             <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload Trash" }</button>
                         }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*deleting}>
                             { "Cancel" }
                         </button>
-                        <button type="button" class="btn btn-error" onclick={on_confirm} disabled={*deleting || error.is_some() || batch_delete_error.is_some()}>
+                        <button type="button" class="btn btn-error" onclick={on_confirm} disabled={stale_retry_blocked(*deleting, *stale_revision_blocked)}>
                             { if *deleting { "Deleting...".to_string() } else { confirm_label } }
                         </button>
                     </div>
@@ -533,7 +598,7 @@ pub fn trash_page() -> Html {
                         <button
                             type="button"
                             class="btn btn-primary"
-                            disabled={selected.is_empty() || *restoring || *deleting}
+                            disabled={selected.is_empty() || *restoring || *deleting || *stale_revision_blocked}
                             onclick={open_batch_restore}
                         >
                             { icons::restore() }
@@ -542,7 +607,7 @@ pub fn trash_page() -> Html {
                         <button
                             type="button"
                             class="btn btn-error"
-                            disabled={selected.is_empty() || *restoring || *deleting}
+                            disabled={selected.is_empty() || *restoring || *deleting || *stale_revision_blocked}
                             onclick={open_batch_delete}
                         >
                             { icons::trash() }
@@ -557,6 +622,7 @@ pub fn trash_page() -> Html {
                     &delete_target,
                     &error,
                     &batch_delete_error,
+                    *stale_revision_blocked,
                     *deleting,
                     *restoring,
                     &select_all_ref,
@@ -577,13 +643,14 @@ fn trash_table(
     delete_target: &UseStateHandle<Option<DeleteTarget>>,
     error: &UseStateHandle<Option<String>>,
     batch_delete_error: &UseStateHandle<Option<String>>,
+    stale_revision_blocked: bool,
     deleting: bool,
     restoring: bool,
     select_all_ref: &NodeRef,
     on_select_all: Callback<Event>,
 ) -> Html {
     let all_selected = !notes.is_empty() && selected.len() == notes.len();
-    let mutations_disabled = deleting || restoring;
+    let mutations_disabled = deleting || restoring || stale_revision_blocked;
     html! {
         <div class="table-scroll">
             <table class="table note-table">

@@ -211,22 +211,18 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             let on_close = {
                 let delete_open = delete_open.clone();
                 let delete_pending = delete_pending.clone();
-                let delete_conflict = delete_conflict.clone();
                 Callback::from(move |_: ()| {
                     if !*delete_pending {
                         delete_open.set(false);
-                        delete_conflict.set(None);
                     }
                 })
             };
             let on_cancel = {
                 let delete_open = delete_open.clone();
                 let delete_pending = delete_pending.clone();
-                let delete_conflict = delete_conflict.clone();
                 Callback::from(move |_: MouseEvent| {
                     if !*delete_pending {
                         delete_open.set(false);
-                        delete_conflict.set(None);
                     }
                 })
             };

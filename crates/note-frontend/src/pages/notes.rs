@@ -7,7 +7,10 @@ use crate::api;
 use crate::components::icons;
 use crate::components::Modal;
 use crate::routes::{NotesQueryParams, Route};
-use crate::state::{stale_retry_blocked, LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
+use crate::state::{
+    next_stale_revision_blocked, stale_retry_blocked, LabelFilter, LabelKey, NoteSummary,
+    SearchResultSummary, StaleRevisionEvent,
+};
 
 /// Notes shown per page in the list view.
 const DEFAULT_PAGE_SIZE: usize = 10;
@@ -180,6 +183,7 @@ pub fn notes_page() -> Html {
     // The note pending deletion (id, title) — drives the confirm modal.
     let delete_target = use_state(|| None::<(String, String, i64)>);
     let delete_conflict = use_state(|| None::<api::NoteMutationApiError>);
+    let stale_revision_blocked = use_state(|| false);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
     let page_size = use_state(|| DEFAULT_PAGE_SIZE);
@@ -216,6 +220,8 @@ pub fn notes_page() -> Html {
         let label_filters = label_filters.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let delete_conflict = delete_conflict.clone();
+        let stale_revision_blocked = stale_revision_blocked.clone();
         use_effect_with((url_state.clone(), *refresh_tick), move |(state, _)| {
             let state = state.clone();
             notes.set(Vec::new());
@@ -238,8 +244,19 @@ pub fn notes_page() -> Html {
                         Ok(page) => {
                             notes.set(page.notes);
                             total_notes.set(page.total);
+                            delete_conflict.set(None);
+                            stale_revision_blocked.set(next_stale_revision_blocked(
+                                *stale_revision_blocked,
+                                StaleRevisionEvent::RefreshSucceeded,
+                            ));
                         }
-                        Err(e) => error.set(Some(e)),
+                        Err(e) => {
+                            stale_revision_blocked.set(next_stale_revision_blocked(
+                                *stale_revision_blocked,
+                                StaleRevisionEvent::RefreshFailed,
+                            ));
+                            error.set(Some(e));
+                        }
                     }
                 } else {
                     let limit = state
@@ -248,8 +265,21 @@ pub fn notes_page() -> Html {
                         .saturating_mul(state.page_size)
                         .max(state.page_size);
                     match api::search_filtered(&search, limit, &state.labels).await {
-                        Ok(r) => results.set(Some(r)),
-                        Err(e) => error.set(Some(e)),
+                        Ok(r) => {
+                            results.set(Some(r));
+                            delete_conflict.set(None);
+                            stale_revision_blocked.set(next_stale_revision_blocked(
+                                *stale_revision_blocked,
+                                StaleRevisionEvent::RefreshSucceeded,
+                            ));
+                        }
+                        Err(e) => {
+                            stale_revision_blocked.set(next_stale_revision_blocked(
+                                *stale_revision_blocked,
+                                StaleRevisionEvent::RefreshFailed,
+                            ));
+                            error.set(Some(e));
+                        }
                     }
                 }
                 loading.set(false);
@@ -350,18 +380,24 @@ pub fn notes_page() -> Html {
         Some((id, title, expected_revision)) => {
             let on_close = {
                 let d = delete_target.clone();
-                let delete_conflict = delete_conflict.clone();
+                let stale_revision_blocked = stale_revision_blocked.clone();
                 Callback::from(move |_: ()| {
                     d.set(None);
-                    delete_conflict.set(None);
+                    stale_revision_blocked.set(next_stale_revision_blocked(
+                        *stale_revision_blocked,
+                        StaleRevisionEvent::Dismiss,
+                    ));
                 })
             };
             let on_cancel = {
                 let d = delete_target.clone();
-                let delete_conflict = delete_conflict.clone();
+                let stale_revision_blocked = stale_revision_blocked.clone();
                 Callback::from(move |_: MouseEvent| {
                     d.set(None);
-                    delete_conflict.set(None);
+                    stale_revision_blocked.set(next_stale_revision_blocked(
+                        *stale_revision_blocked,
+                        StaleRevisionEvent::Dismiss,
+                    ));
                 })
             };
             let on_confirm = {
@@ -369,14 +405,16 @@ pub fn notes_page() -> Html {
                 let reload = reload.clone();
                 let error = error.clone();
                 let delete_conflict = delete_conflict.clone();
+                let stale_revision_blocked = stale_revision_blocked.clone();
                 Callback::from(move |_: MouseEvent| {
-                    if delete_conflict.is_some() {
+                    if *stale_revision_blocked {
                         return;
                     }
                     let d = d.clone();
                     let reload = reload.clone();
                     let error = error.clone();
                     let delete_conflict = delete_conflict.clone();
+                    let stale_revision_blocked = stale_revision_blocked.clone();
                     let id = id.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         match api::delete_note(&id, expected_revision).await {
@@ -388,6 +426,10 @@ pub fn notes_page() -> Html {
                             Err(e) => {
                                 if e.is_stale_revision() {
                                     delete_conflict.set(Some(e));
+                                    stale_revision_blocked.set(next_stale_revision_blocked(
+                                        *stale_revision_blocked,
+                                        StaleRevisionEvent::Conflict,
+                                    ));
                                 } else {
                                     error.set(Some(e.to_string()));
                                 }
@@ -398,10 +440,8 @@ pub fn notes_page() -> Html {
             };
             let on_reload = {
                 let d = delete_target.clone();
-                let delete_conflict = delete_conflict.clone();
                 let reload = reload.clone();
                 Callback::from(move |_| {
-                    delete_conflict.set(None);
                     d.set(None);
                     reload.emit(());
                 })
@@ -420,7 +460,7 @@ pub fn notes_page() -> Html {
                             <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload notes" }</button>
                         }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel}>{ "Cancel" }</button>
-                        <button type="button" class="btn btn-error" disabled={stale_retry_blocked(false, delete_conflict.is_some())} onclick={on_confirm}>{ "Remove note" }</button>
+                        <button type="button" class="btn btn-error" disabled={stale_retry_blocked(false, *stale_revision_blocked)} onclick={on_confirm}>{ "Remove note" }</button>
                     </div>
                 </Modal>
             }

@@ -55,6 +55,22 @@ pub fn stale_retry_blocked(pending: bool, has_conflict: bool) -> bool {
     pending || has_conflict
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleRevisionEvent {
+    Conflict,
+    Dismiss,
+    RefreshFailed,
+    RefreshSucceeded,
+}
+
+pub fn next_stale_revision_blocked(current: bool, event: StaleRevisionEvent) -> bool {
+    match event {
+        StaleRevisionEvent::Conflict => true,
+        StaleRevisionEvent::RefreshSucceeded => false,
+        StaleRevisionEvent::Dismiss | StaleRevisionEvent::RefreshFailed => current,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LabelKey {
     pub key: String,
@@ -109,13 +125,28 @@ pub struct SystemInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{stale_retry_blocked, SystemInfo};
+    use super::{next_stale_revision_blocked, stale_retry_blocked, StaleRevisionEvent, SystemInfo};
 
     #[test]
     fn stale_conflicts_block_retry_until_reload_clears_them() {
         assert!(stale_retry_blocked(false, true));
         assert!(stale_retry_blocked(true, false));
         assert!(!stale_retry_blocked(false, false));
+    }
+
+    #[test]
+    fn stale_conflict_survives_dismiss_and_failed_reload() {
+        let conflicted = next_stale_revision_blocked(false, StaleRevisionEvent::Conflict);
+        let dismissed = next_stale_revision_blocked(conflicted, StaleRevisionEvent::Dismiss);
+        assert!(stale_retry_blocked(false, dismissed));
+
+        let failed_reload =
+            next_stale_revision_blocked(dismissed, StaleRevisionEvent::RefreshFailed);
+        assert!(stale_retry_blocked(false, failed_reload));
+
+        let refreshed =
+            next_stale_revision_blocked(failed_reload, StaleRevisionEvent::RefreshSucceeded);
+        assert!(!stale_retry_blocked(false, refreshed));
     }
 
     #[test]
