@@ -289,7 +289,9 @@ async fn export_import_roundtrips_notes_and_label_keys() {
     )
     .await
     .unwrap();
-    delete_note(&source, &labeled.id).await.unwrap();
+    delete_note(&source, &labeled.id, labeled.revision)
+        .await
+        .unwrap();
 
     let data = export_data(&source).await.unwrap();
     assert_eq!(data.version, 2);

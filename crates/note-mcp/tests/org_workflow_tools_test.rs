@@ -659,6 +659,7 @@ async fn dependency_and_note_relationship_tools_round_trip_with_reverse_lookup()
         .await
         .unwrap();
     let note_id = note["id"].as_str().unwrap();
+    let note_revision = note["revision"].as_i64().unwrap();
     let link = mcp
         .call(
             "org_link_note",
@@ -690,9 +691,12 @@ async fn dependency_and_note_relationship_tools_round_trip_with_reverse_lookup()
         .await
         .unwrap();
     assert_eq!(context["note_links"][0]["available"], true);
-    mcp.call("delete_note", json!({"id": note_id}))
-        .await
-        .unwrap();
+    mcp.call(
+        "delete_note",
+        json!({"id": note_id, "expected_revision": note_revision}),
+    )
+    .await
+    .unwrap();
     let context = mcp
         .call(
             "org_get_item_context",

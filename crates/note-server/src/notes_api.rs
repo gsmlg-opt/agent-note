@@ -11,7 +11,7 @@ use note_pipelines::{
     get_note_metadata, label_note_counts, list_deleted_note_summaries, list_label_keys,
     list_note_summaries, normalized_list_limit, normalized_list_offset, permanently_delete_note,
     restore_notes, save_note, search_notes_filtered, update_note, Context, ListNotesParams,
-    SaveNoteInput,
+    RestoreNoteInput, SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,6 +36,22 @@ pub struct SaveNoteRequest {
     #[serde(default)]
     #[schema(schema_with = crate::openapi::label_pairs_with_empty_default_schema)]
     pub labels: Vec<(String, String)>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct UpdateNoteRequest {
+    pub expected_revision: i64,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<AttachmentRequest>,
+    #[serde(default)]
+    pub labels: Vec<(String, String)>,
+}
+
+#[derive(Deserialize)]
+struct ExpectedRevisionQuery {
+    expected_revision: i64,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -155,6 +171,7 @@ pub struct NoteDto {
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub revision: i64,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -191,6 +208,7 @@ impl From<Note> for NoteDto {
                 .collect(),
             created_at: note.created_at,
             updated_at: note.updated_at,
+            revision: note.revision,
         }
     }
 }
@@ -203,6 +221,7 @@ pub struct NoteListDto {
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub revision: i64,
 }
 
 impl From<NoteListItem> for NoteListDto {
@@ -217,6 +236,7 @@ impl From<NoteListItem> for NoteListDto {
                 .collect(),
             created_at: note.created_at,
             updated_at: note.updated_at,
+            revision: note.revision,
         }
     }
 }
@@ -230,6 +250,7 @@ pub struct TrashNoteDto {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: i64,
+    pub revision: i64,
 }
 
 impl From<NoteListItem> for TrashNoteDto {
@@ -247,6 +268,7 @@ impl From<NoteListItem> for TrashNoteDto {
             deleted_at: note
                 .deleted_at
                 .expect("trash queries only return deleted notes"),
+            revision: note.revision,
         }
     }
 }
@@ -748,12 +770,13 @@ async fn get_attachment_handler(
 async fn update_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
-    Json(req): Json<SaveNoteRequest>,
+    Json(req): Json<UpdateNoteRequest>,
 ) -> Result<Json<NoteDto>, (axum::http::StatusCode, String)> {
     let attachments = decode_attachment_requests(req.attachments)?;
     let note = update_note(
         &ctx,
         &id,
+        req.expected_revision,
         SaveNoteInput {
             title: req.title,
             content: req.content,
@@ -763,7 +786,9 @@ async fn update_note_handler(
     )
     .await
     .map_err(|e| {
-        let status = if e.downcast_ref::<note_core::ValidationError>().is_some()
+        let status = if let Some(error) = e.downcast_ref::<note_pipelines::NoteMutationError>() {
+            ordinary_mutation_status(error)
+        } else if e.downcast_ref::<note_core::ValidationError>().is_some()
             || e.downcast_ref::<note_core::LabelKeyValidationError>()
                 .is_some()
         {
@@ -797,11 +822,17 @@ async fn update_note_handler(
 async fn delete_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
+    Query(query): Query<ExpectedRevisionQuery>,
 ) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
-    match delete_note(&ctx, &id)
+    match delete_note(&ctx, &id, query.expected_revision)
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    {
+        .map_err(|e| {
+            let status = e
+                .downcast_ref::<note_pipelines::NoteMutationError>()
+                .map(ordinary_mutation_status)
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            (status, e.to_string())
+        })? {
         true => {
             invalidate_dashboard_cache();
             Ok(axum::http::StatusCode::NO_CONTENT)
@@ -831,7 +862,13 @@ async fn list_deleted_notes_handler(
 #[derive(Deserialize, utoipa::ToSchema)]
 struct RestoreNotesRequest {
     #[schema(min_items = 1)]
-    ids: Vec<String>,
+    notes: Vec<RestoreNoteInputRequest>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+struct RestoreNoteInputRequest {
+    id: String,
+    expected_revision: i64,
 }
 
 #[utoipa::path(
@@ -850,16 +887,27 @@ async fn restore_notes_handler(
     State(ctx): State<Arc<Context>>,
     Json(req): Json<RestoreNotesRequest>,
 ) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
-    if req.ids.is_empty() {
+    if req.notes.is_empty() {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "at least one note id is required".into(),
         ));
     }
-    match restore_notes(&ctx, &req.ids)
-        .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    {
+    let entries = req
+        .notes
+        .into_iter()
+        .map(|note| RestoreNoteInput {
+            id: note.id,
+            expected_revision: note.expected_revision,
+        })
+        .collect::<Vec<_>>();
+    match restore_notes(&ctx, &entries).await.map_err(|e| {
+        let status = e
+            .downcast_ref::<note_pipelines::NoteMutationError>()
+            .map(ordinary_mutation_status)
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        (status, e.to_string())
+    })? {
         true => {
             invalidate_dashboard_cache();
             Ok(axum::http::StatusCode::NO_CONTENT)
@@ -885,13 +933,29 @@ async fn restore_notes_handler(
 async fn permanently_delete_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
+    Query(query): Query<ExpectedRevisionQuery>,
 ) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
-    match permanently_delete_note(&ctx, &id)
+    match permanently_delete_note(&ctx, &id, query.expected_revision)
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    {
+        .map_err(|e| {
+            let status = e
+                .downcast_ref::<note_pipelines::NoteMutationError>()
+                .map(ordinary_mutation_status)
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            (status, e.to_string())
+        })? {
         true => Ok(axum::http::StatusCode::NO_CONTENT),
         false => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
+    }
+}
+
+fn ordinary_mutation_status(error: &note_pipelines::NoteMutationError) -> axum::http::StatusCode {
+    match error {
+        note_pipelines::NoteMutationError::NotFound(_) => axum::http::StatusCode::NOT_FOUND,
+        note_pipelines::NoteMutationError::StaleRevision { .. }
+        | note_pipelines::NoteMutationError::StaleContentTag { .. } => {
+            axum::http::StatusCode::CONFLICT
+        }
     }
 }
 
@@ -1227,7 +1291,7 @@ mod tests {
     fn openapi_requires_at_least_one_restore_id() {
         let document = note_openapi_document();
         assert_eq!(
-            document["components"]["schemas"]["RestoreNotesRequest"]["properties"]["ids"]
+            document["components"]["schemas"]["RestoreNotesRequest"]["properties"]["notes"]
                 ["minItems"],
             1
         );
@@ -2040,6 +2104,7 @@ mod tests {
         assert!(attachment.get("content").is_none());
 
         let update_body = serde_json::json!({
+            "expected_revision": 1,
             "title": "Binary updated",
             "content": "![blob](./blob.bin)",
             "attachments": [{
@@ -2162,7 +2227,7 @@ mod tests {
             .clone()
             .oneshot(put(
                 &format!("/api/notes/{id}"),
-                r#"{"title":"New","content":"New content","labels":[["topic","rust"]]}"#,
+                r#"{"expected_revision":1,"title":"New","content":"New content","labels":[["topic","rust"]]}"#,
             ))
             .await
             .unwrap();
@@ -2184,7 +2249,7 @@ mod tests {
         let resp = app
             .oneshot(put(
                 "/api/notes/nope",
-                r#"{"title":"New","content":"New content","labels":[]}"#,
+                r#"{"expected_revision":1,"title":"New","content":"New content","labels":[]}"#,
             ))
             .await
             .unwrap();
@@ -2202,7 +2267,7 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(delete(&format!("/api/notes/{id}")))
+            .oneshot(delete(&format!("/api/notes/{id}?expected_revision=1")))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -2243,7 +2308,7 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(delete(&format!("/api/notes/{id}")))
+            .oneshot(delete(&format!("/api/notes/{id}?expected_revision=2")))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -2252,7 +2317,7 @@ mod tests {
             .clone()
             .oneshot(post(
                 "/api/trash/restore",
-                &format!(r#"{{"ids":["{id}"]}}"#),
+                &format!(r#"{{"notes":[{{"id":"{id}","expected_revision":2}}]}}"#),
             ))
             .await
             .unwrap();
@@ -2271,21 +2336,21 @@ mod tests {
             .clone()
             .oneshot(post(
                 "/api/trash/restore",
-                &format!(r#"{{"ids":["{id}"]}}"#),
+                &format!(r#"{{"notes":[{{"id":"{id}","expected_revision":3}}]}}"#),
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let resp = app
             .clone()
-            .oneshot(delete(&format!("/api/notes/{id}")))
+            .oneshot(delete(&format!("/api/notes/{id}?expected_revision=3")))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         let resp = app
             .clone()
-            .oneshot(delete(&format!("/api/trash/{id}")))
+            .oneshot(delete(&format!("/api/trash/{id}?expected_revision=4")))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -2298,12 +2363,15 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(delete(&format!("/api/trash/{id}")))
+            .oneshot(delete(&format!("/api/trash/{id}?expected_revision=4")))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        let resp = app.oneshot(delete("/api/notes/nope")).await.unwrap();
+        let resp = app
+            .oneshot(delete("/api/notes/nope?expected_revision=1"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2323,7 +2391,7 @@ mod tests {
         for id in [&first, &second] {
             let resp = app
                 .clone()
-                .oneshot(delete(&format!("/api/notes/{id}")))
+                .oneshot(delete(&format!("/api/notes/{id}?expected_revision=1")))
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -2331,7 +2399,7 @@ mod tests {
 
         let resp = app
             .clone()
-            .oneshot(post("/api/trash/restore", r#"{"ids":[]}"#))
+            .oneshot(post("/api/trash/restore", r#"{"notes":[]}"#))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -2339,7 +2407,7 @@ mod tests {
             .clone()
             .oneshot(post(
                 "/api/trash/restore",
-                &format!(r#"{{"ids":["{first}","missing"]}}"#),
+                &format!(r#"{{"notes":[{{"id":"{first}","expected_revision":2}},{{"id":"missing","expected_revision":1}}]}}"#),
             ))
             .await
             .unwrap();
@@ -2353,7 +2421,7 @@ mod tests {
             .clone()
             .oneshot(post(
                 "/api/trash/restore",
-                &format!(r#"{{"ids":["{first}","{second}","{first}"]}}"#),
+                &format!(r#"{{"notes":[{{"id":"{first}","expected_revision":2}},{{"id":"{second}","expected_revision":2}},{{"id":"{first}","expected_revision":2}}]}}"#),
             ))
             .await
             .unwrap();

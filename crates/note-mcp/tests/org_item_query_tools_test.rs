@@ -963,6 +963,7 @@ async fn item_context_is_complete_ordered_and_redacts_nested_sensitive_metadata(
         .await
         .unwrap();
     let note_id = note["id"].as_str().unwrap().to_owned();
+    let note_revision = note["revision"].as_i64().unwrap();
     link_note(
         &mcp.org,
         &envelope("link-note"),
@@ -1097,9 +1098,12 @@ async fn item_context_is_complete_ordered_and_redacts_nested_sensitive_metadata(
     assert!(!encoded.contains("raw-lease-token"));
     assert!(!encoded.contains("raw-fencing-token"));
     assert!(!encoded.contains("fencing_token_hash"));
-    mcp.call("delete_note", json!({"id": note_id}))
-        .await
-        .unwrap();
+    mcp.call(
+        "delete_note",
+        json!({"id": note_id, "expected_revision": note_revision}),
+    )
+    .await
+    .unwrap();
     let unavailable = mcp
         .call(
             "org_get_item_context",

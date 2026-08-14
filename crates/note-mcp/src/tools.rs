@@ -53,6 +53,7 @@ pub struct NoteSummaryData {
     pub labels: Vec<LabelData>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub revision: i64,
 }
 
 impl From<NoteListItem> for NoteSummaryData {
@@ -63,6 +64,7 @@ impl From<NoteListItem> for NoteSummaryData {
             labels: note.labels.into_iter().map(Into::into).collect(),
             created_at: note.created_at,
             updated_at: note.updated_at,
+            revision: note.revision,
         }
     }
 }
@@ -76,6 +78,7 @@ pub struct NoteDetailData {
     pub labels: Vec<LabelData>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub revision: i64,
 }
 
 impl From<Note> for NoteDetailData {
@@ -88,6 +91,7 @@ impl From<Note> for NoteDetailData {
             labels: note.labels.into_iter().map(Into::into).collect(),
             created_at: note.created_at,
             updated_at: note.updated_at,
+            revision: note.revision,
         }
     }
 }
@@ -104,6 +108,7 @@ pub struct SaveNoteToolInput {
 #[derive(Debug, Serialize)]
 pub struct SaveNoteToolOutput {
     pub id: String,
+    pub revision: i64,
 }
 
 pub async fn save_note_tool(
@@ -120,7 +125,10 @@ pub async fn save_note_tool(
         },
     )
     .await?;
-    Ok(SaveNoteToolOutput { id: note.id })
+    Ok(SaveNoteToolOutput {
+        id: note.id,
+        revision: note.revision,
+    })
 }
 
 pub async fn get_note_tool(ctx: &Context, id: &str) -> anyhow::Result<Option<NoteDetailData>> {
@@ -136,6 +144,7 @@ pub struct NoteLine {
 #[derive(Debug, Serialize)]
 pub struct NoteLinesData {
     pub id: String,
+    pub revision: i64,
     pub tag: String,
     pub lines: Vec<NoteLine>,
 }
@@ -144,31 +153,34 @@ pub async fn read_note_lines_tool(
     ctx: &Context,
     id: &str,
 ) -> anyhow::Result<Option<NoteLinesData>> {
-    let note = get_note_metadata(ctx, id).await?;
-    Ok(note.map(|note| NoteLinesData {
-        id: note.id,
-        tag: note_pipelines::compute_tag(&note.content),
-        lines: note
-            .content
-            .split('\n')
-            .enumerate()
-            .map(|(idx, text)| NoteLine {
-                n: idx + 1,
-                text: text.to_string(),
-            })
-            .collect(),
-    }))
+    Ok(note_pipelines::read_note_lines(ctx, id)
+        .await?
+        .map(|note| NoteLinesData {
+            id: note.id,
+            revision: note.revision,
+            tag: note.tag,
+            lines: note
+                .lines
+                .into_iter()
+                .map(|line| NoteLine {
+                    n: line.n,
+                    text: line.text,
+                })
+                .collect(),
+        }))
 }
 
 pub async fn edit_note_tool(
     ctx: &Context,
     id: &str,
+    expected_revision: i64,
     tag: &str,
     ops: Vec<note_pipelines::EditOp>,
 ) -> anyhow::Result<Option<NoteLinesData>> {
-    let note = note_pipelines::edit_note(ctx, id, tag, &ops).await?;
+    let note = note_pipelines::edit_note(ctx, id, expected_revision, tag, &ops).await?;
     Ok(note.map(|note| NoteLinesData {
         id: note.id,
+        revision: note.revision,
         tag: note_pipelines::compute_tag(&note.content),
         lines: note
             .content
@@ -186,6 +198,7 @@ pub async fn edit_note_tool(
 #[serde(deny_unknown_fields)]
 pub struct UpdateNoteToolInput {
     pub id: String,
+    pub expected_revision: i64,
     pub title: String,
     pub content: String,
     #[serde(default)]
@@ -200,6 +213,7 @@ pub async fn update_note_tool(
         ctx,
         &input.id,
         UpdateNoteFieldsInput {
+            expected_revision: input.expected_revision,
             title: input.title,
             content: input.content,
             labels: input.labels,
@@ -209,8 +223,12 @@ pub async fn update_note_tool(
     .map(Into::into))
 }
 
-pub async fn delete_note_tool(ctx: &Context, id: &str) -> anyhow::Result<bool> {
-    delete_note(ctx, id).await
+pub async fn delete_note_tool(
+    ctx: &Context,
+    id: &str,
+    expected_revision: i64,
+) -> anyhow::Result<bool> {
+    delete_note(ctx, id, expected_revision).await
 }
 
 pub async fn list_notes_tool(
@@ -272,6 +290,7 @@ pub async fn semantic_search_tool(
 #[derive(Debug)]
 pub struct PutNoteAttachmentToolInput {
     pub note_id: String,
+    pub expected_revision: i64,
     pub attachment_id: String,
     pub path: String,
     pub mime: String,
@@ -282,6 +301,7 @@ pub struct PutNoteAttachmentToolInput {
 #[derive(Debug, Serialize)]
 pub struct PutNoteAttachmentToolOutput {
     pub created: bool,
+    pub revision: i64,
     pub attachment: AttachmentMetadataData,
 }
 
@@ -292,6 +312,7 @@ pub async fn put_note_attachment_tool(
     let result = pipeline_put_note_attachment(
         ctx,
         &input.note_id,
+        input.expected_revision,
         NoteAttachment {
             id: input.attachment_id,
             path: input.path,
@@ -303,6 +324,7 @@ pub async fn put_note_attachment_tool(
     .await?;
     Ok(PutNoteAttachmentToolOutput {
         created: result.created,
+        revision: result.revision,
         attachment: result.attachment.into(),
     })
 }
@@ -352,6 +374,7 @@ pub async fn delete_note_attachment_tool(
     ctx: &Context,
     note_id: &str,
     attachment_id: &str,
-) -> anyhow::Result<bool> {
-    pipeline_delete_note_attachment(ctx, note_id, attachment_id).await
+    expected_revision: i64,
+) -> anyhow::Result<note_pipelines::DeleteNoteAttachmentResult> {
+    pipeline_delete_note_attachment(ctx, note_id, attachment_id, expected_revision).await
 }

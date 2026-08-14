@@ -6,6 +6,9 @@ pub use context::*;
 
 pub mod org;
 
+pub mod mutation_error;
+pub use mutation_error::*;
+
 pub mod note_attachments;
 pub use note_attachments::*;
 

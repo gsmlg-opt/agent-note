@@ -8,9 +8,10 @@ use note_embedding::StubEmbedder;
 use note_pipelines::{
     compute_tag, define_label_key, define_label_key_with_type, delete_note, drain_embedding_jobs,
     edit_note, get_note, get_note_attachment, get_note_metadata, import_json,
-    list_deleted_note_summaries, list_label_keys, purge_expired_deleted_notes, restore_notes,
-    save_note, update_note, update_note_fields, update_system_config, Context, EditOp,
-    SaveNoteInput, UpdateNoteFieldsInput, TRASH_RETENTION_SECONDS,
+    list_deleted_note_summaries, list_label_keys, permanently_delete_note,
+    purge_expired_deleted_notes, restore_notes, save_note, update_note, update_note_fields,
+    update_system_config, Context, EditOp, NoteMutationError, RestoreNoteInput, SaveNoteInput,
+    UpdateNoteFieldsInput, TRASH_RETENTION_SECONDS,
 };
 use note_storage::{NoteMutationResult, StorageBackend, TransactionMode};
 use std::{
@@ -316,6 +317,7 @@ async fn save_and_update_order_attachment_finalization_around_the_database_trans
     update_note(
         &ctx,
         &note.id,
+        note.revision,
         SaveNoteInput {
             title: "After".into(),
             content: "Updated content".into(),
@@ -450,20 +452,22 @@ async fn permanent_delete_and_purge_remove_attachments_only_after_database_delet
     )
     .await
     .unwrap();
-    assert!(delete_note(&ctx, &note.id).await.unwrap());
+    assert!(delete_note(&ctx, &note.id, note.revision).await.unwrap());
     events.lock().unwrap().clear();
 
-    assert!(note_pipelines::permanently_delete_note(&ctx, &note.id)
-        .await
-        .unwrap());
+    assert!(
+        note_pipelines::permanently_delete_note(&ctx, &note.id, note.revision + 1)
+            .await
+            .unwrap()
+    );
     assert_eq!(
         *events.lock().unwrap(),
         vec![format!("remove:{}:absent=true", note.id)]
     );
     events.lock().unwrap().clear();
-    assert!(!note_pipelines::permanently_delete_note(&ctx, "missing")
+    assert!(note_pipelines::permanently_delete_note(&ctx, "missing", 1)
         .await
-        .unwrap());
+        .is_err());
     assert!(events.lock().unwrap().is_empty());
 
     let expired = save_note(
@@ -806,6 +810,7 @@ async fn selector_reserved_label_key_is_not_auto_created_on_update() {
     let error = update_note(
         &ctx,
         &note.id,
+        note.revision,
         SaveNoteInput {
             title: "Updated note".into(),
             content: "Updated content".into(),
@@ -969,8 +974,8 @@ async fn delete_and_restore_preserve_note_data_and_requeue_embeddings() {
     .unwrap();
     drain_embedding_jobs(&ctx, 10).await.unwrap();
 
-    assert!(delete_note(&ctx, &note.id).await.unwrap());
-    assert!(!delete_note(&ctx, &note.id).await.unwrap());
+    assert!(delete_note(&ctx, &note.id, note.revision).await.unwrap());
+    assert!(delete_note(&ctx, &note.id, note.revision).await.is_err());
     assert!(get_note(&ctx, &note.id).await.unwrap().is_none());
     assert_eq!(
         std::fs::read_to_string(
@@ -998,9 +1003,21 @@ async fn delete_and_restore_preserve_note_data_and_requeue_embeddings() {
         .is_empty());
     assert!(!session.chunk_embedding_exists(&note.id, 0).await.unwrap());
 
-    assert!(restore_notes(&ctx, &[note.id.clone(), note.id.clone()])
-        .await
-        .unwrap());
+    assert!(restore_notes(
+        &ctx,
+        &[
+            RestoreNoteInput {
+                id: note.id.clone(),
+                expected_revision: note.revision + 1
+            },
+            RestoreNoteInput {
+                id: note.id.clone(),
+                expected_revision: note.revision + 1
+            }
+        ]
+    )
+    .await
+    .unwrap());
     let restored = get_note(&ctx, &note.id).await.unwrap().unwrap();
     assert_eq!(restored.labels.len(), 1);
     assert_eq!(restored.attachments[0].content, b"{}");
@@ -1044,11 +1061,25 @@ async fn restore_batch_rolls_back_when_any_note_is_not_in_trash() {
     )
     .await
     .unwrap();
-    delete_note(&ctx, &deleted.id).await.unwrap();
-
-    assert!(!restore_notes(&ctx, &[deleted.id.clone(), active.id])
+    delete_note(&ctx, &deleted.id, deleted.revision)
         .await
-        .unwrap());
+        .unwrap();
+
+    assert!(restore_notes(
+        &ctx,
+        &[
+            RestoreNoteInput {
+                id: deleted.id.clone(),
+                expected_revision: deleted.revision + 1
+            },
+            RestoreNoteInput {
+                id: active.id,
+                expected_revision: active.revision
+            }
+        ]
+    )
+    .await
+    .is_err());
     assert!(get_note(&ctx, &deleted.id).await.unwrap().is_none());
     let session = backend.session().await.unwrap();
     assert!(session
@@ -1058,6 +1089,110 @@ async fn restore_batch_rolls_back_when_any_note_is_not_in_trash() {
         .is_empty());
     let pending = session.claim_pending_embedding_jobs(10, 1).await.unwrap();
     assert!(pending.iter().all(|job| job.note_id != deleted.id));
+}
+
+#[tokio::test]
+async fn lifecycle_writes_report_stale_revisions_and_restore_batch_is_atomic() {
+    let (ctx, backend, _dir) = test_context().await;
+    let first = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "First".into(),
+            content: "first".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let second = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Second".into(),
+            content: "second".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let error = delete_note(&ctx, &first.id, first.revision - 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(NoteMutationError::StaleRevision {
+            current_revision: 1,
+            ..
+        })
+    ));
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_note(&first.id)
+        .await
+        .unwrap()
+        .is_some());
+
+    delete_note(&ctx, &first.id, first.revision).await.unwrap();
+    delete_note(&ctx, &second.id, second.revision)
+        .await
+        .unwrap();
+    let error = restore_notes(
+        &ctx,
+        &[
+            RestoreNoteInput {
+                id: first.id.clone(),
+                expected_revision: first.revision + 1,
+            },
+            RestoreNoteInput {
+                id: second.id.clone(),
+                expected_revision: second.revision,
+            },
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(NoteMutationError::StaleRevision { note_id, .. }) if note_id == &second.id
+    ));
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_note(&first.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_note(&second.id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let error = permanently_delete_note(&ctx, &first.id, first.revision)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(NoteMutationError::StaleRevision {
+            current_revision: 2,
+            ..
+        })
+    ));
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .note_exists(&first.id)
+        .await
+        .unwrap());
 }
 
 #[tokio::test]
@@ -1438,6 +1573,7 @@ async fn duplicate_check_does_not_apply_to_updates() {
     let updated = update_note(
         &ctx,
         &second.id,
+        second.revision,
         SaveNoteInput {
             title: "Second".into(),
             content: "Content".into(),
@@ -1540,6 +1676,7 @@ async fn update_only_queues_embedding_when_content_hash_changes() {
     update_note(
         &ctx,
         &note.id,
+        note.revision,
         SaveNoteInput {
             title: "Renamed".into(),
             content: "Stable content".into(),
@@ -1562,6 +1699,7 @@ async fn update_only_queues_embedding_when_content_hash_changes() {
     update_note(
         &ctx,
         &note.id,
+        note.revision + 1,
         SaveNoteInput {
             title: "Renamed".into(),
             content: "Changed content".into(),
@@ -1615,6 +1753,7 @@ async fn field_only_update_preserves_attachments_and_synchronizes_content_embedd
         &ctx,
         &saved.id,
         UpdateNoteFieldsInput {
+            expected_revision: saved.revision,
             title: "After".into(),
             content: "Changed content".into(),
             labels: vec![("status".into(), "published".into())],
@@ -1643,6 +1782,134 @@ async fn field_only_update_preserves_attachments_and_synchronizes_content_embedd
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].content, "Changed content");
     assert_eq!(jobs[0].note_revision, 2);
+}
+
+#[tokio::test]
+async fn stale_full_update_rolls_back_all_note_state_and_does_not_wake() {
+    let (ctx, backend, _attachments, events, _dir) = controlled_context(true).await;
+    let saved = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Before".into(),
+            content: "original".into(),
+            attachments: one_attachment(),
+            labels: vec![("status".into(), "draft".into())],
+        },
+    )
+    .await
+    .unwrap();
+    drain_embedding_jobs(&ctx, 10).await.unwrap();
+    events.lock().unwrap().clear();
+
+    let error = update_note(
+        &ctx,
+        &saved.id,
+        saved.revision - 1,
+        SaveNoteInput {
+            title: "After".into(),
+            content: "changed".into(),
+            attachments: vec![],
+            labels: vec![("status".into(), "published".into())],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(NoteMutationError::StaleRevision {
+            expected_revision: 0,
+            current_revision: 1,
+            ..
+        })
+    ));
+    let stored = backend
+        .session()
+        .await
+        .unwrap()
+        .get_note(&saved.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.title, "Before");
+    assert_eq!(stored.content, "original");
+    assert_eq!(stored.labels[0].value, "draft");
+    assert_eq!(stored.attachments.len(), 1);
+    assert_eq!(stored.revision, 1);
+    let session = backend.session().await.unwrap();
+    assert_eq!(
+        session.list_note_chunks(&saved.id).await.unwrap()[0].content,
+        "original"
+    );
+    assert!(session
+        .claim_pending_embedding_jobs(10, 1)
+        .await
+        .unwrap()
+        .is_empty());
+    let logged = events.lock().unwrap().clone();
+    assert!(logged.iter().any(|event| event == "rollback"));
+    assert!(!logged.iter().any(|event| event == "wake"));
+}
+
+#[tokio::test]
+async fn edit_rejects_stale_revision_even_when_the_content_tag_matches() {
+    let (ctx, backend, _dir) = test_context().await;
+    let saved = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Editable".into(),
+            content: "current".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let current = update_note_fields(
+        &ctx,
+        &saved.id,
+        UpdateNoteFieldsInput {
+            expected_revision: saved.revision,
+            title: saved.title.clone(),
+            content: saved.content.clone(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let error = edit_note(
+        &ctx,
+        &saved.id,
+        saved.revision,
+        &compute_tag(&current.content),
+        &[EditOp::InsertTail {
+            lines: vec!["never".into()],
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(NoteMutationError::StaleRevision {
+            expected_revision: 1,
+            current_revision: 2,
+            ..
+        })
+    ));
+    assert_eq!(
+        backend
+            .session()
+            .await
+            .unwrap()
+            .get_note(&saved.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "current"
+    );
 }
 
 #[tokio::test]
@@ -1675,6 +1942,7 @@ async fn edit_note_preserves_attachment_metadata_without_attachment_io() {
     let edited = edit_note(
         &ctx,
         &saved.id,
+        saved.revision,
         &compute_tag(&saved.content),
         &[EditOp::InsertTail {
             lines: vec!["third".into()],
@@ -1730,6 +1998,7 @@ async fn edit_note_keeps_the_stale_tag_error_without_attachment_io() {
     let error = edit_note(
         &ctx,
         &saved.id,
+        saved.revision,
         &compute_tag("stale"),
         &[EditOp::InsertTail {
             lines: vec!["never written".into()],
@@ -1738,7 +2007,14 @@ async fn edit_note_keeps_the_stale_tag_error_without_attachment_io() {
     .await
     .unwrap_err();
 
-    assert!(error.to_string().contains("stale tag"));
+    assert!(matches!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(NoteMutationError::StaleContentTag {
+            note_id,
+            current_tag,
+            ..
+        }) if note_id == &saved.id && current_tag == &compute_tag("current")
+    ));
     let stored = backend
         .session()
         .await
