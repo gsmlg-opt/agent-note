@@ -8,8 +8,8 @@ use crate::components::icons;
 use crate::components::Modal;
 use crate::routes::{NotesQueryParams, Route};
 use crate::state::{
-    next_stale_revision_blocked, stale_retry_blocked, LabelFilter, LabelKey, NoteSummary,
-    SearchResultSummary, StaleRevisionEvent,
+    stale_retry_blocked, LabelFilter, LabelKey, NoteSummary, SearchResultSummary,
+    StaleRevisionGate, StaleRevisionGateAction,
 };
 
 /// Notes shown per page in the list view.
@@ -183,7 +183,7 @@ pub fn notes_page() -> Html {
     // The note pending deletion (id, title) — drives the confirm modal.
     let delete_target = use_state(|| None::<(String, String, i64)>);
     let delete_conflict = use_state(|| None::<api::NoteMutationApiError>);
-    let stale_revision_blocked = use_state(|| false);
+    let stale_revision_gate = use_reducer(StaleRevisionGate::default);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
     let page_size = use_state(|| DEFAULT_PAGE_SIZE);
@@ -221,9 +221,10 @@ pub fn notes_page() -> Html {
         let loading = loading.clone();
         let error = error.clone();
         let delete_conflict = delete_conflict.clone();
-        let stale_revision_blocked = stale_revision_blocked.clone();
+        let stale_revision_gate = stale_revision_gate.clone();
         use_effect_with((url_state.clone(), *refresh_tick), move |(state, _)| {
             let state = state.clone();
+            let refresh_epoch = stale_revision_gate.refresh_epoch();
             notes.set(Vec::new());
             total_notes.set(0);
             results.set(None);
@@ -245,16 +246,20 @@ pub fn notes_page() -> Html {
                             notes.set(page.notes);
                             total_notes.set(page.total);
                             delete_conflict.set(None);
-                            stale_revision_blocked.set(next_stale_revision_blocked(
-                                *stale_revision_blocked,
-                                StaleRevisionEvent::RefreshSucceeded,
-                            ));
+                            stale_revision_gate.dispatch(
+                                StaleRevisionGateAction::RefreshFinished {
+                                    started_epoch: refresh_epoch,
+                                    succeeded: true,
+                                },
+                            );
                         }
                         Err(e) => {
-                            stale_revision_blocked.set(next_stale_revision_blocked(
-                                *stale_revision_blocked,
-                                StaleRevisionEvent::RefreshFailed,
-                            ));
+                            stale_revision_gate.dispatch(
+                                StaleRevisionGateAction::RefreshFinished {
+                                    started_epoch: refresh_epoch,
+                                    succeeded: false,
+                                },
+                            );
                             error.set(Some(e));
                         }
                     }
@@ -268,16 +273,20 @@ pub fn notes_page() -> Html {
                         Ok(r) => {
                             results.set(Some(r));
                             delete_conflict.set(None);
-                            stale_revision_blocked.set(next_stale_revision_blocked(
-                                *stale_revision_blocked,
-                                StaleRevisionEvent::RefreshSucceeded,
-                            ));
+                            stale_revision_gate.dispatch(
+                                StaleRevisionGateAction::RefreshFinished {
+                                    started_epoch: refresh_epoch,
+                                    succeeded: true,
+                                },
+                            );
                         }
                         Err(e) => {
-                            stale_revision_blocked.set(next_stale_revision_blocked(
-                                *stale_revision_blocked,
-                                StaleRevisionEvent::RefreshFailed,
-                            ));
+                            stale_revision_gate.dispatch(
+                                StaleRevisionGateAction::RefreshFinished {
+                                    started_epoch: refresh_epoch,
+                                    succeeded: false,
+                                },
+                            );
                             error.set(Some(e));
                         }
                     }
@@ -380,24 +389,18 @@ pub fn notes_page() -> Html {
         Some((id, title, expected_revision)) => {
             let on_close = {
                 let d = delete_target.clone();
-                let stale_revision_blocked = stale_revision_blocked.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_: ()| {
                     d.set(None);
-                    stale_revision_blocked.set(next_stale_revision_blocked(
-                        *stale_revision_blocked,
-                        StaleRevisionEvent::Dismiss,
-                    ));
+                    stale_revision_gate.dispatch(StaleRevisionGateAction::Dismiss);
                 })
             };
             let on_cancel = {
                 let d = delete_target.clone();
-                let stale_revision_blocked = stale_revision_blocked.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_: MouseEvent| {
                     d.set(None);
-                    stale_revision_blocked.set(next_stale_revision_blocked(
-                        *stale_revision_blocked,
-                        StaleRevisionEvent::Dismiss,
-                    ));
+                    stale_revision_gate.dispatch(StaleRevisionGateAction::Dismiss);
                 })
             };
             let on_confirm = {
@@ -405,16 +408,16 @@ pub fn notes_page() -> Html {
                 let reload = reload.clone();
                 let error = error.clone();
                 let delete_conflict = delete_conflict.clone();
-                let stale_revision_blocked = stale_revision_blocked.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_: MouseEvent| {
-                    if *stale_revision_blocked {
+                    if stale_revision_gate.blocked() {
                         return;
                     }
                     let d = d.clone();
                     let reload = reload.clone();
                     let error = error.clone();
                     let delete_conflict = delete_conflict.clone();
-                    let stale_revision_blocked = stale_revision_blocked.clone();
+                    let stale_revision_gate = stale_revision_gate.clone();
                     let id = id.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         match api::delete_note(&id, expected_revision).await {
@@ -426,10 +429,7 @@ pub fn notes_page() -> Html {
                             Err(e) => {
                                 if e.is_stale_revision() {
                                     delete_conflict.set(Some(e));
-                                    stale_revision_blocked.set(next_stale_revision_blocked(
-                                        *stale_revision_blocked,
-                                        StaleRevisionEvent::Conflict,
-                                    ));
+                                    stale_revision_gate.dispatch(StaleRevisionGateAction::Conflict);
                                 } else {
                                     error.set(Some(e.to_string()));
                                 }
@@ -460,7 +460,7 @@ pub fn notes_page() -> Html {
                             <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload notes" }</button>
                         }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel}>{ "Cancel" }</button>
-                        <button type="button" class="btn btn-error" disabled={stale_retry_blocked(false, *stale_revision_blocked)} onclick={on_confirm}>{ "Remove note" }</button>
+                        <button type="button" class="btn btn-error" disabled={stale_retry_blocked(false, stale_revision_gate.blocked())} onclick={on_confirm}>{ "Remove note" }</button>
                     </div>
                 </Modal>
             }

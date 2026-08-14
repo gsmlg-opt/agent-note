@@ -1,7 +1,10 @@
 //! Plain view-model types shared across pages. (The app is now multi-page via yew-router, so
 //! state lives locally in each page rather than in one global reducer.)
 
+use std::rc::Rc;
+
 use serde::{Deserialize, Serialize};
+use yew::Reducible;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachmentContent {
@@ -56,18 +59,49 @@ pub fn stale_retry_blocked(pending: bool, has_conflict: bool) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StaleRevisionEvent {
+pub enum StaleRevisionGateAction {
     Conflict,
     Dismiss,
-    RefreshFailed,
-    RefreshSucceeded,
+    RefreshFinished { started_epoch: u64, succeeded: bool },
 }
 
-pub fn next_stale_revision_blocked(current: bool, event: StaleRevisionEvent) -> bool {
-    match event {
-        StaleRevisionEvent::Conflict => true,
-        StaleRevisionEvent::RefreshSucceeded => false,
-        StaleRevisionEvent::Dismiss | StaleRevisionEvent::RefreshFailed => current,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StaleRevisionGate {
+    conflict_epoch: u64,
+    blocked: bool,
+}
+
+impl StaleRevisionGate {
+    pub fn refresh_epoch(&self) -> u64 {
+        self.conflict_epoch
+    }
+
+    pub fn blocked(&self) -> bool {
+        self.blocked
+    }
+}
+
+impl Reducible for StaleRevisionGate {
+    type Action = StaleRevisionGateAction;
+
+    fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
+        match action {
+            StaleRevisionGateAction::Conflict => Self {
+                conflict_epoch: self.conflict_epoch.saturating_add(1),
+                blocked: true,
+            }
+            .into(),
+            StaleRevisionGateAction::Dismiss => self,
+            StaleRevisionGateAction::RefreshFinished {
+                started_epoch,
+                succeeded: true,
+            } if started_epoch == self.conflict_epoch => Self {
+                conflict_epoch: self.conflict_epoch,
+                blocked: false,
+            }
+            .into(),
+            StaleRevisionGateAction::RefreshFinished { .. } => self,
+        }
     }
 }
 
@@ -125,7 +159,11 @@ pub struct SystemInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_stale_revision_blocked, stale_retry_blocked, StaleRevisionEvent, SystemInfo};
+    use std::rc::Rc;
+
+    use yew::Reducible;
+
+    use super::{stale_retry_blocked, StaleRevisionGate, StaleRevisionGateAction, SystemInfo};
 
     #[test]
     fn stale_conflicts_block_retry_until_reload_clears_them() {
@@ -136,17 +174,29 @@ mod tests {
 
     #[test]
     fn stale_conflict_survives_dismiss_and_failed_reload() {
-        let conflicted = next_stale_revision_blocked(false, StaleRevisionEvent::Conflict);
-        let dismissed = next_stale_revision_blocked(conflicted, StaleRevisionEvent::Dismiss);
-        assert!(stale_retry_blocked(false, dismissed));
+        let gate = Rc::new(StaleRevisionGate::default());
+        let old_refresh_epoch = gate.refresh_epoch();
+        let gate = gate.reduce(StaleRevisionGateAction::Conflict);
+        let current_refresh_epoch = gate.refresh_epoch();
+        let gate = gate.reduce(StaleRevisionGateAction::Dismiss);
+        assert!(stale_retry_blocked(false, gate.blocked()));
 
-        let failed_reload =
-            next_stale_revision_blocked(dismissed, StaleRevisionEvent::RefreshFailed);
-        assert!(stale_retry_blocked(false, failed_reload));
+        let gate = gate.reduce(StaleRevisionGateAction::RefreshFinished {
+            started_epoch: old_refresh_epoch,
+            succeeded: false,
+        });
+        assert!(stale_retry_blocked(false, gate.blocked()));
+        let gate = gate.reduce(StaleRevisionGateAction::RefreshFinished {
+            started_epoch: old_refresh_epoch,
+            succeeded: true,
+        });
+        assert!(stale_retry_blocked(false, gate.blocked()));
 
-        let refreshed =
-            next_stale_revision_blocked(failed_reload, StaleRevisionEvent::RefreshSucceeded);
-        assert!(!stale_retry_blocked(false, refreshed));
+        let gate = gate.reduce(StaleRevisionGateAction::RefreshFinished {
+            started_epoch: current_refresh_epoch,
+            succeeded: true,
+        });
+        assert!(!stale_retry_blocked(false, gate.blocked()));
     }
 
     #[test]
