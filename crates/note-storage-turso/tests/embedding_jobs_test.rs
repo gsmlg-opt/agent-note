@@ -60,7 +60,7 @@ async fn dashboard_status_counts_complete_notes_and_reports_only_processing_jobs
     add_chunk(&fixture.session, "deleted", 0, "embedded").await;
     fixture
         .session
-        .soft_delete_note("deleted", 1000)
+        .soft_delete_note("deleted", 1, 1000)
         .await
         .unwrap();
     add_chunk(&fixture.session, "processing", 0, "pending").await;
@@ -467,7 +467,7 @@ async fn reset_embeddings_clears_vectors_and_replaces_jobs_for_active_chunks_onl
     add_chunk(&fixture.session, "deleted", 0, "embedded").await;
     fixture
         .session
-        .soft_delete_note("deleted", 1500)
+        .soft_delete_note("deleted", 1, 1500)
         .await
         .unwrap();
     fixture

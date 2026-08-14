@@ -4,7 +4,7 @@ use note_core::{
     validate_label_key, validate_label_value, validate_note_input, Label, LabelValueType, Note,
     NoteAttachment, NoteInput, ValidationError,
 };
-use note_storage::{NoteFieldsUpdate, NoteUpdate, TransactionMode};
+use note_storage::{NoteFieldsUpdate, NoteMutationResult, NoteUpdate, TransactionMode};
 use std::collections::{HashMap, HashSet};
 
 pub const TRASH_RETENTION_DAYS: i64 = 90;
@@ -103,7 +103,8 @@ async fn update_note_inner(
     }
 
     let now = chrono::Utc::now().timestamp();
-    let note_revision = session.get_note_revision(id).await?.unwrap_or(1) + 1;
+    let expected_revision = existing.revision;
+    let note_revision = expected_revision.saturating_add(1);
     drop(session);
     let chunks = crate::chunk::chunk_content(&input.content);
     let mut prepared_attachments = match attachments.as_deref() {
@@ -130,7 +131,7 @@ async fn update_note_inner(
                         content: &input.content,
                         attachments,
                         updated_at: now,
-                        note_revision,
+                        expected_revision,
                     })
                     .await?
             }
@@ -141,12 +142,12 @@ async fn update_note_inner(
                         title: &input.title,
                         content: &input.content,
                         updated_at: now,
-                        note_revision,
+                        expected_revision,
                     })
                     .await?
             }
         };
-        if affected == 0 {
+        if !matches!(affected, NoteMutationResult::Applied { .. }) {
             return anyhow::Ok(None);
         }
         for key in &missing_keys {
@@ -200,6 +201,7 @@ async fn update_note_inner(
             labels: resolved_labels,
             created_at: existing.created_at,
             updated_at: now,
+            revision: note_revision,
             deleted_at: None,
         })),
         None => crate::get_note_metadata(ctx, id).await,
@@ -219,10 +221,15 @@ async fn abort_optional(
 pub async fn delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
     let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
     let transaction_result = async {
-        let deleted = transaction
-            .soft_delete_note(id, chrono::Utc::now().timestamp())
-            .await?
-            > 0;
+        let Some(expected_revision) = transaction.get_note_revision(id).await? else {
+            return anyhow::Ok(false);
+        };
+        let deleted = matches!(
+            transaction
+                .soft_delete_note(id, expected_revision, chrono::Utc::now().timestamp())
+                .await?,
+            NoteMutationResult::Applied { .. }
+        );
         if deleted {
             transaction.clear_note_search_data(id).await?;
         }
@@ -234,7 +241,16 @@ pub async fn delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
 
 pub async fn permanently_delete_note(ctx: &Context, id: &str) -> anyhow::Result<bool> {
     let session = ctx.storage().session().await?;
-    let deleted = session.permanently_delete_note(id).await? > 0;
+    let Some((_, expected_revision)) = session.get_deleted_note_content_and_revision(id).await?
+    else {
+        return Ok(false);
+    };
+    let deleted = matches!(
+        session
+            .permanently_delete_note(id, expected_revision)
+            .await?,
+        NoteMutationResult::Applied { .. }
+    );
     drop(session);
     if deleted {
         ctx.attachments().remove_note(id).await?;
@@ -263,13 +279,19 @@ pub async fn restore_notes(ctx: &Context, ids: &[String]) -> anyhow::Result<bool
             else {
                 return anyhow::Ok(None);
             };
-            notes.push((id, content, note_revision.saturating_add(1)));
+            notes.push((id, content, note_revision));
         }
 
         let now = chrono::Utc::now().timestamp();
         let mut queued = 0;
-        for (id, content, note_revision) in notes {
-            transaction.restore_note(id, note_revision).await?;
+        for (id, content, expected_revision) in notes {
+            let NoteMutationResult::Applied {
+                revision: note_revision,
+                ..
+            } = transaction.restore_note(id, expected_revision).await?
+            else {
+                return anyhow::Ok(None);
+            };
             let chunks = crate::chunk::chunk_content(&content);
             queued += crate::sync_note_embedding_jobs(
                 transaction.as_ref(),
@@ -305,7 +327,15 @@ pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Res
         let cutoff = now.saturating_sub(TRASH_RETENTION_SECONDS);
         let ids = transaction.list_expired_deleted_note_ids(cutoff).await?;
         for id in &ids {
-            transaction.permanently_delete_note(id).await?;
+            let Some((_, expected_revision)) = transaction
+                .get_deleted_note_content_and_revision(id)
+                .await?
+            else {
+                return anyhow::Ok(Vec::new());
+            };
+            transaction
+                .permanently_delete_note(id, expected_revision)
+                .await?;
         }
         anyhow::Ok(ids)
     }

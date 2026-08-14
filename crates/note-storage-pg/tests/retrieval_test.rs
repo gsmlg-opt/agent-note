@@ -200,7 +200,7 @@ async fn exact_dense_retrieval_validates_vectors_and_filters_active_notes() {
         .insert_chunk_embedding("b", 0, &diagonal)
         .await
         .unwrap();
-    session.soft_delete_note("a", 2).await.unwrap();
+    session.soft_delete_note("a", 1, 2).await.unwrap();
     assert_eq!(
         session.dense_search(&unit(0), 10, None).await.unwrap(),
         vec!["b", "c"]
@@ -320,7 +320,7 @@ async fn title_fts_is_literal_title_only_active_and_uses_gin() {
             content: "unrelated body",
             attachments: &[],
             updated_at: 2,
-            note_revision: 2,
+            expected_revision: 1,
         })
         .await
         .unwrap();
@@ -333,7 +333,7 @@ async fn title_fts_is_literal_title_only_active_and_uses_gin() {
         session.title_search("new", 10, None).await.unwrap(),
         vec!["title"]
     );
-    session.soft_delete_note("title", 3).await.unwrap();
+    session.soft_delete_note("title", 2, 3).await.unwrap();
     assert!(session
         .title_search("new", 10, None)
         .await

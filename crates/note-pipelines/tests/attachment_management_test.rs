@@ -679,7 +679,7 @@ async fn delete_succeeds_when_the_selected_physical_object_is_already_missing() 
 }
 
 #[tokio::test]
-async fn put_preserves_revision_chunks_labels_and_embedding_queue() {
+async fn put_advances_revision_once_and_preserves_chunks_labels_and_embedding_queue() {
     let (ctx, backend, _dir) = test_context().await;
     seed_note(&ctx, &backend, NOTE_ID, &[]).await;
     assert_eq!(drain_embedding_jobs(&ctx, 10).await.unwrap(), 1);
@@ -697,7 +697,7 @@ async fn put_preserves_revision_chunks_labels_and_embedding_queue() {
 
     assert_eq!(
         observer.get_note_revision(NOTE_ID).await.unwrap(),
-        Some(NOTE_REVISION)
+        Some(NOTE_REVISION + 1)
     );
     assert_eq!(
         observer.list_note_chunks(NOTE_ID).await.unwrap(),
@@ -728,7 +728,7 @@ async fn put_advances_updated_at_when_the_stored_timestamp_is_the_current_second
 }
 
 #[tokio::test]
-async fn delete_preserves_revision_chunks_labels_and_embedding_queue() {
+async fn delete_advances_revision_once_and_preserves_chunks_labels_and_embedding_queue() {
     let (ctx, backend, _dir) = test_context().await;
     seed_note(
         &ctx,
@@ -746,7 +746,7 @@ async fn delete_preserves_revision_chunks_labels_and_embedding_queue() {
 
     assert_eq!(
         observer.get_note_revision(NOTE_ID).await.unwrap(),
-        Some(NOTE_REVISION)
+        Some(NOTE_REVISION + 1)
     );
     assert_eq!(
         observer.list_note_chunks(NOTE_ID).await.unwrap(),

@@ -14,7 +14,8 @@ use note_pipelines::{
 };
 use note_server::{openapi::rest_router, AppState};
 use note_storage::{
-    NewNote, NewOrgAttempt, NewOrgEvent, OrgAttemptStatus, OrgEventType, StorageBackend,
+    NewNote, NewOrgAttempt, NewOrgEvent, NoteMutationResult, OrgAttemptStatus, OrgEventType,
+    StorageBackend,
 };
 use note_storage_turso::TursoStorage;
 use serde_json::{json, Value};
@@ -391,7 +392,7 @@ async fn note_links_are_typed_idempotent_weak_and_reverse_queryable() {
         .session()
         .await
         .unwrap()
-        .soft_delete_note(note_id, NOW + 1)
+        .soft_delete_note(note_id, 1, NOW + 1)
         .await
         .unwrap();
     let (status, context) = api
@@ -417,10 +418,13 @@ async fn note_links_are_typed_idempotent_weak_and_reverse_queryable() {
             .session()
             .await
             .unwrap()
-            .permanently_delete_note(note_id)
+            .permanently_delete_note(note_id, 2)
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
     );
     let (status, missing_context) = api
         .call(

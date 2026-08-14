@@ -5,7 +5,9 @@ use note_core::{
     is_relative_attachment_path, normalize_attachment_path, validate_attachments, Note,
     NoteAttachment,
 };
-use note_storage::{AttachmentMetadataUpdate, StorageTransaction, TransactionMode};
+use note_storage::{
+    AttachmentMetadataUpdate, NoteMutationResult, StorageTransaction, TransactionMode,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutNoteAttachmentResult {
@@ -133,6 +135,7 @@ pub async fn put_note_attachment(
             ));
         }
 
+        let expected_revision = note.revision;
         let mut metadata = note.attachments;
         let mut stored_attachment = attachment.clone();
         stored_attachment.content.clear();
@@ -146,11 +149,12 @@ pub async fn put_note_attachment(
         let affected = transaction
             .update_note_attachments(AttachmentMetadataUpdate {
                 id: note_id,
+                expected_revision,
                 attachments: &metadata,
                 updated_at,
             })
             .await?;
-        if affected == 0 {
+        if !matches!(affected, NoteMutationResult::Applied { .. }) {
             return Err(anyhow::Error::new(AttachmentMutationError::NoteNotFound(
                 note_id.to_string(),
             )));
@@ -325,16 +329,18 @@ async fn delete_attachment_metadata(
     }
 
     let updated_at = attachment_mutation_timestamp(note.updated_at);
+    let expected_revision = note.revision;
     let mut metadata = note.attachments;
     metadata.remove(existing_index);
     let affected = transaction
         .update_note_attachments(AttachmentMetadataUpdate {
             id: note_id,
+            expected_revision,
             attachments: &metadata,
             updated_at,
         })
         .await?;
-    if affected == 0 {
+    if !matches!(affected, NoteMutationResult::Applied { .. }) {
         return Ok(DeleteMetadataResult::Absent);
     }
     Ok(DeleteMetadataResult::Deleted)

@@ -472,7 +472,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             content: "Content",
             attachments: &[],
             updated_at: 2,
-            note_revision: 2,
+            expected_revision: 1,
         })
         .await
         .unwrap();
@@ -493,7 +493,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     )
     .await;
     session
-        .soft_delete_note("contract-embedding-dashboard-deleted", 40)
+        .soft_delete_note("contract-embedding-dashboard-deleted", 1, 40)
         .await
         .unwrap();
     let dashboard = session.embedding_dashboard_status().await.unwrap();

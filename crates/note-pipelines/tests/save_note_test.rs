@@ -12,7 +12,7 @@ use note_pipelines::{
     save_note, update_note, update_note_fields, update_system_config, Context, EditOp,
     SaveNoteInput, UpdateNoteFieldsInput, TRASH_RETENTION_SECONDS,
 };
-use note_storage::{StorageBackend, TransactionMode};
+use note_storage::{NoteMutationResult, StorageBackend, TransactionMode};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -482,7 +482,7 @@ async fn permanent_delete_and_purge_remove_attachments_only_after_database_delet
         .session()
         .await
         .unwrap()
-        .soft_delete_note(&expired.id, now.saturating_sub(TRASH_RETENTION_SECONDS))
+        .soft_delete_note(&expired.id, 1, now.saturating_sub(TRASH_RETENTION_SECONDS))
         .await
         .unwrap();
     events.lock().unwrap().clear();
@@ -1005,7 +1005,7 @@ async fn delete_and_restore_preserve_note_data_and_requeue_embeddings() {
     assert_eq!(restored.labels.len(), 1);
     assert_eq!(restored.attachments[0].content, b"{}");
     let observer = backend.session().await.unwrap();
-    assert_eq!(observer.get_note_revision(&note.id).await.unwrap(), Some(2));
+    assert_eq!(observer.get_note_revision(&note.id).await.unwrap(), Some(3));
     assert!(list_deleted_note_summaries(&ctx).await.unwrap().is_empty());
     assert!(!observer
         .list_note_chunks(&note.id)
@@ -1100,12 +1100,21 @@ async fn purge_removes_notes_at_the_ninety_day_boundary_and_their_attachments() 
     let now = 1_800_000_000;
     let cutoff = now - TRASH_RETENTION_SECONDS;
     let unit = backend.begin(TransactionMode::Immediate).await.unwrap();
-    assert_eq!(unit.soft_delete_note(&expired.id, cutoff).await.unwrap(), 1);
     assert_eq!(
-        unit.soft_delete_note(&retained.id, cutoff + 1)
+        unit.soft_delete_note(&expired.id, 1, cutoff).await.unwrap(),
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
+    );
+    assert_eq!(
+        unit.soft_delete_note(&retained.id, 1, cutoff + 1)
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
     );
     unit.commit().await.unwrap();
 

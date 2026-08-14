@@ -3,12 +3,37 @@ use crate::PgSession;
 use note_core::{LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
     resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate,
-    NoteUpdate, NotesRepository, ResolvedLabelSelector, StorageError, StorageErrorKind,
-    StorageResult,
+    NoteMutationResult, NoteUpdate, NotesRepository, ResolvedLabelSelector, StorageError,
+    StorageErrorKind, StorageResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{Postgres, QueryBuilder};
+use sqlx::{PgConnection, Postgres, QueryBuilder};
+
+async fn classify_note_mutation(
+    connection: &mut PgConnection,
+    id: &str,
+    expected_revision: i64,
+    eligible_when_deleted: bool,
+) -> StorageResult<NoteMutationResult<()>> {
+    let current = sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT note_revision, deleted_at FROM notes WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(connection)
+    .await
+    .map_err(|error| map_sqlx_error("classify note mutation", error))?;
+    match current {
+        None => Ok(NoteMutationResult::NotFound),
+        Some((_, deleted_at)) if deleted_at.is_some() != eligible_when_deleted => {
+            Ok(NoteMutationResult::NotFound)
+        }
+        Some((current_revision, _)) => Ok(NoteMutationResult::Conflict {
+            expected_revision,
+            current_revision,
+        }),
+    }
+}
 
 impl PgSession {
     async fn resolved_label_selectors(
@@ -150,7 +175,7 @@ impl NotesRepository for PgSession {
         let mut connection = self.connection().await?;
         sqlx::query_as::<_, NoteRow>(
             "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
-                    n.deleted_at, labels.labels
+                    n.note_revision, n.deleted_at, labels.labels
              FROM notes n
              CROSS JOIN LATERAL (
                  SELECT COALESCE(
@@ -188,77 +213,124 @@ impl NotesRepository for PgSession {
             .map_err(|error| map_sqlx_error("query note content", error))
     }
 
-    async fn update_note(&self, note: NoteUpdate<'_>) -> StorageResult<u64> {
+    async fn update_note(&self, note: NoteUpdate<'_>) -> StorageResult<NoteMutationResult<()>> {
         let attachments = serialize_attachments(note.attachments)?;
         let mut connection = self.connection().await?;
-        let result = sqlx::query(
+        let revision = sqlx::query_scalar::<_, i64>(
             "UPDATE notes
              SET title = $2, content = $3, attachments = $4,
-                 updated_at = $5, note_revision = $6
-             WHERE id = $1 AND deleted_at IS NULL",
+                 updated_at = $5, note_revision = note_revision + 1
+             WHERE id = $1 AND deleted_at IS NULL AND note_revision = $6
+             RETURNING note_revision",
         )
         .bind(note.id)
         .bind(note.title)
         .bind(note.content)
         .bind(attachments)
         .bind(note.updated_at)
-        .bind(note.note_revision)
-        .execute(&mut *connection)
+        .bind(note.expected_revision)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("update note", error))?;
-        Ok(result.rows_affected())
+        match revision {
+            Some(revision) => Ok(NoteMutationResult::Applied {
+                value: (),
+                revision,
+            }),
+            None => {
+                classify_note_mutation(&mut connection, note.id, note.expected_revision, false)
+                    .await
+            }
+        }
     }
 
-    async fn update_note_fields(&self, note: NoteFieldsUpdate<'_>) -> StorageResult<u64> {
+    async fn update_note_fields(
+        &self,
+        note: NoteFieldsUpdate<'_>,
+    ) -> StorageResult<NoteMutationResult<()>> {
         let mut connection = self.connection().await?;
-        let result = sqlx::query(
+        let revision = sqlx::query_scalar::<_, i64>(
             "UPDATE notes
-             SET title = $2, content = $3, updated_at = $4, note_revision = $5
-             WHERE id = $1 AND deleted_at IS NULL",
+             SET title = $2, content = $3, updated_at = $4, note_revision = note_revision + 1
+             WHERE id = $1 AND deleted_at IS NULL AND note_revision = $5
+             RETURNING note_revision",
         )
         .bind(note.id)
         .bind(note.title)
         .bind(note.content)
         .bind(note.updated_at)
-        .bind(note.note_revision)
-        .execute(&mut *connection)
+        .bind(note.expected_revision)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("update note fields", error))?;
-        Ok(result.rows_affected())
+        match revision {
+            Some(revision) => Ok(NoteMutationResult::Applied {
+                value: (),
+                revision,
+            }),
+            None => {
+                classify_note_mutation(&mut connection, note.id, note.expected_revision, false)
+                    .await
+            }
+        }
     }
 
     async fn update_note_attachments(
         &self,
         note: AttachmentMetadataUpdate<'_>,
-    ) -> StorageResult<u64> {
+    ) -> StorageResult<NoteMutationResult<()>> {
         let attachments = serialize_attachments(note.attachments)?;
         let mut connection = self.connection().await?;
-        let result = sqlx::query(
+        let revision = sqlx::query_scalar::<_, i64>(
             "UPDATE notes
-             SET attachments = $2, updated_at = $3
-             WHERE id = $1 AND deleted_at IS NULL",
+             SET attachments = $2, updated_at = $3, note_revision = note_revision + 1
+             WHERE id = $1 AND deleted_at IS NULL AND note_revision = $4
+             RETURNING note_revision",
         )
         .bind(note.id)
         .bind(attachments)
         .bind(note.updated_at)
-        .execute(&mut *connection)
+        .bind(note.expected_revision)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("update note attachments", error))?;
-        Ok(result.rows_affected())
+        match revision {
+            Some(revision) => Ok(NoteMutationResult::Applied {
+                value: (),
+                revision,
+            }),
+            None => {
+                classify_note_mutation(&mut connection, note.id, note.expected_revision, false)
+                    .await
+            }
+        }
     }
 
-    async fn soft_delete_note(&self, id: &str, deleted_at: i64) -> StorageResult<u64> {
+    async fn soft_delete_note(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        deleted_at: i64,
+    ) -> StorageResult<NoteMutationResult<()>> {
         let mut connection = self.connection().await?;
-        let result = sqlx::query(
-            "UPDATE notes SET deleted_at = $2
-             WHERE id = $1 AND deleted_at IS NULL",
+        let revision = sqlx::query_scalar::<_, i64>(
+            "UPDATE notes SET deleted_at = $2, note_revision = note_revision + 1
+             WHERE id = $1 AND deleted_at IS NULL AND note_revision = $3
+             RETURNING note_revision",
         )
         .bind(id)
         .bind(deleted_at)
-        .execute(&mut *connection)
+        .bind(expected_revision)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("soft-delete note", error))?;
-        Ok(result.rows_affected())
+        match revision {
+            Some(revision) => Ok(NoteMutationResult::Applied {
+                value: (),
+                revision,
+            }),
+            None => classify_note_mutation(&mut connection, id, expected_revision, false).await,
+        }
     }
 
     async fn get_deleted_note_content_and_revision(
@@ -277,29 +349,54 @@ impl NotesRepository for PgSession {
         .map_err(|error| map_sqlx_error("query deleted note", error))
     }
 
-    async fn restore_note(&self, id: &str, note_revision: i64) -> StorageResult<u64> {
+    async fn restore_note(
+        &self,
+        id: &str,
+        expected_revision: i64,
+    ) -> StorageResult<NoteMutationResult<()>> {
         let mut connection = self.connection().await?;
-        let result = sqlx::query(
+        let revision = sqlx::query_scalar::<_, i64>(
             "UPDATE notes
-             SET deleted_at = NULL, note_revision = $2
-             WHERE id = $1 AND deleted_at IS NOT NULL",
+             SET deleted_at = NULL, note_revision = note_revision + 1
+             WHERE id = $1 AND deleted_at IS NOT NULL AND note_revision = $2
+             RETURNING note_revision",
         )
         .bind(id)
-        .bind(note_revision)
-        .execute(&mut *connection)
+        .bind(expected_revision)
+        .fetch_optional(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("restore note", error))?;
-        Ok(result.rows_affected())
+        match revision {
+            Some(revision) => Ok(NoteMutationResult::Applied {
+                value: (),
+                revision,
+            }),
+            None => classify_note_mutation(&mut connection, id, expected_revision, true).await,
+        }
     }
 
-    async fn permanently_delete_note(&self, id: &str) -> StorageResult<u64> {
+    async fn permanently_delete_note(
+        &self,
+        id: &str,
+        expected_revision: i64,
+    ) -> StorageResult<NoteMutationResult<()>> {
         let mut connection = self.connection().await?;
-        let result = sqlx::query("DELETE FROM notes WHERE id = $1 AND deleted_at IS NOT NULL")
-            .bind(id)
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx_error("permanently delete note", error))?;
-        Ok(result.rows_affected())
+        let result = sqlx::query(
+            "DELETE FROM notes WHERE id = $1 AND deleted_at IS NOT NULL AND note_revision = $2",
+        )
+        .bind(id)
+        .bind(expected_revision)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("permanently delete note", error))?;
+        if result.rows_affected() == 1 {
+            Ok(NoteMutationResult::Applied {
+                value: (),
+                revision: expected_revision,
+            })
+        } else {
+            classify_note_mutation(&mut connection, id, expected_revision, true).await
+        }
     }
 
     async fn list_expired_deleted_note_ids(&self, cutoff: i64) -> StorageResult<Vec<String>> {
@@ -406,7 +503,7 @@ impl NotesRepository for PgSession {
         let mut connection = self.connection().await?;
         let rows = sqlx::query_as::<_, NoteRow>(
             "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
-                    n.deleted_at, labels.labels
+                    n.note_revision, n.deleted_at, labels.labels
              FROM notes n
              CROSS JOIN LATERAL (
                  SELECT COALESCE(
@@ -456,7 +553,7 @@ impl NotesRepository for PgSession {
     async fn list_deleted_note_summaries(&self) -> StorageResult<Vec<NoteListItem>> {
         let mut connection = self.connection().await?;
         let rows = sqlx::query_as::<_, SummaryRow>(
-            "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at, labels.labels
+            "SELECT n.id, n.title, n.created_at, n.updated_at, n.note_revision, n.deleted_at, labels.labels
              FROM notes n
              CROSS JOIN LATERAL (
                  SELECT COALESCE(
@@ -575,7 +672,7 @@ impl PgSession {
         let mut connection = self.connection().await?;
         sqlx::query_as::<_, NoteRow>(
             "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
-                    n.deleted_at, labels.labels
+                    n.note_revision, n.deleted_at, labels.labels
              FROM notes n
              CROSS JOIN LATERAL (
                  SELECT COALESCE(
@@ -613,7 +710,7 @@ impl PgSession {
     ) -> StorageResult<Vec<NoteRow>> {
         let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
             "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
-                    n.deleted_at, labels.labels
+                    n.note_revision, n.deleted_at, labels.labels
              FROM notes n
              CROSS JOIN LATERAL (
                  SELECT COALESCE(
@@ -655,7 +752,7 @@ impl PgSession {
     ) -> StorageResult<Vec<SummaryRow>> {
         let mut connection = self.connection().await?;
         sqlx::query_as::<_, SummaryRow>(
-            "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at, labels.labels
+            "SELECT n.id, n.title, n.created_at, n.updated_at, n.note_revision, n.deleted_at, labels.labels
              FROM notes n
              CROSS JOIN LATERAL (
                  SELECT COALESCE(
@@ -692,7 +789,7 @@ impl PgSession {
         offset: Option<i64>,
     ) -> StorageResult<Vec<SummaryRow>> {
         let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
-            "SELECT n.id, n.title, n.created_at, n.updated_at, n.deleted_at, labels.labels
+            "SELECT n.id, n.title, n.created_at, n.updated_at, n.note_revision, n.deleted_at, labels.labels
              FROM notes n
              CROSS JOIN LATERAL (
                  SELECT COALESCE(
@@ -736,6 +833,7 @@ struct NoteRow {
     attachments: Value,
     created_at: i64,
     updated_at: i64,
+    note_revision: i64,
     deleted_at: Option<i64>,
     labels: Value,
 }
@@ -750,6 +848,7 @@ impl NoteRow {
             labels: deserialize_labels(self.labels)?,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            revision: self.note_revision,
             deleted_at: self.deleted_at,
         })
     }
@@ -761,6 +860,7 @@ struct SummaryRow {
     title: String,
     created_at: i64,
     updated_at: i64,
+    note_revision: i64,
     deleted_at: Option<i64>,
     labels: Value,
 }
@@ -773,6 +873,7 @@ impl SummaryRow {
             labels: deserialize_labels(self.labels)?,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            revision: self.note_revision,
             deleted_at: self.deleted_at,
         })
     }

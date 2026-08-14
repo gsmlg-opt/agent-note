@@ -11,6 +11,19 @@ pub enum CompareAndSwap<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteMutationResult<T> {
+    Applied {
+        value: T,
+        revision: i64,
+    },
+    NotFound,
+    Conflict {
+        expected_revision: i64,
+        current_revision: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgWorkspace {
     pub id: note_org::WorkspaceId,
     pub slug: String,
@@ -666,23 +679,24 @@ pub struct NewNote<'a> {
 
 pub struct NoteUpdate<'a> {
     pub id: &'a str,
+    pub expected_revision: i64,
     pub title: &'a str,
     pub content: &'a str,
     pub attachments: &'a [note_core::NoteAttachment],
     pub updated_at: i64,
-    pub note_revision: i64,
 }
 
 pub struct NoteFieldsUpdate<'a> {
     pub id: &'a str,
+    pub expected_revision: i64,
     pub title: &'a str,
     pub content: &'a str,
     pub updated_at: i64,
-    pub note_revision: i64,
 }
 
 pub struct AttachmentMetadataUpdate<'a> {
     pub id: &'a str,
+    pub expected_revision: i64,
     pub attachments: &'a [note_core::NoteAttachment],
     pub updated_at: i64,
 }

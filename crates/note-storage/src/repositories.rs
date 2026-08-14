@@ -1,11 +1,12 @@
 use crate::{
     ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, CompareAndSwap,
     EmbeddingDashboardStatus, EmbeddingJob, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent,
-    NewOrgLease, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteUpdate, OrgArtifactReference,
-    OrgAttempt, OrgAttemptNoteReference, OrgAttemptUpdate, OrgDocument, OrgDocumentUpdate,
-    OrgEvent, OrgLease, OrgLeaseEndReason, OrgLeaseKind, OrgOperationalQuery, OrgOperationalRow,
-    OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate,
-    StorageError, StorageErrorKind, StorageResult, StoredOrgOperation, UpsertNoteChunk,
+    NewOrgLease, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteMutationResult, NoteUpdate,
+    OrgArtifactReference, OrgAttempt, OrgAttemptNoteReference, OrgAttemptUpdate, OrgDocument,
+    OrgDocumentUpdate, OrgEvent, OrgLease, OrgLeaseEndReason, OrgLeaseKind, OrgOperationalQuery,
+    OrgOperationalRow, OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceOperationalSummary,
+    OrgWorkspaceUpdate, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
+    UpsertNoteChunk,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -266,19 +267,35 @@ pub trait NotesRepository: Send + Sync {
     async fn note_exists(&self, id: &str) -> StorageResult<bool>;
     async fn get_note(&self, id: &str) -> StorageResult<Option<note_core::Note>>;
     async fn get_note_content(&self, id: &str) -> StorageResult<Option<String>>;
-    async fn update_note(&self, note: NoteUpdate<'_>) -> StorageResult<u64>;
-    async fn update_note_fields(&self, note: NoteFieldsUpdate<'_>) -> StorageResult<u64>;
+    async fn update_note(&self, note: NoteUpdate<'_>) -> StorageResult<NoteMutationResult<()>>;
+    async fn update_note_fields(
+        &self,
+        note: NoteFieldsUpdate<'_>,
+    ) -> StorageResult<NoteMutationResult<()>>;
     async fn update_note_attachments(
         &self,
         note: AttachmentMetadataUpdate<'_>,
-    ) -> StorageResult<u64>;
-    async fn soft_delete_note(&self, id: &str, deleted_at: i64) -> StorageResult<u64>;
+    ) -> StorageResult<NoteMutationResult<()>>;
+    async fn soft_delete_note(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        deleted_at: i64,
+    ) -> StorageResult<NoteMutationResult<()>>;
     async fn get_deleted_note_content_and_revision(
         &self,
         id: &str,
     ) -> StorageResult<Option<(String, i64)>>;
-    async fn restore_note(&self, id: &str, note_revision: i64) -> StorageResult<u64>;
-    async fn permanently_delete_note(&self, id: &str) -> StorageResult<u64>;
+    async fn restore_note(
+        &self,
+        id: &str,
+        expected_revision: i64,
+    ) -> StorageResult<NoteMutationResult<()>>;
+    async fn permanently_delete_note(
+        &self,
+        id: &str,
+        expected_revision: i64,
+    ) -> StorageResult<NoteMutationResult<()>>;
     async fn list_expired_deleted_note_ids(&self, cutoff: i64) -> StorageResult<Vec<String>>;
     async fn clear_note_search_data(&self, id: &str) -> StorageResult<()>;
     async fn clear_note_labels(&self, id: &str) -> StorageResult<()>;

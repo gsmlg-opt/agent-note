@@ -1,7 +1,8 @@
 use crate::unit;
 use note_core::LabelValueType;
 use note_storage::{
-    NewNote, NoteUpdate, StorageBackend, StorageErrorKind, UpsertNoteChunk, EMBEDDING_DIMENSION,
+    NewNote, NoteMutationResult, NoteUpdate, StorageBackend, StorageErrorKind, UpsertNoteChunk,
+    EMBEDDING_DIMENSION,
 };
 use std::sync::Arc;
 
@@ -99,7 +100,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap()
         .is_empty());
     session
-        .soft_delete_note("contract-retrieval-a", 2)
+        .soft_delete_note("contract-retrieval-a", 1, 2)
         .await
         .unwrap();
     assert!(session
@@ -210,7 +211,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             content: "unrelated body",
             attachments: &[],
             updated_at: 2,
-            note_revision: 2,
+            expected_revision: 1,
         })
         .await
         .unwrap();
@@ -224,7 +225,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         vec!["contract-retrieval-title"]
     );
     session
-        .soft_delete_note("contract-retrieval-title", 3)
+        .soft_delete_note("contract-retrieval-title", 2, 3)
         .await
         .unwrap();
     assert!(session
@@ -343,15 +344,18 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap();
     session
-        .soft_delete_note("contract-retrieval-cascade", 4)
+        .soft_delete_note("contract-retrieval-cascade", 1, 4)
         .await
         .unwrap();
     assert_eq!(
         session
-            .permanently_delete_note("contract-retrieval-cascade")
+            .permanently_delete_note("contract-retrieval-cascade", 2)
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
     );
     assert!(session
         .list_note_chunks("contract-retrieval-cascade")
@@ -372,17 +376,17 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     );
     assert_eq!(
         session
-            .permanently_delete_note("contract-retrieval-cascade")
+            .permanently_delete_note("contract-retrieval-cascade", 2)
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
     assert_eq!(
         session
             .restore_note("contract-retrieval-cascade", 2)
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
     assert!(!session
         .chunk_embedding_exists("contract-retrieval-cascade", 0)

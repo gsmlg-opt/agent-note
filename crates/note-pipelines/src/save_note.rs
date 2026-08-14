@@ -192,6 +192,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
         labels: resolved_labels,
         created_at: now,
         updated_at: now,
+        revision: note_revision,
         deleted_at: None,
     })
 }

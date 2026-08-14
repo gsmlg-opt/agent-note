@@ -167,7 +167,7 @@ async fn finds_a_note_matching_all_requested_labels_in_any_order() {
 
     fixture
         .session
-        .soft_delete_note("note-1", 2000)
+        .soft_delete_note("note-1", 1, 2000)
         .await
         .unwrap();
     let matched = fixture
