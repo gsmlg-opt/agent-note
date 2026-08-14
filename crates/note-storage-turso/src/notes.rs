@@ -9,6 +9,39 @@ use note_storage::{
 };
 
 impl TursoSession {
+    async fn begin_note_mutation(&self) -> StorageResult<()> {
+        // SQLite savepoints start a transaction on standalone sessions and nest inside pipeline
+        // transactions, keeping the failed-CAS classification under the same write lock.
+        self.connection
+            .execute("SAVEPOINT note_mutation_cas", ())
+            .await
+            .map(|_| ())
+            .map_err(|error| map_turso_error("begin atomic note mutation", error))
+    }
+
+    async fn finish_note_mutation<T>(&self, result: StorageResult<T>) -> StorageResult<T> {
+        match result {
+            Ok(value) => {
+                self.connection
+                    .execute("RELEASE SAVEPOINT note_mutation_cas", ())
+                    .await
+                    .map_err(|error| map_turso_error("commit atomic note mutation", error))?;
+                Ok(value)
+            }
+            Err(primary) => {
+                let _ = self
+                    .connection
+                    .execute("ROLLBACK TO SAVEPOINT note_mutation_cas", ())
+                    .await;
+                let _ = self
+                    .connection
+                    .execute("RELEASE SAVEPOINT note_mutation_cas", ())
+                    .await;
+                Err(primary)
+            }
+        }
+    }
+
     async fn classify_note_mutation(
         &self,
         id: &str,
@@ -291,42 +324,47 @@ impl NotesRepository for TursoSession {
     async fn update_note(&self, note: NoteUpdate<'_>) -> StorageResult<NoteMutationResult<()>> {
         let _operation_guard = self.operation_guard().await;
         let attachments = serialize_attachments(note.attachments)?;
-        let mut rows = self
-            .connection
-            .query(
-                "UPDATE notes
+        self.begin_note_mutation().await?;
+        let result = async {
+            let mut rows = self
+                .connection
+                .query(
+                    "UPDATE notes
                  SET title = ?2, content = ?3, attachments = ?4, updated_at = ?5,
                      note_revision = note_revision + 1
                  WHERE id = ?1 AND deleted_at IS NULL AND note_revision = ?6
                  RETURNING note_revision",
-                turso::params![
-                    note.id,
-                    note.title,
-                    note.content,
-                    attachments,
-                    note.updated_at,
-                    note.expected_revision
-                ],
-            )
-            .await
-            .map_err(|error| map_turso_error("update note", error))?;
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read updated note revision", error))?
-        {
-            let revision = row
-                .get(0)
-                .map_err(|error| map_turso_error("decode updated note revision", error))?;
-            Ok(NoteMutationResult::Applied {
-                value: (),
-                revision,
-            })
-        } else {
-            drop(rows);
-            self.classify_note_mutation(note.id, note.expected_revision, false)
+                    turso::params![
+                        note.id,
+                        note.title,
+                        note.content,
+                        attachments,
+                        note.updated_at,
+                        note.expected_revision
+                    ],
+                )
                 .await
+                .map_err(|error| map_turso_error("update note", error))?;
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| map_turso_error("read updated note revision", error))?
+            {
+                let revision = row
+                    .get(0)
+                    .map_err(|error| map_turso_error("decode updated note revision", error))?;
+                Ok(NoteMutationResult::Applied {
+                    value: (),
+                    revision,
+                })
+            } else {
+                drop(rows);
+                self.classify_note_mutation(note.id, note.expected_revision, false)
+                    .await
+            }
         }
+        .await;
+        self.finish_note_mutation(result).await
     }
 
     async fn update_note_fields(
@@ -334,40 +372,45 @@ impl NotesRepository for TursoSession {
         note: NoteFieldsUpdate<'_>,
     ) -> StorageResult<NoteMutationResult<()>> {
         let _operation_guard = self.operation_guard().await;
-        let mut rows = self
-            .connection
-            .query(
-                "UPDATE notes
+        self.begin_note_mutation().await?;
+        let result = async {
+            let mut rows = self
+                .connection
+                .query(
+                    "UPDATE notes
                  SET title = ?2, content = ?3, updated_at = ?4, note_revision = note_revision + 1
                  WHERE id = ?1 AND deleted_at IS NULL AND note_revision = ?5
                  RETURNING note_revision",
-                turso::params![
-                    note.id,
-                    note.title,
-                    note.content,
-                    note.updated_at,
-                    note.expected_revision
-                ],
-            )
-            .await
-            .map_err(|error| map_turso_error("update note fields", error))?;
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read updated note fields revision", error))?
-        {
-            let revision = row
-                .get(0)
-                .map_err(|error| map_turso_error("decode updated note fields revision", error))?;
-            Ok(NoteMutationResult::Applied {
-                value: (),
-                revision,
-            })
-        } else {
-            drop(rows);
-            self.classify_note_mutation(note.id, note.expected_revision, false)
+                    turso::params![
+                        note.id,
+                        note.title,
+                        note.content,
+                        note.updated_at,
+                        note.expected_revision
+                    ],
+                )
                 .await
+                .map_err(|error| map_turso_error("update note fields", error))?;
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| map_turso_error("read updated note fields revision", error))?
+            {
+                let revision = row.get(0).map_err(|error| {
+                    map_turso_error("decode updated note fields revision", error)
+                })?;
+                Ok(NoteMutationResult::Applied {
+                    value: (),
+                    revision,
+                })
+            } else {
+                drop(rows);
+                self.classify_note_mutation(note.id, note.expected_revision, false)
+                    .await
+            }
         }
+        .await;
+        self.finish_note_mutation(result).await
     }
 
     async fn update_note_attachments(
@@ -376,39 +419,44 @@ impl NotesRepository for TursoSession {
     ) -> StorageResult<NoteMutationResult<()>> {
         let _operation_guard = self.operation_guard().await;
         let attachments = serialize_attachments(note.attachments)?;
-        let mut rows = self
-            .connection
-            .query(
-                "UPDATE notes
+        self.begin_note_mutation().await?;
+        let result = async {
+            let mut rows = self
+                .connection
+                .query(
+                    "UPDATE notes
                  SET attachments = ?2, updated_at = ?3, note_revision = note_revision + 1
                  WHERE id = ?1 AND deleted_at IS NULL AND note_revision = ?4
                  RETURNING note_revision",
-                turso::params![
-                    note.id,
-                    attachments,
-                    note.updated_at,
-                    note.expected_revision
-                ],
-            )
-            .await
-            .map_err(|error| map_turso_error("update note attachments", error))?;
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read updated attachment revision", error))?
-        {
-            let revision = row
-                .get(0)
-                .map_err(|error| map_turso_error("decode updated attachment revision", error))?;
-            Ok(NoteMutationResult::Applied {
-                value: (),
-                revision,
-            })
-        } else {
-            drop(rows);
-            self.classify_note_mutation(note.id, note.expected_revision, false)
+                    turso::params![
+                        note.id,
+                        attachments,
+                        note.updated_at,
+                        note.expected_revision
+                    ],
+                )
                 .await
+                .map_err(|error| map_turso_error("update note attachments", error))?;
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| map_turso_error("read updated attachment revision", error))?
+            {
+                let revision = row.get(0).map_err(|error| {
+                    map_turso_error("decode updated attachment revision", error)
+                })?;
+                Ok(NoteMutationResult::Applied {
+                    value: (),
+                    revision,
+                })
+            } else {
+                drop(rows);
+                self.classify_note_mutation(note.id, note.expected_revision, false)
+                    .await
+            }
         }
+        .await;
+        self.finish_note_mutation(result).await
     }
 
     async fn soft_delete_note(
@@ -418,33 +466,38 @@ impl NotesRepository for TursoSession {
         deleted_at: i64,
     ) -> StorageResult<NoteMutationResult<()>> {
         let _operation_guard = self.operation_guard().await;
-        let mut rows = self
-            .connection
-            .query(
-                "UPDATE notes SET deleted_at = ?2, note_revision = note_revision + 1
+        self.begin_note_mutation().await?;
+        let result = async {
+            let mut rows = self
+                .connection
+                .query(
+                    "UPDATE notes SET deleted_at = ?2, note_revision = note_revision + 1
                  WHERE id = ?1 AND deleted_at IS NULL AND note_revision = ?3
                  RETURNING note_revision",
-                turso::params![id, deleted_at, expected_revision],
-            )
-            .await
-            .map_err(|error| map_turso_error("soft-delete note", error))?;
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read soft-delete revision", error))?
-        {
-            let revision = row
-                .get(0)
-                .map_err(|error| map_turso_error("decode soft-delete revision", error))?;
-            Ok(NoteMutationResult::Applied {
-                value: (),
-                revision,
-            })
-        } else {
-            drop(rows);
-            self.classify_note_mutation(id, expected_revision, false)
+                    turso::params![id, deleted_at, expected_revision],
+                )
                 .await
+                .map_err(|error| map_turso_error("soft-delete note", error))?;
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| map_turso_error("read soft-delete revision", error))?
+            {
+                let revision = row
+                    .get(0)
+                    .map_err(|error| map_turso_error("decode soft-delete revision", error))?;
+                Ok(NoteMutationResult::Applied {
+                    value: (),
+                    revision,
+                })
+            } else {
+                drop(rows);
+                self.classify_note_mutation(id, expected_revision, false)
+                    .await
+            }
         }
+        .await;
+        self.finish_note_mutation(result).await
     }
 
     async fn get_deleted_note_content_and_revision(
@@ -483,34 +536,39 @@ impl NotesRepository for TursoSession {
         expected_revision: i64,
     ) -> StorageResult<NoteMutationResult<()>> {
         let _operation_guard = self.operation_guard().await;
-        let mut rows = self
-            .connection
-            .query(
-                "UPDATE notes
+        self.begin_note_mutation().await?;
+        let result = async {
+            let mut rows = self
+                .connection
+                .query(
+                    "UPDATE notes
                  SET deleted_at = NULL, note_revision = note_revision + 1
                  WHERE id = ?1 AND deleted_at IS NOT NULL AND note_revision = ?2
                  RETURNING note_revision",
-                turso::params![id, expected_revision],
-            )
-            .await
-            .map_err(|error| map_turso_error("restore note", error))?;
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read restored note revision", error))?
-        {
-            let revision = row
-                .get(0)
-                .map_err(|error| map_turso_error("decode restored note revision", error))?;
-            Ok(NoteMutationResult::Applied {
-                value: (),
-                revision,
-            })
-        } else {
-            drop(rows);
-            self.classify_note_mutation(id, expected_revision, true)
+                    turso::params![id, expected_revision],
+                )
                 .await
+                .map_err(|error| map_turso_error("restore note", error))?;
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| map_turso_error("read restored note revision", error))?
+            {
+                let revision = row
+                    .get(0)
+                    .map_err(|error| map_turso_error("decode restored note revision", error))?;
+                Ok(NoteMutationResult::Applied {
+                    value: (),
+                    revision,
+                })
+            } else {
+                drop(rows);
+                self.classify_note_mutation(id, expected_revision, true)
+                    .await
+            }
         }
+        .await;
+        self.finish_note_mutation(result).await
     }
 
     async fn permanently_delete_note(
@@ -519,7 +577,9 @@ impl NotesRepository for TursoSession {
         expected_revision: i64,
     ) -> StorageResult<NoteMutationResult<()>> {
         let _operation_guard = self.operation_guard().await;
-        let affected = self
+        self.begin_note_mutation().await?;
+        let result = async {
+            let affected = self
             .connection
             .execute(
                 "DELETE FROM notes WHERE id = ?1 AND deleted_at IS NOT NULL AND note_revision = ?2",
@@ -527,15 +587,18 @@ impl NotesRepository for TursoSession {
             )
             .await
             .map_err(|error| map_turso_error("permanently delete note", error))?;
-        if affected == 1 {
-            Ok(NoteMutationResult::Applied {
-                value: (),
-                revision: expected_revision,
-            })
-        } else {
-            self.classify_note_mutation(id, expected_revision, true)
-                .await
+            if affected == 1 {
+                Ok(NoteMutationResult::Applied {
+                    value: (),
+                    revision: expected_revision,
+                })
+            } else {
+                self.classify_note_mutation(id, expected_revision, true)
+                    .await
+            }
         }
+        .await;
+        self.finish_note_mutation(result).await
     }
 
     async fn list_expired_deleted_note_ids(&self, cutoff: i64) -> StorageResult<Vec<String>> {

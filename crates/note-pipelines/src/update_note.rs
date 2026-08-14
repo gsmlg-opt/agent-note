@@ -325,19 +325,23 @@ pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Res
     let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
     let transaction_result = async {
         let cutoff = now.saturating_sub(TRASH_RETENTION_SECONDS);
-        let ids = transaction.list_expired_deleted_note_ids(cutoff).await?;
-        for id in &ids {
+        let candidates = transaction.list_expired_deleted_note_ids(cutoff).await?;
+        let mut deleted_ids = Vec::with_capacity(candidates.len());
+        for id in &candidates {
             let Some((_, expected_revision)) = transaction
                 .get_deleted_note_content_and_revision(id)
                 .await?
             else {
-                return anyhow::Ok(Vec::new());
+                continue;
             };
-            transaction
+            let result = transaction
                 .permanently_delete_note(id, expected_revision)
                 .await?;
+            if let Some(id) = applied_deleted_note_id(id, result) {
+                deleted_ids.push(id);
+            }
         }
-        anyhow::Ok(ids)
+        anyhow::Ok(deleted_ids)
     }
     .await;
     let ids = crate::save_note::finish_transaction(transaction, transaction_result).await?;
@@ -345,4 +349,41 @@ pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Res
         ctx.attachments().remove_note(id).await?;
     }
     Ok(ids.len())
+}
+
+fn applied_deleted_note_id(id: &str, result: NoteMutationResult<()>) -> Option<String> {
+    matches!(result, NoteMutationResult::Applied { .. }).then(|| id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purge_only_cleans_up_applied_note_deletions() {
+        assert_eq!(
+            applied_deleted_note_id(
+                "applied",
+                NoteMutationResult::Applied {
+                    value: (),
+                    revision: 2,
+                },
+            ),
+            Some("applied".to_string())
+        );
+        assert_eq!(
+            applied_deleted_note_id(
+                "conflict",
+                NoteMutationResult::Conflict {
+                    expected_revision: 1,
+                    current_revision: 2,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            applied_deleted_note_id("missing", NoteMutationResult::NotFound),
+            None
+        );
+    }
 }
