@@ -361,8 +361,9 @@ pub fn trash_page() -> Html {
                             Err(message) => {
                                 if message.is_stale_revision() {
                                     stale_revision_gate.dispatch(StaleRevisionGateAction::Conflict);
+                                } else {
+                                    error.set(Some(message.to_string()));
                                 }
-                                error.set(Some(message.to_string()));
                             }
                         }
                         restoring.set(false);
@@ -380,8 +381,13 @@ pub fn trash_page() -> Html {
             html! {
                 <Modal title={modal_title} on_close={on_close}>
                     <p>{ message }</p>
+                    if stale_revision_gate.conflict_notice_visible() {
+                        <Alert variant={Some("error".to_string())}>
+                            <span>{ "Trash changed after it was loaded. Reload Trash before retrying this mutation." }</span>
+                        </Alert>
+                    }
                     <div class="app-modal-actions">
-                        if error.is_some() || stale_revision_gate.blocked() {
+                        if error.is_some() || stale_revision_gate.conflict_notice_visible() {
                             <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload Trash" }</button>
                         }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*restoring}>
@@ -478,7 +484,7 @@ pub fn trash_page() -> Html {
                                 failed,
                             });
                             batch_delete_error.set(if conflict {
-                                Some("One or more notes changed after Trash was loaded. Failed notes remain selected; reload Trash before retrying.".to_string())
+                                None
                             } else {
                                 batch_delete_failure_message(ids.len(), failed_count)
                             });
@@ -510,8 +516,9 @@ pub fn trash_page() -> Html {
                                     if message.is_stale_revision() {
                                         stale_revision_gate
                                             .dispatch(StaleRevisionGateAction::Conflict);
+                                    } else {
+                                        error.set(Some(message.to_string()));
                                     }
-                                    error.set(Some(message.to_string()));
                                 }
                             }
                             deleting.set(false);
@@ -530,8 +537,13 @@ pub fn trash_page() -> Html {
             html! {
                 <Modal title={modal_title} on_close={on_close}>
                     <p>{ message }</p>
+                    if stale_revision_gate.conflict_notice_visible() {
+                        <Alert variant={Some("error".to_string())}>
+                            <span>{ "Trash changed after it was loaded. Reload Trash before retrying this mutation." }</span>
+                        </Alert>
+                    }
                     <div class="app-modal-actions">
-                        if error.is_some() || batch_delete_error.is_some() || stale_revision_gate.blocked() {
+                        if error.is_some() || batch_delete_error.is_some() || stale_revision_gate.conflict_notice_visible() {
                             <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload Trash" }</button>
                         }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*deleting}>
@@ -564,6 +576,12 @@ pub fn trash_page() -> Html {
 
             if let Some(message) = &*batch_delete_error {
                 <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
+            }
+
+            if stale_revision_gate.conflict_notice_visible() {
+                <Alert variant={Some("error".to_string())}>
+                    <span>{ "Trash changed after it was loaded. Reload Trash before retrying mutations." }</span>
+                </Alert>
             }
 
             if *loading {

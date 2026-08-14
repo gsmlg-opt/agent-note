@@ -79,6 +79,10 @@ impl StaleRevisionGate {
     pub fn blocked(&self) -> bool {
         self.blocked
     }
+
+    pub fn conflict_notice_visible(&self) -> bool {
+        self.blocked
+    }
 }
 
 impl Reducible for StaleRevisionGate {
@@ -191,12 +195,14 @@ mod tests {
             succeeded: true,
         });
         assert!(stale_retry_blocked(false, gate.blocked()));
+        assert!(gate.conflict_notice_visible());
 
         let gate = gate.reduce(StaleRevisionGateAction::RefreshFinished {
             started_epoch: current_refresh_epoch,
             succeeded: true,
         });
         assert!(!stale_retry_blocked(false, gate.blocked()));
+        assert!(!gate.conflict_notice_visible());
     }
 
     #[test]
