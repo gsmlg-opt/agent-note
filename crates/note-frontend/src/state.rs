@@ -28,6 +28,7 @@ pub struct NoteSummary {
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +39,7 @@ pub struct DeletedNoteSummary {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: i64,
+    pub revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

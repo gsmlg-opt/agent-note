@@ -5,6 +5,66 @@ use crate::state::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use gloo_net::http::{Request, Response};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fmt;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct NoteMutationApiError {
+    pub code: String,
+    pub message: String,
+    pub details: Value,
+    pub retryable: bool,
+    #[serde(skip)]
+    pub status: Option<u16>,
+}
+
+impl NoteMutationApiError {
+    fn transport() -> Self {
+        Self {
+            code: "transport_error".into(),
+            message: "The note service could not be reached".into(),
+            details: Value::Object(Default::default()),
+            retryable: true,
+            status: None,
+        }
+    }
+
+    fn unexpected(status: u16) -> Self {
+        Self {
+            code: "unexpected_response".into(),
+            message: "The note service returned an unexpected response".into(),
+            details: Value::Object(Default::default()),
+            retryable: status >= 500,
+            status: Some(status),
+        }
+    }
+
+    pub fn is_stale_revision(&self) -> bool {
+        self.code == "stale_revision"
+    }
+}
+
+impl fmt::Display for NoteMutationApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+fn decode_mutation_error(status: u16, body: &str) -> NoteMutationApiError {
+    let mut error = serde_json::from_str::<NoteMutationApiError>(body)
+        .unwrap_or_else(|_| NoteMutationApiError::unexpected(status));
+    error.status = Some(status);
+    error
+}
+
+async fn ok_or_mutation_error(resp: Response) -> Result<Response, NoteMutationApiError> {
+    if resp.ok() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    Err(decode_mutation_error(status, &body))
+}
 
 // gloo-net (like the Fetch API) does NOT return Err on a 4xx/5xx status — .send() resolves fine and
 // only the body read would fail. So without this check, a server error (e.g. "empty title") gets
@@ -240,6 +300,7 @@ struct NoteDto {
     created_at: i64,
     #[serde(default)]
     updated_at: i64,
+    revision: i64,
 }
 
 #[derive(Deserialize)]
@@ -251,6 +312,7 @@ struct NoteListDto {
     created_at: i64,
     #[serde(default)]
     updated_at: i64,
+    revision: i64,
 }
 
 pub struct NotesPage {
@@ -342,6 +404,7 @@ async fn fetch_note_summaries(
             labels: d.labels,
             created_at: d.created_at,
             updated_at: d.updated_at,
+            revision: d.revision,
         })
         .collect())
 }
@@ -404,7 +467,32 @@ pub async fn get_note(id: &str) -> Result<NoteSummary, String> {
         labels: d.labels,
         created_at: d.created_at,
         updated_at: d.updated_at,
+        revision: d.revision,
     })
+}
+
+fn update_note_body(
+    title: &str,
+    content: &str,
+    attachments: &[NoteAttachment],
+    labels: &[(String, String)],
+    expected_revision: i64,
+) -> Value {
+    let attachments = attachments
+        .iter()
+        .map(NoteAttachmentRequestDto::from)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "expected_revision": expected_revision,
+        "title": title,
+        "content": content,
+        "attachments": attachments,
+        "labels": labels
+    })
+}
+
+fn mutation_url(base: &str, expected_revision: i64) -> String {
+    format!("{base}?expected_revision={expected_revision}")
 }
 
 pub async fn update_note(
@@ -413,32 +501,32 @@ pub async fn update_note(
     content: &str,
     attachments: &[NoteAttachment],
     labels: &[(String, String)],
-) -> Result<(), String> {
-    let attachments = attachments
-        .iter()
-        .map(NoteAttachmentRequestDto::from)
-        .collect::<Vec<_>>();
-    let body = serde_json::json!({
-        "title": title,
-        "content": content,
-        "attachments": attachments,
-        "labels": labels
-    });
+    expected_revision: i64,
+) -> Result<i64, NoteMutationApiError> {
+    let body = update_note_body(title, content, attachments, labels, expected_revision);
     let resp = Request::put(&format!("/api/notes/{id}"))
         .json(&body)
-        .map_err(|e| e.to_string())?
+        .map_err(|_| NoteMutationApiError::transport())?
         .send()
         .await
-        .map_err(|e| e.to_string())?;
-    ok_or_body_error(resp).await.map(|_| ())
+        .map_err(|_| NoteMutationApiError::transport())?;
+    let note: NoteDto = ok_or_mutation_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|_| NoteMutationApiError::unexpected(200))?;
+    Ok(note.revision)
 }
 
-pub async fn delete_note(id: &str) -> Result<(), String> {
-    let resp = Request::delete(&format!("/api/notes/{id}"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    ok_or_body_error(resp).await.map(|_| ())
+pub async fn delete_note(id: &str, expected_revision: i64) -> Result<(), NoteMutationApiError> {
+    let resp = Request::delete(&mutation_url(
+        &format!("/api/notes/{id}"),
+        expected_revision,
+    ))
+    .send()
+    .await
+    .map_err(|_| NoteMutationApiError::transport())?;
+    ok_or_mutation_error(resp).await.map(|_| ())
 }
 
 #[derive(Deserialize)]
@@ -449,6 +537,7 @@ struct TrashNoteDto {
     created_at: i64,
     updated_at: i64,
     deleted_at: i64,
+    revision: i64,
 }
 
 pub async fn list_deleted_notes() -> Result<Vec<DeletedNoteSummary>, String> {
@@ -470,26 +559,48 @@ pub async fn list_deleted_notes() -> Result<Vec<DeletedNoteSummary>, String> {
             created_at: note.created_at,
             updated_at: note.updated_at,
             deleted_at: note.deleted_at,
+            revision: note.revision,
         })
         .collect())
 }
 
-pub async fn permanently_delete_note(id: &str) -> Result<(), String> {
-    let resp = Request::delete(&format!("/api/trash/{id}"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    ok_or_body_error(resp).await.map(|_| ())
+pub async fn permanently_delete_note(
+    id: &str,
+    expected_revision: i64,
+) -> Result<(), NoteMutationApiError> {
+    let resp = Request::delete(&mutation_url(
+        &format!("/api/trash/{id}"),
+        expected_revision,
+    ))
+    .send()
+    .await
+    .map_err(|_| NoteMutationApiError::transport())?;
+    ok_or_mutation_error(resp).await.map(|_| ())
 }
 
-pub async fn restore_deleted_notes(ids: &[String]) -> Result<(), String> {
+fn restore_notes_body(notes: &[DeletedNoteSummary]) -> Value {
+    let notes = notes
+        .iter()
+        .map(|note| {
+            serde_json::json!({
+                "id": note.id,
+                "expected_revision": note.revision,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "notes": notes })
+}
+
+pub async fn restore_deleted_notes(
+    notes: &[DeletedNoteSummary],
+) -> Result<(), NoteMutationApiError> {
     let resp = Request::post("/api/trash/restore")
-        .json(&serde_json::json!({ "ids": ids }))
-        .map_err(|e| e.to_string())?
+        .json(&restore_notes_body(notes))
+        .map_err(|_| NoteMutationApiError::transport())?
         .send()
         .await
-        .map_err(|e| e.to_string())?;
-    ok_or_body_error(resp).await.map(|_| ())
+        .map_err(|_| NoteMutationApiError::transport())?;
+    ok_or_mutation_error(resp).await.map(|_| ())
 }
 
 // ---- Labels ----
@@ -621,5 +732,67 @@ mod tests {
             ),
             "/api/notes/note-1/attachments/images/report%20%231%3Fprogress%3D50%25.png"
         );
+    }
+
+    #[test]
+    fn ordinary_note_mutations_include_the_loaded_revision() {
+        let update = update_note_body("Title", "Body", &[], &[], 7);
+        assert_eq!(update["expected_revision"], 7);
+        assert_eq!(
+            mutation_url("/api/notes/note-1", 7),
+            "/api/notes/note-1?expected_revision=7"
+        );
+
+        let notes = vec![DeletedNoteSummary {
+            id: "note-1".into(),
+            title: "Title".into(),
+            labels: vec![],
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: 0,
+            revision: 8,
+        }];
+        assert_eq!(
+            restore_notes_body(&notes),
+            serde_json::json!({"notes": [{"id": "note-1", "expected_revision": 8}]})
+        );
+    }
+
+    #[test]
+    fn structured_stale_revision_errors_are_decoded_without_losing_details() {
+        let error = decode_mutation_error(
+            409,
+            r#"{"code":"stale_revision","message":"the note changed after it was read","details":{"note_id":"note-1","expected_revision":5,"current_revision":6},"retryable":false}"#,
+        );
+
+        assert!(error.is_stale_revision());
+        assert_eq!(error.details["expected_revision"], 5);
+        assert_eq!(error.details["current_revision"], 6);
+        assert_eq!(error.status, Some(409));
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn ordinary_note_reads_require_the_authoritative_revision() {
+        let note = serde_json::from_value::<NoteDto>(serde_json::json!({
+            "id": "note-1",
+            "title": "Title",
+            "content": "Body",
+            "attachments": [],
+            "labels": [],
+            "created_at": 1,
+            "updated_at": 1
+        }));
+
+        assert!(note.is_err());
+    }
+
+    #[test]
+    fn malformed_error_responses_use_safe_fallback_copy() {
+        let error = decode_mutation_error(502, "proxy secret must not reach the UI");
+
+        assert_eq!(error.code, "unexpected_response");
+        assert!(error.retryable);
+        assert!(!error.to_string().contains("proxy secret"));
     }
 }

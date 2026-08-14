@@ -114,6 +114,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
     let content_copy_generation = use_mut_ref(|| 0_u64);
     let delete_open = use_state(|| false);
     let delete_pending = use_state(|| false);
+    let delete_conflict = use_state(|| None::<api::NoteMutationApiError>);
     let delete_in_flight = use_mut_ref(|| false);
 
     {
@@ -126,6 +127,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         let delete_open = delete_open.clone();
         let delete_pending = delete_pending.clone();
         let delete_in_flight = delete_in_flight.clone();
+        let delete_conflict = delete_conflict.clone();
         let id = props.id.clone();
         use_effect_with(props.id.clone(), move |_| {
             loading.set(true);
@@ -137,6 +139,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             delete_open.set(false);
             delete_pending.set(false);
             *delete_in_flight.borrow_mut() = false;
+            delete_conflict.set(None);
             wasm_bindgen_futures::spawn_local(async move {
                 match api::get_note(&id).await {
                     Ok(n) => note.set(Some(n)),
@@ -202,23 +205,28 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         })
     };
 
+    let loaded_note_state = note.clone();
     let delete_modal = match (*delete_open, (*note).clone()) {
         (true, Some(note)) => {
             let on_close = {
                 let delete_open = delete_open.clone();
                 let delete_pending = delete_pending.clone();
+                let delete_conflict = delete_conflict.clone();
                 Callback::from(move |_: ()| {
                     if !*delete_pending {
                         delete_open.set(false);
+                        delete_conflict.set(None);
                     }
                 })
             };
             let on_cancel = {
                 let delete_open = delete_open.clone();
                 let delete_pending = delete_pending.clone();
+                let delete_conflict = delete_conflict.clone();
                 Callback::from(move |_: MouseEvent| {
                     if !*delete_pending {
                         delete_open.set(false);
+                        delete_conflict.set(None);
                     }
                 })
             };
@@ -230,6 +238,8 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                 let navigator = navigator.clone();
                 let notes_query = notes_query.clone();
                 let id = note.id.clone();
+                let expected_revision = note.revision;
+                let delete_conflict = delete_conflict.clone();
                 Callback::from(move |_: MouseEvent| {
                     {
                         let mut in_flight = delete_in_flight.borrow_mut();
@@ -244,10 +254,11 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                     let navigator = navigator.clone();
                     let notes_query = notes_query.clone();
                     let id = id.clone();
+                    let delete_conflict = delete_conflict.clone();
                     delete_pending.set(true);
                     error.set(None);
                     wasm_bindgen_futures::spawn_local(async move {
-                        let result = api::delete_note(&id).await;
+                        let result = api::delete_note(&id, expected_revision).await;
                         *delete_in_flight.borrow_mut() = false;
                         delete_pending.set(false);
                         match result {
@@ -259,7 +270,35 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                                     navigator.push(&Route::Notes);
                                 }
                             }
-                            Err(delete_error) => error.set(Some(delete_error)),
+                            Err(delete_error) => {
+                                if delete_error.is_stale_revision() {
+                                    delete_conflict.set(Some(delete_error));
+                                } else {
+                                    error.set(Some(delete_error.to_string()));
+                                }
+                            }
+                        }
+                    });
+                })
+            };
+            let on_reload = {
+                let note_state = loaded_note_state.clone();
+                let delete_conflict = delete_conflict.clone();
+                let error = error.clone();
+                let id = note.id.clone();
+                Callback::from(move |_| {
+                    let note_state = note_state.clone();
+                    let delete_conflict = delete_conflict.clone();
+                    let error = error.clone();
+                    let id = id.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match api::get_note(&id).await {
+                            Ok(latest) => {
+                                note_state.set(Some(latest));
+                                delete_conflict.set(None);
+                                error.set(None);
+                            }
+                            Err(message) => error.set(Some(message)),
                         }
                     });
                 })
@@ -273,7 +312,18 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                             <span>{ delete_error.clone() }</span>
                         </Alert>
                     }
+                    if let Some(conflict_error) = &*delete_conflict {
+                        <Alert variant={Some("error".to_string())}>
+                            <span>{ conflict_error.message.clone() }</span>
+                            <span>{ " Reload the note before deciding whether to retry deletion." }</span>
+                        </Alert>
+                    }
                     <div class="app-modal-actions">
+                        if delete_conflict.is_some() {
+                            <button type="button" class="btn btn-outline" onclick={on_reload}>
+                                { "Reload note" }
+                            </button>
+                        }
                         <button type="button" class="btn btn-ghost" disabled={*delete_pending} onclick={on_cancel}>
                             { "Cancel" }
                         </button>

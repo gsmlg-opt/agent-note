@@ -520,6 +520,37 @@ implementation, and no in-place legacy-data migration is guaranteed. Delete and 
 disposable test/development databases. Export or back up any non-disposable database before
 upgrading so its data can be recovered or imported deliberately.
 
+### Ordinary-note revisions and concurrent mutations
+
+Every ordinary-note read returns a positive `revision`. Detail, list, and Trash responses expose
+that value; clients must keep it with the data they loaded. Every mutation of an existing note is
+an atomic compare-and-swap and requires that caller-held value as `expected_revision`. A successful
+logical mutation increments the revision exactly once. A rejected stale mutation changes neither
+the note nor its labels, chunks, attachment metadata, or embedding jobs.
+
+REST full updates include `expected_revision` in the `PUT /api/notes/{id}` JSON body. Soft delete
+and permanent delete send it as the `expected_revision` query parameter. Trash restore posts
+`{"notes":[{"id":"...","expected_revision":5}]}`; each selected note has its own token. Missing
+tokens are invalid requests. A stale token returns HTTP 409 using the common JSON error envelope:
+
+```json
+{
+  "code": "stale_revision",
+  "message": "the note changed after it was read",
+  "details": {
+    "note_id": "note-id",
+    "expected_revision": 5,
+    "current_revision": 6
+  },
+  "retryable": false
+}
+```
+
+Refetch and deliberately merge or reapply local work after a conflict; never blindly retry the
+stale payload. The bundled editor preserves its local draft and provides an explicit refetch and
+reapply action. Note and Trash delete dialogs remain open on conflict and require a reload before
+retrying.
+
 ## MCP
 
 The same binary also speaks MCP over stdio (for MCP clients that spawn a subprocess):
@@ -533,17 +564,26 @@ This mode loads the same mandatory runtime configuration as HTTP, import, and ex
 It exposes `save_note`, `get_note`, `read_note_lines`, `edit_note`, `update_note`, `delete_note`,
 `list_notes`, `semantic_search`, `put_note_attachment`, `get_note_attachment_content`, and
 `delete_note_attachment`. Label-key management is REST/UI-only. `list_notes` returns exactly `id`,
-`title`, `labels`, `created_at`, and `updated_at` for each result; `semantic_search` returns exactly
-those fields plus `score`. Neither response includes note content or attachments.
+`title`, `labels`, `created_at`, `updated_at`, and `revision` for each result. `semantic_search`
+returns `id`, `title`, `labels`, `created_at`, `updated_at`, and `score`. Neither response includes
+note content or attachments.
 
 `get_note` and `update_note` return note content plus attachment metadata (`id`, `path`, `mime`, and
-`description`) without attachment bytes. MCP `save_note` and `update_note` do not accept inline
+`description`) without attachment bytes, plus the authoritative note `revision`. `read_note_lines`
+returns both `revision` and the content-specific `tag`; `edit_note` requires both. `update_note`,
+`delete_note`, `put_note_attachment`, and `delete_note_attachment` also require
+`expected_revision`. Successful save, update, edit, and attachment-put results expose the resulting
+revision. MCP `save_note` and `update_note` do not accept inline
 attachments. Create or replace one attachment with `put_note_attachment`, and remove one with
 `delete_note_attachment`; both address it by its stable `attachment_id`. An existing attachment id
 cannot change its normalized path, so rename an attachment with delete followed by put.
 `get_note_attachment_content` is the only MCP tool that reads attachment bytes. It returns exactly
 one content representation: direct `content` when the bytes are valid UTF-8, otherwise canonical
 Base64 in `content_base64`. These changes apply only to MCP; REST attachment behavior is unchanged.
+
+Ordinary-note MCP conflicts use the same `code`, `message`, `details`, and `retryable` fields as
+REST, including `stale_revision` with the expected and current revision. Missing required inputs
+are protocol caller errors; missing notes are `not_found`; storage failures use safe messages.
 
 The same registry also exposes exactly these 36 Org tools over both transports (47 tools total):
 

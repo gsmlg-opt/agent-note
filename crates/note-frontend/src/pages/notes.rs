@@ -178,7 +178,8 @@ pub fn notes_page() -> Html {
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
     // The note pending deletion (id, title) — drives the confirm modal.
-    let delete_target = use_state(|| None::<(String, String)>);
+    let delete_target = use_state(|| None::<(String, String, i64)>);
+    let delete_conflict = use_state(|| None::<api::NoteMutationApiError>);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
     let page_size = use_state(|| DEFAULT_PAGE_SIZE);
@@ -346,39 +347,75 @@ pub fn notes_page() -> Html {
     // than re-reading `delete_target` inside the click handler) keeps the confirm handler correct.
     let delete_modal = match (*delete_target).clone() {
         None => html! {},
-        Some((id, title)) => {
+        Some((id, title, expected_revision)) => {
             let on_close = {
                 let d = delete_target.clone();
-                Callback::from(move |_: ()| d.set(None))
+                let delete_conflict = delete_conflict.clone();
+                Callback::from(move |_: ()| {
+                    d.set(None);
+                    delete_conflict.set(None);
+                })
             };
             let on_cancel = {
                 let d = delete_target.clone();
-                Callback::from(move |_: MouseEvent| d.set(None))
+                let delete_conflict = delete_conflict.clone();
+                Callback::from(move |_: MouseEvent| {
+                    d.set(None);
+                    delete_conflict.set(None);
+                })
             };
             let on_confirm = {
                 let d = delete_target.clone();
                 let reload = reload.clone();
                 let error = error.clone();
+                let delete_conflict = delete_conflict.clone();
                 Callback::from(move |_: MouseEvent| {
                     let d = d.clone();
                     let reload = reload.clone();
                     let error = error.clone();
+                    let delete_conflict = delete_conflict.clone();
                     let id = id.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        match api::delete_note(&id).await {
+                        match api::delete_note(&id, expected_revision).await {
                             Ok(()) => {
                                 d.set(None);
+                                delete_conflict.set(None);
                                 reload.emit(());
                             }
-                            Err(e) => error.set(Some(e)),
+                            Err(e) => {
+                                if e.is_stale_revision() {
+                                    delete_conflict.set(Some(e));
+                                } else {
+                                    error.set(Some(e.to_string()));
+                                }
+                            }
                         }
                     });
+                })
+            };
+            let on_reload = {
+                let d = delete_target.clone();
+                let delete_conflict = delete_conflict.clone();
+                let reload = reload.clone();
+                Callback::from(move |_| {
+                    delete_conflict.set(None);
+                    d.set(None);
+                    reload.emit(());
                 })
             };
             html! {
                 <Modal title="Remove note" on_close={on_close}>
                     <p>{ format!("Remove the note \u{201c}{title}\u{201d}? This cannot be undone.") }</p>
+                    if let Some(conflict_error) = &*delete_conflict {
+                        <Alert variant={Some("error".to_string())}>
+                            <span>{ conflict_error.message.clone() }</span>
+                            <span>{ " Reload the notes before deciding whether to retry." }</span>
+                        </Alert>
+                    }
                     <div class="app-modal-actions">
+                        if delete_conflict.is_some() {
+                            <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload notes" }</button>
+                        }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel}>{ "Cancel" }</button>
                         <button type="button" class="btn btn-error" onclick={on_confirm}>{ "Remove note" }</button>
                     </div>
@@ -648,7 +685,7 @@ fn list_view(
     total: usize,
     page: &UseStateHandle<usize>,
     page_size: &UseStateHandle<usize>,
-    delete_target: &UseStateHandle<Option<(String, String)>>,
+    delete_target: &UseStateHandle<Option<(String, String, i64)>>,
     notes_query: &NotesQueryParams,
     on_quick_add_filter: Callback<(String, String)>,
     on_page_change: Callback<usize>,
@@ -749,7 +786,7 @@ fn pagination_bar(
 
 fn note_table(
     notes: &[NoteSummary],
-    delete_target: &UseStateHandle<Option<(String, String)>>,
+    delete_target: &UseStateHandle<Option<(String, String, i64)>>,
     notes_query: &NotesQueryParams,
     on_quick_add_filter: Callback<(String, String)>,
 ) -> Html {
@@ -782,7 +819,8 @@ fn note_table(
                             let delete_target = delete_target.clone();
                             let id = note.id.clone();
                             let title = note.title.clone();
-                            Callback::from(move |_| delete_target.set(Some((id.clone(), title.clone()))))
+                            let revision = note.revision;
+                            Callback::from(move |_| delete_target.set(Some((id.clone(), title.clone(), revision))))
                         };
                         html! {
                             <tr key={note.id.clone()}>

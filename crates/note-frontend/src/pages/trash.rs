@@ -302,6 +302,7 @@ pub fn trash_page() -> Html {
                 let selected = selected.clone();
                 let error = error.clone();
                 let refresh_tick = refresh_tick.clone();
+                let notes = notes.clone();
                 Callback::from(move |_| {
                     if *restoring {
                         return;
@@ -313,23 +314,41 @@ pub fn trash_page() -> Html {
                     let error = error.clone();
                     let refresh_tick = refresh_tick.clone();
                     let ids = ids.clone();
+                    let notes = notes.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        match api::restore_deleted_notes(&ids).await {
+                        let selected_notes = ids
+                            .iter()
+                            .filter_map(|id| notes.iter().find(|note| &note.id == id).cloned())
+                            .collect::<Vec<_>>();
+                        match api::restore_deleted_notes(&selected_notes).await {
                             Ok(()) => {
                                 selected.dispatch(SelectionAction::Remove(ids.clone()));
+                                restore_target.set(None);
+                                refresh_tick.set((*refresh_tick).saturating_add(1));
                             }
-                            Err(message) => error.set(Some(message)),
+                            Err(message) => error.set(Some(message.to_string())),
                         }
-                        restore_target.set(None);
                         restoring.set(false);
-                        refresh_tick.set((*refresh_tick).saturating_add(1));
                     });
+                })
+            };
+            let on_reload = {
+                let restore_target = restore_target.clone();
+                let refresh_tick = refresh_tick.clone();
+                let error = error.clone();
+                Callback::from(move |_| {
+                    restore_target.set(None);
+                    error.set(None);
+                    refresh_tick.set((*refresh_tick).saturating_add(1));
                 })
             };
             html! {
                 <Modal title={modal_title} on_close={on_close}>
                     <p>{ message }</p>
                     <div class="app-modal-actions">
+                        if error.is_some() {
+                            <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload Trash" }</button>
+                        }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*restoring}>
                             { "Cancel" }
                         </button>
@@ -373,6 +392,7 @@ pub fn trash_page() -> Html {
                 let batch_delete_error = batch_delete_error.clone();
                 let selected = selected.clone();
                 let refresh_tick = refresh_tick.clone();
+                let notes = notes.clone();
                 Callback::from(move |_| {
                     if *deleting {
                         return;
@@ -385,41 +405,89 @@ pub fn trash_page() -> Html {
                     let selected = selected.clone();
                     let refresh_tick = refresh_tick.clone();
                     let ids = ids.clone();
+                    let notes = notes.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         if is_batch {
                             let mut failed = HashSet::new();
+                            let mut conflict = false;
                             for id in &ids {
-                                if api::permanently_delete_note(id).await.is_err() {
+                                let Some(revision) = notes
+                                    .iter()
+                                    .find(|note| &note.id == id)
+                                    .map(|note| note.revision)
+                                else {
+                                    failed.insert(id.clone());
+                                    continue;
+                                };
+                                if let Err(delete_error) =
+                                    api::permanently_delete_note(id, revision).await
+                                {
+                                    conflict |= delete_error.is_stale_revision();
                                     failed.insert(id.clone());
                                 }
                             }
                             let failed_count = failed.len();
+                            let failed_ids = ids
+                                .iter()
+                                .filter(|id| failed.contains(*id))
+                                .cloned()
+                                .collect::<Vec<_>>();
                             selected.dispatch(SelectionAction::ReconcileDelete {
                                 attempted: ids.clone(),
                                 failed,
                             });
-                            batch_delete_error
-                                .set(batch_delete_failure_message(ids.len(), failed_count));
-                            delete_target.set(None);
+                            batch_delete_error.set(if conflict {
+                                Some("One or more notes changed after Trash was loaded. Failed notes remain selected; reload Trash before retrying.".to_string())
+                            } else {
+                                batch_delete_failure_message(ids.len(), failed_count)
+                            });
+                            if failed_count == 0 {
+                                delete_target.set(None);
+                            } else {
+                                delete_target.set(Some(DeleteTarget::Batch { ids: failed_ids }));
+                            }
                             deleting.set(false);
-                            refresh_tick.set((*refresh_tick).saturating_add(1));
                         } else {
-                            match api::permanently_delete_note(&ids[0]).await {
+                            let revision = notes
+                                .iter()
+                                .find(|note| note.id == ids[0])
+                                .map(|note| note.revision);
+                            let Some(revision) = revision else {
+                                error.set(Some("The selected note is no longer in Trash.".into()));
+                                deleting.set(false);
+                                return;
+                            };
+                            match api::permanently_delete_note(&ids[0], revision).await {
                                 Ok(()) => {
                                     delete_target.set(None);
                                     refresh_tick.set((*refresh_tick).saturating_add(1));
                                 }
-                                Err(message) => error.set(Some(message)),
+                                Err(message) => error.set(Some(message.to_string())),
                             }
                             deleting.set(false);
                         }
                     });
                 })
             };
+            let on_reload = {
+                let delete_target = delete_target.clone();
+                let refresh_tick = refresh_tick.clone();
+                let error = error.clone();
+                let batch_delete_error = batch_delete_error.clone();
+                Callback::from(move |_| {
+                    delete_target.set(None);
+                    error.set(None);
+                    batch_delete_error.set(None);
+                    refresh_tick.set((*refresh_tick).saturating_add(1));
+                })
+            };
             html! {
                 <Modal title={modal_title} on_close={on_close}>
                     <p>{ message }</p>
                     <div class="app-modal-actions">
+                        if error.is_some() || batch_delete_error.is_some() {
+                            <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload Trash" }</button>
+                        }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*deleting}>
                             { "Cancel" }
                         </button>
@@ -662,6 +730,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             deleted_at: 0,
+            revision: 1,
         }
     }
 
