@@ -389,6 +389,40 @@ async fn put_rejects_path_changes_and_normalized_path_collisions_without_mutatio
 }
 
 #[tokio::test]
+async fn put_reports_stale_revision_before_errors_derived_from_newer_attachment_state() {
+    let (ctx, backend, _dir) = test_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[
+            attachment("first", "first.txt", "text/plain", "", b"first"),
+            attachment("second", "second.txt", "text/plain", "", b"second"),
+        ],
+    )
+    .await;
+
+    let error = put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        NOTE_REVISION - 1,
+        attachment("first", "second.txt", "text/plain", "", b"stale"),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(&NoteMutationError::StaleRevision {
+            note_id: NOTE_ID.into(),
+            expected_revision: NOTE_REVISION - 1,
+            current_revision: NOTE_REVISION,
+        })
+    );
+    assert_eq!(stored_note(&backend, NOTE_ID).await.revision, NOTE_REVISION);
+}
+
+#[tokio::test]
 async fn put_rejects_invalid_id_mime_and_paths_before_mutation() {
     let (ctx, backend, _event_backend, _attachments, events, _dir) = controlled_context().await;
     seed_note(&ctx, &backend, NOTE_ID, &[]).await;
@@ -650,10 +684,12 @@ async fn delete_removes_only_selected_metadata_and_object_and_is_idempotent() {
             .await
             .unwrap()
     );
-    assert!(
-        !delete_note_attachment(&ctx, "missing-note", "first", NOTE_REVISION)
-            .await
-            .unwrap()
+    let error = delete_note_attachment(&ctx, "missing-note", "first", NOTE_REVISION)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(&NoteMutationError::NotFound("missing-note".into()))
     );
     assert_eq!(
         get_note_attachment_by_id(&ctx, NOTE_ID, "first")
@@ -878,7 +914,7 @@ async fn put_and_delete_do_not_hydrate_or_rewrite_sibling_objects() {
 }
 
 #[tokio::test]
-async fn missing_note_contract_is_typed_for_put_and_idempotent_for_reads_and_delete() {
+async fn missing_note_contract_is_typed_for_mutations_and_idempotent_for_reads() {
     let (ctx, _backend, _dir) = test_context().await;
 
     let error = put_note_attachment(
@@ -900,10 +936,12 @@ async fn missing_note_contract_is_typed_for_put_and_idempotent_for_reads_and_del
             .unwrap(),
         None
     );
-    assert!(
-        !delete_note_attachment(&ctx, "missing-note", "file", NOTE_REVISION)
-            .await
-            .unwrap()
+    let error = delete_note_attachment(&ctx, "missing-note", "file", NOTE_REVISION)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(&NoteMutationError::NotFound("missing-note".into()))
     );
 }
 

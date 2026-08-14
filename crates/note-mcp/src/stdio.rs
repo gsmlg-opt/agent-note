@@ -594,6 +594,8 @@ pub struct DeleteNoteAttachmentRequest {
 pub struct DeleteNoteAttachmentResponse {
     /// Whether the attachment existed and was deleted.
     pub deleted: bool,
+    /// New owning-note revision, or null when the attachment was already absent.
+    pub revision: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -817,12 +819,13 @@ impl NoteMcpServer {
         )
         .await
         .map_err(to_error_data)?;
-        Ok(Json(DeleteNoteAttachmentResponse {
-            deleted: matches!(
-                deleted,
-                note_pipelines::DeleteNoteAttachmentResult::Applied { .. }
-            ),
-        }))
+        let (deleted, revision) = match deleted {
+            note_pipelines::DeleteNoteAttachmentResult::Applied { revision } => {
+                (true, Some(revision))
+            }
+            note_pipelines::DeleteNoteAttachmentResult::Absent => (false, None),
+        };
+        Ok(Json(DeleteNoteAttachmentResponse { deleted, revision }))
     }
 }
 
@@ -1416,6 +1419,12 @@ mod tests {
             ),
             vec!["created_at", "id", "labels", "score", "title", "updated_at"]
         );
+        assert_eq!(
+            property_names(
+                &serde_json::to_value(schemars::schema_for!(DeleteNoteAttachmentResponse)).unwrap()
+            ),
+            vec!["deleted", "revision"]
+        );
     }
 
     #[test]
@@ -1684,7 +1693,10 @@ mod tests {
                 .0;
             assert_eq!(
                 serde_json::to_value(deleted).unwrap(),
-                json!({"deleted": expected})
+                json!({
+                    "deleted": expected,
+                    "revision": if expected { Some(5) } else { None },
+                })
             );
         }
     }
@@ -1798,6 +1810,20 @@ mod tests {
         );
         assert_eq!(missing_put.code, ErrorCode::RESOURCE_NOT_FOUND);
         assert!(missing_put.message.contains("note not found: missing-note"));
+
+        let missing_delete = expect_error(
+            server
+                .delete_note_attachment(Parameters(DeleteNoteAttachmentRequest {
+                    note_id: "missing-note".into(),
+                    attachment_id: "blob".into(),
+                    expected_revision: 1,
+                }))
+                .await,
+        );
+        assert_eq!(missing_delete.code, ErrorCode::RESOURCE_NOT_FOUND);
+        assert!(missing_delete
+            .message
+            .contains("note not found: missing-note"));
 
         let missing_get = expect_error(
             server

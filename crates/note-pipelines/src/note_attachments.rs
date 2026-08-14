@@ -120,6 +120,14 @@ pub async fn put_note_attachment(
         let Some(note) = transaction.get_note(note_id).await? else {
             return Err(crate::NoteMutationError::NotFound(note_id.to_string()).into());
         };
+        if note.revision != expected_revision {
+            return Err(crate::NoteMutationError::StaleRevision {
+                note_id: note_id.to_string(),
+                expected_revision,
+                current_revision: note.revision,
+            }
+            .into());
+        }
         let updated_at = attachment_mutation_timestamp(note.updated_at);
         let normalized_path = normalize_attachment_path(&attachment.path);
         let existing_index = note.attachments.iter().position(|existing| {
@@ -327,7 +335,7 @@ async fn delete_attachment_metadata(
     expected_revision: i64,
 ) -> anyhow::Result<DeleteMetadataResult> {
     let Some(note) = transaction.get_note(note_id).await? else {
-        return Ok(DeleteMetadataResult::Absent);
+        return Err(crate::NoteMutationError::NotFound(note_id.to_string()).into());
     };
     let Some(existing_index) = note.attachments.iter().position(|attachment| {
         canonical_attachment_id(&attachment.id) == canonical_attachment_id(attachment_id)
@@ -359,8 +367,16 @@ async fn resolve_attachment_path(
     note_id: &str,
     attachment_id: &str,
 ) -> anyhow::Result<Option<String>> {
-    Ok(resolve_attachment_metadata(ctx, note_id, attachment_id)
-        .await?
+    let session = ctx.storage().session().await?;
+    let Some(note) = session.get_note(note_id).await? else {
+        return Err(crate::NoteMutationError::NotFound(note_id.to_string()).into());
+    };
+    Ok(note
+        .attachments
+        .into_iter()
+        .find(|attachment| {
+            canonical_attachment_id(&attachment.id) == canonical_attachment_id(attachment_id)
+        })
         .map(|attachment| attachment.path))
 }
 
