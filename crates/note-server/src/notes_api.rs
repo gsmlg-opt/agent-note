@@ -1,7 +1,11 @@
 use axum::{
     body::Body,
-    extract::{FromRef, Path, Query, State},
-    response::{Html, Response},
+    extract::{
+        rejection::{JsonRejection, QueryRejection},
+        FromRef, FromRequest, FromRequestParts, Path, Query, Request, State,
+    },
+    http::{request::Parts, StatusCode},
+    response::{Html, IntoResponse, Response},
     routing::get as route_get,
     Json,
 };
@@ -13,7 +17,7 @@ use note_pipelines::{
     restore_notes, save_note, search_notes_filtered, update_note, Context, ListNotesParams,
     RestoreNoteInput, SaveNoteInput,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
@@ -49,9 +53,160 @@ pub struct UpdateNoteRequest {
     pub labels: Vec<(String, String)>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ExpectedRevisionQuery {
+    /// Revision returned by the latest read of this note.
     expected_revision: i64,
+}
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct NoteMutationApiError {
+    pub code: String,
+    pub message: String,
+    #[schema(example = json!({}))]
+    pub details: serde_json::Value,
+    pub retryable: bool,
+    #[serde(skip)]
+    #[schema(ignore)]
+    status: StatusCode,
+}
+
+impl NoteMutationApiError {
+    fn expected_revision_required() -> Self {
+        Self {
+            code: "expected_revision_required".into(),
+            message: "expected_revision is required".into(),
+            details: serde_json::json!({}),
+            retryable: false,
+            status: StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn invalid_input(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_input".into(),
+            message: message.into(),
+            details: serde_json::json!({}),
+            retryable: false,
+            status: StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn not_found(note_id: impl Into<String>) -> Self {
+        Self {
+            code: "not_found".into(),
+            message: "note not found".into(),
+            details: serde_json::json!({"note_id": note_id.into()}),
+            retryable: false,
+            status: StatusCode::NOT_FOUND,
+        }
+    }
+
+    fn storage_failure() -> Self {
+        Self {
+            code: "storage_failure".into(),
+            message: "note storage operation failed".into(),
+            details: serde_json::json!({}),
+            retryable: true,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn from_anyhow(error: anyhow::Error) -> Self {
+        if let Some(error) = error.downcast_ref::<note_pipelines::NoteMutationError>() {
+            return Self::from(error.clone());
+        }
+        if error.downcast_ref::<note_core::ValidationError>().is_some()
+            || error
+                .downcast_ref::<note_core::LabelKeyValidationError>()
+                .is_some()
+        {
+            return Self::invalid_input(error.to_string());
+        }
+        Self::storage_failure()
+    }
+}
+
+impl From<note_pipelines::NoteMutationError> for NoteMutationApiError {
+    fn from(error: note_pipelines::NoteMutationError) -> Self {
+        let (message, status) = match &error {
+            note_pipelines::NoteMutationError::NotFound(_) => {
+                ("note not found", StatusCode::NOT_FOUND)
+            }
+            note_pipelines::NoteMutationError::StaleRevision { .. } => {
+                ("the note changed after it was read", StatusCode::CONFLICT)
+            }
+            note_pipelines::NoteMutationError::StaleContentTag { .. } => (
+                "the note content changed after it was read",
+                StatusCode::CONFLICT,
+            ),
+        };
+        Self {
+            code: error.code().into(),
+            message: message.into(),
+            details: serde_json::to_value(error.details())
+                .unwrap_or_else(|_| serde_json::json!({})),
+            retryable: error.retryable(),
+            status,
+        }
+    }
+}
+
+impl IntoResponse for NoteMutationApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(self)).into_response()
+    }
+}
+
+struct NoteJson<T>(T);
+
+impl<S, T> FromRequest<S> for NoteJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = NoteMutationApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        Json::<T>::from_request(request, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(note_json_rejection)
+    }
+}
+
+fn note_json_rejection(rejection: JsonRejection) -> NoteMutationApiError {
+    if rejection.body_text().contains("expected_revision") {
+        NoteMutationApiError::expected_revision_required()
+    } else {
+        NoteMutationApiError::invalid_input("Invalid JSON request body")
+    }
+}
+
+struct NoteQuery<T>(T);
+
+impl<S, T> FromRequestParts<S> for NoteQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = NoteMutationApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(value)| Self(value))
+            .map_err(note_query_rejection)
+    }
+}
+
+fn note_query_rejection(rejection: QueryRejection) -> NoteMutationApiError {
+    if rejection.body_text().contains("expected_revision") {
+        NoteMutationApiError::expected_revision_required()
+    } else {
+        NoteMutationApiError::invalid_input("Invalid query parameters")
+    }
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -120,6 +275,22 @@ impl utoipa::ToSchema for AttachmentRequestDocumentation {
 #[schema(as = SaveNoteRequest)]
 #[allow(dead_code)]
 struct SaveNoteRequestDocumentation {
+    title: String,
+    content: String,
+    #[schema(default = json!([]), required = false)]
+    attachments: Vec<AttachmentRequestDocumentation>,
+    #[schema(
+        schema_with = crate::openapi::label_pairs_with_empty_default_schema,
+        required = false
+    )]
+    labels: Vec<(String, String)>,
+}
+
+#[derive(utoipa::ToSchema)]
+#[schema(as = UpdateNoteRequest)]
+#[allow(dead_code)]
+struct UpdateNoteRequestDocumentation {
+    expected_revision: i64,
     title: String,
     content: String,
     #[schema(default = json!([]), required = false)]
@@ -759,20 +930,22 @@ async fn get_attachment_handler(
     path = "/api/notes/{id}",
     tag = "notes",
     params(("id" = String, Path, description = "Note ID")),
-    request_body = SaveNoteRequestDocumentation,
+    request_body = UpdateNoteRequestDocumentation,
     responses(
         (status = 200, description = "Updated note", body = NoteDto),
-        (status = 400, description = "Invalid note", body = String, content_type = "text/plain"),
-        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
-        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+        (status = 400, description = "Invalid note or missing expected revision", body = NoteMutationApiError),
+        (status = 404, description = "Note not found", body = NoteMutationApiError),
+        (status = 409, description = "Stale note revision", body = NoteMutationApiError),
+        (status = 500, description = "Server error", body = NoteMutationApiError)
     )
 )]
 async fn update_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
-    Json(req): Json<UpdateNoteRequest>,
-) -> Result<Json<NoteDto>, (axum::http::StatusCode, String)> {
-    let attachments = decode_attachment_requests(req.attachments)?;
+    NoteJson(req): NoteJson<UpdateNoteRequest>,
+) -> Result<Json<NoteDto>, NoteMutationApiError> {
+    let attachments = decode_attachment_requests(req.attachments)
+        .map_err(|(_, message)| NoteMutationApiError::invalid_input(message))?;
     let note = update_note(
         &ctx,
         &id,
@@ -785,26 +958,14 @@ async fn update_note_handler(
         },
     )
     .await
-    .map_err(|e| {
-        let status = if let Some(error) = e.downcast_ref::<note_pipelines::NoteMutationError>() {
-            ordinary_mutation_status(error)
-        } else if e.downcast_ref::<note_core::ValidationError>().is_some()
-            || e.downcast_ref::<note_core::LabelKeyValidationError>()
-                .is_some()
-        {
-            axum::http::StatusCode::BAD_REQUEST
-        } else {
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (status, e.to_string())
-    })?;
+    .map_err(NoteMutationApiError::from_anyhow)?;
 
     match note {
         Some(note) => {
             invalidate_dashboard_cache();
             Ok(Json(NoteDto::from(note)))
         }
-        None => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
+        None => Err(NoteMutationApiError::not_found(id)),
     }
 }
 
@@ -812,32 +973,29 @@ async fn update_note_handler(
     delete,
     path = "/api/notes/{id}",
     tag = "notes",
-    params(("id" = String, Path, description = "Note ID")),
+    params(("id" = String, Path, description = "Note ID"), ExpectedRevisionQuery),
     responses(
         (status = 204, description = "Note moved to Trash"),
-        (status = 404, description = "Note not found", body = String, content_type = "text/plain"),
-        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+        (status = 400, description = "Missing expected revision", body = NoteMutationApiError),
+        (status = 404, description = "Note not found", body = NoteMutationApiError),
+        (status = 409, description = "Stale note revision", body = NoteMutationApiError),
+        (status = 500, description = "Server error", body = NoteMutationApiError)
     )
 )]
 async fn delete_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
-    Query(query): Query<ExpectedRevisionQuery>,
-) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    NoteQuery(query): NoteQuery<ExpectedRevisionQuery>,
+) -> Result<axum::http::StatusCode, NoteMutationApiError> {
     match delete_note(&ctx, &id, query.expected_revision)
         .await
-        .map_err(|e| {
-            let status = e
-                .downcast_ref::<note_pipelines::NoteMutationError>()
-                .map(ordinary_mutation_status)
-                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-            (status, e.to_string())
-        })? {
+        .map_err(NoteMutationApiError::from_anyhow)?
+    {
         true => {
             invalidate_dashboard_cache();
             Ok(axum::http::StatusCode::NO_CONTENT)
         }
-        false => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
+        false => Err(NoteMutationApiError::not_found(id)),
     }
 }
 
@@ -878,19 +1036,19 @@ struct RestoreNoteInputRequest {
     request_body = RestoreNotesRequest,
     responses(
         (status = 204, description = "Notes restored"),
-        (status = 400, description = "Invalid restore request", body = String, content_type = "text/plain"),
-        (status = 404, description = "Trashed note not found", body = String, content_type = "text/plain"),
-        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+        (status = 400, description = "Invalid restore request", body = NoteMutationApiError),
+        (status = 404, description = "Trashed note not found", body = NoteMutationApiError),
+        (status = 409, description = "Stale note revision", body = NoteMutationApiError),
+        (status = 500, description = "Server error", body = NoteMutationApiError)
     )
 )]
 async fn restore_notes_handler(
     State(ctx): State<Arc<Context>>,
-    Json(req): Json<RestoreNotesRequest>,
-) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    NoteJson(req): NoteJson<RestoreNotesRequest>,
+) -> Result<axum::http::StatusCode, NoteMutationApiError> {
     if req.notes.is_empty() {
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            "at least one note id is required".into(),
+        return Err(NoteMutationApiError::invalid_input(
+            "at least one note id is required",
         ));
     }
     let entries = req
@@ -901,20 +1059,16 @@ async fn restore_notes_handler(
             expected_revision: note.expected_revision,
         })
         .collect::<Vec<_>>();
-    match restore_notes(&ctx, &entries).await.map_err(|e| {
-        let status = e
-            .downcast_ref::<note_pipelines::NoteMutationError>()
-            .map(ordinary_mutation_status)
-            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-        (status, e.to_string())
-    })? {
+    match restore_notes(&ctx, &entries)
+        .await
+        .map_err(NoteMutationApiError::from_anyhow)?
+    {
         true => {
             invalidate_dashboard_cache();
             Ok(axum::http::StatusCode::NO_CONTENT)
         }
-        false => Err((
-            axum::http::StatusCode::NOT_FOUND,
-            "one or more notes were not found in Trash".into(),
+        false => Err(NoteMutationApiError::invalid_input(
+            "at least one note id is required",
         )),
     }
 }
@@ -923,39 +1077,26 @@ async fn restore_notes_handler(
     delete,
     path = "/api/trash/{id}",
     tag = "trash",
-    params(("id" = String, Path, description = "Note ID")),
+    params(("id" = String, Path, description = "Note ID"), ExpectedRevisionQuery),
     responses(
         (status = 204, description = "Note permanently deleted"),
-        (status = 404, description = "Trashed note not found", body = String, content_type = "text/plain"),
-        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+        (status = 400, description = "Missing expected revision", body = NoteMutationApiError),
+        (status = 404, description = "Trashed note not found", body = NoteMutationApiError),
+        (status = 409, description = "Stale note revision", body = NoteMutationApiError),
+        (status = 500, description = "Server error", body = NoteMutationApiError)
     )
 )]
 async fn permanently_delete_note_handler(
     State(ctx): State<Arc<Context>>,
     Path(id): Path<String>,
-    Query(query): Query<ExpectedRevisionQuery>,
-) -> Result<axum::http::StatusCode, (axum::http::StatusCode, String)> {
+    NoteQuery(query): NoteQuery<ExpectedRevisionQuery>,
+) -> Result<axum::http::StatusCode, NoteMutationApiError> {
     match permanently_delete_note(&ctx, &id, query.expected_revision)
         .await
-        .map_err(|e| {
-            let status = e
-                .downcast_ref::<note_pipelines::NoteMutationError>()
-                .map(ordinary_mutation_status)
-                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-            (status, e.to_string())
-        })? {
+        .map_err(NoteMutationApiError::from_anyhow)?
+    {
         true => Ok(axum::http::StatusCode::NO_CONTENT),
-        false => Err((axum::http::StatusCode::NOT_FOUND, "note not found".into())),
-    }
-}
-
-fn ordinary_mutation_status(error: &note_pipelines::NoteMutationError) -> axum::http::StatusCode {
-    match error {
-        note_pipelines::NoteMutationError::NotFound(_) => axum::http::StatusCode::NOT_FOUND,
-        note_pipelines::NoteMutationError::StaleRevision { .. }
-        | note_pipelines::NoteMutationError::StaleContentTag { .. } => {
-            axum::http::StatusCode::CONFLICT
-        }
+        false => Err(NoteMutationApiError::not_found(id)),
     }
 }
 
@@ -1395,6 +1536,39 @@ mod tests {
                 "{response}.labels must not publish a default"
             );
         }
+    }
+
+    #[test]
+    fn openapi_documents_required_revisions_and_structured_mutation_errors() {
+        let document = note_openapi_document();
+        let schemas = &document["components"]["schemas"];
+        assert!(schemas["UpdateNoteRequest"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("expected_revision")));
+        assert_eq!(
+            operation_parameter(
+                &document["paths"]["/api/notes/{id}"]["delete"],
+                "expected_revision"
+            )["required"],
+            true
+        );
+        assert_eq!(
+            operation_parameter(
+                &document["paths"]["/api/trash/{id}"]["delete"],
+                "expected_revision"
+            )["required"],
+            true
+        );
+        assert_eq!(
+            document["paths"]["/api/notes/{id}"]["put"]["responses"]["409"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/NoteMutationApiError"
+        );
+        assert_eq!(
+            schemas["NoteMutationApiError"]["required"],
+            serde_json::json!(["code", "message", "details", "retryable"])
+        );
     }
 
     #[test]
@@ -2236,6 +2410,43 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json.get("title").and_then(|v| v.as_str()), Some("New"));
 
+        let stale = app
+            .clone()
+            .oneshot(put(
+                &format!("/api/notes/{id}"),
+                r#"{"expected_revision":1,"title":"Stale","content":"stale","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&stale.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["code"], "stale_revision");
+        assert_eq!(body["details"]["note_id"], id);
+        assert_eq!(body["details"]["expected_revision"], 1);
+        assert_eq!(body["details"]["current_revision"], 2);
+        assert_eq!(body["retryable"], false);
+
+        let missing_revision = app
+            .clone()
+            .oneshot(put(
+                &format!("/api/notes/{id}"),
+                r#"{"title":"Unsafe","content":"unsafe","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_revision.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_slice(
+            &missing_revision
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], "expected_revision_required");
+
         let resp = app
             .clone()
             .oneshot(get(&format!("/api/notes/{id}")))
@@ -2254,6 +2465,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(body["code"], "not_found");
+        assert_eq!(body["details"]["note_id"], "nope");
     }
 
     #[tokio::test]
@@ -2264,6 +2479,23 @@ mod tests {
             r#"{"title":"Delete Me","content":"C","attachments":[{"id":"proof","path":"./proof.txt","mime":"text/plain","description":"proof","content":"keep me"}],"labels":[["status","deleted"]]}"#,
         )
         .await;
+
+        let missing_revision = app
+            .clone()
+            .oneshot(delete(&format!("/api/notes/{id}")))
+            .await
+            .unwrap();
+        assert_eq!(missing_revision.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_slice(
+            &missing_revision
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(body["code"], "expected_revision_required");
 
         let resp = app
             .clone()

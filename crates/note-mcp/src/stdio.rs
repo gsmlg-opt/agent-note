@@ -849,10 +849,31 @@ fn to_error_data(error: anyhow::Error) -> ErrorData {
     {
         return ErrorData::invalid_params(error.to_string(), None);
     }
-    if let Some(note_pipelines::NoteMutationError::NotFound(_)) =
-        error.downcast_ref::<note_pipelines::NoteMutationError>()
-    {
-        return ErrorData::resource_not_found(error.to_string(), None);
+    if let Some(error) = error.downcast_ref::<note_pipelines::NoteMutationError>() {
+        let message = match error {
+            note_pipelines::NoteMutationError::NotFound(_) => "note not found",
+            note_pipelines::NoteMutationError::StaleRevision { .. } => {
+                "the note changed after it was read"
+            }
+            note_pipelines::NoteMutationError::StaleContentTag { .. } => {
+                "the note content changed after it was read"
+            }
+        };
+        let data = serde_json::json!({
+            "code": error.code(),
+            "message": message,
+            "details": error.details(),
+            "retryable": error.retryable(),
+        });
+        return match error {
+            note_pipelines::NoteMutationError::NotFound(_) => {
+                ErrorData::resource_not_found(message, Some(data))
+            }
+            note_pipelines::NoteMutationError::StaleRevision { .. }
+            | note_pipelines::NoteMutationError::StaleContentTag { .. } => {
+                ErrorData::invalid_request(message, Some(data))
+            }
+        };
     }
     if let Some(error_kind) = error.downcast_ref::<AttachmentMutationError>() {
         return match error_kind {
@@ -866,7 +887,7 @@ fn to_error_data(error: anyhow::Error) -> ErrorData {
             }
         };
     }
-    ErrorData::internal_error(error.to_string(), None)
+    ErrorData::internal_error("note operation failed", None)
 }
 
 fn to_put_error_data(error: anyhow::Error) -> ErrorData {
@@ -1470,6 +1491,31 @@ mod tests {
         assert_eq!(to_error_data(error).code, ErrorCode::INVALID_PARAMS);
     }
 
+    #[test]
+    fn note_conflicts_preserve_the_shared_structured_error_fields() {
+        let mapped = to_error_data(anyhow::Error::new(
+            note_pipelines::NoteMutationError::StaleRevision {
+                note_id: "note-1".into(),
+                expected_revision: 5,
+                current_revision: 6,
+            },
+        ));
+        assert_eq!(mapped.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(
+            mapped.data,
+            Some(json!({
+                "code": "stale_revision",
+                "message": "the note changed after it was read",
+                "details": {
+                    "note_id": "note-1",
+                    "expected_revision": 5,
+                    "current_revision": 6
+                },
+                "retryable": false
+            }))
+        );
+    }
+
     #[tokio::test]
     async fn standalone_handlers_use_metadata_and_exclusive_content_shapes() {
         let (ctx, backend, dir) = test_context().await;
@@ -1620,6 +1666,32 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(updated.attachments.len(), 2);
+
+        let stale = expect_error(
+            server
+                .update_note(Parameters(UpdateNoteRequest {
+                    id: saved.id.clone(),
+                    expected_revision: 3,
+                    title: "Stale".into(),
+                    content: "stale body".into(),
+                    labels: vec![],
+                }))
+                .await,
+        );
+        assert_eq!(stale.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(
+            stale.data,
+            Some(json!({
+                "code": "stale_revision",
+                "message": "the note changed after it was read",
+                "details": {
+                    "note_id": saved.id.clone(),
+                    "expected_revision": 3,
+                    "current_revision": 4
+                },
+                "retryable": false
+            }))
+        );
 
         let listed = server
             .list_notes(Parameters(ListNotesRequest {
@@ -1809,7 +1881,16 @@ mod tests {
                 .await,
         );
         assert_eq!(missing_put.code, ErrorCode::RESOURCE_NOT_FOUND);
-        assert!(missing_put.message.contains("note not found: missing-note"));
+        assert_eq!(missing_put.message, "note not found");
+        assert_eq!(
+            missing_put.data,
+            Some(json!({
+                "code": "not_found",
+                "message": "note not found",
+                "details": {"note_id": "missing-note"},
+                "retryable": false
+            }))
+        );
 
         let missing_delete = expect_error(
             server
@@ -1821,9 +1902,16 @@ mod tests {
                 .await,
         );
         assert_eq!(missing_delete.code, ErrorCode::RESOURCE_NOT_FOUND);
-        assert!(missing_delete
-            .message
-            .contains("note not found: missing-note"));
+        assert_eq!(missing_delete.message, "note not found");
+        assert_eq!(
+            missing_delete.data,
+            Some(json!({
+                "code": "not_found",
+                "message": "note not found",
+                "details": {"note_id": "missing-note"},
+                "retryable": false
+            }))
+        );
 
         let missing_get = expect_error(
             server
