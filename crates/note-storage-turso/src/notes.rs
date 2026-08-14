@@ -7,41 +7,125 @@ use note_storage::{
     NoteMutationResult, NoteUpdate, NotesRepository, ResolvedLabelSelector, StorageError,
     StorageErrorKind, StorageResult,
 };
+use tokio::sync::OwnedMutexGuard;
 
-impl TursoSession {
-    async fn begin_note_mutation(&self) -> StorageResult<()> {
-        // SQLite savepoints start a transaction on standalone sessions and nest inside pipeline
-        // transactions, keeping the failed-CAS classification under the same write lock.
-        self.connection
-            .execute("SAVEPOINT note_mutation_cas", ())
-            .await
-            .map(|_| ())
-            .map_err(|error| map_turso_error("begin atomic note mutation", error))
-    }
+const NOTE_MUTATION_SAVEPOINT: &str = "note_mutation_cas";
 
-    async fn finish_note_mutation<T>(&self, result: StorageResult<T>) -> StorageResult<T> {
-        match result {
-            Ok(value) => {
-                self.connection
-                    .execute("RELEASE SAVEPOINT note_mutation_cas", ())
-                    .await
-                    .map_err(|error| map_turso_error("commit atomic note mutation", error))?;
-                Ok(value)
-            }
-            Err(primary) => {
-                let _ = self
-                    .connection
-                    .execute("ROLLBACK TO SAVEPOINT note_mutation_cas", ())
-                    .await;
-                let _ = self
-                    .connection
-                    .execute("RELEASE SAVEPOINT note_mutation_cas", ())
-                    .await;
-                Err(primary)
+struct NoteMutationSavepoint {
+    connection: turso::Connection,
+    operation_guard: Option<OwnedMutexGuard<()>>,
+    active: bool,
+}
+
+impl NoteMutationSavepoint {
+    async fn begin(
+        session: &TursoSession,
+        operation_guard: OwnedMutexGuard<()>,
+    ) -> StorageResult<Self> {
+        let mut savepoint = Self {
+            connection: session.connection.clone(),
+            operation_guard: Some(operation_guard),
+            active: true,
+        };
+        let begin = savepoint
+            .connection
+            .execute(&format!("SAVEPOINT {NOTE_MUTATION_SAVEPOINT}"), ())
+            .await;
+        match begin {
+            Ok(_) => Ok(savepoint),
+            Err(error) => {
+                let primary = map_turso_error("begin atomic note mutation", error);
+                Err(savepoint.rollback_with_cleanup(primary).await)
             }
         }
     }
 
+    async fn finish<T>(mut self, result: StorageResult<T>) -> StorageResult<T> {
+        match result {
+            Ok(value) => match self
+                .connection
+                .execute(&format!("RELEASE SAVEPOINT {NOTE_MUTATION_SAVEPOINT}"), ())
+                .await
+            {
+                Ok(_) => {
+                    self.active = false;
+                    Ok(value)
+                }
+                Err(error) => {
+                    let primary = map_turso_error("finish atomic note mutation", error);
+                    Err(self.rollback_with_cleanup(primary).await)
+                }
+            },
+            Err(primary) => Err(self.rollback_with_cleanup(primary).await),
+        }
+    }
+
+    async fn rollback_with_cleanup(&mut self, primary: StorageError) -> StorageError {
+        let rollback = self
+            .connection
+            .execute(
+                &format!("ROLLBACK TO SAVEPOINT {NOTE_MUTATION_SAVEPOINT}"),
+                (),
+            )
+            .await
+            .err();
+        let release = self
+            .connection
+            .execute(&format!("RELEASE SAVEPOINT {NOTE_MUTATION_SAVEPOINT}"), ())
+            .await
+            .err();
+        self.active = false;
+        note_savepoint_cleanup_error(primary, rollback, release)
+    }
+}
+
+impl Drop for NoteMutationSavepoint {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let connection = self.connection.clone();
+        let Some(operation_guard) = self.operation_guard.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _operation_guard = operation_guard;
+                let _ = connection
+                    .execute(
+                        &format!("ROLLBACK TO SAVEPOINT {NOTE_MUTATION_SAVEPOINT}"),
+                        (),
+                    )
+                    .await;
+                let _ = connection
+                    .execute(&format!("RELEASE SAVEPOINT {NOTE_MUTATION_SAVEPOINT}"), ())
+                    .await;
+            });
+        } else {
+            std::mem::forget(operation_guard);
+        }
+    }
+}
+
+fn note_savepoint_cleanup_error(
+    primary: StorageError,
+    rollback: Option<turso::Error>,
+    release: Option<turso::Error>,
+) -> StorageError {
+    if rollback.is_none() && release.is_none() {
+        return primary;
+    }
+    let mut message = primary.to_string();
+    if let Some(rollback) = rollback {
+        message.push_str(&format!("; savepoint rollback also failed: {rollback}"));
+    }
+    if let Some(release) = release {
+        message.push_str(&format!("; savepoint release also failed: {release}"));
+    }
+    StorageError::with_source(primary.kind(), message, primary)
+}
+
+impl TursoSession {
     async fn classify_note_mutation(
         &self,
         id: &str,
@@ -322,9 +406,9 @@ impl NotesRepository for TursoSession {
     }
 
     async fn update_note(&self, note: NoteUpdate<'_>) -> StorageResult<NoteMutationResult<()>> {
-        let _operation_guard = self.operation_guard().await;
+        let operation_guard = self.operation_guard().await;
         let attachments = serialize_attachments(note.attachments)?;
-        self.begin_note_mutation().await?;
+        let savepoint = NoteMutationSavepoint::begin(self, operation_guard).await?;
         let result = async {
             let mut rows = self
                 .connection
@@ -364,15 +448,15 @@ impl NotesRepository for TursoSession {
             }
         }
         .await;
-        self.finish_note_mutation(result).await
+        savepoint.finish(result).await
     }
 
     async fn update_note_fields(
         &self,
         note: NoteFieldsUpdate<'_>,
     ) -> StorageResult<NoteMutationResult<()>> {
-        let _operation_guard = self.operation_guard().await;
-        self.begin_note_mutation().await?;
+        let operation_guard = self.operation_guard().await;
+        let savepoint = NoteMutationSavepoint::begin(self, operation_guard).await?;
         let result = async {
             let mut rows = self
                 .connection
@@ -410,16 +494,16 @@ impl NotesRepository for TursoSession {
             }
         }
         .await;
-        self.finish_note_mutation(result).await
+        savepoint.finish(result).await
     }
 
     async fn update_note_attachments(
         &self,
         note: AttachmentMetadataUpdate<'_>,
     ) -> StorageResult<NoteMutationResult<()>> {
-        let _operation_guard = self.operation_guard().await;
+        let operation_guard = self.operation_guard().await;
         let attachments = serialize_attachments(note.attachments)?;
-        self.begin_note_mutation().await?;
+        let savepoint = NoteMutationSavepoint::begin(self, operation_guard).await?;
         let result = async {
             let mut rows = self
                 .connection
@@ -456,7 +540,7 @@ impl NotesRepository for TursoSession {
             }
         }
         .await;
-        self.finish_note_mutation(result).await
+        savepoint.finish(result).await
     }
 
     async fn soft_delete_note(
@@ -465,8 +549,8 @@ impl NotesRepository for TursoSession {
         expected_revision: i64,
         deleted_at: i64,
     ) -> StorageResult<NoteMutationResult<()>> {
-        let _operation_guard = self.operation_guard().await;
-        self.begin_note_mutation().await?;
+        let operation_guard = self.operation_guard().await;
+        let savepoint = NoteMutationSavepoint::begin(self, operation_guard).await?;
         let result = async {
             let mut rows = self
                 .connection
@@ -497,7 +581,7 @@ impl NotesRepository for TursoSession {
             }
         }
         .await;
-        self.finish_note_mutation(result).await
+        savepoint.finish(result).await
     }
 
     async fn get_deleted_note_content_and_revision(
@@ -535,8 +619,8 @@ impl NotesRepository for TursoSession {
         id: &str,
         expected_revision: i64,
     ) -> StorageResult<NoteMutationResult<()>> {
-        let _operation_guard = self.operation_guard().await;
-        self.begin_note_mutation().await?;
+        let operation_guard = self.operation_guard().await;
+        let savepoint = NoteMutationSavepoint::begin(self, operation_guard).await?;
         let result = async {
             let mut rows = self
                 .connection
@@ -568,7 +652,7 @@ impl NotesRepository for TursoSession {
             }
         }
         .await;
-        self.finish_note_mutation(result).await
+        savepoint.finish(result).await
     }
 
     async fn permanently_delete_note(
@@ -576,8 +660,8 @@ impl NotesRepository for TursoSession {
         id: &str,
         expected_revision: i64,
     ) -> StorageResult<NoteMutationResult<()>> {
-        let _operation_guard = self.operation_guard().await;
-        self.begin_note_mutation().await?;
+        let operation_guard = self.operation_guard().await;
+        let savepoint = NoteMutationSavepoint::begin(self, operation_guard).await?;
         let result = async {
             let affected = self
             .connection
@@ -598,7 +682,7 @@ impl NotesRepository for TursoSession {
             }
         }
         .await;
-        self.finish_note_mutation(result).await
+        savepoint.finish(result).await
     }
 
     async fn list_expired_deleted_note_ids(&self, cutoff: i64) -> StorageResult<Vec<String>> {

@@ -104,7 +104,6 @@ async fn update_note_inner(
 
     let now = chrono::Utc::now().timestamp();
     let expected_revision = existing.revision;
-    let note_revision = expected_revision.saturating_add(1);
     drop(session);
     let chunks = crate::chunk::chunk_content(&input.content);
     let mut prepared_attachments = match attachments.as_deref() {
@@ -122,7 +121,7 @@ async fn update_note_inner(
         }
     };
     let transaction_result = async {
-        let affected = match attachment_metadata.as_deref() {
+        let mutation = match attachment_metadata.as_deref() {
             Some(attachments) => {
                 transaction
                     .update_note(NoteUpdate {
@@ -147,9 +146,13 @@ async fn update_note_inner(
                     .await?
             }
         };
-        if !matches!(affected, NoteMutationResult::Applied { .. }) {
+        let NoteMutationResult::Applied {
+            revision: note_revision,
+            ..
+        } = mutation
+        else {
             return anyhow::Ok(None);
-        }
+        };
         for key in &missing_keys {
             transaction.insert_label_key(key, "").await?;
         }
@@ -161,7 +164,7 @@ async fn update_note_inner(
             transaction.attach_label(id, key, value).await?;
         }
         let resolved_labels: Vec<Label> = transaction.labels_for_note(id).await?;
-        anyhow::Ok(Some((queued, resolved_labels)))
+        anyhow::Ok(Some((queued, resolved_labels, note_revision)))
     }
     .await;
 
@@ -179,7 +182,7 @@ async fn update_note_inner(
         Err(error) => Err(error),
     };
     let finalized = crate::save_note::finish_transaction(transaction, transaction_result).await;
-    let (queued, resolved_labels) = match finalized {
+    let (queued, resolved_labels, note_revision) = match finalized {
         Ok(result) => result,
         Err(error) => {
             return Err(abort_optional(prepared_attachments.take(), error).await);
