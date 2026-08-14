@@ -66,7 +66,7 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
                 Vec<(String, String)>,
                 Vec<NoteAttachment>,
             )| {
-                if *submitting {
+                if *submitting || conflict.is_some() {
                     return;
                 }
                 let Some(expected_revision) = (*note).as_ref().map(|note| note.revision) else {
@@ -189,6 +189,7 @@ pub fn note_edit_page(props: &NoteEditProps) -> Html {
                     card_title="Edit note"
                     submit_label="Save changes"
                     submitting={*submitting}
+                    submit_blocked={conflict.is_some()}
                     {on_submit}
                 />
             } else {

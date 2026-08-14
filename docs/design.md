@@ -381,7 +381,7 @@ and fingerprint.
 
 Strict MVU: single `AppState`, all mutations go through a reducer dispatching typed actions (no direct field mutation from components).
 
-State surface: notes list, retrieval results (with fused score attached — do not label it as
+State surface: notes list, retrieval results (with revision and fused score attached — do not label it as
 "similarity," since it is rank fusion rather than raw distance), loading flag, error slot.
 
 Ordinary note and Trash view models retain the storage `note_revision` returned by their read.
@@ -430,7 +430,7 @@ those exact contexts into stdio or HTTP. Stdio uses JSON-RPC over process stdin/
 stderr. Streamable HTTP is stateless JSON POST at the single `/mcp` endpoint; it has no GET/SSE
 transport, MCP sessions, authentication middleware, or legacy two-endpoint HTTP+SSE path.
 
-Markdown-note detail and summary results expose `revision`. Line reads expose both that
+Markdown-note detail, summary, and search results expose `revision`. Line reads expose both that
 authoritative note-wide revision and a content tag. MCP update, edit, soft-delete, attachment put,
 and attachment delete inputs require `expected_revision`; line edit additionally requires its read
 tag. REST full update requires the field in JSON, delete routes require it as a query parameter, and

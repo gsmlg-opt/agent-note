@@ -263,6 +263,7 @@ pub struct SemanticSearchToolInput {
 pub struct SemanticSearchToolResult {
     pub id: String,
     pub title: String,
+    pub revision: i64,
     pub score: f32,
     pub labels: Vec<LabelData>,
     pub created_at: i64,
@@ -279,6 +280,7 @@ pub async fn semantic_search_tool(
         .map(|result| SemanticSearchToolResult {
             id: result.note.id,
             title: result.note.title,
+            revision: result.note.revision,
             score: result.score,
             labels: result.note.labels.into_iter().map(Into::into).collect(),
             created_at: result.note.created_at,

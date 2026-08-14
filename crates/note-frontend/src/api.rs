@@ -134,6 +134,7 @@ pub fn attachment_url(base: &str, path: &str) -> String {
 struct SearchResultDto {
     id: String,
     title: String,
+    revision: i64,
     score: f32,
 }
 
@@ -182,6 +183,7 @@ pub async fn search_filtered(
         .map(|d| SearchResultSummary {
             id: d.id,
             title: d.title,
+            revision: d.revision,
             // Guard against a non-finite score from a malformed payload (breaks PartialEq/render).
             score: if d.score.is_finite() { d.score } else { 0.0 },
         })
@@ -770,6 +772,26 @@ mod tests {
         assert_eq!(error.details["current_revision"], 6);
         assert_eq!(error.status, Some(409));
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn search_results_require_the_revision_needed_for_follow_up_mutations() {
+        let result: SearchResultDto = serde_json::from_value(serde_json::json!({
+            "id": "note-1",
+            "title": "Match",
+            "revision": 4,
+            "score": 0.25
+        }))
+        .unwrap();
+        assert_eq!(result.revision, 4);
+        assert!(
+            serde_json::from_value::<SearchResultDto>(serde_json::json!({
+                "id": "note-1",
+                "title": "Match",
+                "score": 0.25
+            }))
+            .is_err()
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::api;
 use crate::components::icons;
 use crate::components::Modal;
 use crate::routes::{NotesQueryParams, Route};
-use crate::state::{LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
+use crate::state::{stale_retry_blocked, LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
 
 /// Notes shown per page in the list view.
 const DEFAULT_PAGE_SIZE: usize = 10;
@@ -370,6 +370,9 @@ pub fn notes_page() -> Html {
                 let error = error.clone();
                 let delete_conflict = delete_conflict.clone();
                 Callback::from(move |_: MouseEvent| {
+                    if delete_conflict.is_some() {
+                        return;
+                    }
                     let d = d.clone();
                     let reload = reload.clone();
                     let error = error.clone();
@@ -417,7 +420,7 @@ pub fn notes_page() -> Html {
                             <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload notes" }</button>
                         }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel}>{ "Cancel" }</button>
-                        <button type="button" class="btn btn-error" onclick={on_confirm}>{ "Remove note" }</button>
+                        <button type="button" class="btn btn-error" disabled={stale_retry_blocked(false, delete_conflict.is_some())} onclick={on_confirm}>{ "Remove note" }</button>
                     </div>
                 </Modal>
             }

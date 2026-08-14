@@ -9,7 +9,7 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::components::Modal;
 use crate::routes::{NotesQueryParams, Route};
-use crate::state::{AttachmentContent, NoteSummary};
+use crate::state::{stale_retry_blocked, AttachmentContent, NoteSummary};
 
 #[derive(Properties, PartialEq)]
 pub struct NoteShowProps {
@@ -241,6 +241,9 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                 let expected_revision = note.revision;
                 let delete_conflict = delete_conflict.clone();
                 Callback::from(move |_: MouseEvent| {
+                    if delete_conflict.is_some() {
+                        return;
+                    }
                     {
                         let mut in_flight = delete_in_flight.borrow_mut();
                         if !try_start_delete(&mut in_flight) {
@@ -327,7 +330,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                         <button type="button" class="btn btn-ghost" disabled={*delete_pending} onclick={on_cancel}>
                             { "Cancel" }
                         </button>
-                        <button type="button" class="btn btn-error" disabled={*delete_pending} onclick={on_confirm}>
+                        <button type="button" class="btn btn-error" disabled={stale_retry_blocked(*delete_pending, delete_conflict.is_some())} onclick={on_confirm}>
                             { if *delete_pending { "Moving…" } else { "Move to Trash" } }
                         </button>
                     </div>

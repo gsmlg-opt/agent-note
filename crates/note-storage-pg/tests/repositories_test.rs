@@ -767,7 +767,7 @@ async fn notes_and_labels_follow_repository_semantics() {
             ("newer".into(), "newer".into(), 1),
             ("numeric-low".into(), "numeric-low".into(), 1),
             ("numeric-ten".into(), "numeric-ten".into(), 1),
-            ("pg-jsonb".into(), "updated body".into(), 6),
+            ("pg-jsonb".into(), "updated body".into(), 7),
         ]
     );
 

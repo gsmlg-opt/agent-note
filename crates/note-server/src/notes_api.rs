@@ -1117,6 +1117,7 @@ pub struct SearchQuery {
 pub struct SearchResultDto {
     pub id: String,
     pub title: String,
+    pub revision: i64,
     pub score: f32, // fused RRF score — label as such in any client UI, not "similarity" (docs/design.md §7)
 }
 
@@ -1143,6 +1144,7 @@ async fn search_handler(
             .map(|r| SearchResultDto {
                 id: r.note.id,
                 title: r.note.title,
+                revision: r.note.revision,
                 score: r.score,
             })
             .collect(),
@@ -1546,6 +1548,10 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("expected_revision")));
+        assert!(schemas["SearchResultDto"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("revision")));
         assert_eq!(
             operation_parameter(
                 &document["paths"]["/api/notes/{id}"]["delete"],
@@ -2706,6 +2712,9 @@ mod tests {
         // The StubEmbedder is deterministic and the query equals the seeded content, so the seeded
         // note must be found — assert a real hit so the seed step is load-bearing, not decorative.
         let hits = arr.as_array().expect("response is a JSON array");
+        assert!(hits.iter().all(|result| result["revision"]
+            .as_i64()
+            .is_some_and(|revision| revision > 0)));
         assert!(
             hits.iter()
                 .any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Find")),

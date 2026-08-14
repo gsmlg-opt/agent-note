@@ -46,8 +46,13 @@ pub struct DeletedNoteSummary {
 pub struct SearchResultSummary {
     pub id: String,
     pub title: String,
+    pub revision: i64,
     /// Fused RRF rank-fusion score — label it as such in the UI, not "similarity" (docs/design.md §7).
     pub score: f32,
+}
+
+pub fn stale_retry_blocked(pending: bool, has_conflict: bool) -> bool {
+    pending || has_conflict
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,7 +109,14 @@ pub struct SystemInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::SystemInfo;
+    use super::{stale_retry_blocked, SystemInfo};
+
+    #[test]
+    fn stale_conflicts_block_retry_until_reload_clears_them() {
+        assert!(stale_retry_blocked(false, true));
+        assert!(stale_retry_blocked(true, false));
+        assert!(!stale_retry_blocked(false, false));
+    }
 
     #[test]
     fn system_info_accepts_backends_without_filesystem_metadata() {

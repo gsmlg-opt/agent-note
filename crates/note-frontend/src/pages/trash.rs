@@ -6,7 +6,7 @@ use yew_duskmoon::Alert;
 
 use crate::api;
 use crate::components::{icons, Modal};
-use crate::state::DeletedNoteSummary;
+use crate::state::{stale_retry_blocked, DeletedNoteSummary};
 
 #[derive(Clone, PartialEq)]
 enum RestoreTarget {
@@ -304,7 +304,7 @@ pub fn trash_page() -> Html {
                 let refresh_tick = refresh_tick.clone();
                 let notes = notes.clone();
                 Callback::from(move |_| {
-                    if *restoring {
+                    if stale_retry_blocked(*restoring, error.is_some()) {
                         return;
                     }
                     restoring.set(true);
@@ -352,7 +352,7 @@ pub fn trash_page() -> Html {
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*restoring}>
                             { "Cancel" }
                         </button>
-                        <button type="button" class="btn btn-primary" onclick={on_confirm} disabled={*restoring}>
+                        <button type="button" class="btn btn-primary" onclick={on_confirm} disabled={stale_retry_blocked(*restoring, error.is_some())}>
                             { if *restoring { "Restoring...".to_string() } else { confirm_label } }
                         </button>
                     </div>
@@ -394,7 +394,7 @@ pub fn trash_page() -> Html {
                 let refresh_tick = refresh_tick.clone();
                 let notes = notes.clone();
                 Callback::from(move |_| {
-                    if *deleting {
+                    if *deleting || error.is_some() || batch_delete_error.is_some() {
                         return;
                     }
                     deleting.set(true);
@@ -491,7 +491,7 @@ pub fn trash_page() -> Html {
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*deleting}>
                             { "Cancel" }
                         </button>
-                        <button type="button" class="btn btn-error" onclick={on_confirm} disabled={*deleting}>
+                        <button type="button" class="btn btn-error" onclick={on_confirm} disabled={*deleting || error.is_some() || batch_delete_error.is_some()}>
                             { if *deleting { "Deleting...".to_string() } else { confirm_label } }
                         </button>
                     </div>

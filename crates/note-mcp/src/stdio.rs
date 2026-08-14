@@ -382,6 +382,8 @@ pub struct SemanticSearchHit {
     pub id: String,
     /// Title of the matching note.
     pub title: String,
+    /// Optimistic concurrency revision for subsequent writes.
+    pub revision: i64,
     /// Relevance score.
     pub score: f32,
     /// Labels attached to the matching note.
@@ -414,6 +416,7 @@ impl From<SemanticSearchToolResult> for SemanticSearchHit {
         Self {
             id: result.id,
             title: result.title,
+            revision: result.revision,
             score: result.score,
             labels: result.labels.into_iter().map(Into::into).collect(),
             created_at: result.created_at,
@@ -1348,7 +1351,15 @@ mod tests {
         assert_exact_closed_object(
             &search_output,
             hit,
-            &["created_at", "id", "labels", "score", "title", "updated_at"],
+            &[
+                "created_at",
+                "id",
+                "labels",
+                "revision",
+                "score",
+                "title",
+                "updated_at",
+            ],
         );
 
         let attachment_output = tool_schema(&server, "get_note_attachment_content", true);
@@ -1438,7 +1449,15 @@ mod tests {
             property_names(
                 &serde_json::to_value(schemars::schema_for!(SemanticSearchHit)).unwrap()
             ),
-            vec!["created_at", "id", "labels", "score", "title", "updated_at"]
+            vec![
+                "created_at",
+                "id",
+                "labels",
+                "revision",
+                "score",
+                "title",
+                "updated_at"
+            ]
         );
         assert_eq!(
             property_names(
@@ -1747,10 +1766,18 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["created_at", "id", "labels", "score", "title", "updated_at"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
+            [
+                "created_at",
+                "id",
+                "labels",
+                "revision",
+                "score",
+                "title",
+                "updated_at",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
         );
 
         for expected in [true, false] {

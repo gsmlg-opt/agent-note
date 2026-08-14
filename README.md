@@ -522,8 +522,8 @@ upgrading so its data can be recovered or imported deliberately.
 
 ### Ordinary-note revisions and concurrent mutations
 
-Every ordinary-note read returns a positive `revision`. Detail, list, and Trash responses expose
-that value; clients must keep it with the data they loaded. Every mutation of an existing note is
+Every ordinary-note read returns a positive `revision`. Detail, list, search, and Trash responses
+expose that value; clients must keep it with the data they loaded. Every mutation of an existing note is
 an atomic compare-and-swap and requires that caller-held value as `expected_revision`. A successful
 logical mutation increments the revision exactly once. A rejected stale mutation changes neither
 the note nor its labels, chunks, attachment metadata, or embedding jobs.
@@ -565,7 +565,7 @@ It exposes `save_note`, `get_note`, `read_note_lines`, `edit_note`, `update_note
 `list_notes`, `semantic_search`, `put_note_attachment`, `get_note_attachment_content`, and
 `delete_note_attachment`. Label-key management is REST/UI-only. `list_notes` returns exactly `id`,
 `title`, `labels`, `created_at`, `updated_at`, and `revision` for each result. `semantic_search`
-returns `id`, `title`, `labels`, `created_at`, `updated_at`, and `score`. Neither response includes
+returns `id`, `title`, `labels`, `created_at`, `updated_at`, `revision`, and `score`. Neither response includes
 note content or attachments.
 
 `get_note` and `update_note` return note content plus attachment metadata (`id`, `path`, `mime`, and
