@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{FromRef, Path, Query, State},
+    extract::{rejection::JsonRejection, FromRef, Path, Query, State},
     response::{Html, Response},
     routing::get as route_get,
     Json,
@@ -12,7 +12,8 @@ use note_pipelines::{
     list_deleted_note_summaries, list_label_keys, list_note_summaries, normalized_list_limit,
     normalized_list_offset, permanently_delete_note, restore_notes, save_note,
     search_notes_filtered, update_note, BulkUpdateNoteLabelsInput,
-    BulkUpdateNoteLabelsValidationError, Context, ListNotesParams, SaveNoteInput,
+    BulkUpdateNoteLabelsValidationError, Context, ListNotesParams, NoteMutationNotifier,
+    SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -313,6 +314,16 @@ static DASHBOARD_CACHE: OnceLock<RwLock<Option<DashboardCacheEntry>>> = OnceLock
 static BULK_DASHBOARD_CACHE_INVALIDATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+pub struct DashboardCacheInvalidator;
+
+impl NoteMutationNotifier for DashboardCacheInvalidator {
+    fn note_mutated(&self) {
+        invalidate_dashboard_cache();
+        #[cfg(test)]
+        BULK_DASHBOARD_CACHE_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn dashboard_cache() -> &'static RwLock<Option<DashboardCacheEntry>> {
     DASHBOARD_CACHE.get_or_init(|| RwLock::new(None))
 }
@@ -484,8 +495,14 @@ async fn save_note_handler(
 )]
 async fn bulk_update_note_labels_handler(
     State(ctx): State<Arc<Context>>,
-    Json(req): Json<BulkUpdateNoteLabelsRequest>,
+    req: Result<Json<BulkUpdateNoteLabelsRequest>, JsonRejection>,
 ) -> Result<Json<BulkUpdateNoteLabelsResponse>, (axum::http::StatusCode, String)> {
+    let Json(req) = req.map_err(|_| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid bulk note label update request".into(),
+        )
+    })?;
     let result = bulk_update_note_labels(
         &ctx,
         BulkUpdateNoteLabelsInput {
@@ -495,11 +512,6 @@ async fn bulk_update_note_labels_handler(
     )
     .await
     .map_err(map_bulk_update_note_labels_error)?;
-    if result.updated > 0 {
-        invalidate_dashboard_cache();
-        #[cfg(test)]
-        BULK_DASHBOARD_CACHE_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
     Ok(Json(BulkUpdateNoteLabelsResponse {
         matched: result.matched,
         updated: result.updated,
@@ -1730,13 +1742,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn StorageBackend> =
             Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
-        let ctx = Arc::new(Context::new(
-            storage.clone(),
-            Arc::new(StubEmbedder),
-            Arc::new(FilesystemAttachmentStore::new(
-                dir.path().join("attachments"),
-            )),
-        ));
+        let ctx = Arc::new(
+            Context::new(
+                storage.clone(),
+                Arc::new(StubEmbedder),
+                Arc::new(FilesystemAttachmentStore::new(
+                    dir.path().join("attachments"),
+                )),
+            )
+            .with_note_mutation_notifier(Arc::new(DashboardCacheInvalidator)),
+        );
         (
             notes_router::<Arc<Context>>()
                 .with_state(ctx.clone())
@@ -1756,11 +1771,14 @@ mod tests {
         storage: Arc<dyn StorageBackend>,
         attachments: impl Into<std::path::PathBuf>,
     ) -> Router {
-        let ctx = Arc::new(Context::new(
-            storage,
-            Arc::new(StubEmbedder),
-            Arc::new(FilesystemAttachmentStore::new(attachments.into())),
-        ));
+        let ctx = Arc::new(
+            Context::new(
+                storage,
+                Arc::new(StubEmbedder),
+                Arc::new(FilesystemAttachmentStore::new(attachments.into())),
+            )
+            .with_note_mutation_notifier(Arc::new(DashboardCacheInvalidator)),
+        );
         notes_router::<Arc<Context>>().with_state(ctx).into()
     }
 
@@ -1953,14 +1971,22 @@ mod tests {
             );
         }
 
-        let response = app
-            .oneshot(post(
-                "/api/notes/bulk-labels",
-                r#"{"selector":"type=ietf-rfc","set":[["project","IETF-RFC"]],"unknown":true}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        for body in [
+            r#"{"selector":"type=ietf-rfc","set":[["project","IETF-RFC"]],"unknown":true}"#,
+            r#"{"selector":"type=ietf-rfc","set":[["project","IETF-RFC"]]"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post("/api/notes/bulk-labels", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let response_body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                &response_body[..],
+                b"invalid bulk note label update request"
+            );
+        }
     }
 
     #[tokio::test]

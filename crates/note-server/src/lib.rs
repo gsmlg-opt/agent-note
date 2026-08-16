@@ -9,3 +9,4 @@ mod render;
 mod system_api;
 
 pub use app_state::AppState;
+pub use notes_api::DashboardCacheInvalidator;

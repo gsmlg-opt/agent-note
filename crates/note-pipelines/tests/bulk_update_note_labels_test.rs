@@ -5,7 +5,7 @@ use note_core::{Label, LabelKeyValidationError, LabelValueType, NoteAttachment, 
 use note_embedding::{EmbeddingBackendInfo, StubEmbedder};
 use note_pipelines::{
     bulk_update_note_labels, chunk_hash, get_note, BulkUpdateNoteLabelsInput,
-    BulkUpdateNoteLabelsResult, BulkUpdateNoteLabelsValidationError, Context,
+    BulkUpdateNoteLabelsResult, BulkUpdateNoteLabelsValidationError, Context, NoteMutationNotifier,
 };
 use note_storage::{
     EmbeddingJob, NewNote, NoteChunk, StorageBackend, TransactionMode, UpsertNoteChunk,
@@ -16,6 +16,16 @@ use support::{event_log, test_context, EventLog, EventNotifier, EventStorageBack
 const CREATED_AT: i64 = 10;
 const UPDATED_AT: i64 = 20;
 const NOTE_REVISION: i64 = 7;
+
+struct MutationEventNotifier {
+    events: EventLog,
+}
+
+impl NoteMutationNotifier for MutationEventNotifier {
+    fn note_mutated(&self) {
+        self.events.lock().unwrap().push("note_mutated".to_string());
+    }
+}
 
 fn test_embedding() -> Vec<f32> {
     let mut embedding = vec![0.0; 1_024];
@@ -769,4 +779,78 @@ async fn commit_failure_returns_no_result_and_leaves_no_partial_state() {
         .unwrap()
         .iter()
         .any(|key| key.key == "commit-created-key"));
+}
+
+#[tokio::test]
+async fn mutation_notifier_runs_once_after_changed_commit_and_not_for_other_outcomes() {
+    let (base_ctx, backend, dir) = test_context().await;
+    seed_note(&base_ctx, &backend, "notifier", Some("old"), false).await;
+    let events = event_log();
+    let (ctx, traced) = traced_context(backend, events.clone(), &dir);
+    let ctx = ctx.with_note_mutation_notifier(Arc::new(MutationEventNotifier {
+        events: events.clone(),
+    }));
+
+    let changed = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![("project".into(), "new".into())],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(changed.updated, 1);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["begin", "commit", "note_mutated"]
+    );
+
+    let noop = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![("project".into(), "new".into())],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(noop.updated, 0);
+
+    let zero = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=missing".into(),
+            set: vec![("project".into(), "new".into())],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(zero.matched, 0);
+
+    traced.fail_next_commit();
+    let error = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![("project".into(), "commit-failed".into())],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("controlled commit failure"));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "begin",
+            "commit",
+            "note_mutated",
+            "begin",
+            "commit",
+            "begin",
+            "rollback",
+            "begin",
+            "commit_failed",
+        ]
+    );
 }

@@ -154,5 +154,9 @@ pub async fn bulk_update_note_labels(
     }
     .await;
 
-    crate::save_note::finish_transaction(transaction, transaction_result).await
+    let result = crate::save_note::finish_transaction(transaction, transaction_result).await?;
+    if result.updated > 0 {
+        ctx.notify_note_mutated();
+    }
+    Ok(result)
 }

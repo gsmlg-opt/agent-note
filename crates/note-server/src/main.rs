@@ -13,7 +13,7 @@ use note_pipelines::{
     Context, EmbeddingJobNotifier, FingerprintReconciliation, ProcessEmbeddingJobStatus,
 };
 use note_server::config::{AttachmentConfig, DatabaseConfig, EmbeddingConfig, RuntimeConfig};
-use note_server::{openapi as rest_openapi, AppState};
+use note_server::{openapi as rest_openapi, AppState, DashboardCacheInvalidator};
 use note_storage::StorageBackend;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -578,13 +578,16 @@ async fn main() -> anyhow::Result<()> {
         let notifier = Arc::new(NotifyEmbeddingJobs {
             notify: embedding.wake.clone(),
         });
-        let ctx = Arc::new(Context::with_embedding_job_notifier(
-            storage.clone(),
-            embedding.embedder.clone(),
-            embedding.info.clone(),
-            notifier,
-            attachments.clone(),
-        ));
+        let ctx = Arc::new(
+            Context::with_embedding_job_notifier(
+                storage.clone(),
+                embedding.embedder.clone(),
+                embedding.info.clone(),
+                notifier,
+                attachments.clone(),
+            )
+            .with_note_mutation_notifier(Arc::new(DashboardCacheInvalidator)),
+        );
         let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
         let trash_retention = tokio::spawn(run_trash_retention(
             ctx.clone(),

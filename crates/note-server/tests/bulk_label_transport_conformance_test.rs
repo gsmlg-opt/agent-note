@@ -11,7 +11,7 @@ use note_pipelines::{
     org::{OrgContext, SystemOrgClock},
     save_note, Context, SaveNoteInput,
 };
-use note_server::{openapi::rest_router, AppState};
+use note_server::{openapi::rest_router, AppState, DashboardCacheInvalidator};
 use note_storage::StorageBackend;
 use note_storage_turso::TursoStorage;
 use serde_json::{json, Value};
@@ -21,6 +21,51 @@ struct TransportSide {
     router: Router,
     storage: Arc<dyn StorageBackend>,
     _dir: tempfile::TempDir,
+}
+
+struct SharedHttpSide {
+    rest: Router,
+    mcp: Router,
+    _dir: tempfile::TempDir,
+}
+
+impl SharedHttpSide {
+    async fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            TursoStorage::open(dir.path().join("shared.db"))
+                .await
+                .unwrap(),
+        );
+        let note = Arc::new(
+            Context::new(
+                storage.clone(),
+                Arc::new(StubEmbedder),
+                Arc::new(FilesystemAttachmentStore::new(
+                    dir.path().join("attachments"),
+                )),
+            )
+            .with_note_mutation_notifier(Arc::new(DashboardCacheInvalidator)),
+        );
+        save_note(
+            &note,
+            SaveNoteInput {
+                title: "Shared dashboard note".into(),
+                content: "Body".into(),
+                attachments: vec![],
+                labels: vec![("type".into(), "ietf-rfc".into())],
+            },
+        )
+        .await
+        .unwrap();
+        let org = Arc::new(OrgContext::new(storage, Arc::new(SystemOrgClock)));
+        let (rest, _) = rest_router();
+        Self {
+            rest: rest.with_state(AppState::new(note.clone(), org.clone())),
+            mcp: note_mcp::mcp_router(note, org),
+            _dir: dir,
+        }
+    }
 }
 
 impl TransportSide {
@@ -206,4 +251,95 @@ async fn bulk_note_label_update_has_rest_mcp_transport_parity() {
         rest_labels["Unmatched"],
         vec![("type".into(), "private-note".into())]
     );
+}
+
+#[tokio::test]
+async fn mcp_bulk_label_update_invalidates_the_shared_dashboard_cache() {
+    let side = SharedHttpSide::new().await;
+
+    let before = side
+        .rest
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before.status(), StatusCode::OK);
+    let before: Value =
+        serde_json::from_slice(&to_bytes(before.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(before["label_count"], 1);
+    assert!(before["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|label| label["key"] != "project"));
+    let before_updated_at = before["recent_updates"][0]["updated_at"].as_i64().unwrap();
+
+    let mcp_response = side
+        .mcp
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::HOST, "proxy.example.test")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "bulk_update_note_labels",
+                            "arguments": {
+                                "selector": "type=ietf-rfc",
+                                "set": [["project", "IETF-RFC"]]
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mcp_response.status(), StatusCode::OK);
+    let mcp_body: Value = serde_json::from_slice(
+        &to_bytes(mcp_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        mcp_body["result"]["structuredContent"],
+        json!({"matched": 1, "updated": 1, "unchanged": 0})
+    );
+
+    let after = side
+        .rest
+        .oneshot(
+            Request::builder()
+                .uri("/api/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+    let after: Value =
+        serde_json::from_slice(&to_bytes(after.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(after["label_count"], 2);
+    let project = after["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|label| label["key"] == "project")
+        .expect("project label appears after MCP mutation");
+    assert_eq!(project["count"], 1);
+    assert!(after["recent_updates"][0]["updated_at"].as_i64().unwrap() > before_updated_at);
 }
