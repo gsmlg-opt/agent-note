@@ -186,12 +186,16 @@ They return only bounded aggregate counts, never a per-note result list:
 {"matched":42,"updated":40,"unchanged":2}
 ```
 
+`matched` is the number of matching active notes. `updated` counts matched notes where at least one
+requested assignment changed, and `unchanged` is `matched - updated`. A note with one no-op
+assignment and one changed assignment counts once as updated.
+
 The operation fixes the unpaginated set of matching active note IDs before any label changes, then
-applies the update atomically and all-or-nothing; a blank selector is rejected. Each assignment
-expresses desired state: a missing label is added, a different value is replaced, and an exact
-existing value is counted as unchanged. Unrelated labels are preserved. Missing target catalog keys
-are created as text only when at least one note matches, while values for existing typed catalog
-keys are validated. Zero matches returns zero counts and creates nothing.
+applies the entire update atomically; a blank selector is rejected. Each assignment expresses
+desired state: a missing label is added, a different value is replaced, and an exact existing value
+is a no-op. Unrelated labels are preserved. Missing target catalog keys are created as text only
+when at least one note matches, while values for existing typed catalog keys are validated. A
+zero-match request returns zero counts and creates nothing.
 
 Only changed notes advance `updated_at`. Their content, note revision, attachments, and derived
 embedding state remain unchanged; exact no-ops do not advance the timestamp.
@@ -557,10 +561,10 @@ This mode loads the same mandatory runtime configuration as HTTP, import, and ex
 
 It exposes `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`, `edit_note`,
 `update_note`, `delete_note`, `list_notes`, `semantic_search`, `put_note_attachment`,
-`get_note_attachment_content`, and `delete_note_attachment`. Label-key catalog management is
-REST/UI-only. `list_notes` returns exactly `id`, `title`, `labels`, `created_at`, and `updated_at`
-for each result; `semantic_search` returns exactly those fields plus `score`. Neither response
-includes note content or attachments.
+`get_note_attachment_content`, and `delete_note_attachment`. Explicit label-key catalog management
+is REST/UI-only. `list_notes` returns exactly `id`, `title`, `labels`, `created_at`, and
+`updated_at` for each result; `semantic_search` returns exactly those fields plus `score`. Neither
+response includes note content or attachments.
 
 `get_note` and `update_note` return note content plus attachment metadata (`id`, `path`, `mime`, and
 `description`) without attachment bytes. MCP `save_note` and `update_note` do not accept inline

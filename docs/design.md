@@ -350,6 +350,13 @@ them unambiguously.
 **list_label_keys**: read-only → return the full label-key catalog (`key` + `description`), used by
 clients and the UI to populate suggestions and explain known keys.
 
+**bulk_update_note_labels**: validate a non-blank label `selector` and a non-empty `set` of unique
+`[key, value]` desired-state assignments → fix all matching active note IDs before writes →
+atomically add or replace the requested labels while preserving unrelated labels → return
+note-level `matched`, `updated`, and `unchanged` counts. `matched` is the number of matching active
+notes; `updated` counts a matched note once when at least one assignment changes; `unchanged` is
+`matched - updated`, so a note with both a no-op and a change is updated.
+
 **save_note**: validate non-empty title/content and typed label values → prepare the attachment set
 outside the database transaction → atomically persist the note, auto-created missing label keys,
 attached labels, chunk records, and durable embedding jobs → commit the database transaction →
@@ -390,10 +397,11 @@ Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than 
 
 ## 8. MCP Integration
 
-One `NoteMcpServer` registry exposes 47 tools through both transports. The eleven Markdown-note
-tools are `save_note`, `get_note`, `read_note_lines`, `edit_note`, `update_note`, `delete_note`,
-`list_notes`, `semantic_search`, `put_note_attachment`, `get_note_attachment_content`, and
-`delete_note_attachment`. Explicit label-catalog management remains REST/UI-only.
+One `NoteMcpServer` registry exposes 48 tools through both transports. The twelve Markdown-note
+tools are `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`, `edit_note`,
+`update_note`, `delete_note`, `list_notes`, `semantic_search`, `put_note_attachment`,
+`get_note_attachment_content`, and `delete_note_attachment`. Explicit label-key catalog management
+remains REST/UI-only.
 
 The exact 36 Org tools are:
 
