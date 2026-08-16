@@ -1,19 +1,42 @@
 mod support;
 
 use note_attachments::FilesystemAttachmentStore;
-use note_core::{LabelKeyValidationError, LabelValueType, NoteAttachment, ValidationError};
+use note_core::{Label, LabelKeyValidationError, LabelValueType, NoteAttachment, ValidationError};
 use note_embedding::{EmbeddingBackendInfo, StubEmbedder};
 use note_pipelines::{
-    bulk_update_note_labels, get_note, BulkUpdateNoteLabelsInput, BulkUpdateNoteLabelsResult,
-    BulkUpdateNoteLabelsValidationError, Context,
+    bulk_update_note_labels, chunk_hash, get_note, BulkUpdateNoteLabelsInput,
+    BulkUpdateNoteLabelsResult, BulkUpdateNoteLabelsValidationError, Context,
 };
-use note_storage::{NewNote, StorageBackend, TransactionMode};
+use note_storage::{
+    EmbeddingJob, NewNote, NoteChunk, StorageBackend, TransactionMode, UpsertNoteChunk,
+};
 use std::sync::Arc;
 use support::{event_log, test_context, EventLog, EventNotifier, EventStorageBackend};
 
 const CREATED_AT: i64 = 10;
 const UPDATED_AT: i64 = 20;
 const NOTE_REVISION: i64 = 7;
+
+fn test_embedding() -> Vec<f32> {
+    let mut embedding = vec![0.0; 1_024];
+    embedding[0] = 1.0;
+    embedding
+}
+
+#[derive(Debug)]
+struct NotePreservationSnapshot {
+    title: String,
+    content: String,
+    attachments: Vec<NoteAttachment>,
+    created_at: i64,
+    updated_at: i64,
+    note_revision: Option<i64>,
+    non_project_labels: Vec<Label>,
+    chunks: Vec<NoteChunk>,
+    dense_search: Vec<String>,
+    title_search: Vec<String>,
+    pending_jobs: Vec<EmbeddingJob>,
+}
 
 async fn seed_note(
     ctx: &Context,
@@ -22,6 +45,8 @@ async fn seed_note(
     project: Option<&str>,
     deleted: bool,
 ) {
+    let title = format!("Title for {id}");
+    let content = format!("Content for {id}");
     let attachments = vec![NoteAttachment {
         id: "source".into(),
         path: "source.txt".into(),
@@ -41,8 +66,8 @@ async fn seed_note(
     transaction
         .insert_note(NewNote {
             id,
-            title: &format!("Title for {id}"),
-            content: &format!("Content for {id}"),
+            title: &title,
+            content: &content,
             attachments: &metadata,
             created_at: CREATED_AT,
             updated_at: UPDATED_AT,
@@ -65,11 +90,112 @@ async fn seed_note(
             .await
             .unwrap();
     }
+    let content_hash = chunk_hash(&content);
+    transaction
+        .upsert_note_chunk(UpsertNoteChunk {
+            note_id: id,
+            chunk_idx: 0,
+            content_hash: &content_hash,
+            content: &content,
+            note_revision: NOTE_REVISION,
+            status: "ready",
+            updated_at: UPDATED_AT,
+        })
+        .await
+        .unwrap();
+    transaction
+        .insert_chunk_embedding(id, 0, &test_embedding())
+        .await
+        .unwrap();
+    transaction
+        .enqueue_embedding_job(id, 0, &content_hash, &content, NOTE_REVISION, UPDATED_AT)
+        .await
+        .unwrap();
     if deleted {
         transaction.soft_delete_note(id, 30).await.unwrap();
     }
     transaction.commit().await.unwrap();
     prepared.publish().await.unwrap();
+}
+
+async fn preservation_snapshot(
+    ctx: &Context,
+    backend: &Arc<dyn StorageBackend>,
+    id: &str,
+) -> NotePreservationSnapshot {
+    let note = get_note(ctx, id).await.unwrap().unwrap();
+    let non_project_labels = note
+        .labels
+        .iter()
+        .filter(|label| label.key != "project")
+        .cloned()
+        .collect();
+    let session = backend.session().await.unwrap();
+    let allowed_ids = [id.to_string()];
+    let note_revision = session.get_note_revision(id).await.unwrap();
+    let chunks = session.list_note_chunks(id).await.unwrap();
+    let dense_search = session
+        .dense_search(&test_embedding(), 10, Some(&allowed_ids))
+        .await
+        .unwrap();
+    let title_search = session
+        .title_search("Title", 10, Some(&allowed_ids))
+        .await
+        .unwrap();
+    drop(session);
+
+    let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
+    let pending_jobs = transaction
+        .claim_pending_embedding_jobs(100, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|job| job.note_id == id)
+        .collect();
+    transaction.rollback().await.unwrap();
+
+    NotePreservationSnapshot {
+        title: note.title,
+        content: note.content,
+        attachments: note.attachments,
+        created_at: note.created_at,
+        updated_at: note.updated_at,
+        note_revision,
+        non_project_labels,
+        chunks,
+        dense_search,
+        title_search,
+        pending_jobs,
+    }
+}
+
+fn assert_preserved_note_state(
+    id: &str,
+    before: &NotePreservationSnapshot,
+    after: &NotePreservationSnapshot,
+    timestamp_changed: bool,
+) {
+    assert_eq!(after.title, before.title, "{id} title");
+    assert_eq!(after.content, before.content, "{id} content");
+    assert_eq!(after.attachments, before.attachments, "{id} attachments");
+    assert_eq!(after.created_at, before.created_at, "{id} created_at");
+    assert_eq!(
+        after.note_revision, before.note_revision,
+        "{id} note_revision"
+    );
+    assert_eq!(
+        after.non_project_labels, before.non_project_labels,
+        "{id} unrelated labels"
+    );
+    assert_eq!(after.chunks, before.chunks, "{id} chunks");
+    assert_eq!(after.dense_search, before.dense_search, "{id} dense search");
+    assert_eq!(after.title_search, before.title_search, "{id} title search");
+    assert_eq!(after.pending_jobs, before.pending_jobs, "{id} pending jobs");
+    if timestamp_changed {
+        assert!(after.updated_at > before.updated_at, "{id} updated_at");
+    } else {
+        assert_eq!(after.updated_at, before.updated_at, "{id} updated_at");
+    }
 }
 
 fn traced_context(
@@ -98,8 +224,10 @@ async fn updates_matching_active_notes_with_add_replace_and_exact_noop_semantics
     seed_note(&base_ctx, &backend, "noop", Some("new"), false).await;
     seed_note(&base_ctx, &backend, "deleted", Some("old"), true).await;
 
-    let add_before = get_note(&base_ctx, "add").await.unwrap().unwrap();
-    let noop_before = get_note(&base_ctx, "noop").await.unwrap().unwrap();
+    let mut active_before = Vec::new();
+    for id in ["add", "replace", "noop"] {
+        active_before.push((id, preservation_snapshot(&base_ctx, &backend, id).await));
+    }
     let deleted_labels_before = backend
         .session()
         .await
@@ -144,20 +272,11 @@ async fn updates_matching_active_notes_with_add_replace_and_exact_noop_semantics
         deleted_labels_before
     );
 
-    let add_after = get_note(&ctx, "add").await.unwrap().unwrap();
-    assert_eq!(add_after.title, add_before.title);
-    assert_eq!(add_after.content, add_before.content);
-    assert_eq!(add_after.attachments, add_before.attachments);
-    assert_eq!(add_after.created_at, add_before.created_at);
-    assert!(add_after.updated_at > add_before.updated_at);
-    assert_eq!(
-        session.get_note_revision("add").await.unwrap(),
-        Some(NOTE_REVISION)
-    );
-
-    let noop_after = get_note(&ctx, "noop").await.unwrap().unwrap();
-    assert_eq!(noop_after.updated_at, noop_before.updated_at);
-    assert_eq!(noop_after.attachments, noop_before.attachments);
+    drop(session);
+    for (id, before) in active_before {
+        let after = preservation_snapshot(&ctx, &backend, id).await;
+        assert_preserved_note_state(id, &before, &after, id != "noop");
+    }
     assert_eq!(
         traced.repository_call_count("matching_note_ids_for_update"),
         1
@@ -422,7 +541,10 @@ async fn updates_all_1001_matches_without_a_page_cap() {
     seed_note(&base_ctx, &backend, "scale", Some("done"), false).await;
     let events = event_log();
     let (ctx, traced) = traced_context(backend, events, &dir);
-    traced.override_matching_note_ids_for_update(vec!["scale".into(); 1_001]);
+    let expected_ids: Vec<String> = (0..1_001)
+        .map(|index| format!("synthetic-{index:04}"))
+        .collect();
+    traced.override_bulk_label_noops(expected_ids.clone());
 
     let result = bulk_update_note_labels(
         &ctx,
@@ -438,6 +560,7 @@ async fn updates_all_1001_matches_without_a_page_cap() {
     assert_eq!(result.updated, 0);
     assert_eq!(result.unchanged, 1_001);
     assert_eq!(traced.repository_call_count("set_note_label"), 1_001);
+    assert_eq!(traced.set_note_label_note_ids(), expected_ids);
 }
 
 #[tokio::test]

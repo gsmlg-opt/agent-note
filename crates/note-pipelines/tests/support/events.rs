@@ -37,6 +37,8 @@ pub struct EventStorageBackend {
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
     repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
     matching_note_ids_for_update_override: Arc<Mutex<Option<Vec<String>>>>,
+    noop_set_note_label_ids: Arc<Mutex<HashSet<String>>>,
+    set_note_label_note_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl EventStorageBackend {
@@ -48,6 +50,8 @@ impl EventStorageBackend {
             fail_repository_calls: Arc::new(Mutex::new(VecDeque::new())),
             repository_call_counts: Arc::new(Mutex::new(HashMap::new())),
             matching_note_ids_for_update_override: Arc::new(Mutex::new(None)),
+            noop_set_note_label_ids: Arc::new(Mutex::new(HashSet::new())),
+            set_note_label_note_ids: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -71,8 +75,14 @@ impl EventStorageBackend {
             .unwrap_or_default()
     }
 
-    pub fn override_matching_note_ids_for_update(&self, note_ids: Vec<String>) {
+    pub fn override_bulk_label_noops(&self, note_ids: Vec<String>) {
+        *self.noop_set_note_label_ids.lock().unwrap() = note_ids.iter().cloned().collect();
         *self.matching_note_ids_for_update_override.lock().unwrap() = Some(note_ids);
+        self.set_note_label_note_ids.lock().unwrap().clear();
+    }
+
+    pub fn set_note_label_note_ids(&self) -> Vec<String> {
+        self.set_note_label_note_ids.lock().unwrap().clone()
     }
 }
 
@@ -83,6 +93,8 @@ struct EventTransaction {
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
     repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
     matching_note_ids_for_update_override: Arc<Mutex<Option<Vec<String>>>>,
+    noop_set_note_label_ids: Arc<Mutex<HashSet<String>>>,
+    set_note_label_note_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl EventTransaction {
@@ -136,6 +148,8 @@ impl StorageBackend for EventStorageBackend {
             matching_note_ids_for_update_override: self
                 .matching_note_ids_for_update_override
                 .clone(),
+            noop_set_note_label_ids: self.noop_set_note_label_ids.clone(),
+            set_note_label_note_ids: self.set_note_label_note_ids.clone(),
         }))
     }
 
@@ -200,29 +214,57 @@ impl_forward_repository! {
     }
 }
 
-impl_forward_repository! {
-    LabelRepository {
-        fn insert_label_key(key: &str, description: &str) -> ();
-        fn insert_label_key_if_missing(key: &str, description: &str) -> ();
-        fn insert_label_key_with_type(
-            key: &str,
-            description: &str,
-            value_type: note_core::LabelValueType,
-        ) -> ();
-        fn list_label_keys() -> Vec<note_core::LabelKey>;
-        fn update_label_key(key: &str, description: &str) -> ();
-        fn update_label_key_with_type(
-            key: &str,
-            description: &str,
-            value_type: note_core::LabelValueType,
-        ) -> ();
-        fn delete_label_key(key: &str) -> ();
-        fn attach_label(note_id: &str, key: &str, value: &str) -> ();
-        fn set_note_label(note_id: &str, key: &str, value: &str) -> bool;
-        fn labels_for_note(note_id: &str) -> Vec<note_core::Label>;
-        fn label_note_counts() -> Vec<(String, usize)>;
-        fn find_note_with_labels(labels: &[(String, String)]) -> Option<String>;
-    }
+macro_rules! impl_forward_label_repository {
+    ($(fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty;)*) => {
+        #[async_trait::async_trait]
+        impl LabelRepository for EventTransaction {
+            $(
+                async fn $name(&self, $($arg: $ty),*) -> StorageResult<$result> {
+                    self.fail_if_requested(stringify!($name))?;
+                    self.inner.$name($($arg),*).await
+                }
+            )*
+
+            async fn set_note_label(
+                &self,
+                note_id: &str,
+                key: &str,
+                value: &str,
+            ) -> StorageResult<bool> {
+                self.fail_if_requested("set_note_label")?;
+                if self.noop_set_note_label_ids.lock().unwrap().contains(note_id) {
+                    self.set_note_label_note_ids
+                        .lock()
+                        .unwrap()
+                        .push(note_id.to_string());
+                    return Ok(false);
+                }
+                self.inner.set_note_label(note_id, key, value).await
+            }
+        }
+    };
+}
+
+impl_forward_label_repository! {
+    fn insert_label_key(key: &str, description: &str) -> ();
+    fn insert_label_key_if_missing(key: &str, description: &str) -> ();
+    fn insert_label_key_with_type(
+        key: &str,
+        description: &str,
+        value_type: note_core::LabelValueType,
+    ) -> ();
+    fn list_label_keys() -> Vec<note_core::LabelKey>;
+    fn update_label_key(key: &str, description: &str) -> ();
+    fn update_label_key_with_type(
+        key: &str,
+        description: &str,
+        value_type: note_core::LabelValueType,
+    ) -> ();
+    fn delete_label_key(key: &str) -> ();
+    fn attach_label(note_id: &str, key: &str, value: &str) -> ();
+    fn labels_for_note(note_id: &str) -> Vec<note_core::Label>;
+    fn label_note_counts() -> Vec<(String, usize)>;
+    fn find_note_with_labels(labels: &[(String, String)]) -> Option<String>;
 }
 
 impl_forward_repository! {
@@ -393,6 +435,8 @@ impl StorageTransaction for EventTransaction {
             fail_repository_calls: _,
             repository_call_counts: _,
             matching_note_ids_for_update_override: _,
+            noop_set_note_label_ids: _,
+            set_note_label_note_ids: _,
         } = *self;
         if fail_commit.swap(false, Ordering::SeqCst) {
             inner.rollback().await?;
@@ -415,6 +459,8 @@ impl StorageTransaction for EventTransaction {
             fail_repository_calls: _,
             repository_call_counts: _,
             matching_note_ids_for_update_override: _,
+            noop_set_note_label_ids: _,
+            set_note_label_note_ids: _,
         } = *self;
         inner.rollback().await?;
         events.lock().unwrap().push("rollback".into());
