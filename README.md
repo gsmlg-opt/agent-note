@@ -44,7 +44,7 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
                    • org — transport-free, revision-safe workspace/document/item commands,
                      append-only audit reads, and recovery-context assembly
    ▲
-   ├── note-mcp     11 Markdown-note + 36 Org tools over stdio and Streamable HTTP (one registry)
+   ├── note-mcp     12 Markdown-note + 36 Org tools over stdio and Streamable HTTP (one registry)
    └── note-server  Axum REST (/api/notes, /api/labels, /api/org) + /mcp
                         ▲
                    note-frontend   Yew MVU (AppState + pure reducer) → talks to note-server over REST
@@ -170,6 +170,31 @@ The OpenAPI document covers the REST API only. `/mcp` remains outside the docume
 own MCP protocol discovery and schemas. Swagger UI has **Try it out** enabled, including for
 destructive operations, and the HTTP API is unauthenticated. Use it only on a trusted network or
 behind an authenticating reverse proxy.
+
+### Bulk note label updates
+
+The MCP tool `bulk_update_note_labels` and REST endpoint `POST /api/notes/bulk-labels` call the
+same pipeline and accept the same request:
+
+```json
+{"selector":"type=ietf-rfc","set":[["project","IETF-RFC"]]}
+```
+
+They return only bounded aggregate counts, never a per-note result list:
+
+```json
+{"matched":42,"updated":40,"unchanged":2}
+```
+
+The operation is atomic and all-or-nothing across the unpaginated set of matching active notes; a
+blank selector is rejected. Each assignment expresses desired state: a missing label is added, a
+different value is replaced, and an exact existing value is counted as unchanged. Unrelated labels
+are preserved. Missing target catalog keys are created as text only when at least one note matches,
+while values for existing typed catalog keys are validated. Zero matches returns zero counts and
+creates nothing.
+
+Only changed notes advance `updated_at`. Their content, note revision, attachments, and derived
+embedding state remain unchanged; exact no-ops do not advance the timestamp.
 
 ### Org Web operations console and workspace management
 
@@ -530,11 +555,12 @@ cargo run -p note-server -- --stdio
 
 This mode loads the same mandatory runtime configuration as HTTP, import, and export modes.
 
-It exposes `save_note`, `get_note`, `read_note_lines`, `edit_note`, `update_note`, `delete_note`,
-`list_notes`, `semantic_search`, `put_note_attachment`, `get_note_attachment_content`, and
-`delete_note_attachment`. Label-key management is REST/UI-only. `list_notes` returns exactly `id`,
-`title`, `labels`, `created_at`, and `updated_at` for each result; `semantic_search` returns exactly
-those fields plus `score`. Neither response includes note content or attachments.
+It exposes `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`, `edit_note`,
+`update_note`, `delete_note`, `list_notes`, `semantic_search`, `put_note_attachment`,
+`get_note_attachment_content`, and `delete_note_attachment`. Label-key catalog management is
+REST/UI-only. `list_notes` returns exactly `id`, `title`, `labels`, `created_at`, and `updated_at`
+for each result; `semantic_search` returns exactly those fields plus `score`. Neither response
+includes note content or attachments.
 
 `get_note` and `update_note` return note content plus attachment metadata (`id`, `path`, `mime`, and
 `description`) without attachment bytes. MCP `save_note` and `update_note` do not accept inline
@@ -545,7 +571,7 @@ cannot change its normalized path, so rename an attachment with delete followed 
 one content representation: direct `content` when the bytes are valid UTF-8, otherwise canonical
 Base64 in `content_base64`. These changes apply only to MCP; REST attachment behavior is unchanged.
 
-The same registry also exposes exactly these 36 Org tools over both transports (47 tools total):
+The same registry also exposes exactly these 36 Org tools over both transports (48 tools total):
 
 ```text
 org_list_workspaces       org_create_workspace      org_get_workspace
