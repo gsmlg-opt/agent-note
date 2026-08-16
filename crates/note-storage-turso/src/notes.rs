@@ -752,6 +752,12 @@ impl NotesRepository for TursoSession {
         &self,
         selectors: &[LabelSelector],
     ) -> StorageResult<Vec<String>> {
+        if self.transaction_mode != Some(note_storage::TransactionMode::Immediate) {
+            return Err(StorageError::new(
+                StorageErrorKind::Transaction,
+                "matching note IDs for update requires an immediate transaction",
+            ));
+        }
         let _operation_guard = self.operation_guard().await;
         self.matching_note_ids_unlocked(selectors).await
     }

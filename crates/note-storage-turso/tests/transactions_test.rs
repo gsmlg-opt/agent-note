@@ -598,6 +598,29 @@ async fn deferred_transaction_commits_repository_writes() {
 }
 
 #[tokio::test]
+async fn bulk_update_selection_requires_an_immediate_transaction() {
+    let (_dir, storage) = storage().await;
+    let deferred = storage.begin(TransactionMode::Deferred).await.unwrap();
+
+    let error = deferred
+        .matching_note_ids_for_update(&[])
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), StorageErrorKind::Transaction);
+    assert!(error.to_string().contains("immediate transaction"));
+    deferred.rollback().await.unwrap();
+
+    let immediate = storage.begin(TransactionMode::Immediate).await.unwrap();
+    assert!(immediate
+        .matching_note_ids_for_update(&[])
+        .await
+        .unwrap()
+        .is_empty());
+    immediate.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn immediate_transaction_commits_repository_writes() {
     let (_dir, storage) = storage().await;
     let transaction = storage.begin(TransactionMode::Immediate).await.unwrap();

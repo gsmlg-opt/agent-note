@@ -308,8 +308,9 @@ pub trait NotesRepository: Send + Sync {
         selectors: &[note_core::LabelSelector],
     ) -> StorageResult<Vec<String>>;
     /// Returns sorted IDs for matching active notes while locking those note
-    /// rows until the enclosing transaction ends. Call through an explicit
-    /// storage transaction to retain the locks across subsequent writes.
+    /// rows until the enclosing transaction ends. Call through a
+    /// `TransactionMode::Immediate` storage transaction to retain the locks
+    /// across subsequent writes on every backend.
     async fn matching_note_ids_for_update(
         &self,
         selectors: &[note_core::LabelSelector],

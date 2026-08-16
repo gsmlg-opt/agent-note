@@ -25,7 +25,7 @@ pub(crate) enum OpenedState {
 
 pub struct TursoSession {
     pub(crate) connection: turso::Connection,
-    pub(crate) transaction_open: bool,
+    pub(crate) transaction_mode: Option<TransactionMode>,
     operation_gate: Arc<Mutex<()>>,
 }
 
@@ -52,7 +52,7 @@ impl TursoSession {
 
         Ok(Self {
             connection,
-            transaction_open: false,
+            transaction_mode: None,
             operation_gate: Arc::new(Mutex::new(())),
         })
     }
@@ -72,12 +72,12 @@ impl TursoSession {
             .execute(sql, ())
             .await
             .map_err(|error| map_turso_error(context, error))?;
-        self.transaction_open = true;
+        self.transaction_mode = Some(mode);
         Ok(())
     }
 
     async fn finalize_transaction(&mut self, sql: &str, context: &str) -> StorageResult<()> {
-        let context = if self.transaction_open {
+        let context = if self.transaction_mode.is_some() {
             context
         } else {
             "finalize storage session without an open transaction"
@@ -86,7 +86,7 @@ impl TursoSession {
             .execute(sql, ())
             .await
             .map_err(|error| map_transaction_error(context, error))?;
-        self.transaction_open = false;
+        self.transaction_mode = None;
         Ok(())
     }
 

@@ -326,10 +326,14 @@ async fn matching_note_ids_for_update_locks_selected_notes_until_commit() {
     );
 
     let second_storage = Arc::clone(&storage);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut handle = tokio::spawn(async move {
         let second = StorageBackend::begin(second_storage.as_ref(), TransactionMode::Deferred)
             .await
             .unwrap();
+        ready_tx
+            .send(())
+            .expect("row-lock update readiness receiver was dropped");
         let affected = second
             .advance_note_updated_at("bulk-row-lock", 10)
             .await
@@ -337,6 +341,9 @@ async fn matching_note_ids_for_update_locks_selected_notes_until_commit() {
         second.commit().await.unwrap();
         affected
     });
+    ready_rx
+        .await
+        .expect("row-lock update task ended before reaching the update");
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut handle)
             .await

@@ -106,7 +106,7 @@ impl LabelRepository for TursoSession {
 
     async fn attach_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<()> {
         let _operation_guard = self.operation_guard().await;
-        let label_key_id = label_key_id_unlocked(self, key).await?;
+        let label_key_id = label_key_id_for_note_label_unlocked(self, key).await?;
 
         self.connection
             .execute(
@@ -120,7 +120,7 @@ impl LabelRepository for TursoSession {
 
     async fn set_note_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<bool> {
         let _operation_guard = self.operation_guard().await;
-        let label_key_id = label_key_id_unlocked(self, key).await?;
+        let label_key_id = label_key_id_for_note_label_unlocked(self, key).await?;
         let affected = self
             .connection
             .execute(
@@ -224,7 +224,10 @@ impl LabelRepository for TursoSession {
     }
 }
 
-async fn label_key_id_unlocked(session: &TursoSession, key: &str) -> StorageResult<i64> {
+async fn label_key_id_for_note_label_unlocked(
+    session: &TursoSession,
+    key: &str,
+) -> StorageResult<i64> {
     let mut rows = session
         .connection
         .query(
@@ -232,11 +235,11 @@ async fn label_key_id_unlocked(session: &TursoSession, key: &str) -> StorageResu
             turso::params![key],
         )
         .await
-        .map_err(|error| map_turso_error("query label key for attachment", error))?;
+        .map_err(|error| map_turso_error("query label key for note label", error))?;
     let row = rows
         .next()
         .await
-        .map_err(|error| map_turso_error("read label key for attachment", error))?
+        .map_err(|error| map_turso_error("read label key for note label", error))?
         .ok_or_else(|| {
             StorageError::new(
                 StorageErrorKind::Operation,
