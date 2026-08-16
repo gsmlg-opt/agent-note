@@ -4,6 +4,9 @@ extern crate self as note_pipelines;
 pub mod context;
 pub use context::*;
 
+pub mod bulk_update_note_labels;
+pub use bulk_update_note_labels::*;
+
 pub mod org;
 
 pub mod note_attachments;

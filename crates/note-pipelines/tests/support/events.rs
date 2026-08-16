@@ -15,6 +15,7 @@ use note_storage::{
     StorageSession, StorageTransaction, StoredOrgOperation, TransactionMode, UpsertNoteChunk,
 };
 use std::{
+    any::Any,
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -35,6 +36,7 @@ pub struct EventStorageBackend {
     fail_commit: Arc<AtomicBool>,
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
     repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
+    matching_note_ids_for_update_override: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl EventStorageBackend {
@@ -45,6 +47,7 @@ impl EventStorageBackend {
             fail_commit: Arc::new(AtomicBool::new(false)),
             fail_repository_calls: Arc::new(Mutex::new(VecDeque::new())),
             repository_call_counts: Arc::new(Mutex::new(HashMap::new())),
+            matching_note_ids_for_update_override: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -67,6 +70,10 @@ impl EventStorageBackend {
             .copied()
             .unwrap_or_default()
     }
+
+    pub fn override_matching_note_ids_for_update(&self, note_ids: Vec<String>) {
+        *self.matching_note_ids_for_update_override.lock().unwrap() = Some(note_ids);
+    }
 }
 
 struct EventTransaction {
@@ -75,6 +82,7 @@ struct EventTransaction {
     fail_commit: Arc<AtomicBool>,
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
     repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
+    matching_note_ids_for_update_override: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl EventTransaction {
@@ -95,6 +103,19 @@ impl EventTransaction {
         }
         Ok(())
     }
+
+    fn repository_override<T: 'static>(&self, name: &str) -> Option<T> {
+        if name != "matching_note_ids_for_update" {
+            return None;
+        }
+        let note_ids = self
+            .matching_note_ids_for_update_override
+            .lock()
+            .unwrap()
+            .clone()?;
+        let value: Box<dyn Any> = Box::new(note_ids);
+        value.downcast::<T>().ok().map(|value| *value)
+    }
 }
 
 #[async_trait::async_trait]
@@ -112,6 +133,9 @@ impl StorageBackend for EventStorageBackend {
             fail_commit: self.fail_commit.clone(),
             fail_repository_calls: self.fail_repository_calls.clone(),
             repository_call_counts: self.repository_call_counts.clone(),
+            matching_note_ids_for_update_override: self
+                .matching_note_ids_for_update_override
+                .clone(),
         }))
     }
 
@@ -127,6 +151,9 @@ macro_rules! impl_forward_repository {
             $(
                 async fn $name(&self, $($arg: $ty),*) -> StorageResult<$result> {
                     self.fail_if_requested(stringify!($name))?;
+                    if let Some(result) = self.repository_override(stringify!($name)) {
+                        return Ok(result);
+                    }
                     self.inner.$name($($arg),*).await
                 }
             )*
@@ -365,6 +392,7 @@ impl StorageTransaction for EventTransaction {
             fail_commit,
             fail_repository_calls: _,
             repository_call_counts: _,
+            matching_note_ids_for_update_override: _,
         } = *self;
         if fail_commit.swap(false, Ordering::SeqCst) {
             inner.rollback().await?;
@@ -386,6 +414,7 @@ impl StorageTransaction for EventTransaction {
             fail_commit: _,
             fail_repository_calls: _,
             repository_call_counts: _,
+            matching_note_ids_for_update_override: _,
         } = *self;
         inner.rollback().await?;
         events.lock().unwrap().push("rollback".into());
