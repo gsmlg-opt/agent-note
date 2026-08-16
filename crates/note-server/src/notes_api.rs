@@ -7,11 +7,12 @@ use axum::{
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
-    count_notes, delete_note, embedding_dashboard_status, get_note_attachment, get_note_markdown,
-    get_note_metadata, label_note_counts, list_deleted_note_summaries, list_label_keys,
-    list_note_summaries, normalized_list_limit, normalized_list_offset, permanently_delete_note,
-    restore_notes, save_note, search_notes_filtered, update_note, Context, ListNotesParams,
-    SaveNoteInput,
+    bulk_update_note_labels, count_notes, delete_note, embedding_dashboard_status,
+    get_note_attachment, get_note_markdown, get_note_metadata, label_note_counts,
+    list_deleted_note_summaries, list_label_keys, list_note_summaries, normalized_list_limit,
+    normalized_list_offset, permanently_delete_note, restore_notes, save_note,
+    search_notes_filtered, update_note, BulkUpdateNoteLabelsInput,
+    BulkUpdateNoteLabelsValidationError, Context, ListNotesParams, SaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -136,6 +137,22 @@ impl TryFrom<AttachmentRequest> for NoteAttachment {
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct SaveNoteResponse {
     pub id: String,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct BulkUpdateNoteLabelsRequest {
+    #[schema(min_length = 1)]
+    selector: String,
+    #[schema(schema_with = crate::openapi::nonempty_label_pairs_schema)]
+    set: Vec<(String, String)>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct BulkUpdateNoteLabelsResponse {
+    matched: usize,
+    updated: usize,
+    unchanged: usize,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -291,6 +308,10 @@ struct DashboardCacheEntry {
 }
 
 static DASHBOARD_CACHE: OnceLock<RwLock<Option<DashboardCacheEntry>>> = OnceLock::new();
+
+#[cfg(test)]
+static BULK_DASHBOARD_CACHE_INVALIDATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn dashboard_cache() -> &'static RwLock<Option<DashboardCacheEntry>> {
     DASHBOARD_CACHE.get_or_init(|| RwLock::new(None))
@@ -448,6 +469,68 @@ async fn save_note_handler(
     })?;
     invalidate_dashboard_cache();
     Ok(Json(SaveNoteResponse { id: note.id }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/notes/bulk-labels",
+    tag = "notes",
+    request_body = BulkUpdateNoteLabelsRequest,
+    responses(
+        (status = 200, description = "Bulk note label update result", body = BulkUpdateNoteLabelsResponse),
+        (status = 400, description = "Invalid bulk label update", body = String, content_type = "text/plain"),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
+async fn bulk_update_note_labels_handler(
+    State(ctx): State<Arc<Context>>,
+    Json(req): Json<BulkUpdateNoteLabelsRequest>,
+) -> Result<Json<BulkUpdateNoteLabelsResponse>, (axum::http::StatusCode, String)> {
+    let result = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: req.selector,
+            set: req.set,
+        },
+    )
+    .await
+    .map_err(map_bulk_update_note_labels_error)?;
+    if result.updated > 0 {
+        invalidate_dashboard_cache();
+        #[cfg(test)]
+        BULK_DASHBOARD_CACHE_INVALIDATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(Json(BulkUpdateNoteLabelsResponse {
+        matched: result.matched,
+        updated: result.updated,
+        unchanged: result.unchanged,
+    }))
+}
+
+fn map_bulk_update_note_labels_error(error: anyhow::Error) -> (axum::http::StatusCode, String) {
+    let caller_message = error
+        .downcast_ref::<BulkUpdateNoteLabelsValidationError>()
+        .map(ToString::to_string)
+        .or_else(|| {
+            error
+                .downcast_ref::<note_core::ValidationError>()
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            error
+                .downcast_ref::<note_core::LabelKeyValidationError>()
+                .map(ToString::to_string)
+        });
+    if caller_message
+        .as_ref()
+        .is_some_and(|message| error.to_string() == *message)
+    {
+        return (axum::http::StatusCode::BAD_REQUEST, caller_message.unwrap());
+    }
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "bulk note label update failed".into(),
+    )
 }
 
 fn decode_attachment_requests(
@@ -978,6 +1061,7 @@ where
 
     OpenApiRouter::with_openapi(AttachmentOpenApi::openapi())
         .routes(routes!(save_note_handler, list_notes_handler))
+        .routes(routes!(bulk_update_note_labels_handler))
         .routes(routes!(count_notes_handler))
         .routes(routes!(list_deleted_notes_handler))
         .routes(routes!(restore_notes_handler))
@@ -1012,15 +1096,236 @@ mod tests {
         PreparedAttachmentMutation, PreparedAttachmentSet,
     };
     use note_embedding::StubEmbedder;
-    use note_storage::{StorageBackend, TransactionMode};
+    use note_storage::{
+        ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, EmbeddingDashboardStatus,
+        EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteFieldsUpdate,
+        NoteUpdate, NotesRepository, OrgRepository, RetrievalRepository, SettingsRepository,
+        StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
+        StorageTransaction, TransactionMode, UpsertNoteChunk,
+    };
     use note_storage_turso::TursoStorage;
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
+    static BULK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct RecordingReadAttachmentStore {
         inner: FilesystemAttachmentStore,
         read_calls: AtomicUsize,
+    }
+
+    struct FailingBeginStorageBackend {
+        inner: Arc<dyn StorageBackend>,
+    }
+
+    struct RollbackFailingStorageBackend {
+        inner: Arc<dyn StorageBackend>,
+    }
+
+    struct RollbackFailingTransaction {
+        inner: Box<dyn StorageTransaction>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FailingBeginStorageBackend {
+        async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+            self.inner.session().await
+        }
+
+        async fn begin(
+            &self,
+            _mode: TransactionMode,
+        ) -> StorageResult<Box<dyn StorageTransaction>> {
+            Err(StorageError::new(
+                StorageErrorKind::Unavailable,
+                "private repository failure detail",
+            ))
+        }
+
+        async fn info(&self) -> StorageResult<BackendInfo> {
+            self.inner.info().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for RollbackFailingStorageBackend {
+        async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+            self.inner.session().await
+        }
+
+        async fn begin(&self, mode: TransactionMode) -> StorageResult<Box<dyn StorageTransaction>> {
+            Ok(Box::new(RollbackFailingTransaction {
+                inner: self.inner.begin(mode).await?,
+            }))
+        }
+
+        async fn info(&self) -> StorageResult<BackendInfo> {
+            self.inner.info().await
+        }
+    }
+
+    macro_rules! impl_forward_repository {
+        ($repository:path { $(fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty;)* }) => {
+            #[async_trait::async_trait]
+            impl $repository for RollbackFailingTransaction {
+                $(
+                    async fn $name(&self, $($arg: $ty),*) -> StorageResult<$result> {
+                        self.inner.$name($($arg),*).await
+                    }
+                )*
+            }
+        };
+    }
+
+    impl_forward_repository! {
+        NotesRepository {
+            fn insert_note(note: NewNote<'_>) -> ();
+            fn get_note_revision(id: &str) -> Option<i64>;
+            fn note_exists(id: &str) -> bool;
+            fn get_note(id: &str) -> Option<note_core::Note>;
+            fn get_note_content(id: &str) -> Option<String>;
+            fn update_note(note: NoteUpdate<'_>) -> u64;
+            fn update_note_fields(note: NoteFieldsUpdate<'_>) -> u64;
+            fn update_note_attachments(note: AttachmentMetadataUpdate<'_>) -> u64;
+            fn soft_delete_note(id: &str, deleted_at: i64) -> u64;
+            fn get_deleted_note_content_and_revision(id: &str) -> Option<(String, i64)>;
+            fn restore_note(id: &str, note_revision: i64) -> u64;
+            fn permanently_delete_note(id: &str) -> u64;
+            fn list_expired_deleted_note_ids(cutoff: i64) -> Vec<String>;
+            fn clear_note_search_data(id: &str) -> ();
+            fn clear_note_labels(id: &str) -> ();
+            fn clear_note_chunk_derived(id: &str, chunk_idx: i64) -> ();
+            fn clear_note_chunks_from_derived(id: &str, min_chunk_idx: i64) -> ();
+            fn list_notes(
+                selectors: &[note_core::LabelSelector],
+                limit: Option<i64>,
+                offset: Option<i64>,
+            ) -> Vec<note_core::Note>;
+            fn list_all_notes() -> Vec<note_core::Note>;
+            fn list_note_summaries(
+                selectors: &[note_core::LabelSelector],
+                limit: Option<i64>,
+                offset: Option<i64>,
+            ) -> Vec<note_core::NoteListItem>;
+            fn list_deleted_note_summaries() -> Vec<note_core::NoteListItem>;
+            fn count_notes(selectors: &[note_core::LabelSelector]) -> usize;
+            fn matching_note_ids(selectors: &[note_core::LabelSelector]) -> Vec<String>;
+            fn matching_note_ids_for_update(selectors: &[note_core::LabelSelector]) -> Vec<String>;
+            fn advance_note_updated_at(id: &str, now: i64) -> u64;
+            fn list_active_note_sources() -> Vec<ActiveNoteSource>;
+        }
+    }
+
+    impl_forward_repository! {
+        LabelRepository {
+            fn insert_label_key(key: &str, description: &str) -> ();
+            fn insert_label_key_if_missing(key: &str, description: &str) -> ();
+            fn insert_label_key_with_type(
+                key: &str,
+                description: &str,
+                value_type: note_core::LabelValueType,
+            ) -> ();
+            fn list_label_keys() -> Vec<note_core::LabelKey>;
+            fn update_label_key(key: &str, description: &str) -> ();
+            fn update_label_key_with_type(
+                key: &str,
+                description: &str,
+                value_type: note_core::LabelValueType,
+            ) -> ();
+            fn delete_label_key(key: &str) -> ();
+            fn attach_label(note_id: &str, key: &str, value: &str) -> ();
+            fn set_note_label(note_id: &str, key: &str, value: &str) -> bool;
+            fn labels_for_note(note_id: &str) -> Vec<note_core::Label>;
+            fn label_note_counts() -> Vec<(String, usize)>;
+            fn find_note_with_labels(labels: &[(String, String)]) -> Option<String>;
+        }
+    }
+
+    impl_forward_repository! {
+        EmbeddingRepository {
+            fn embedding_dashboard_status() -> EmbeddingDashboardStatus;
+            fn list_note_chunks(note_id: &str) -> Vec<NoteChunk>;
+            fn get_note_chunk(note_id: &str, chunk_idx: i64) -> Option<NoteChunk>;
+            fn upsert_note_chunk(chunk: UpsertNoteChunk<'_>) -> ();
+            fn mark_note_chunk_status(
+                note_id: &str,
+                chunk_idx: i64,
+                content_hash: &str,
+                note_revision: i64,
+                status: &str,
+                updated_at: i64,
+            ) -> u64;
+            fn delete_note_chunks_from(note_id: &str, min_chunk_idx: i64) -> u64;
+            fn chunk_embedding_exists(note_id: &str, chunk_idx: i64) -> bool;
+            fn enqueue_embedding_job(
+                note_id: &str,
+                chunk_idx: i64,
+                content_hash: &str,
+                content: &str,
+                note_revision: i64,
+                now: i64,
+            ) -> ();
+            fn delete_stale_embedding_jobs_for_chunk(
+                note_id: &str,
+                chunk_idx: i64,
+                current_hash: &str,
+            ) -> u64;
+            fn delete_embedding_jobs_from_chunk(note_id: &str, min_chunk_idx: i64) -> u64;
+            fn claim_pending_embedding_jobs(limit: usize, now: i64) -> Vec<EmbeddingJob>;
+            fn delete_embedding_job(id: i64) -> u64;
+            fn fail_embedding_job(
+                id: i64,
+                attempts: i64,
+                max_attempts: i64,
+                error: &str,
+                now: i64,
+            ) -> u64;
+            fn requeue_processing_embedding_jobs(now: i64) -> u64;
+            fn reset_embeddings_for_regeneration(now: i64) -> u64;
+        }
+    }
+
+    impl_forward_repository! {
+        RetrievalRepository {
+            fn insert_chunk_embedding(note_id: &str, chunk_idx: i64, embedding: &[f32]) -> ();
+            fn dense_search(
+                query: &[f32],
+                limit: usize,
+                allowed_note_ids: Option<&[String]>,
+            ) -> Vec<String>;
+            fn title_search(
+                query: &str,
+                limit: usize,
+                allowed_note_ids: Option<&[String]>,
+            ) -> Vec<String>;
+        }
+    }
+
+    impl_forward_repository! {
+        SettingsRepository {
+            fn get_system_config() -> note_core::SystemConfig;
+            fn set_system_config(config: &note_core::SystemConfig) -> ();
+            fn get_embedding_fingerprint() -> Option<String>;
+            fn set_embedding_fingerprint(fingerprint: &str) -> ();
+        }
+    }
+
+    impl OrgRepository for RollbackFailingTransaction {}
+
+    #[async_trait::async_trait]
+    impl StorageTransaction for RollbackFailingTransaction {
+        async fn commit(self: Box<Self>) -> StorageResult<()> {
+            self.inner.commit().await
+        }
+
+        async fn rollback(self: Box<Self>) -> StorageResult<()> {
+            self.inner.rollback().await?;
+            Err(StorageError::new(
+                StorageErrorKind::Transaction,
+                "ROLLBACK-SECRET-42",
+            ))
+        }
     }
 
     impl RecordingReadAttachmentStore {
@@ -1096,6 +1401,7 @@ mod tests {
 
         for (path, methods) in [
             ("/api/notes", &["get", "post"][..]),
+            ("/api/notes/bulk-labels", &["post"][..]),
             ("/api/notes/count", &["get"][..]),
             ("/api/notes/{id}", &["get", "put", "delete"][..]),
             ("/api/notes/{id}/raw", &["get"][..]),
@@ -1139,6 +1445,76 @@ mod tests {
             empty_response.get("content").is_none(),
             "204 response must not publish a body"
         );
+    }
+
+    #[test]
+    fn openapi_documents_exact_bulk_label_contract() {
+        let document = note_openapi_document();
+        let schemas = &document["components"]["schemas"];
+        let request = &schemas["BulkUpdateNoteLabelsRequest"];
+        let response = &schemas["BulkUpdateNoteLabelsResponse"];
+
+        let mut request_properties = request["properties"]
+            .as_object()
+            .expect("bulk request properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        request_properties.sort_unstable();
+        assert_eq!(request_properties, vec!["selector", "set"]);
+        assert_eq!(request["additionalProperties"], false);
+        assert_eq!(request["required"], serde_json::json!(["selector", "set"]));
+        assert_eq!(request["properties"]["selector"]["type"], "string");
+        assert_eq!(request["properties"]["selector"]["minLength"], 1);
+
+        let set = &request["properties"]["set"];
+        assert_eq!(set["type"], "array");
+        assert_eq!(set["minItems"], 1);
+        assert_eq!(set["items"]["type"], "array");
+        assert_eq!(set["items"]["minItems"], 2);
+        assert_eq!(set["items"]["maxItems"], 2);
+        assert_eq!(set["items"]["items"]["type"], "string");
+
+        let mut response_properties = response["properties"]
+            .as_object()
+            .expect("bulk response properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        response_properties.sort_unstable();
+        assert_eq!(response_properties, vec!["matched", "unchanged", "updated"]);
+        assert_eq!(
+            response["required"],
+            serde_json::json!(["matched", "updated", "unchanged"])
+        );
+        for field in ["matched", "updated", "unchanged"] {
+            assert_eq!(response["properties"][field]["type"], "integer");
+        }
+
+        let operation = &document["paths"]["/api/notes/bulk-labels"]["post"];
+        assert_eq!(operation["tags"], serde_json::json!(["notes"]));
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BulkUpdateNoteLabelsRequest"
+        );
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BulkUpdateNoteLabelsResponse"
+        );
+        let mut statuses = operation["responses"]
+            .as_object()
+            .expect("bulk response statuses")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        statuses.sort_unstable();
+        assert_eq!(statuses, vec!["200", "400", "500"]);
+        for status in ["400", "500"] {
+            assert_eq!(
+                operation["responses"][status]["content"]["text/plain"]["schema"]["type"],
+                "string"
+            );
+        }
     }
 
     #[test]
@@ -1376,6 +1752,18 @@ mod tests {
         (app, ctx, dir)
     }
 
+    fn test_app_from_backend(
+        storage: Arc<dyn StorageBackend>,
+        attachments: impl Into<std::path::PathBuf>,
+    ) -> Router {
+        let ctx = Arc::new(Context::new(
+            storage,
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(attachments.into())),
+        ));
+        notes_router::<Arc<Context>>().with_state(ctx).into()
+    }
+
     fn post(uri: &str, body: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -1439,6 +1827,261 @@ mod tests {
             .and_then(|v| v.as_str())
             .map(|s| !s.is_empty())
             .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn bulk_label_update_adds_replaces_and_reports_noops() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, _dir) = test_app().await;
+        let mut ids = Vec::new();
+        for body in [
+            r#"{"title":"Add","content":"Body","labels":[["type","ietf-rfc"],["owner","protocols"]]}"#,
+            r#"{"title":"Replace","content":"Body","labels":[["type","ietf-rfc"],["owner","protocols"],["project","old"]]}"#,
+            r#"{"title":"Noop","content":"Body","labels":[["type","ietf-rfc"],["owner","protocols"],["project","IETF-RFC"]]}"#,
+        ] {
+            ids.push(save_note_id(app.clone(), body).await);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","set":[["project","IETF-RFC"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::json!({"matched": 3, "updated": 2, "unchanged": 1})
+        );
+
+        for id in ids {
+            let response = app
+                .clone()
+                .oneshot(get(&format!("/api/notes/{id}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let note: Value = serde_json::from_slice(&body).unwrap();
+            assert!(note["labels"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(["project", "IETF-RFC"])));
+            assert!(note["labels"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(["owner", "protocols"])));
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_label_update_zero_matches_does_not_create_catalog_entries() {
+        let (app, ctx, _dir) = test_app().await;
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=not-present","set":[["project","IETF-RFC"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::json!({"matched": 0, "updated": 0, "unchanged": 0})
+        );
+        assert!(list_label_keys(&ctx).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_label_update_rejects_caller_errors_and_unknown_fields() {
+        let (app, ctx, _dir) = test_app().await;
+        note_pipelines::define_label_key_with_type(
+            &ctx,
+            "priority",
+            "Priority score",
+            note_core::LabelValueType::Number,
+        )
+        .await
+        .unwrap();
+        save_note_id(
+            app.clone(),
+            r#"{"title":"Typed","content":"Body","labels":[["type","ietf-rfc"]]}"#,
+        )
+        .await;
+
+        for (body, expected_message) in [
+            (
+                r#"{"selector":"   ","set":[["project","IETF-RFC"]]}"#,
+                "selector must not be empty",
+            ),
+            (
+                r#"{"selector":"type=ietf-rfc&&owner=protocols","set":[["project","IETF-RFC"]]}"#,
+                "label selector is malformed",
+            ),
+            (
+                r#"{"selector":"type=ietf-rfc","set":[]}"#,
+                "at least one label assignment is required",
+            ),
+            (
+                r#"{"selector":"type=ietf-rfc","set":[["project","one"],["project","two"]]}"#,
+                "duplicate label assignment key: project",
+            ),
+            (
+                r#"{"selector":"type=ietf-rfc","set":[["bad$key","value"]]}"#,
+                "label key must not contain selector-reserved character: $",
+            ),
+            (
+                r#"{"selector":"type=ietf-rfc","set":[["priority","urgent"]]}"#,
+                "invalid value for label priority: urgent is not number",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post("/api/notes/bulk-labels", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let response_body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                std::str::from_utf8(&response_body).unwrap(),
+                expected_message
+            );
+        }
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","set":[["project","IETF-RFC"]],"unknown":true}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn bulk_label_update_invalidates_dashboard_only_when_a_note_changes() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, _dir) = test_app().await;
+        save_note_id(
+            app.clone(),
+            r#"{"title":"Cache","content":"Body","labels":[["type","ietf-rfc"],["project","IETF-RFC"]]}"#,
+        )
+        .await;
+
+        let invalidations_before = BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst);
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","set":[["project","IETF-RFC"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
+            invalidations_before
+        );
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=missing","set":[["project","other"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
+            invalidations_before
+        );
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","set":[["project","changed"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
+            invalidations_before + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_label_update_sanitizes_storage_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
+        let failing: Arc<dyn StorageBackend> =
+            Arc::new(FailingBeginStorageBackend { inner: backend });
+        let app = test_app_from_backend(failing, dir.path().join("attachments"));
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","set":[["project","IETF-RFC"]]}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"bulk note label update failed");
+        assert!(!String::from_utf8_lossy(&body).contains("private repository failure detail"));
+    }
+
+    #[tokio::test]
+    async fn bulk_label_update_sanitizes_typed_validation_with_rollback_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
+        let base_app = test_app_from_backend(backend.clone(), dir.path().join("base-attachments"));
+        let base_ctx = Arc::new(Context::new(
+            backend.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("setup-attachments"),
+            )),
+        ));
+        note_pipelines::define_label_key_with_type(
+            &base_ctx,
+            "priority",
+            "Priority score",
+            note_core::LabelValueType::Number,
+        )
+        .await
+        .unwrap();
+        save_note_id(
+            base_app,
+            r#"{"title":"Typed rollback","content":"Body","labels":[["type","ietf-rfc"]]}"#,
+        )
+        .await;
+        let failing: Arc<dyn StorageBackend> =
+            Arc::new(RollbackFailingStorageBackend { inner: backend });
+        let app = test_app_from_backend(failing, dir.path().join("failing-attachments"));
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","set":[["priority","urgent"]]}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"bulk note label update failed");
+        assert!(!String::from_utf8_lossy(&body).contains("ROLLBACK-SECRET-42"));
     }
 
     #[tokio::test]

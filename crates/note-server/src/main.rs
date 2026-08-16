@@ -770,8 +770,8 @@ mod tests {
             })
             .sum::<usize>();
 
-        assert_eq!(paths.len(), 49);
-        assert_eq!(operation_count, 59);
+        assert_eq!(paths.len(), 50);
+        assert_eq!(operation_count, 60);
         assert!(!paths.keys().any(|path| path.starts_with("/mcp")));
         assert!(document["tags"]
             .as_array()
