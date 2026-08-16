@@ -123,7 +123,7 @@ pub(crate) fn checked_tool_router(
     let expected_note_names = NOTE_TOOL_NAMES.into_iter().collect::<HashSet<_>>();
     assert_eq!(
         note_names, expected_note_names,
-        "legacy note tool inventory changed"
+        "note tool inventory changed"
     );
 
     let org_names = org_router

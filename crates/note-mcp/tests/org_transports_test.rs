@@ -891,7 +891,7 @@ fn normalized_inventory(response: &Value) -> Vec<Value> {
 }
 
 #[tokio::test]
-async fn production_transport_factories_share_the_same_47_tool_registry() {
+async fn production_transport_factories_share_the_same_48_tool_registry() {
     let bundle = Bundle::new("inventory").await;
     let mut stdio = StdioClient::start(&bundle).await;
     let mut http = HttpClient::start(&bundle).await;

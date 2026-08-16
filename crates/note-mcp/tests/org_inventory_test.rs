@@ -113,7 +113,7 @@ async fn aggregate_inventory_is_48_and_preserves_the_12_note_tools() {
         36
     );
     for name in NOTE_TOOL_NAMES {
-        assert!(names.contains(name), "missing legacy note tool {name}");
+        assert!(names.contains(name), "missing note tool {name}");
     }
     for name in ORG_TOOL_NAMES {
         assert!(names.contains(name), "missing Org tool {name}");

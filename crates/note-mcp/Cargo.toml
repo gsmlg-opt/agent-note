@@ -21,6 +21,7 @@ serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["io-std", "rt", "macros"] }
 
 [dev-dependencies]
+async-trait = "0.1.89"
 note-attachments = { path = "../note-attachments" }
 note-embedding = { path = "../note-embedding" }
 note-storage = { path = "../note-storage" }

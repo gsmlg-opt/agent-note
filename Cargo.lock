@@ -3511,6 +3511,7 @@ name = "note-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "note-attachments",
  "note-core",

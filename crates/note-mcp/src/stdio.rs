@@ -874,15 +874,24 @@ fn to_error_data(error: anyhow::Error) -> ErrorData {
 }
 
 fn to_bulk_update_note_labels_error_data(error: anyhow::Error) -> ErrorData {
-    if error
+    let caller_message = error
         .downcast_ref::<BulkUpdateNoteLabelsValidationError>()
-        .is_some()
-        || error.downcast_ref::<note_core::ValidationError>().is_some()
-        || error
-            .downcast_ref::<note_core::LabelKeyValidationError>()
-            .is_some()
+        .map(ToString::to_string)
+        .or_else(|| {
+            error
+                .downcast_ref::<note_core::ValidationError>()
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            error
+                .downcast_ref::<note_core::LabelKeyValidationError>()
+                .map(ToString::to_string)
+        });
+    if caller_message
+        .as_ref()
+        .is_some_and(|message| error.to_string() == *message)
     {
-        return ErrorData::invalid_params(error.to_string(), None);
+        return ErrorData::invalid_params(caller_message.unwrap(), None);
     }
     ErrorData::internal_error("bulk note label update failed", None)
 }
@@ -925,8 +934,11 @@ mod tests {
     use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
     use note_storage::{
-        BackendInfo, StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
-        StorageTransaction, TransactionMode,
+        ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, EmbeddingDashboardStatus,
+        EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteFieldsUpdate,
+        NoteUpdate, NotesRepository, OrgRepository, RetrievalRepository, SettingsRepository,
+        StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
+        StorageTransaction, TransactionMode, UpsertNoteChunk,
     };
     use note_storage_turso::TursoStorage;
     use rmcp::model::ErrorCode;
@@ -935,6 +947,194 @@ mod tests {
 
     struct FailingBeginStorageBackend {
         inner: Arc<dyn StorageBackend>,
+    }
+
+    struct RollbackFailingStorageBackend {
+        inner: Arc<dyn StorageBackend>,
+    }
+
+    struct RollbackFailingTransaction {
+        inner: Box<dyn StorageTransaction>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for RollbackFailingStorageBackend {
+        async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+            self.inner.session().await
+        }
+
+        async fn begin(&self, mode: TransactionMode) -> StorageResult<Box<dyn StorageTransaction>> {
+            Ok(Box::new(RollbackFailingTransaction {
+                inner: self.inner.begin(mode).await?,
+            }))
+        }
+
+        async fn info(&self) -> StorageResult<BackendInfo> {
+            self.inner.info().await
+        }
+    }
+
+    macro_rules! impl_forward_repository {
+        ($repository:path { $(fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty;)* }) => {
+            #[async_trait::async_trait]
+            impl $repository for RollbackFailingTransaction {
+                $(
+                    async fn $name(&self, $($arg: $ty),*) -> StorageResult<$result> {
+                        self.inner.$name($($arg),*).await
+                    }
+                )*
+            }
+        };
+    }
+
+    impl_forward_repository! {
+        NotesRepository {
+            fn insert_note(note: NewNote<'_>) -> ();
+            fn get_note_revision(id: &str) -> Option<i64>;
+            fn note_exists(id: &str) -> bool;
+            fn get_note(id: &str) -> Option<note_core::Note>;
+            fn get_note_content(id: &str) -> Option<String>;
+            fn update_note(note: NoteUpdate<'_>) -> u64;
+            fn update_note_fields(note: NoteFieldsUpdate<'_>) -> u64;
+            fn update_note_attachments(note: AttachmentMetadataUpdate<'_>) -> u64;
+            fn soft_delete_note(id: &str, deleted_at: i64) -> u64;
+            fn get_deleted_note_content_and_revision(id: &str) -> Option<(String, i64)>;
+            fn restore_note(id: &str, note_revision: i64) -> u64;
+            fn permanently_delete_note(id: &str) -> u64;
+            fn list_expired_deleted_note_ids(cutoff: i64) -> Vec<String>;
+            fn clear_note_search_data(id: &str) -> ();
+            fn clear_note_labels(id: &str) -> ();
+            fn clear_note_chunk_derived(id: &str, chunk_idx: i64) -> ();
+            fn clear_note_chunks_from_derived(id: &str, min_chunk_idx: i64) -> ();
+            fn list_notes(
+                selectors: &[note_core::LabelSelector],
+                limit: Option<i64>,
+                offset: Option<i64>,
+            ) -> Vec<note_core::Note>;
+            fn list_all_notes() -> Vec<note_core::Note>;
+            fn list_note_summaries(
+                selectors: &[note_core::LabelSelector],
+                limit: Option<i64>,
+                offset: Option<i64>,
+            ) -> Vec<note_core::NoteListItem>;
+            fn list_deleted_note_summaries() -> Vec<note_core::NoteListItem>;
+            fn count_notes(selectors: &[note_core::LabelSelector]) -> usize;
+            fn matching_note_ids(selectors: &[note_core::LabelSelector]) -> Vec<String>;
+            fn matching_note_ids_for_update(selectors: &[note_core::LabelSelector]) -> Vec<String>;
+            fn advance_note_updated_at(id: &str, now: i64) -> u64;
+            fn list_active_note_sources() -> Vec<ActiveNoteSource>;
+        }
+    }
+
+    impl_forward_repository! {
+        LabelRepository {
+            fn insert_label_key(key: &str, description: &str) -> ();
+            fn insert_label_key_if_missing(key: &str, description: &str) -> ();
+            fn insert_label_key_with_type(
+                key: &str,
+                description: &str,
+                value_type: note_core::LabelValueType,
+            ) -> ();
+            fn list_label_keys() -> Vec<note_core::LabelKey>;
+            fn update_label_key(key: &str, description: &str) -> ();
+            fn update_label_key_with_type(
+                key: &str,
+                description: &str,
+                value_type: note_core::LabelValueType,
+            ) -> ();
+            fn delete_label_key(key: &str) -> ();
+            fn attach_label(note_id: &str, key: &str, value: &str) -> ();
+            fn set_note_label(note_id: &str, key: &str, value: &str) -> bool;
+            fn labels_for_note(note_id: &str) -> Vec<note_core::Label>;
+            fn label_note_counts() -> Vec<(String, usize)>;
+            fn find_note_with_labels(labels: &[(String, String)]) -> Option<String>;
+        }
+    }
+
+    impl_forward_repository! {
+        EmbeddingRepository {
+            fn embedding_dashboard_status() -> EmbeddingDashboardStatus;
+            fn list_note_chunks(note_id: &str) -> Vec<NoteChunk>;
+            fn get_note_chunk(note_id: &str, chunk_idx: i64) -> Option<NoteChunk>;
+            fn upsert_note_chunk(chunk: UpsertNoteChunk<'_>) -> ();
+            fn mark_note_chunk_status(
+                note_id: &str,
+                chunk_idx: i64,
+                content_hash: &str,
+                note_revision: i64,
+                status: &str,
+                updated_at: i64,
+            ) -> u64;
+            fn delete_note_chunks_from(note_id: &str, min_chunk_idx: i64) -> u64;
+            fn chunk_embedding_exists(note_id: &str, chunk_idx: i64) -> bool;
+            fn enqueue_embedding_job(
+                note_id: &str,
+                chunk_idx: i64,
+                content_hash: &str,
+                content: &str,
+                note_revision: i64,
+                now: i64,
+            ) -> ();
+            fn delete_stale_embedding_jobs_for_chunk(
+                note_id: &str,
+                chunk_idx: i64,
+                current_hash: &str,
+            ) -> u64;
+            fn delete_embedding_jobs_from_chunk(note_id: &str, min_chunk_idx: i64) -> u64;
+            fn claim_pending_embedding_jobs(limit: usize, now: i64) -> Vec<EmbeddingJob>;
+            fn delete_embedding_job(id: i64) -> u64;
+            fn fail_embedding_job(
+                id: i64,
+                attempts: i64,
+                max_attempts: i64,
+                error: &str,
+                now: i64,
+            ) -> u64;
+            fn requeue_processing_embedding_jobs(now: i64) -> u64;
+            fn reset_embeddings_for_regeneration(now: i64) -> u64;
+        }
+    }
+
+    impl_forward_repository! {
+        RetrievalRepository {
+            fn insert_chunk_embedding(note_id: &str, chunk_idx: i64, embedding: &[f32]) -> ();
+            fn dense_search(
+                query: &[f32],
+                limit: usize,
+                allowed_note_ids: Option<&[String]>,
+            ) -> Vec<String>;
+            fn title_search(
+                query: &str,
+                limit: usize,
+                allowed_note_ids: Option<&[String]>,
+            ) -> Vec<String>;
+        }
+    }
+
+    impl_forward_repository! {
+        SettingsRepository {
+            fn get_system_config() -> note_core::SystemConfig;
+            fn set_system_config(config: &note_core::SystemConfig) -> ();
+            fn get_embedding_fingerprint() -> Option<String>;
+            fn set_embedding_fingerprint(fingerprint: &str) -> ();
+        }
+    }
+
+    impl OrgRepository for RollbackFailingTransaction {}
+
+    #[async_trait::async_trait]
+    impl StorageTransaction for RollbackFailingTransaction {
+        async fn commit(self: Box<Self>) -> StorageResult<()> {
+            self.inner.commit().await
+        }
+
+        async fn rollback(self: Box<Self>) -> StorageResult<()> {
+            self.inner.rollback().await?;
+            Err(StorageError::new(
+                StorageErrorKind::Transaction,
+                "ROLLBACK-SECRET-42",
+            ))
+        }
     }
 
     impl StorageBackend for FailingBeginStorageBackend {
@@ -1576,6 +1776,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_update_note_labels_handler_returns_zero_counts_for_no_matches() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
+
+        let response = server
+            .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
+                selector: "type=not-present".into(),
+                set: vec![("project".into(), "new".into())],
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({"matched": 0, "updated": 0, "unchanged": 0})
+        );
+    }
+
+    #[tokio::test]
     async fn bulk_update_note_labels_maps_caller_faults_to_invalid_params() {
         let (ctx, backend, _dir) = test_context().await;
         let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
@@ -1673,6 +1893,50 @@ mod tests {
         assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
         assert_eq!(error.message, "bulk note label update failed");
         assert!(!error.message.contains("private repository failure detail"));
+    }
+
+    #[tokio::test]
+    async fn bulk_update_note_labels_sanitizes_typed_validation_with_rollback_failure() {
+        let (ctx, backend, dir) = test_context().await;
+        let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
+        transaction
+            .insert_label_key_with_type("priority", "", note_core::LabelValueType::Number)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let base_server = test_server(ctx, backend.clone());
+        base_server
+            .save_note(Parameters(SaveNoteRequest {
+                title: "Typed rollback".into(),
+                content: "Body".into(),
+                labels: vec![("type".into(), "ietf-rfc".into())],
+            }))
+            .await
+            .unwrap();
+
+        let failing_backend: Arc<dyn StorageBackend> =
+            Arc::new(RollbackFailingStorageBackend { inner: backend });
+        let failing_ctx = Context::new(
+            failing_backend.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("rollback-failing-attachments"),
+            )),
+        );
+        let server = test_server(failing_ctx, failing_backend);
+
+        let error = expect_error(
+            server
+                .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
+                    selector: "type=ietf-rfc".into(),
+                    set: vec![("priority".into(), "urgent".into())],
+                }))
+                .await,
+        );
+
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(error.message, "bulk note label update failed");
+        assert!(!error.message.contains("ROLLBACK-SECRET-42"));
     }
 
     #[test]
