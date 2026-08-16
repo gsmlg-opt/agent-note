@@ -350,8 +350,9 @@ them unambiguously.
 **list_label_keys**: read-only → return the full label-key catalog (`key` + `description`), used by
 clients and the UI to populate suggestions and explain known keys.
 
-**bulk_update_note_labels**: validate a non-blank label `selector` and a non-empty `set` of unique
-`[key, value]` desired-state assignments → fix all matching active note IDs before writes →
+**bulk_update_note_labels**: validate a non-blank label `selector` and a non-empty set of
+desired-state `[key, value]` assignments with unique target keys → fix all matching active note IDs
+before writes →
 atomically add or replace the requested labels while preserving unrelated labels → return
 note-level `matched`, `updated`, and `unchanged` counts. `matched` is the number of matching active
 notes; `updated` counts a matched note once when at least one assignment changes; `unchanged` is
