@@ -4,12 +4,12 @@ use note_core::{
 };
 use note_embedding::StubEmbedder;
 use note_mcp::{
-    delete_note_attachment_tool, delete_note_tool, edit_note_tool,
+    bulk_update_note_labels_tool, delete_note_attachment_tool, delete_note_tool, edit_note_tool,
     get_note_attachment_content_tool, get_note_tool, list_notes_tool, put_note_attachment_tool,
     read_note_lines_tool, save_note_tool, semantic_search_tool, update_note_tool,
-    AttachmentMetadataData, GetNoteAttachmentContentToolInput, NoteDetailData, NoteSummaryData,
-    PutNoteAttachmentToolInput, PutNoteAttachmentToolOutput, SaveNoteToolInput,
-    SemanticSearchToolInput, UpdateNoteToolInput,
+    AttachmentMetadataData, BulkUpdateNoteLabelsToolInput, GetNoteAttachmentContentToolInput,
+    NoteDetailData, NoteSummaryData, PutNoteAttachmentToolInput, PutNoteAttachmentToolOutput,
+    SaveNoteToolInput, SemanticSearchToolInput, UpdateNoteToolInput,
 };
 use note_pipelines::{drain_embedding_jobs, update_system_config, Context, EditOp};
 use note_storage::StorageBackend;
@@ -513,4 +513,73 @@ async fn semantic_search_returns_summary_labels_and_timestamps() {
     assert_eq!(result.labels[0].value, "rust");
     assert!(result.created_at > 0);
     assert!(result.updated_at >= result.created_at);
+}
+
+#[tokio::test]
+async fn bulk_update_note_labels_tool_delegates_matching_and_set_semantics() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let added = save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Add project".into(),
+            content: "Body".into(),
+            labels: vec![
+                ("type".into(), "ietf-rfc".into()),
+                ("owner".into(), "protocols".into()),
+            ],
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    let replaced = save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Replace project".into(),
+            content: "Body".into(),
+            labels: vec![
+                ("type".into(), "ietf-rfc".into()),
+                ("project".into(), "old".into()),
+                ("owner".into(), "protocols".into()),
+            ],
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Unmatched".into(),
+            content: "Body".into(),
+            labels: vec![("type".into(), "other".into())],
+        },
+    )
+    .await
+    .unwrap();
+
+    let output = bulk_update_note_labels_tool(
+        &ctx,
+        BulkUpdateNoteLabelsToolInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![("project".into(), "IETF-RFC".into())],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.matched, 2);
+    assert_eq!(output.updated, 2);
+    assert_eq!(output.unchanged, 0);
+    for id in [added, replaced] {
+        let note = get_note_tool(&ctx, &id).await.unwrap().unwrap();
+        assert!(note
+            .labels
+            .iter()
+            .any(|label| label.key == "project" && label.value == "IETF-RFC"));
+        assert!(note
+            .labels
+            .iter()
+            .any(|label| label.key == "owner" && label.value == "protocols"));
+    }
 }

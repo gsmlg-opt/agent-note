@@ -67,7 +67,8 @@ pub const ORG_TOOL_NAMES: [&str; 36] = [
     "org_list_events",
 ];
 
-pub const NOTE_TOOL_NAMES: [&str; 11] = [
+pub const NOTE_TOOL_NAMES: [&str; 12] = [
+    "bulk_update_note_labels",
     "delete_note",
     "delete_note_attachment",
     "edit_note",

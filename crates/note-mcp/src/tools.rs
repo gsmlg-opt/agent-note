@@ -1,10 +1,11 @@
 use note_core::{Label, Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
-    delete_note, delete_note_attachment as pipeline_delete_note_attachment,
-    get_note_attachment_by_id, get_note_metadata, list_note_summaries,
-    put_note_attachment as pipeline_put_note_attachment, save_note, search_notes_filtered,
-    update_note_fields, Context, ListNotesParams, SaveNoteInput as PipelineSaveNoteInput,
-    UpdateNoteFieldsInput,
+    bulk_update_note_labels as pipeline_bulk_update_note_labels, delete_note,
+    delete_note_attachment as pipeline_delete_note_attachment, get_note_attachment_by_id,
+    get_note_metadata, list_note_summaries, put_note_attachment as pipeline_put_note_attachment,
+    save_note, search_notes_filtered, update_note_fields,
+    BulkUpdateNoteLabelsInput as PipelineBulkUpdateNoteLabelsInput, Context, ListNotesParams,
+    SaveNoteInput as PipelineSaveNoteInput, UpdateNoteFieldsInput,
 };
 use serde::{Deserialize, Serialize};
 
@@ -121,6 +122,39 @@ pub async fn save_note_tool(
     )
     .await?;
     Ok(SaveNoteToolOutput { id: note.id })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkUpdateNoteLabelsToolInput {
+    pub selector: String,
+    pub set: Vec<(String, String)>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkUpdateNoteLabelsToolOutput {
+    pub matched: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
+pub async fn bulk_update_note_labels_tool(
+    ctx: &Context,
+    input: BulkUpdateNoteLabelsToolInput,
+) -> anyhow::Result<BulkUpdateNoteLabelsToolOutput> {
+    let result = pipeline_bulk_update_note_labels(
+        ctx,
+        PipelineBulkUpdateNoteLabelsInput {
+            selector: input.selector,
+            set: input.set,
+        },
+    )
+    .await?;
+    Ok(BulkUpdateNoteLabelsToolOutput {
+        matched: result.matched,
+        updated: result.updated,
+        unchanged: result.unchanged,
+    })
 }
 
 pub async fn get_note_tool(ctx: &Context, id: &str) -> anyhow::Result<Option<NoteDetailData>> {

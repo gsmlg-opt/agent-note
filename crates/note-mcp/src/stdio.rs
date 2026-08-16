@@ -7,7 +7,7 @@ use std::{borrow::Cow, sync::Arc};
 
 use note_pipelines::{
     normalized_list_limit, normalized_list_offset, org::OrgContext, AttachmentMutationError,
-    Context,
+    BulkUpdateNoteLabelsValidationError, Context,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Json, wrapper::Parameters},
@@ -20,11 +20,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::tools::{
-    delete_note_attachment_tool, delete_note_tool, edit_note_tool,
+    bulk_update_note_labels_tool, delete_note_attachment_tool, delete_note_tool, edit_note_tool,
     get_note_attachment_content_tool, get_note_tool, list_notes_tool, put_note_attachment_tool,
     read_note_lines_tool, save_note_tool, semantic_search_tool, update_note_tool,
-    AttachmentContentData, AttachmentMetadataData, GetNoteAttachmentContentToolInput, LabelData,
-    NoteDetailData, NoteLine, NoteLinesData, NoteSummaryData, PutNoteAttachmentToolInput,
+    AttachmentContentData, AttachmentMetadataData, BulkUpdateNoteLabelsToolInput,
+    BulkUpdateNoteLabelsToolOutput, GetNoteAttachmentContentToolInput, LabelData, NoteDetailData,
+    NoteLine, NoteLinesData, NoteSummaryData, PutNoteAttachmentToolInput,
     PutNoteAttachmentToolOutput, SaveNoteToolInput, SaveNoteToolOutput, SemanticSearchToolInput,
     SemanticSearchToolResult, UpdateNoteToolInput,
 };
@@ -62,6 +63,47 @@ impl From<SaveNoteRequest> for SaveNoteToolInput {
 impl From<SaveNoteToolOutput> for SaveNoteResponse {
     fn from(output: SaveNoteToolOutput) -> Self {
         Self { id: output.id }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct BulkUpdateNoteLabelsRequest {
+    /// Label selector used to choose active notes.
+    pub selector: String,
+    /// Label `(key, value)` pairs to set or replace on every matching note.
+    #[schemars(length(min = 1))]
+    pub set: Vec<(String, String)>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct BulkUpdateNoteLabelsResponse {
+    /// Number of active notes matching the selector.
+    pub matched: usize,
+    /// Number of matching notes whose labels changed.
+    pub updated: usize,
+    /// Number of matching notes already in the requested state.
+    pub unchanged: usize,
+}
+
+impl From<BulkUpdateNoteLabelsRequest> for BulkUpdateNoteLabelsToolInput {
+    fn from(request: BulkUpdateNoteLabelsRequest) -> Self {
+        Self {
+            selector: request.selector,
+            set: request.set,
+        }
+    }
+}
+
+impl From<BulkUpdateNoteLabelsToolOutput> for BulkUpdateNoteLabelsResponse {
+    fn from(output: BulkUpdateNoteLabelsToolOutput) -> Self {
+        Self {
+            matched: output.matched,
+            updated: output.updated,
+            unchanged: output.unchanged,
+        }
     }
 }
 
@@ -596,6 +638,20 @@ impl NoteMcpServer {
 #[tool_router(router = tool_router)]
 impl NoteMcpServer {
     #[tool(
+        name = "bulk_update_note_labels",
+        description = "Atomically set or replace labels on active notes matching a label selector while preserving unrelated labels."
+    )]
+    pub async fn bulk_update_note_labels(
+        &self,
+        params: Parameters<BulkUpdateNoteLabelsRequest>,
+    ) -> Result<Json<BulkUpdateNoteLabelsResponse>, ErrorData> {
+        let output = bulk_update_note_labels_tool(&self.ctx, params.0.into())
+            .await
+            .map_err(to_bulk_update_note_labels_error_data)?;
+        Ok(Json(output.into()))
+    }
+
+    #[tool(
         name = "save_note",
         description = "Save a note with a title, Markdown content, and optional labels."
     )]
@@ -817,6 +873,20 @@ fn to_error_data(error: anyhow::Error) -> ErrorData {
     ErrorData::internal_error(error.to_string(), None)
 }
 
+fn to_bulk_update_note_labels_error_data(error: anyhow::Error) -> ErrorData {
+    if error
+        .downcast_ref::<BulkUpdateNoteLabelsValidationError>()
+        .is_some()
+        || error.downcast_ref::<note_core::ValidationError>().is_some()
+        || error
+            .downcast_ref::<note_core::LabelKeyValidationError>()
+            .is_some()
+    {
+        return ErrorData::invalid_params(error.to_string(), None);
+    }
+    ErrorData::internal_error("bulk note label update failed", None)
+}
+
 fn to_put_error_data(error: anyhow::Error) -> ErrorData {
     if matches!(
         error.downcast_ref::<AttachmentMutationError>(),
@@ -854,11 +924,70 @@ mod tests {
     use super::*;
     use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
-    use note_storage::{StorageBackend, TransactionMode};
+    use note_storage::{
+        BackendInfo, StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
+        StorageTransaction, TransactionMode,
+    };
     use note_storage_turso::TursoStorage;
     use rmcp::model::ErrorCode;
     use serde_json::json;
     use tempfile::TempDir;
+
+    struct FailingBeginStorageBackend {
+        inner: Arc<dyn StorageBackend>,
+    }
+
+    impl StorageBackend for FailingBeginStorageBackend {
+        fn session<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = StorageResult<Box<dyn StorageSession>>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.session().await })
+        }
+
+        fn begin<'life0, 'async_trait>(
+            &'life0 self,
+            _mode: TransactionMode,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = StorageResult<Box<dyn StorageTransaction>>>
+                    + Send
+                    + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async {
+                Err(StorageError::new(
+                    StorageErrorKind::Unavailable,
+                    "private repository failure detail",
+                ))
+            })
+        }
+
+        fn info<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = StorageResult<BackendInfo>> + Send + 'async_trait>,
+        >
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { self.inner.info().await })
+        }
+    }
 
     async fn test_context() -> (Context, Arc<dyn StorageBackend>, TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -1055,7 +1184,7 @@ mod tests {
             .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 47);
+        assert_eq!(names.len(), 48);
         names.sort();
         for name in crate::org::NOTE_TOOL_NAMES {
             assert!(names.iter().any(|registered| registered == name));
@@ -1163,6 +1292,35 @@ mod tests {
             &update_input,
             &["content", "id", "labels", "title"],
         );
+
+        let bulk_input = tool_schema(&server, "bulk_update_note_labels", false);
+        assert_exact_closed_object(&bulk_input, &bulk_input, &["selector", "set"]);
+        assert_eq!(required_names(&bulk_input), vec!["selector", "set"]);
+        assert_eq!(bulk_input["properties"]["selector"]["type"], "string");
+        let assignments = &bulk_input["properties"]["set"];
+        assert_eq!(assignments["type"], "array");
+        assert_eq!(assignments["minItems"], 1);
+        assert_eq!(assignments["items"]["type"], "array");
+        assert_eq!(assignments["items"]["minItems"], 2);
+        assert_eq!(assignments["items"]["maxItems"], 2);
+        assert_eq!(
+            assignments["items"]["prefixItems"],
+            json!([{"type": "string"}, {"type": "string"}])
+        );
+
+        let bulk_output = tool_schema(&server, "bulk_update_note_labels", true);
+        assert_exact_closed_object(
+            &bulk_output,
+            &bulk_output,
+            &["matched", "unchanged", "updated"],
+        );
+        assert_eq!(
+            required_names(&bulk_output),
+            vec!["matched", "unchanged", "updated"]
+        );
+        for field in ["matched", "updated", "unchanged"] {
+            assert_eq!(bulk_output["properties"][field]["type"], "integer");
+        }
 
         let put_schema = tool_schema(&server, "put_note_attachment", false);
         assert_exact_closed_object(
@@ -1362,6 +1520,159 @@ mod tests {
             "attachments": []
         }));
         assert!(update.is_err());
+    }
+
+    #[test]
+    fn bulk_update_note_labels_request_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_value::<BulkUpdateNoteLabelsRequest>(json!({
+                "selector": "type=ietf-rfc",
+                "set": [["project", "IETF-RFC"]],
+                "unknown": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_update_note_labels_handler_adds_replaces_and_reports_noops() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
+        for (title, project) in [
+            ("Add", None),
+            ("Replace", Some("old")),
+            ("Noop", Some("new")),
+        ] {
+            let mut labels = vec![
+                ("type".into(), "ietf-rfc".into()),
+                ("owner".into(), "protocols".into()),
+            ];
+            if let Some(project) = project {
+                labels.push(("project".into(), project.into()));
+            }
+            server
+                .save_note(Parameters(SaveNoteRequest {
+                    title: title.into(),
+                    content: "Body".into(),
+                    labels,
+                }))
+                .await
+                .unwrap();
+        }
+
+        let response = server
+            .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
+                selector: "type=ietf-rfc".into(),
+                set: vec![("project".into(), "new".into())],
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({"matched": 3, "updated": 2, "unchanged": 1})
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_update_note_labels_maps_caller_faults_to_invalid_params() {
+        let (ctx, backend, _dir) = test_context().await;
+        let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
+        transaction
+            .insert_label_key_with_type("priority", "", note_core::LabelValueType::Number)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let server = test_server(ctx, backend);
+        server
+            .save_note(Parameters(SaveNoteRequest {
+                title: "Typed".into(),
+                content: "Body".into(),
+                labels: vec![("type".into(), "ietf-rfc".into())],
+            }))
+            .await
+            .unwrap();
+
+        for (request, expected_message) in [
+            (
+                BulkUpdateNoteLabelsRequest {
+                    selector: "   ".into(),
+                    set: vec![("project".into(), "new".into())],
+                },
+                "selector must not be empty",
+            ),
+            (
+                BulkUpdateNoteLabelsRequest {
+                    selector: "type=ietf-rfc&&owner=protocols".into(),
+                    set: vec![("project".into(), "new".into())],
+                },
+                "label selector is malformed",
+            ),
+            (
+                BulkUpdateNoteLabelsRequest {
+                    selector: "type=ietf-rfc".into(),
+                    set: vec![],
+                },
+                "at least one label assignment is required",
+            ),
+            (
+                BulkUpdateNoteLabelsRequest {
+                    selector: "type=ietf-rfc".into(),
+                    set: vec![
+                        ("project".into(), "new".into()),
+                        ("project".into(), "again".into()),
+                    ],
+                },
+                "duplicate label assignment key: project",
+            ),
+            (
+                BulkUpdateNoteLabelsRequest {
+                    selector: "type=ietf-rfc".into(),
+                    set: vec![("bad$key".into(), "new".into())],
+                },
+                "label key must not contain selector-reserved character: $",
+            ),
+            (
+                BulkUpdateNoteLabelsRequest {
+                    selector: "type=ietf-rfc".into(),
+                    set: vec![("priority".into(), "urgent".into())],
+                },
+                "invalid value for label priority: urgent is not number",
+            ),
+        ] {
+            let error = expect_error(server.bulk_update_note_labels(Parameters(request)).await);
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+            assert_eq!(error.message, expected_message);
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_update_note_labels_sanitizes_repository_failures() {
+        let (_ctx, backend, dir) = test_context().await;
+        let failing_backend: Arc<dyn StorageBackend> =
+            Arc::new(FailingBeginStorageBackend { inner: backend });
+        let failing_ctx = Context::new(
+            failing_backend.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("failing-attachments"),
+            )),
+        );
+        let server = test_server(failing_ctx, failing_backend);
+
+        let error = expect_error(
+            server
+                .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
+                    selector: "type=ietf-rfc".into(),
+                    set: vec![("project".into(), "new".into())],
+                }))
+                .await,
+        );
+
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(error.message, "bulk note label update failed");
+        assert!(!error.message.contains("private repository failure detail"));
     }
 
     #[test]

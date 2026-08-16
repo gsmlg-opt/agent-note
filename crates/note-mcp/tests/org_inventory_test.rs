@@ -60,6 +60,27 @@ fn org_inventory_is_the_ordered_36_tool_contract() {
     );
 }
 
+#[test]
+fn note_inventory_is_the_ordered_12_tool_contract() {
+    assert_eq!(
+        NOTE_TOOL_NAMES,
+        [
+            "bulk_update_note_labels",
+            "delete_note",
+            "delete_note_attachment",
+            "edit_note",
+            "get_note",
+            "get_note_attachment_content",
+            "list_notes",
+            "put_note_attachment",
+            "read_note_lines",
+            "save_note",
+            "semantic_search",
+            "update_note",
+        ]
+    );
+}
+
 async fn registered_tools() -> (Vec<Tool>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let backend: Arc<dyn StorageBackend> = Arc::new(
@@ -79,14 +100,14 @@ async fn registered_tools() -> (Vec<Tool>, tempfile::TempDir) {
 }
 
 #[tokio::test]
-async fn aggregate_inventory_is_47_and_preserves_the_11_note_tools() {
+async fn aggregate_inventory_is_48_and_preserves_the_12_note_tools() {
     let (tools, _dir) = registered_tools().await;
     let names = tools
         .iter()
         .map(|tool| tool.name.as_ref())
         .collect::<HashSet<_>>();
-    assert_eq!(tools.len(), 47);
-    assert_eq!(names.len(), 47);
+    assert_eq!(tools.len(), 48);
+    assert_eq!(names.len(), 48);
     assert_eq!(
         names.iter().filter(|name| name.starts_with("org_")).count(),
         36
@@ -97,6 +118,24 @@ async fn aggregate_inventory_is_47_and_preserves_the_11_note_tools() {
     for name in ORG_TOOL_NAMES {
         assert!(names.contains(name), "missing Org tool {name}");
     }
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|tool| tool.name == "bulk_update_note_labels")
+            .count(),
+        1
+    );
+    assert_eq!(
+        tools
+            .iter()
+            .find(|tool| tool.name == "bulk_update_note_labels")
+            .unwrap()
+            .description,
+        Some(
+            "Atomically set or replace labels on active notes matching a label selector while preserving unrelated labels."
+                .into()
+        )
+    );
 }
 
 #[test]

@@ -898,8 +898,8 @@ async fn production_transport_factories_share_the_same_47_tool_registry() {
     let stdio_tools = stdio.request("tools/list", json!({})).await;
     let http_tools = http.request("tools/list", json!({})).await;
 
-    assert_eq!(stdio_tools["result"]["tools"].as_array().unwrap().len(), 47);
-    assert_eq!(http_tools["result"]["tools"].as_array().unwrap().len(), 47);
+    assert_eq!(stdio_tools["result"]["tools"].as_array().unwrap().len(), 48);
+    assert_eq!(http_tools["result"]["tools"].as_array().unwrap().len(), 48);
     let stdio_inventory = normalized_inventory(&stdio_tools);
     let http_inventory = normalized_inventory(&http_tools);
     assert_eq!(
