@@ -1,5 +1,6 @@
 mod support;
 
+use note_core::parse_label_selectors;
 use note_org::{WorkItemId, WorkspaceId, WorkspacePolicy};
 use note_storage::{
     NewNote, NewOrgAttemptAllocation, NewOrgWorkspace, OrgRepository, StorageBackend,
@@ -277,6 +278,94 @@ async fn immediate_transactions_serialize_writers_until_commit() {
         .await
         .expect("second immediate transaction did not proceed after commit");
     second.rollback().await.unwrap();
+    database.cleanup(Some(&storage)).await.unwrap();
+}
+
+#[tokio::test]
+async fn matching_note_ids_for_update_locks_selected_notes_until_commit() {
+    let Some((database, storage)) =
+        storage("matching_note_ids_for_update_locks_selected_notes_until_commit").await
+    else {
+        return;
+    };
+    let session = StorageBackend::session(storage.as_ref()).await.unwrap();
+    session
+        .insert_note(NewNote {
+            id: "bulk-row-lock",
+            title: "Bulk row lock",
+            content: "content",
+            attachments: &[],
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    session
+        .insert_label_key("bulk-row-lock-selector", "Bulk row lock selector")
+        .await
+        .unwrap();
+    session
+        .attach_label("bulk-row-lock", "bulk-row-lock-selector", "selected")
+        .await
+        .unwrap();
+    drop(session);
+
+    let first = StorageBackend::begin(storage.as_ref(), TransactionMode::Immediate)
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .matching_note_ids_for_update(
+                &parse_label_selectors("bulk-row-lock-selector=selected",)
+            )
+            .await
+            .unwrap(),
+        vec!["bulk-row-lock"]
+    );
+
+    let second_storage = Arc::clone(&storage);
+    let mut handle = tokio::spawn(async move {
+        let second = StorageBackend::begin(second_storage.as_ref(), TransactionMode::Deferred)
+            .await
+            .unwrap();
+        let affected = second
+            .advance_note_updated_at("bulk-row-lock", 10)
+            .await
+            .unwrap();
+        second.commit().await.unwrap();
+        affected
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut handle)
+            .await
+            .is_err(),
+        "concurrent note timestamp update was not blocked by the selected row lock"
+    );
+
+    first.commit().await.unwrap();
+    let affected = tokio::time::timeout(Duration::from_secs(2), &mut handle)
+        .await
+        .expect("concurrent note timestamp update did not finish after commit")
+        .expect("concurrent note timestamp task failed");
+    assert_eq!(affected, 1);
+
+    let observer = StorageBackend::session(storage.as_ref()).await.unwrap();
+    assert_eq!(
+        observer
+            .get_note("bulk-row-lock")
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        10
+    );
+    assert_eq!(
+        observer.get_note_revision("bulk-row-lock").await.unwrap(),
+        Some(1)
+    );
+    drop(observer);
     database.cleanup(Some(&storage)).await.unwrap();
 }
 

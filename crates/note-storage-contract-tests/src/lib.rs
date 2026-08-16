@@ -1,3 +1,4 @@
+mod bulk_labels;
 mod embedding;
 mod notes;
 mod org;
@@ -18,6 +19,7 @@ pub async fn run_storage_contracts(storage: Arc<dyn StorageBackend>) {
     embedding::run(storage.clone()).await;
     retrieval::run(storage.clone()).await;
     settings::run(storage.clone()).await;
+    bulk_labels::run(storage.clone()).await;
     transactions::run(storage).await;
 }
 

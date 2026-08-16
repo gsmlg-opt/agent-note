@@ -167,6 +167,8 @@ impl_forward_repository! {
         fn list_deleted_note_summaries() -> Vec<note_core::NoteListItem>;
         fn count_notes(selectors: &[LabelSelector]) -> usize;
         fn matching_note_ids(selectors: &[LabelSelector]) -> Vec<String>;
+        fn matching_note_ids_for_update(selectors: &[LabelSelector]) -> Vec<String>;
+        fn advance_note_updated_at(id: &str, now: i64) -> u64;
         fn list_active_note_sources() -> Vec<ActiveNoteSource>;
     }
 }
@@ -189,6 +191,7 @@ impl_forward_repository! {
         ) -> ();
         fn delete_label_key(key: &str) -> ();
         fn attach_label(note_id: &str, key: &str, value: &str) -> ();
+        fn set_note_label(note_id: &str, key: &str, value: &str) -> bool;
         fn labels_for_note(note_id: &str) -> Vec<note_core::Label>;
         fn label_note_counts() -> Vec<(String, usize)>;
         fn find_note_with_labels(labels: &[(String, String)]) -> Option<String>;

@@ -133,6 +133,36 @@ impl LabelRepository for PgSession {
         Ok(())
     }
 
+    async fn set_note_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<bool> {
+        let mut connection = self.connection().await?;
+        let label_key_id: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM label_keys WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(|error| map_sqlx_error("query label key for note label", error))?;
+        let label_key_id = label_key_id.ok_or_else(|| {
+            StorageError::new(
+                StorageErrorKind::Operation,
+                format!("unknown label key: {key}"),
+            )
+        })?;
+        let result = sqlx::query(
+            "INSERT INTO note_labels (note_id, label_key_id, value)
+             VALUES ($1, $2, $3)
+             ON CONFLICT(note_id, label_key_id) DO UPDATE
+             SET value = EXCLUDED.value
+             WHERE note_labels.value IS DISTINCT FROM EXCLUDED.value",
+        )
+        .bind(note_id)
+        .bind(label_key_id)
+        .bind(value)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("set note label", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn labels_for_note(&self, note_id: &str) -> StorageResult<Vec<Label>> {
         let mut connection = self.connection().await?;
         let rows = sqlx::query_as::<_, (String, String, String, String)>(

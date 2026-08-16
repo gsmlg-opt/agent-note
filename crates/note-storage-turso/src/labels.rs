@@ -106,28 +106,7 @@ impl LabelRepository for TursoSession {
 
     async fn attach_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<()> {
         let _operation_guard = self.operation_guard().await;
-        let label_key_id = {
-            let mut rows = self
-                .connection
-                .query(
-                    "SELECT id FROM label_keys WHERE key = ?1",
-                    turso::params![key],
-                )
-                .await
-                .map_err(|error| map_turso_error("query label key for attachment", error))?;
-            let row = rows
-                .next()
-                .await
-                .map_err(|error| map_turso_error("read label key for attachment", error))?
-                .ok_or_else(|| {
-                    StorageError::new(
-                        StorageErrorKind::Operation,
-                        format!("unknown label key: {key}"),
-                    )
-                })?;
-            row.get::<i64>(0)
-                .map_err(|error| map_turso_error("decode label key id", error))?
-        };
+        let label_key_id = label_key_id_unlocked(self, key).await?;
 
         self.connection
             .execute(
@@ -137,6 +116,24 @@ impl LabelRepository for TursoSession {
             .await
             .map_err(|error| map_turso_error("attach label", error))?;
         Ok(())
+    }
+
+    async fn set_note_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<bool> {
+        let _operation_guard = self.operation_guard().await;
+        let label_key_id = label_key_id_unlocked(self, key).await?;
+        let affected = self
+            .connection
+            .execute(
+                "INSERT INTO note_labels (note_id, label_key_id, value)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(note_id, label_key_id) DO UPDATE
+                 SET value = excluded.value
+                 WHERE note_labels.value != excluded.value",
+                turso::params![note_id, label_key_id, value],
+            )
+            .await
+            .map_err(|error| map_turso_error("set note label", error))?;
+        Ok(affected > 0)
     }
 
     async fn labels_for_note(&self, note_id: &str) -> StorageResult<Vec<Label>> {
@@ -225,6 +222,29 @@ impl LabelRepository for TursoSession {
             })
             .transpose()
     }
+}
+
+async fn label_key_id_unlocked(session: &TursoSession, key: &str) -> StorageResult<i64> {
+    let mut rows = session
+        .connection
+        .query(
+            "SELECT id FROM label_keys WHERE key = ?1",
+            turso::params![key],
+        )
+        .await
+        .map_err(|error| map_turso_error("query label key for attachment", error))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|error| map_turso_error("read label key for attachment", error))?
+        .ok_or_else(|| {
+            StorageError::new(
+                StorageErrorKind::Operation,
+                format!("unknown label key: {key}"),
+            )
+        })?;
+    row.get::<i64>(0)
+        .map_err(|error| map_turso_error("decode label key id", error))
 }
 
 async fn insert_label_key_with_type_unlocked(

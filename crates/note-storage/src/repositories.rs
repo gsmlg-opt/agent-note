@@ -307,6 +307,16 @@ pub trait NotesRepository: Send + Sync {
         &self,
         selectors: &[note_core::LabelSelector],
     ) -> StorageResult<Vec<String>>;
+    /// Returns sorted IDs for matching active notes while locking those note
+    /// rows until the enclosing transaction ends. Call through an explicit
+    /// storage transaction to retain the locks across subsequent writes.
+    async fn matching_note_ids_for_update(
+        &self,
+        selectors: &[note_core::LabelSelector],
+    ) -> StorageResult<Vec<String>>;
+    /// Advances an active note's label-only mutation timestamp monotonically
+    /// without changing its content or note revision.
+    async fn advance_note_updated_at(&self, id: &str, now: i64) -> StorageResult<u64>;
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>>;
 }
 
@@ -330,6 +340,9 @@ pub trait LabelRepository: Send + Sync {
     ) -> StorageResult<()>;
     async fn delete_label_key(&self, key: &str) -> StorageResult<()>;
     async fn attach_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<()>;
+    /// Inserts or replaces one note label, returning whether its desired value
+    /// changed.
+    async fn set_note_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<bool>;
     async fn labels_for_note(&self, note_id: &str) -> StorageResult<Vec<note_core::Label>>;
     async fn label_note_counts(&self) -> StorageResult<Vec<(String, usize)>>;
     async fn find_note_with_labels(

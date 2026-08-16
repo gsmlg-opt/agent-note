@@ -68,6 +68,44 @@ impl TursoSession {
         }
         Ok(resolve_label_selectors(selectors, &labels))
     }
+
+    async fn matching_note_ids_unlocked(
+        &self,
+        selectors: &[LabelSelector],
+    ) -> StorageResult<Vec<String>> {
+        let resolved = if selectors.is_empty() {
+            None
+        } else {
+            let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
+                return Ok(Vec::new());
+            };
+            Some(resolved)
+        };
+        let mut sql = "SELECT n.id FROM notes n WHERE n.deleted_at IS NULL".to_string();
+        let mut params = Vec::<turso::Value>::new();
+        if let Some(resolved) = &resolved {
+            push_label_predicates(&mut sql, &mut params, "n", resolved)?;
+        }
+        sql.push_str(" ORDER BY n.id");
+
+        let mut rows = self
+            .connection
+            .query(&sql, turso::params_from_iter(params))
+            .await
+            .map_err(|error| map_turso_error("query matching note ids", error))?;
+        let mut note_ids = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read matching note ids", error))?
+        {
+            note_ids.push(
+                row.get(0)
+                    .map_err(|error| map_turso_error("decode matching note id", error))?,
+            );
+        }
+        Ok(note_ids)
+    }
 }
 
 fn push_label_predicates(
@@ -305,6 +343,19 @@ impl NotesRepository for TursoSession {
             )
             .await
             .map_err(|error| map_turso_error("update note attachments", error))
+    }
+
+    async fn advance_note_updated_at(&self, id: &str, now: i64) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
+        self.connection
+            .execute(
+                "UPDATE notes
+                 SET updated_at = CASE WHEN updated_at >= ?2 THEN updated_at + 1 ELSE ?2 END
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                turso::params![id, now],
+            )
+            .await
+            .map_err(|error| map_turso_error("advance note updated timestamp", error))
     }
 
     async fn soft_delete_note(&self, id: &str, deleted_at: i64) -> StorageResult<u64> {
@@ -694,38 +745,15 @@ impl NotesRepository for TursoSession {
 
     async fn matching_note_ids(&self, selectors: &[LabelSelector]) -> StorageResult<Vec<String>> {
         let _operation_guard = self.operation_guard().await;
-        let resolved = if selectors.is_empty() {
-            None
-        } else {
-            let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
-                return Ok(Vec::new());
-            };
-            Some(resolved)
-        };
-        let mut sql = "SELECT n.id FROM notes n WHERE n.deleted_at IS NULL".to_string();
-        let mut params = Vec::<turso::Value>::new();
-        if let Some(resolved) = &resolved {
-            push_label_predicates(&mut sql, &mut params, "n", resolved)?;
-        }
-        sql.push_str(" ORDER BY n.id");
+        self.matching_note_ids_unlocked(selectors).await
+    }
 
-        let mut rows = self
-            .connection
-            .query(&sql, turso::params_from_iter(params))
-            .await
-            .map_err(|error| map_turso_error("query matching note ids", error))?;
-        let mut note_ids = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|error| map_turso_error("read matching note ids", error))?
-        {
-            note_ids.push(
-                row.get(0)
-                    .map_err(|error| map_turso_error("decode matching note id", error))?,
-            );
-        }
-        Ok(note_ids)
+    async fn matching_note_ids_for_update(
+        &self,
+        selectors: &[LabelSelector],
+    ) -> StorageResult<Vec<String>> {
+        let _operation_guard = self.operation_guard().await;
+        self.matching_note_ids_unlocked(selectors).await
     }
 
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>> {

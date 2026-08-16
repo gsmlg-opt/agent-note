@@ -53,6 +53,36 @@ impl PgSession {
             .collect::<StorageResult<Vec<_>>>()?;
         Ok(resolve_label_selectors(selectors, &labels))
     }
+
+    async fn matching_note_ids_impl(
+        &self,
+        selectors: &[LabelSelector],
+        for_update: bool,
+    ) -> StorageResult<Vec<String>> {
+        let resolved = if selectors.is_empty() {
+            None
+        } else {
+            let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
+                return Ok(Vec::new());
+            };
+            Some(resolved)
+        };
+        let mut builder: QueryBuilder<Postgres> =
+            QueryBuilder::new("SELECT n.id FROM notes n WHERE n.deleted_at IS NULL");
+        if let Some(resolved) = &resolved {
+            push_label_predicates(&mut builder, "n", resolved);
+        }
+        builder.push(" ORDER BY n.id");
+        if for_update {
+            builder.push(" FOR UPDATE OF n");
+        }
+        let mut connection = self.connection().await?;
+        builder
+            .build_query_scalar::<String>()
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|error| map_sqlx_error("query matching note ids", error))
+    }
 }
 
 fn push_label_predicates(
@@ -244,6 +274,21 @@ impl NotesRepository for PgSession {
         .execute(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("update note attachments", error))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn advance_note_updated_at(&self, id: &str, now: i64) -> StorageResult<u64> {
+        let mut connection = self.connection().await?;
+        let result = sqlx::query(
+            "UPDATE notes
+             SET updated_at = GREATEST(updated_at + 1, $2)
+             WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .bind(now)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("advance note updated timestamp", error))?;
         Ok(result.rows_affected())
     }
 
@@ -522,26 +567,14 @@ impl NotesRepository for PgSession {
     }
 
     async fn matching_note_ids(&self, selectors: &[LabelSelector]) -> StorageResult<Vec<String>> {
-        if selectors.is_empty() {
-            let mut connection = self.connection().await?;
-            return sqlx::query_scalar("SELECT id FROM notes WHERE deleted_at IS NULL ORDER BY id")
-                .fetch_all(&mut *connection)
-                .await
-                .map_err(|error| map_sqlx_error("query matching note ids", error));
-        }
-        let Some(resolved) = self.resolved_label_selectors(selectors).await? else {
-            return Ok(Vec::new());
-        };
-        let mut builder: QueryBuilder<Postgres> =
-            QueryBuilder::new("SELECT n.id FROM notes n WHERE n.deleted_at IS NULL");
-        push_label_predicates(&mut builder, "n", &resolved);
-        builder.push(" ORDER BY n.id");
-        let mut connection = self.connection().await?;
-        builder
-            .build_query_scalar::<String>()
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|error| map_sqlx_error("query matching note ids", error))
+        self.matching_note_ids_impl(selectors, false).await
+    }
+
+    async fn matching_note_ids_for_update(
+        &self,
+        selectors: &[LabelSelector],
+    ) -> StorageResult<Vec<String>> {
+        self.matching_note_ids_impl(selectors, true).await
     }
 
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>> {
