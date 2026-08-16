@@ -186,12 +186,12 @@ They return only bounded aggregate counts, never a per-note result list:
 {"matched":42,"updated":40,"unchanged":2}
 ```
 
-The operation is atomic and all-or-nothing across the unpaginated set of matching active notes; a
-blank selector is rejected. Each assignment expresses desired state: a missing label is added, a
-different value is replaced, and an exact existing value is counted as unchanged. Unrelated labels
-are preserved. Missing target catalog keys are created as text only when at least one note matches,
-while values for existing typed catalog keys are validated. Zero matches returns zero counts and
-creates nothing.
+The operation fixes the unpaginated set of matching active note IDs before any label changes, then
+applies the update atomically and all-or-nothing; a blank selector is rejected. Each assignment
+expresses desired state: a missing label is added, a different value is replaced, and an exact
+existing value is counted as unchanged. Unrelated labels are preserved. Missing target catalog keys
+are created as text only when at least one note matches, while values for existing typed catalog
+keys are validated. Zero matches returns zero counts and creates nothing.
 
 Only changed notes advance `updated_at`. Their content, note revision, attachments, and derived
 embedding state remain unchanged; exact no-ops do not advance the timestamp.
