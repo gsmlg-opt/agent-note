@@ -125,6 +125,89 @@ impl NoteCoordination {
 }
 
 impl S3AttachmentStore {
+    async fn put_immutable_object(
+        &self,
+        request: crate::PutObjectRequest,
+    ) -> anyhow::Result<crate::StoredObject> {
+        let object_key = crate::path::canonical_object_key(&request.object_key)?;
+        if !valid_sha256(&request.checksum_sha256) {
+            anyhow::bail!("invalid expected SHA-256 checksum");
+        }
+        let actual_checksum = format!("{:x}", Sha256::digest(&request.bytes));
+        if actual_checksum != request.checksum_sha256 {
+            anyhow::bail!("attachment object checksum does not match expected SHA-256");
+        }
+        let key = object_key_with_prefix(&self.prefix, &object_key)?;
+        let expected = crate::ObjectMetadata {
+            size_bytes: request.bytes.len() as u64,
+            checksum_sha256: request.checksum_sha256,
+        };
+        if self.key_exists(&key).await? {
+            return self
+                .classify_existing_object(object_key, &key, &expected)
+                .await;
+        }
+        let put = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .if_none_match("*")
+            .metadata("checksum-sha256", &expected.checksum_sha256)
+            .body(ByteStream::from(request.bytes))
+            .send()
+            .await;
+        match put {
+            Ok(_) => self.verify_object(object_key, &key, &expected).await,
+            Err(error)
+                if error.code() == Some("PreconditionFailed")
+                    || error
+                        .raw_response()
+                        .is_some_and(|r| r.status().as_u16() == 412) =>
+            {
+                self.classify_existing_object(object_key, &key, &expected)
+                    .await
+            }
+            Err(error) => Err(safe_sdk_error("put object", &error)),
+        }
+    }
+
+    async fn verify_object(
+        &self,
+        object_key: String,
+        key: &str,
+        expected: &crate::ObjectMetadata,
+    ) -> anyhow::Result<crate::StoredObject> {
+        let metadata = self
+            .head_key(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("S3 put object verification failed (missing object)"))?;
+        let bytes = self.read_key(key).await?;
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        if metadata != *expected
+            || bytes.len() as u64 != expected.size_bytes
+            || checksum != expected.checksum_sha256
+        {
+            anyhow::bail!("S3 put object verification failed (content mismatch)");
+        }
+        Ok(crate::StoredObject {
+            object_key,
+            size_bytes: metadata.size_bytes,
+            checksum_sha256: metadata.checksum_sha256,
+        })
+    }
+
+    async fn classify_existing_object(
+        &self,
+        object_key: String,
+        key: &str,
+        expected: &crate::ObjectMetadata,
+    ) -> anyhow::Result<crate::StoredObject> {
+        match self.verify_object(object_key, key, expected).await {
+            Ok(stored) => Ok(stored),
+            Err(_) => anyhow::bail!("attachment object already exists"),
+        }
+    }
     pub async fn new(config: S3AttachmentConfig) -> anyhow::Result<Self> {
         let bucket = config.bucket.trim().to_owned();
         if bucket.is_empty() {
@@ -812,56 +895,10 @@ impl crate::AttachmentStore for S3AttachmentStore {
         &self,
         request: crate::PutObjectRequest,
     ) -> anyhow::Result<crate::StoredObject> {
-        let object_key = crate::path::canonical_object_key(&request.object_key)?;
-        if !valid_sha256(&request.checksum_sha256) {
-            anyhow::bail!("invalid expected SHA-256 checksum");
-        }
-        let actual_checksum = format!("{:x}", Sha256::digest(&request.bytes));
-        if actual_checksum != request.checksum_sha256 {
-            anyhow::bail!("attachment object checksum does not match expected SHA-256");
-        }
-        let key = object_key_with_prefix(&self.prefix, &object_key)?;
-        if self.key_exists(&key).await? {
-            anyhow::bail!("attachment object already exists");
-        }
-        let expected = crate::ObjectMetadata {
-            size_bytes: request.bytes.len() as u64,
-            checksum_sha256: request.checksum_sha256,
-        };
-        match self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .if_none_match("*")
-            .metadata("checksum-sha256", &expected.checksum_sha256)
-            .body(ByteStream::from(request.bytes))
-            .send()
+        let store = self.clone();
+        tokio::spawn(async move { store.put_immutable_object(request).await })
             .await
-        {
-            Ok(_) => {}
-            Err(error)
-                if error.code() == Some("PreconditionFailed")
-                    || error
-                        .raw_response()
-                        .is_some_and(|response| response.status().as_u16() == 412) =>
-            {
-                anyhow::bail!("attachment object already exists")
-            }
-            Err(error) => return Err(safe_sdk_error("put object", &error)),
-        }
-        let verified = self
-            .head_key(&key)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("S3 put object verification failed (missing object)"))?;
-        if verified != expected {
-            anyhow::bail!("S3 put object verification failed (metadata mismatch)");
-        }
-        Ok(crate::StoredObject {
-            object_key,
-            size_bytes: verified.size_bytes,
-            checksum_sha256: verified.checksum_sha256,
-        })
+            .map_err(|_| anyhow::anyhow!("S3 immutable object put task failed"))?
     }
 
     async fn read_object(&self, object_key: &str) -> anyhow::Result<Vec<u8>> {
@@ -1437,6 +1474,12 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/configured/generations/key.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let store = S3AttachmentStore::new(S3AttachmentConfig {
             bucket: "agent-note".into(),
@@ -1494,6 +1537,12 @@ mod tests {
                     .insert_header("content-length", "7")
                     .insert_header("x-amz-meta-checksum-sha256", checksum),
             )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/collision"))
+            .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&server)
             .await;
@@ -1518,7 +1567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn immutable_put_conditionally_rejects_a_collision_after_absent_preflight() {
+    async fn immutable_put_treats_matching_412_object_as_idempotent_success() {
         let _lock = AWS_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1531,10 +1580,15 @@ mod tests {
         ]);
         let server = MockServer::start().await;
         let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        let calls = Arc::new(AtomicUsize::new(0));
         Mock::given(method("HEAD"))
             .and(path("/agent-note/generations/raced"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
+            .respond_with(MissingThenObjectMetadata {
+                calls,
+                checksum: checksum.into(),
+                size_bytes: 7,
+            })
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("PUT"))
@@ -1547,8 +1601,14 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/raced"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-        let error = test_store(server.uri())
+        let stored = test_store(server.uri())
             .await
             .put_immutable(crate::PutObjectRequest {
                 object_key: "generations/raced".into(),
@@ -1556,13 +1616,118 @@ mod tests {
                 checksum_sha256: checksum.into(),
             })
             .await
+            .unwrap();
+        assert_eq!(stored.object_key, "generations/raced");
+    }
+
+    #[tokio::test]
+    async fn immutable_put_rejects_substituted_content_after_successful_put() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("verify-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("verify-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/corrupt"))
+            .respond_with(MissingThenObjectMetadata {
+                calls,
+                checksum: checksum.into(),
+                size_bytes: 7,
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/generations/corrupt"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/corrupt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"corrupt".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = test_store(server.uri())
+            .await
+            .put_immutable(crate::PutObjectRequest {
+                object_key: "generations/corrupt".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: checksum.into(),
+            })
+            .await
             .unwrap_err()
             .to_string();
+        assert_eq!(
+            error,
+            "S3 put object verification failed (content mismatch)"
+        );
+    }
 
-        assert_eq!(error, "attachment object already exists");
-        assert!(!error.contains("private collision detail"));
-        assert!(!error.contains("conditional-access"));
-        assert!(!error.contains("conditional-secret"));
+    #[tokio::test]
+    async fn cancelled_immutable_put_finishes_delayed_publication_and_verification() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("cancel-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("cancel-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/cancelled"))
+            .respond_with(MissingThenObjectMetadata {
+                calls: Arc::new(AtomicUsize::new(0)),
+                checksum: checksum.into(),
+                size_bytes: 7,
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/generations/cancelled"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(150)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/cancelled"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = test_store(server.uri()).await;
+        let task = tokio::spawn(async move {
+            store
+                .put_immutable(crate::PutObjectRequest {
+                    object_key: "generations/cancelled".into(),
+                    bytes: b"payload".to_vec(),
+                    checksum_sha256: checksum.into(),
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        task.abort();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method.as_str() == "GET")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

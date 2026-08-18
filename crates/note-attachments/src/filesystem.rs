@@ -363,9 +363,12 @@ fn put_immutable_blocking(root: &Path, request: PutObjectRequest) -> anyhow::Res
     temp.disarm();
     created.disarm();
 
+    #[cfg(test)]
+    if FORCE_OBJECT_VERIFICATION_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("attachment object verification failed");
+    }
     let verified = object_metadata(&std::fs::read(&final_path)?);
     if verified != actual {
-        let _ = std::fs::remove_file(&final_path);
         anyhow::bail!("attachment object verification failed");
     }
     Ok(StoredObject {
@@ -374,6 +377,10 @@ fn put_immutable_blocking(root: &Path, request: PutObjectRequest) -> anyhow::Res
         checksum_sha256: verified.checksum_sha256,
     })
 }
+
+#[cfg(test)]
+static FORCE_OBJECT_VERIFICATION_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn validate_sha256(value: &str) -> anyhow::Result<String> {
     if value.len() != 64
@@ -1400,5 +1407,27 @@ mod tests {
             .unwrap();
         replacement.abort().await.unwrap();
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn verification_failure_leaves_published_object_as_safe_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("attachments");
+        let store = FilesystemAttachmentStore::new(root.clone());
+        FORCE_OBJECT_VERIFICATION_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = store
+            .put_immutable(PutObjectRequest {
+                object_key: "objects/orphan".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+                    .into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("verification failed"));
+        assert_eq!(
+            std::fs::read(root.join("objects/orphan")).unwrap(),
+            b"payload"
+        );
     }
 }
