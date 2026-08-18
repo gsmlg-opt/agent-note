@@ -336,6 +336,19 @@ pub struct DashboardLabel {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DashboardCategoryValue {
+    pub value: String,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DashboardCategory {
+    pub key: String,
+    pub description: String,
+    pub values: Vec<DashboardCategoryValue>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct DashboardNote {
     pub id: String,
     pub title: String,
@@ -356,6 +369,7 @@ pub struct DashboardSummary {
     pub label_count: usize,
     pub last_updated_at: Option<i64>,
     pub labels: Vec<DashboardLabel>,
+    pub categories: Vec<DashboardCategory>,
     pub recent_updates: Vec<DashboardNote>,
 }
 
@@ -816,5 +830,39 @@ mod tests {
         assert_eq!(error.code, "unexpected_response");
         assert!(error.retryable);
         assert!(!error.to_string().contains("proxy secret"));
+    }
+
+    #[test]
+    fn dashboard_summary_deserializes_category_values() {
+        let summary: DashboardSummary = serde_json::from_value(serde_json::json!({
+            "note_count": 7,
+            "embedded_note_count": 5,
+            "embedding_note": { "id": "note-5", "title": "Embedded note" },
+            "label_count": 3,
+            "last_updated_at": 1_723_456_789,
+            "labels": [{
+                "key": "project",
+                "description": "Project",
+                "value_type": "text",
+                "count": 2
+            }],
+            "categories": [{
+                "key": "project",
+                "description": "Project",
+                "values": [{ "value": "yellow-dog", "count": 2 }]
+            }],
+            "recent_updates": [{
+                "id": "note-7",
+                "title": "Latest note",
+                "updated_at": 1_723_456_789
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(summary.categories.len(), 1);
+        assert_eq!(summary.categories[0].key, "project");
+        assert_eq!(summary.categories[0].description, "Project");
+        assert_eq!(summary.categories[0].values[0].value, "yellow-dog");
+        assert_eq!(summary.categories[0].values[0].count, 2);
     }
 }

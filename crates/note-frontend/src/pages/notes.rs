@@ -6,14 +6,12 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::components::icons;
 use crate::components::Modal;
-use crate::routes::{NotesQueryParams, Route};
+use crate::routes::{NotesQueryParams, Route, DEFAULT_NOTES_PAGE_SIZE};
 use crate::state::{
     stale_retry_blocked, LabelFilter, LabelKey, NoteSummary, SearchResultSummary,
     StaleRevisionGate, StaleRevisionGateAction,
 };
 
-/// Notes shown per page in the list view.
-const DEFAULT_PAGE_SIZE: usize = 10;
 const MAX_PAGE_SIZE: usize = 1000;
 const PAGE_SIZE_OPTIONS: [usize; 5] = [10, 30, 50, 100, 1000];
 const RETRIEVAL_PLACEHOLDER: &str = "Retrieve by title or content";
@@ -34,7 +32,7 @@ struct NotesUrlState {
 fn default_notes_url_state() -> NotesUrlState {
     NotesUrlState {
         current: 1,
-        page_size: DEFAULT_PAGE_SIZE,
+        page_size: DEFAULT_NOTES_PAGE_SIZE,
         search: String::new(),
         labels: Vec::new(),
     }
@@ -92,7 +90,7 @@ fn normalize_page_size(page_size: usize) -> usize {
     } else if page_size > MAX_PAGE_SIZE {
         MAX_PAGE_SIZE
     } else {
-        DEFAULT_PAGE_SIZE
+        DEFAULT_NOTES_PAGE_SIZE
     }
 }
 
@@ -185,7 +183,7 @@ pub fn notes_page() -> Html {
     let stale_revision_gate = use_reducer(StaleRevisionGate::default);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
-    let page_size = use_state(|| DEFAULT_PAGE_SIZE);
+    let page_size = use_state(|| DEFAULT_NOTES_PAGE_SIZE);
     let label_filters = use_state(Vec::<LabelFilter>::new);
     let filter_key = use_state(String::new);
     let filter_operator = use_state(|| "=".to_string());

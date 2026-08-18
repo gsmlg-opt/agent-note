@@ -126,6 +126,8 @@ pub struct LabelFilter {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
+    pub category_labels: Vec<String>,
+    #[serde(default)]
     pub duplicate_check: DuplicateCheckConfig,
 }
 
@@ -167,7 +169,9 @@ mod tests {
 
     use yew::Reducible;
 
-    use super::{stale_retry_blocked, StaleRevisionGate, StaleRevisionGateAction, SystemInfo};
+    use super::{
+        stale_retry_blocked, StaleRevisionGate, StaleRevisionGateAction, SystemConfig, SystemInfo,
+    };
 
     #[test]
     fn stale_conflicts_block_retry_until_reload_clears_them() {
@@ -229,5 +233,16 @@ mod tests {
         assert_eq!(info.embedding_engine, "openai");
         assert_eq!(info.embedding_model, "bge-m3");
         assert_eq!(info.embedding_fingerprint, "bge-m3:1024");
+    }
+
+    #[test]
+    fn system_config_deserializes_category_labels_with_an_empty_backward_compatible_default() {
+        let omitted: SystemConfig = serde_json::from_str(r#"{"duplicate_check": {}}"#).unwrap();
+        let configured: SystemConfig =
+            serde_json::from_str(r#"{"category_labels":["team","project"],"duplicate_check":{}}"#)
+                .unwrap();
+
+        assert!(omitted.category_labels.is_empty());
+        assert_eq!(configured.category_labels, ["team", "project"]);
     }
 }
