@@ -414,6 +414,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
         },
+        time::Duration,
     };
     use wiremock::{
         matchers::{header_regex, method, path},
@@ -478,6 +479,46 @@ mod tests {
                     .insert_header("x-amz-meta-checksum-sha256", self.checksum.as_str())
             }
         }
+    }
+
+    #[derive(Clone)]
+    struct FailThenSucceed {
+        calls: Arc<AtomicUsize>,
+        failures: usize,
+        success: ResponseTemplate,
+    }
+
+    impl Respond for FailThenSucceed {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.failures {
+                ResponseTemplate::new(503)
+            } else {
+                self.success.clone()
+            }
+        }
+    }
+
+    fn test_env(access: &str, secret: &str) -> AwsEnvGuard {
+        AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some(access)),
+            ("AWS_SECRET_ACCESS_KEY", Some(secret)),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ])
+    }
+
+    async fn test_store(endpoint: String) -> S3AttachmentStore {
+        S3AttachmentStore::new(S3AttachmentConfig {
+            bucket: "agent-note".into(),
+            prefix: String::new(),
+            region: Some("us-east-1".into()),
+            endpoint: Some(endpoint),
+            force_path_style: true,
+        })
+        .await
+        .unwrap()
     }
 
     #[test]
@@ -568,5 +609,409 @@ mod tests {
         assert_eq!(stored.size_bytes, 7);
         assert_eq!(stored.checksum_sha256, checksum);
         assert_eq!(head_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn immutable_collision_is_rejected_before_put() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("collision-access", "collision-secret");
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/collision"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "7")
+                    .insert_header("x-amz-meta-checksum-sha256", checksum),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/collision"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = test_store(server.uri())
+            .await
+            .put_immutable(crate::PutObjectRequest {
+                object_key: "generations/collision".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: checksum.into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method.as_str() != "PUT"));
+    }
+
+    async fn mount_conditional_collision(
+        server: &MockServer,
+        key: &str,
+        checksum: &str,
+        bytes: &'static [u8],
+    ) {
+        Mock::given(method("HEAD"))
+            .and(path(format!("/agent-note/{key}")))
+            .respond_with(MissingThenObjectMetadata {
+                calls: Arc::new(AtomicUsize::new(0)),
+                checksum: checksum.into(),
+                size_bytes: bytes.len() as u64,
+            })
+            .expect(2)
+            .mount(server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/agent-note/{key}")))
+            .and(header_regex("if-none-match", r"^\*$"))
+            .respond_with(ResponseTemplate::new(412).set_body_raw(
+                "<Error><Code>PreconditionFailed</Code></Error>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/agent-note/{key}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn conditional_412_is_idempotent_only_for_exact_matching_content() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("conditional-access", "conditional-secret");
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+
+        let matching = MockServer::start().await;
+        mount_conditional_collision(&matching, "generations/matching", checksum, b"payload").await;
+        let stored = test_store(matching.uri())
+            .await
+            .put_immutable(crate::PutObjectRequest {
+                object_key: "generations/matching".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: checksum.into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored.object_key, "generations/matching");
+
+        let mismatched = MockServer::start().await;
+        mount_conditional_collision(&mismatched, "generations/mismatch", checksum, b"corrupt")
+            .await;
+        let error = test_store(mismatched.uri())
+            .await
+            .put_immutable(crate::PutObjectRequest {
+                object_key: "generations/mismatch".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: checksum.into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "attachment object already exists");
+    }
+
+    #[tokio::test]
+    async fn immutable_put_rejects_substituted_content_after_successful_put() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("verify-access", "verify-secret");
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/corrupt"))
+            .respond_with(MissingThenObjectMetadata {
+                calls: Arc::new(AtomicUsize::new(0)),
+                checksum: checksum.into(),
+                size_bytes: 7,
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/generations/corrupt"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/corrupt"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"corrupt".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = test_store(server.uri())
+            .await
+            .put_immutable(crate::PutObjectRequest {
+                object_key: "generations/corrupt".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: checksum.into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "S3 put object verification failed (content mismatch)"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_immutable_put_finishes_publication_and_verification() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("cancel-access", "cancel-secret");
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/cancelled"))
+            .respond_with(MissingThenObjectMetadata {
+                calls: Arc::new(AtomicUsize::new(0)),
+                checksum: checksum.into(),
+                size_bytes: 7,
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/generations/cancelled"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(150)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/cancelled"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = test_store(server.uri()).await;
+        let task = tokio::spawn(async move {
+            store
+                .put_immutable(crate::PutObjectRequest {
+                    object_key: "generations/cancelled".into(),
+                    bytes: b"payload".to_vec(),
+                    checksum_sha256: checksum.into(),
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        task.abort();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.method.as_str() == "GET")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_lifecycle_targets_one_exact_key_and_reports_missing_delete() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("lifecycle-access", "lifecycle-secret");
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "7")
+                    .insert_header("x-amz-meta-checksum-sha256", checksum),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/agent-note/generations/key"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = test_store(server.uri()).await;
+
+        assert_eq!(
+            store.read_object("generations/key").await.unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            store
+                .head_object("generations/key")
+                .await
+                .unwrap()
+                .size_bytes,
+            7
+        );
+        assert_eq!(
+            store.delete_object("generations/key").await.unwrap(),
+            crate::DeleteObjectOutcome::Deleted
+        );
+        assert_eq!(
+            store.delete_object("generations/missing").await.unwrap(),
+            crate::DeleteObjectOutcome::AlreadyAbsent
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_delete_targets_only_the_validated_note_path_key() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("legacy-access", "legacy-secret");
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/configured/note-1/nested/file.txt"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/agent-note/configured/note-1/nested/file.txt"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = S3AttachmentStore::new(S3AttachmentConfig {
+            bucket: "agent-note".into(),
+            prefix: "configured".into(),
+            region: Some("us-east-1".into()),
+            endpoint: Some(server.uri()),
+            force_path_style: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store
+                .delete_legacy("note-1", "nested/file.txt")
+                .await
+                .unwrap(),
+            crate::DeleteObjectOutcome::Deleted
+        );
+        assert!(store.delete_legacy("../escape", "file").await.is_err());
+        assert!(store.delete_legacy("note-1", "../escape").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sdk_retries_transient_immutable_reads_at_most_four_total_attempts() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("retry-access", "retry-secret");
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/retry"))
+            .respond_with(FailThenSucceed {
+                calls: calls.clone(),
+                failures: 3,
+                success: ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()),
+            })
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            test_store(server.uri())
+                .await
+                .read_object("generations/retry")
+                .await
+                .unwrap(),
+            b"payload"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn endpoint_validation_is_fixed_and_never_echoes_input() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("endpoint-access", "endpoint-secret");
+        for endpoint in [
+            "ftp://example.test",
+            "https://",
+            "https://sentinel-user:sentinel-password@example.test",
+            "https://example.test?sentinel-query",
+            "https://example.test#sentinel-fragment",
+            "not a URL",
+        ] {
+            let error = S3AttachmentStore::new(S3AttachmentConfig {
+                bucket: "bucket".into(),
+                prefix: String::new(),
+                region: Some("us-east-1".into()),
+                endpoint: Some(endpoint.into()),
+                force_path_style: false,
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.to_string(), "invalid S3 attachment endpoint URL");
+            assert!(!error.to_string().contains("sentinel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_endpoint_region_path_style_and_credentials_apply_to_immutable_reads() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("chain-access", "chain-secret");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/configured/generations/key"))
+            .and(header_regex(
+                "authorization",
+                r"Credential=chain-access/.*/us-east-1/s3/aws4_request",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let endpoint = server.uri();
+        let store = S3AttachmentStore::new(S3AttachmentConfig {
+            bucket: " agent-note ".into(),
+            prefix: "configured".into(),
+            region: Some(" us-east-1 ".into()),
+            endpoint: Some(endpoint.clone()),
+            force_path_style: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.read_object("generations/key").await.unwrap(),
+            b"payload"
+        );
+        let debug = format!("{store:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&endpoint));
+    }
+
+    #[test]
+    fn sdk_errors_keep_category_without_source_secrets() {
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+
+        let error = SdkError::<GetObjectError>::construction_failure(anyhow::anyhow!(
+            "AWS_ACCESS_KEY_ID=secret-access AWS_SECRET_ACCESS_KEY=secret-key"
+        ));
+        let rendered = safe_sdk_error("get object", &error).to_string();
+        assert_eq!(rendered, "S3 get object failed (request construction)");
+        assert!(!rendered.contains("secret-access"));
+        assert!(!rendered.contains("secret-key"));
     }
 }

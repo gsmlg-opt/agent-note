@@ -136,6 +136,10 @@ fn put_immutable_blocking(root: &Path, request: PutObjectRequest) -> anyhow::Res
     temp.disarm();
     created.disarm();
 
+    #[cfg(test)]
+    if FORCE_OBJECT_VERIFICATION_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("attachment object verification failed");
+    }
     let verified = object_metadata(&std::fs::read(&final_path)?);
     if verified != actual {
         anyhow::bail!("attachment object verification failed");
@@ -146,6 +150,10 @@ fn put_immutable_blocking(root: &Path, request: PutObjectRequest) -> anyhow::Res
         checksum_sha256: verified.checksum_sha256,
     })
 }
+
+#[cfg(test)]
+static FORCE_OBJECT_VERIFICATION_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn validate_sha256(value: &str) -> anyhow::Result<String> {
     if value.len() != 64
@@ -295,7 +303,7 @@ fn ensure_safe_parent_directories_blocking(
     relative_path: &str,
 ) -> anyhow::Result<CreatedDirectoriesCleanupGuard> {
     let mut created = Vec::new();
-    if !root.exists() {
+    if !validate_configured_root_blocking(root)? {
         std::fs::create_dir_all(root)?;
         created.push(root.to_path_buf());
     }
@@ -318,4 +326,46 @@ fn ensure_safe_parent_directories_blocking(
         }
     }
     Ok(CreatedDirectoriesCleanupGuard { paths: created })
+}
+
+fn validate_configured_root_blocking(root: &Path) -> anyhow::Result<bool> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("attachment root must not be a symlink")
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => anyhow::bail!("attachment root path is not a directory"),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verification_failure_reports_a_safe_orphan_and_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("attachments");
+        FORCE_OBJECT_VERIFICATION_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = put_immutable_blocking(
+            &root,
+            PutObjectRequest {
+                object_key: "objects/orphan".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+                    .into(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "attachment object verification failed");
+        assert_eq!(
+            std::fs::read(root.join("objects/orphan")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(std::fs::read_dir(root.join("objects")).unwrap().count(), 1);
+    }
 }

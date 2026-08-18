@@ -148,6 +148,44 @@ async fn immutable_object_operations_reject_symlink_escapes() {
     assert!(!outside.join("escape").exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn immutable_put_rejects_a_symlinked_configured_root() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, &root).unwrap();
+    let store = FilesystemAttachmentStore::new(root);
+    let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+
+    let error = store
+        .put_immutable(object_request("objects/escape", b"payload", checksum))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("root must not be a symlink"));
+    assert!(!outside.join("objects/escape").exists());
+}
+
+#[tokio::test]
+async fn immutable_put_rejects_a_non_directory_configured_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    std::fs::write(&root, b"not a directory").unwrap();
+    let store = FilesystemAttachmentStore::new(root);
+    let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+
+    let error = store
+        .put_immutable(object_request("objects/file", b"payload", checksum))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("root path is not a directory"));
+}
+
 #[test]
 fn info_reports_filesystem_engine_and_configured_root() {
     let root = std::path::PathBuf::from("configured/attachments");
