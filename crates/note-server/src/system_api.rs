@@ -47,20 +47,26 @@ async fn update_config_handler(
     State(ctx): State<Arc<Context>>,
     Json(config): Json<SystemConfig>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    update_system_config(&ctx, &config)
-        .await
-        .map(|_| StatusCode::NO_CONTENT)
-        .map_err(|error| {
+    match update_system_config(&ctx, &config).await {
+        Ok(()) => {
+            crate::notes_api::invalidate_dashboard_cache();
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(error) => {
             let status = if error
                 .downcast_ref::<note_core::SystemConfigValidationError>()
                 .is_some()
+                || error
+                    .downcast_ref::<note_core::CategoryLabelConfigError>()
+                    .is_some()
             {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (status, error.to_string())
-        })
+            Err((status, error.to_string()))
+        }
+    }
 }
 
 #[utoipa::path(
@@ -137,7 +143,7 @@ mod tests {
     use note_embedding::{
         EmbeddingBackendInfo, OpenAiCompatibleConfig, OpenAiCompatibleEmbedder, StubEmbedder,
     };
-    use note_pipelines::{save_note, EmbeddingJobNotifier, SaveNoteInput};
+    use note_pipelines::{define_label_key, save_note, EmbeddingJobNotifier, SaveNoteInput};
     use note_storage::{
         BackendInfo, StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
         StorageTransaction, TransactionMode,
@@ -297,6 +303,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(config["category_labels"], serde_json::json!([]));
         assert_eq!(config["duplicate_check"]["enabled"], false);
 
         let response = app
@@ -338,6 +345,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn unknown_category_label_returns_bad_request_without_changing_config() {
+        let (app, _ctx, _dir) = test_app().await;
+        let response = app
+            .clone()
+            .oneshot(request(
+                "PUT",
+                "/api/system/config",
+                r#"{"category_labels":["missing"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("unknown category label key: missing"),
+            "{body}"
+        );
+
+        let response = app
+            .oneshot(request("GET", "/api/system/config", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            config,
+            serde_json::json!({
+                "category_labels": [],
+                "duplicate_check": {"enabled": false, "rules": []}
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_category_labels_roundtrip_in_configured_order() {
+        let (app, ctx, _dir) = test_app().await;
+        define_label_key(&ctx, "project", "Project").await.unwrap();
+        define_label_key(&ctx, "status", "Status").await.unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "PUT",
+                "/api/system/config",
+                r#"{"category_labels":["status","project"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(request("GET", "/api/system/config", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            config["category_labels"],
+            serde_json::json!(["status", "project"])
+        );
     }
 
     #[tokio::test]

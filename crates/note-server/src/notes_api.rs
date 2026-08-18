@@ -11,11 +11,11 @@ use axum::{
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
-    bulk_update_note_labels, count_notes, delete_note, embedding_dashboard_status,
-    get_note_attachment, get_note_markdown, get_note_metadata, label_note_counts,
-    list_deleted_note_summaries, list_label_keys, list_note_summaries, normalized_list_limit,
-    normalized_list_offset, permanently_delete_note, restore_notes, save_note,
-    search_notes_filtered, update_note, BulkUpdateNoteLabelsInput,
+    bulk_update_note_labels, category_label_summaries, count_notes, delete_note,
+    embedding_dashboard_status, get_note_attachment, get_note_markdown, get_note_metadata,
+    label_note_counts, list_deleted_note_summaries, list_label_keys, list_note_summaries,
+    normalized_list_limit, normalized_list_offset, permanently_delete_note, restore_notes,
+    save_note, search_notes_filtered, update_note, BulkUpdateNoteLabelsInput,
     BulkUpdateNoteLabelsValidationError, Context, ListNotesParams, NoteMutationNotifier,
     RestoreNoteInput, SaveNoteInput,
 };
@@ -485,6 +485,19 @@ pub struct DashboardEmbeddingNoteDto {
 }
 
 #[derive(Clone, Serialize, utoipa::ToSchema)]
+pub struct DashboardCategoryValueDto {
+    pub value: String,
+    pub count: usize,
+}
+
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+pub struct DashboardCategoryDto {
+    pub key: String,
+    pub description: String,
+    pub values: Vec<DashboardCategoryValueDto>,
+}
+
+#[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct DashboardDto {
     pub note_count: usize,
     pub embedded_note_count: usize,
@@ -492,6 +505,7 @@ pub struct DashboardDto {
     pub label_count: usize,
     pub last_updated_at: Option<i64>,
     pub labels: Vec<DashboardLabelDto>,
+    pub categories: Vec<DashboardCategoryDto>,
     pub recent_updates: Vec<DashboardNoteDto>,
 }
 
@@ -566,6 +580,22 @@ async fn load_dashboard(ctx: &Context) -> anyhow::Result<DashboardDto> {
         })
         .collect::<Vec<_>>();
     let last_updated_at = recent_updates.first().map(|note| note.updated_at);
+    let categories = category_label_summaries(ctx)
+        .await?
+        .into_iter()
+        .map(|category| DashboardCategoryDto {
+            key: category.key,
+            description: category.description,
+            values: category
+                .values
+                .into_iter()
+                .map(|value| DashboardCategoryValueDto {
+                    value: value.value,
+                    count: value.count,
+                })
+                .collect(),
+        })
+        .collect();
 
     let mut dashboard = DashboardDto {
         note_count,
@@ -574,6 +604,7 @@ async fn load_dashboard(ctx: &Context) -> anyhow::Result<DashboardDto> {
         label_count,
         last_updated_at,
         labels,
+        categories,
         recent_updates,
     };
     refresh_dashboard_embedding_status(ctx, &mut dashboard).await?;
@@ -1967,13 +1998,48 @@ mod tests {
     }
 
     #[test]
-    fn openapi_constrains_dashboard_label_value_types() {
+    fn openapi_documents_dashboard_categories_and_constrains_label_value_types() {
         let document = note_openapi_document();
+        let schemas = &document["components"]["schemas"];
+
         assert_eq!(
-            document["components"]["schemas"]["DashboardLabelDto"]["properties"]["value_type"]
-                ["enum"],
+            schemas["DashboardLabelDto"]["properties"]["value_type"]["enum"],
             serde_json::json!(["text", "number", "version", "date", "datetime", "time"])
         );
+        assert_eq!(
+            schemas["DashboardDto"]["properties"]["categories"]["type"],
+            "array"
+        );
+        assert_eq!(
+            schemas["DashboardDto"]["properties"]["categories"]["items"]["$ref"],
+            "#/components/schemas/DashboardCategoryDto"
+        );
+
+        let mut category_fields = schemas["DashboardCategoryDto"]["properties"]
+            .as_object()
+            .expect("dashboard category properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        category_fields.sort_unstable();
+        assert_eq!(category_fields, vec!["description", "key", "values"]);
+        assert_eq!(
+            schemas["DashboardCategoryDto"]["properties"]["values"]["type"],
+            "array"
+        );
+        assert_eq!(
+            schemas["DashboardCategoryDto"]["properties"]["values"]["items"]["$ref"],
+            "#/components/schemas/DashboardCategoryValueDto"
+        );
+
+        let mut value_fields = schemas["DashboardCategoryValueDto"]["properties"]
+            .as_object()
+            .expect("dashboard category value properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        value_fields.sort_unstable();
+        assert_eq!(value_fields, vec!["count", "value"]);
     }
 
     // Builds the real /api/notes router over a fresh temp DB + stub embedder so tests exercise the
@@ -2534,6 +2600,7 @@ mod tests {
             Some(0)
         );
         assert!(json.get("embedding_note").unwrap().is_null());
+        assert_eq!(json["categories"], serde_json::json!([]));
 
         app.clone()
             .oneshot(post(
@@ -2597,6 +2664,68 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["embedding_note"].is_null());
         assert_eq!(json["embedded_note_count"].as_u64(), Some(1));
+        invalidate_dashboard_cache();
+    }
+
+    #[tokio::test]
+    async fn dashboard_categories_reflect_config_and_invalidate_cache() {
+        invalidate_dashboard_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
+        let ctx = Arc::new(
+            Context::new(
+                storage,
+                Arc::new(StubEmbedder),
+                Arc::new(FilesystemAttachmentStore::new(
+                    dir.path().join("attachments"),
+                )),
+            )
+            .with_note_mutation_notifier(Arc::new(DashboardCacheInvalidator)),
+        );
+        let app: Router = notes_router::<Arc<Context>>()
+            .merge(crate::system_api::system_router::<Arc<Context>>())
+            .with_state(ctx)
+            .into();
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Category note","content":"C","labels":[["project","yellow-dog"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let dashboard: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(dashboard["categories"], serde_json::json!([]));
+
+        let response = app
+            .clone()
+            .oneshot(put(
+                "/api/system/config",
+                r#"{"category_labels":["project"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app.oneshot(get("/api/dashboard")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let dashboard: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            dashboard["categories"],
+            serde_json::json!([{
+                "key": "project",
+                "description": "",
+                "values": [{"value": "yellow-dog", "count": 1}]
+            }])
+        );
         invalidate_dashboard_cache();
     }
 

@@ -163,6 +163,7 @@ async fn update_label_key_handler(
     params(("key" = String, Path, description = "Label key")),
     responses(
         (status = 200, description = "Label key deleted"),
+        (status = 400, description = "Invalid label key deletion", body = String, content_type = "text/plain"),
         (status = 500, description = "Server error", body = String, content_type = "text/plain")
     )
 )]
@@ -170,9 +171,17 @@ async fn delete_label_key_handler(
     State(ctx): State<Arc<Context>>,
     Path(key): Path<String>,
 ) -> Result<(), (axum::http::StatusCode, String)> {
-    delete_label_key(&ctx, &key)
-        .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    delete_label_key(&ctx, &key).await.map_err(|error| {
+        let status = if error
+            .downcast_ref::<note_core::CategoryLabelConfigError>()
+            .is_some()
+        {
+            axum::http::StatusCode::BAD_REQUEST
+        } else {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, error.to_string())
+    })?;
     crate::notes_api::invalidate_dashboard_cache();
     Ok(())
 }
@@ -261,7 +270,7 @@ mod tests {
             "string"
         );
 
-        for (method, error_status) in [("put", "400"), ("delete", "500")] {
+        for (method, error_statuses) in [("put", &["400"][..]), ("delete", &["400", "500"][..])] {
             let operation = &document["paths"]["/api/labels/{key}"][method];
             let key = operation["parameters"]
                 .as_array()
@@ -273,10 +282,12 @@ mod tests {
             assert_eq!(key["required"], true);
             assert_eq!(key["schema"]["type"], "string");
             assert!(operation["responses"]["200"].get("content").is_none());
-            assert_eq!(
-                operation["responses"][error_status]["content"]["text/plain"]["schema"]["type"],
-                "string"
-            );
+            for error_status in error_statuses {
+                assert_eq!(
+                    operation["responses"][error_status]["content"]["text/plain"]["schema"]["type"],
+                    "string"
+                );
+            }
         }
 
         assert_eq!(
@@ -321,7 +332,13 @@ mod tests {
                 dir.path().join("attachments"),
             )),
         ));
-        (labels_router::<Arc<Context>>().with_state(ctx).into(), dir)
+        (
+            labels_router::<Arc<Context>>()
+                .merge(crate::system_api::system_router::<Arc<Context>>())
+                .with_state(ctx)
+                .into(),
+            dir,
+        )
     }
 
     fn post(uri: &str, body: &str) -> Request<Body> {
@@ -535,5 +552,52 @@ mod tests {
             .expect("array")
             .iter()
             .any(|k| k.get("key").and_then(|v| v.as_str()) == Some("status")));
+    }
+
+    #[tokio::test]
+    async fn configured_category_label_cannot_be_deleted() {
+        let (app, _dir) = test_app().await;
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/labels",
+                r#"{"key":"project","description":"Project"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(put(
+                "/api/system/config",
+                r#"{"category_labels":["project"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(delete("/api/labels/project"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("remove it from System settings first"),
+            "{body}"
+        );
+
+        let response = app.oneshot(get("/api/labels")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let labels: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(labels
+            .as_array()
+            .expect("labels array")
+            .iter()
+            .any(|label| label["key"] == "project"));
     }
 }
