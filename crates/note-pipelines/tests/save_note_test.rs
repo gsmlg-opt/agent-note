@@ -431,6 +431,44 @@ async fn object_write_failure_opens_no_transaction_persists_no_note_and_does_not
 }
 
 #[tokio::test]
+async fn object_write_failure_preserves_the_sanitized_adapter_error_chain() {
+    let (ctx, _backend, attachments, events, _dir) = controlled_context(false).await;
+    attachments.fail_put_on_call(1);
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Adapter failure".into(),
+            content: "Preserve the safe adapter cause".into(),
+            attachments: vec![NoteAttachment {
+                id: "secret-id".into(),
+                path: "secret-path.bin".into(),
+                mime: "application/octet-stream".into(),
+                description: String::new(),
+                content: b"super-secret-payload".to_vec(),
+                storage: None,
+            }],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let chain = format!("{error:#}");
+    assert!(chain.contains("attachment object write failed"));
+    assert!(chain.contains("controlled immutable put failure"));
+    let object_key = events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|event| event.strip_prefix("put_object:"))
+        .unwrap()
+        .to_string();
+    assert!(!chain.contains(&object_key));
+    assert!(!chain.contains("super-secret-payload"));
+}
+
+#[tokio::test]
 async fn partial_multi_upload_failure_best_effort_deletes_every_generated_key() {
     let (ctx, _backend, attachments, events, _dir) = controlled_context(false).await;
     attachments.fail_put_on_call(2);
@@ -501,13 +539,12 @@ async fn returned_object_metadata_is_verified_before_opening_a_transaction() {
 }
 
 #[tokio::test]
-async fn begin_repository_and_commit_failures_delete_all_new_objects_and_keep_primary_errors() {
-    for failure in ["begin", "insert_note", "commit"] {
+async fn begin_and_repository_failures_delete_all_new_objects_and_keep_primary_errors() {
+    for failure in ["begin", "insert_note"] {
         let (ctx, backend, event_backend, attachments, events, _dir) =
             controlled_failure_context().await;
         match failure {
             "begin" => event_backend.fail_next_begin(),
-            "commit" => event_backend.fail_next_commit(),
             _ => event_backend.fail_next_repository_call(failure),
         }
 
@@ -525,7 +562,6 @@ async fn begin_repository_and_commit_failures_delete_all_new_objects_and_keep_pr
 
         assert!(format!("{error:#}").contains(match failure {
             "begin" => "controlled begin failure",
-            "commit" => "controlled commit failure",
             _ => "controlled repository failure at insert_note",
         }));
         assert!(backend
@@ -547,6 +583,54 @@ async fn begin_repository_and_commit_failures_delete_all_new_objects_and_keep_pr
             .any(|event| event == &format!("delete_object:{key}")));
         assert!(!events.iter().any(|event| event == "wake"));
     }
+}
+
+#[tokio::test]
+async fn commit_acknowledgement_failure_retains_active_metadata_and_generated_objects() {
+    let (ctx, backend, event_backend, attachments, events, _dir) =
+        controlled_failure_context().await;
+    event_backend.fail_next_commit_acknowledgement();
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Committed despite acknowledgement".into(),
+            content: "The commit outcome is unknown to the caller".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let chain = format!("{error:#}");
+    assert!(chain.contains("sentinel commit acknowledgement failure"));
+    assert!(chain.contains("commit outcome is unknown"));
+    assert!(chain.contains("generated attachment objects retained"));
+    let note = backend
+        .session()
+        .await
+        .unwrap()
+        .list_all_notes()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    assert!(attachments.has_object(&object_key));
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec![
+            format!("put_object:{object_key}"),
+            "begin".into(),
+            "commit_ack_failed".into(),
+        ]
+    );
 }
 
 #[tokio::test]

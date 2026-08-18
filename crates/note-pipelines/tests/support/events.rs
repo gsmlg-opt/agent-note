@@ -38,6 +38,7 @@ pub struct EventStorageBackend {
     events: EventLog,
     fail_begin: Arc<AtomicBool>,
     fail_commit: Arc<AtomicBool>,
+    fail_commit_ack: Arc<AtomicBool>,
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
     repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
     matching_note_ids_for_update_override: Arc<Mutex<Option<Vec<String>>>>,
@@ -52,6 +53,7 @@ impl EventStorageBackend {
             events,
             fail_begin: Arc::new(AtomicBool::new(false)),
             fail_commit: Arc::new(AtomicBool::new(false)),
+            fail_commit_ack: Arc::new(AtomicBool::new(false)),
             fail_repository_calls: Arc::new(Mutex::new(VecDeque::new())),
             repository_call_counts: Arc::new(Mutex::new(HashMap::new())),
             matching_note_ids_for_update_override: Arc::new(Mutex::new(None)),
@@ -62,6 +64,10 @@ impl EventStorageBackend {
 
     pub fn fail_next_commit(&self) {
         self.fail_commit.store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_next_commit_acknowledgement(&self) {
+        self.fail_commit_ack.store(true, Ordering::SeqCst);
     }
 
     pub fn fail_next_begin(&self) {
@@ -99,6 +105,7 @@ struct EventTransaction {
     inner: Box<dyn StorageTransaction>,
     events: EventLog,
     fail_commit: Arc<AtomicBool>,
+    fail_commit_ack: Arc<AtomicBool>,
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
     repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
     matching_note_ids_for_update_override: Arc<Mutex<Option<Vec<String>>>>,
@@ -159,6 +166,7 @@ impl StorageBackend for EventStorageBackend {
             inner: transaction,
             events: self.events.clone(),
             fail_commit: self.fail_commit.clone(),
+            fail_commit_ack: self.fail_commit_ack.clone(),
             fail_repository_calls: self.fail_repository_calls.clone(),
             repository_call_counts: self.repository_call_counts.clone(),
             matching_note_ids_for_update_override: self
@@ -477,6 +485,7 @@ impl StorageTransaction for EventTransaction {
             inner,
             events,
             fail_commit,
+            fail_commit_ack,
             fail_repository_calls: _,
             repository_call_counts: _,
             matching_note_ids_for_update_override: _,
@@ -492,6 +501,13 @@ impl StorageTransaction for EventTransaction {
             ));
         }
         inner.commit().await?;
+        if fail_commit_ack.swap(false, Ordering::SeqCst) {
+            events.lock().unwrap().push("commit_ack_failed".into());
+            return Err(StorageError::new(
+                StorageErrorKind::Transaction,
+                "sentinel commit acknowledgement failure",
+            ));
+        }
         events.lock().unwrap().push("commit".into());
         Ok(())
     }
@@ -501,6 +517,7 @@ impl StorageTransaction for EventTransaction {
             inner,
             events,
             fail_commit: _,
+            fail_commit_ack: _,
             fail_repository_calls: _,
             repository_call_counts: _,
             matching_note_ids_for_update_override: _,

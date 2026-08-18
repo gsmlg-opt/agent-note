@@ -172,13 +172,24 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     }
     .await;
 
-    let finalized = finish_transaction(transaction, transaction_result).await;
-    let (queued, resolved_labels) = match finalized {
-        Ok(result) => result,
+    let (queued, resolved_labels) = match transaction_result {
+        Ok(result) => match transaction.commit().await {
+            Ok(()) => result,
+            Err(error) => {
+                return Err(anyhow::Error::from(error).context(
+                    "note transaction commit failed; generated attachment objects retained because commit outcome is unknown",
+                ));
+            }
+        },
         Err(error) => {
-            return Err(published_attachments
-                .cleanup_with_primary(ctx.attachments(), error)
-                .await);
+            return match transaction.rollback().await {
+                Ok(()) => Err(published_attachments
+                    .cleanup_with_primary(ctx.attachments(), error)
+                    .await),
+                Err(rollback_error) => Err(error.context(format!(
+                    "transaction rollback failed; generated attachment objects retained because rollback outcome is unknown: {rollback_error}"
+                ))),
+            };
         }
     };
     if queued > 0 {

@@ -40,9 +40,9 @@ pub(crate) async fn publish_generated_attachments(
             .await
         {
             Ok(stored) => stored,
-            Err(_) => {
+            Err(error) => {
                 return Err(published
-                    .cleanup_with_primary(store, anyhow::anyhow!("attachment object write failed"))
+                    .cleanup_with_primary(store, error.context("attachment object write failed"))
                     .await);
             }
         };
