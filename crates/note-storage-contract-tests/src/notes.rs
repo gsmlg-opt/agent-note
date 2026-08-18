@@ -832,6 +832,112 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             })
             .collect::<Vec<_>>()
     );
+    assert_eq!(
+        session
+            .label_value_counts(&[
+                "contract-notes-status".to_string(),
+                "contract-notes-missing".to_string(),
+                "contract-notes-priority".to_string(),
+                "contract-notes-status".to_string(),
+            ])
+            .await
+            .unwrap(),
+        vec![
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "1".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "10".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "3".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "5".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "9".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-status".into(),
+                value: "ready".into(),
+                count: 4,
+            },
+            LabelValueCount {
+                key: "contract-notes-status".into(),
+                value: "blocked".into(),
+                count: 1,
+            },
+        ]
+    );
+    session
+        .insert_label_key_with_type("contract-notes-category", "Category", LabelValueType::Text)
+        .await
+        .unwrap();
+    for (id, value) in [
+        ("contract-notes-category-zebra", "Zebra"),
+        ("contract-notes-category-alpha", "alpha"),
+        ("contract-notes-category-eclair", "Éclair"),
+    ] {
+        session
+            .insert_note(NewNote {
+                id,
+                title: id,
+                content: id,
+                attachments: &[],
+                created_at: 100,
+                updated_at: 100,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        session
+            .attach_label(id, "contract-notes-category", value)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session
+            .label_value_counts(&["contract-notes-category".to_string()])
+            .await
+            .unwrap(),
+        vec![
+            LabelValueCount {
+                key: "contract-notes-category".into(),
+                value: "Zebra".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-category".into(),
+                value: "alpha".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-category".into(),
+                value: "Éclair".into(),
+                count: 1,
+            },
+        ]
+    );
+    for id in [
+        "contract-notes-category-zebra",
+        "contract-notes-category-alpha",
+        "contract-notes-category-eclair",
+    ] {
+        session.soft_delete_note(id, 1, 110).await.unwrap();
+        session.permanently_delete_note(id, 2).await.unwrap();
+    }
     assert!(session.label_value_counts(&[]).await.unwrap().is_empty());
     assert_eq!(
         session
