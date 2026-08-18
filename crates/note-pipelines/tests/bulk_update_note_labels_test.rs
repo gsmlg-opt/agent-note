@@ -41,7 +41,7 @@ struct NotePreservationSnapshot {
     created_at: i64,
     updated_at: i64,
     note_revision: Option<i64>,
-    non_project_labels: Vec<Label>,
+    unrelated_labels: Vec<Label>,
     chunks: Vec<NoteChunk>,
     dense_search: Vec<String>,
     title_search: Vec<String>,
@@ -149,12 +149,13 @@ async fn preservation_snapshot(
     ctx: &Context,
     backend: &Arc<dyn StorageBackend>,
     id: &str,
+    excluded_label_keys: &[&str],
 ) -> NotePreservationSnapshot {
     let note = get_note(ctx, id).await.unwrap().unwrap();
-    let non_project_labels = note
+    let unrelated_labels = note
         .labels
         .iter()
-        .filter(|label| label.key != "project")
+        .filter(|label| !excluded_label_keys.contains(&label.key.as_str()))
         .cloned()
         .collect();
     let session = backend.session().await.unwrap();
@@ -188,7 +189,7 @@ async fn preservation_snapshot(
         created_at: note.created_at,
         updated_at: note.updated_at,
         note_revision,
-        non_project_labels,
+        unrelated_labels,
         chunks,
         dense_search,
         title_search,
@@ -211,7 +212,7 @@ fn assert_preserved_note_state(
         "{id} note_revision"
     );
     assert_eq!(
-        after.non_project_labels, before.non_project_labels,
+        after.unrelated_labels, before.unrelated_labels,
         "{id} unrelated labels"
     );
     assert_eq!(after.chunks, before.chunks, "{id} chunks");
@@ -253,7 +254,10 @@ async fn updates_matching_active_notes_with_add_replace_and_exact_noop_semantics
 
     let mut active_before = Vec::new();
     for id in ["add", "replace", "noop"] {
-        active_before.push((id, preservation_snapshot(&base_ctx, &backend, id).await));
+        active_before.push((
+            id,
+            preservation_snapshot(&base_ctx, &backend, id, &["project"]).await,
+        ));
     }
     let deleted_labels_before = backend
         .session()
@@ -270,6 +274,7 @@ async fn updates_matching_active_notes_with_add_replace_and_exact_noop_semantics
         BulkUpdateNoteLabelsInput {
             selector: "type=ietf-rfc".into(),
             set: vec![("project".into(), "new".into())],
+            remove: vec![],
         },
     )
     .await
@@ -301,7 +306,7 @@ async fn updates_matching_active_notes_with_add_replace_and_exact_noop_semantics
 
     drop(session);
     for (id, before) in active_before {
-        let after = preservation_snapshot(&ctx, &backend, id).await;
+        let after = preservation_snapshot(&ctx, &backend, id, &["project"]).await;
         assert_preserved_note_state(id, &before, &after, id != "noop");
     }
     assert_eq!(
@@ -329,6 +334,259 @@ async fn updates_matching_active_notes_with_add_replace_and_exact_noop_semantics
 }
 
 #[tokio::test]
+async fn removes_selector_label_from_fixed_active_targets_and_preserves_note_state() {
+    let (base_ctx, backend, dir) = test_context().await;
+    seed_note(&base_ctx, &backend, "remove-a", Some("IETF"), false).await;
+    seed_note(&base_ctx, &backend, "remove-b", None, false).await;
+    seed_note(&base_ctx, &backend, "remove-deleted", Some("IETF"), true).await;
+    let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
+    transaction
+        .insert_label_key_if_missing("status", "")
+        .await
+        .unwrap();
+    for id in ["remove-a", "remove-b"] {
+        transaction
+            .attach_label(id, "status", "ready")
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+
+    let mut active_before = Vec::new();
+    for id in ["remove-a", "remove-b"] {
+        active_before.push((
+            id,
+            preservation_snapshot(&base_ctx, &backend, id, &["type"]).await,
+        ));
+    }
+    let deleted_labels_before = backend
+        .session()
+        .await
+        .unwrap()
+        .labels_for_note("remove-deleted")
+        .await
+        .unwrap();
+    let events = event_log();
+    let (ctx, traced) = traced_context(backend.clone(), events.clone(), &dir);
+
+    let result = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![],
+            remove: vec!["type".into()],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result,
+        BulkUpdateNoteLabelsResult {
+            matched: 2,
+            updated: 2,
+            unchanged: 0,
+        }
+    );
+    let session = backend.session().await.unwrap();
+    for id in ["remove-a", "remove-b"] {
+        let labels = session.labels_for_note(id).await.unwrap();
+        assert!(!labels.iter().any(|label| label.key == "type"));
+        assert!(labels
+            .iter()
+            .any(|label| label.key == "owner" && label.value == "protocols"));
+        assert!(labels
+            .iter()
+            .any(|label| label.key == "status" && label.value == "ready"));
+    }
+    assert!(session
+        .labels_for_note("remove-a")
+        .await
+        .unwrap()
+        .iter()
+        .any(|label| label.key == "project" && label.value == "IETF"));
+    assert_eq!(
+        session.labels_for_note("remove-deleted").await.unwrap(),
+        deleted_labels_before
+    );
+    assert!(session
+        .list_label_keys()
+        .await
+        .unwrap()
+        .iter()
+        .any(|label_key| label_key.key == "type"));
+    drop(session);
+
+    for (id, before) in active_before {
+        let after = preservation_snapshot(&ctx, &backend, id, &["type"]).await;
+        assert_preserved_note_state(id, &before, &after, true);
+    }
+    assert_eq!(traced.repository_call_count("remove_note_label"), 2);
+    assert_eq!(traced.repository_call_count("advance_note_updated_at"), 2);
+    assert_eq!(traced.repository_call_count("list_label_keys"), 0);
+
+    let replay = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![],
+            remove: vec!["type".into()],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay,
+        BulkUpdateNoteLabelsResult {
+            matched: 0,
+            updated: 0,
+            unchanged: 0,
+        }
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["begin", "commit", "begin", "rollback"]
+    );
+}
+
+#[tokio::test]
+async fn mixed_set_and_remove_count_each_note_once_and_replay_as_unchanged() {
+    let (ctx, backend, _dir) = test_context().await;
+    seed_note(&ctx, &backend, "mixed-a", Some("old-a"), false).await;
+    seed_note(&ctx, &backend, "mixed-b", Some("old-b"), false).await;
+    let mut before = Vec::new();
+    for id in ["mixed-a", "mixed-b"] {
+        before.push((
+            id,
+            preservation_snapshot(&ctx, &backend, id, &["project", "owner"]).await,
+        ));
+    }
+
+    let input = BulkUpdateNoteLabelsInput {
+        selector: "type=ietf-rfc".into(),
+        set: vec![("project".into(), "IETF-RFC".into())],
+        remove: vec!["owner".into()],
+    };
+    let first = bulk_update_note_labels(&ctx, input.clone()).await.unwrap();
+    assert_eq!(
+        first,
+        BulkUpdateNoteLabelsResult {
+            matched: 2,
+            updated: 2,
+            unchanged: 0,
+        }
+    );
+    let session = backend.session().await.unwrap();
+    for id in ["mixed-a", "mixed-b"] {
+        let labels = session.labels_for_note(id).await.unwrap();
+        assert!(labels
+            .iter()
+            .any(|label| label.key == "project" && label.value == "IETF-RFC"));
+        assert!(!labels.iter().any(|label| label.key == "owner"));
+    }
+    drop(session);
+    for (id, snapshot) in &before {
+        let after = preservation_snapshot(&ctx, &backend, id, &["project", "owner"]).await;
+        assert_preserved_note_state(id, snapshot, &after, true);
+    }
+
+    let mut changed_timestamps = Vec::new();
+    for id in ["mixed-a", "mixed-b"] {
+        changed_timestamps.push(
+            backend
+                .session()
+                .await
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .updated_at,
+        );
+    }
+    let replay = bulk_update_note_labels(&ctx, input).await.unwrap();
+    assert_eq!(
+        replay,
+        BulkUpdateNoteLabelsResult {
+            matched: 2,
+            updated: 0,
+            unchanged: 2,
+        }
+    );
+    for (id, timestamp) in ["mixed-a", "mixed-b"].into_iter().zip(changed_timestamps) {
+        assert_eq!(
+            backend
+                .session()
+                .await
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .updated_at,
+            timestamp
+        );
+    }
+}
+
+#[tokio::test]
+async fn absent_known_and_unknown_removals_are_exact_noops() {
+    let (base_ctx, backend, dir) = test_context().await;
+    seed_note(&base_ctx, &backend, "remove-noop", None, false).await;
+    let before = backend
+        .session()
+        .await
+        .unwrap()
+        .get_note("remove-noop")
+        .await
+        .unwrap()
+        .unwrap();
+    let events = event_log();
+    let (ctx, traced) = traced_context(backend.clone(), events.clone(), &dir);
+    let ctx = ctx.with_note_mutation_notifier(Arc::new(MutationEventNotifier {
+        events: events.clone(),
+    }));
+
+    let result = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![],
+            remove: vec!["project".into(), "never-known".into()],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result,
+        BulkUpdateNoteLabelsResult {
+            matched: 1,
+            updated: 0,
+            unchanged: 1,
+        }
+    );
+    let session = backend.session().await.unwrap();
+    assert_eq!(
+        session
+            .get_note("remove-noop")
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        before.updated_at
+    );
+    assert!(!session
+        .list_label_keys()
+        .await
+        .unwrap()
+        .iter()
+        .any(|label_key| label_key.key == "never-known"));
+    assert_eq!(traced.repository_call_count("remove_note_label"), 2);
+    assert_eq!(*events.lock().unwrap(), vec!["begin", "commit"]);
+}
+
+#[tokio::test]
 async fn rejects_invalid_request_shapes_before_beginning_a_transaction() {
     let (_base_ctx, backend, dir) = test_context().await;
     let events = event_log();
@@ -337,38 +595,44 @@ async fn rejects_invalid_request_shapes_before_beginning_a_transaction() {
         (
             "   ",
             vec![("project".into(), "new".into())],
+            vec![],
             BulkUpdateNoteLabelsValidationError::EmptySelector,
             "selector must not be empty",
         ),
         (
             "type=x&&status=y",
             vec![("project".into(), "new".into())],
+            vec![],
             BulkUpdateNoteLabelsValidationError::MalformedSelector,
             "label selector is malformed",
         ),
         (
             "&type=x",
             vec![("project".into(), "new".into())],
+            vec![],
             BulkUpdateNoteLabelsValidationError::MalformedSelector,
             "label selector is malformed",
         ),
         (
             "type=x&",
             vec![("project".into(), "new".into())],
+            vec![],
             BulkUpdateNoteLabelsValidationError::MalformedSelector,
             "label selector is malformed",
         ),
         (
             "&",
             vec![("project".into(), "new".into())],
+            vec![],
             BulkUpdateNoteLabelsValidationError::MalformedSelector,
             "label selector is malformed",
         ),
         (
             "type=x",
             vec![],
-            BulkUpdateNoteLabelsValidationError::EmptySet,
-            "at least one label assignment is required",
+            vec![],
+            BulkUpdateNoteLabelsValidationError::EmptyMutations,
+            "at least one label set or remove mutation is required",
         ),
         (
             "type=x",
@@ -376,17 +640,33 @@ async fn rejects_invalid_request_shapes_before_beginning_a_transaction() {
                 ("project".into(), "one".into()),
                 ("project".into(), "two".into()),
             ],
+            vec![],
             BulkUpdateNoteLabelsValidationError::DuplicateKey("project".into()),
             "duplicate label assignment key: project",
         ),
+        (
+            "type=x",
+            vec![],
+            vec!["type".into(), "type".into()],
+            BulkUpdateNoteLabelsValidationError::DuplicateRemoveKey("type".into()),
+            "duplicate label removal key: type",
+        ),
+        (
+            "type=x",
+            vec![("type".into(), "new".into())],
+            vec!["type".into()],
+            BulkUpdateNoteLabelsValidationError::ConflictingKey("type".into()),
+            "label key cannot be both set and removed: type",
+        ),
     ];
 
-    for (selector, set, expected, message) in cases {
+    for (selector, set, remove, expected, message) in cases {
         let error = bulk_update_note_labels(
             &ctx,
             BulkUpdateNoteLabelsInput {
                 selector: selector.into(),
                 set,
+                remove,
             },
         )
         .await
@@ -412,10 +692,17 @@ async fn rejects_invalid_selector_and_target_keys_before_beginning_a_transaction
         BulkUpdateNoteLabelsInput {
             selector: "project$name=old".into(),
             set: vec![("project".into(), "new".into())],
+            remove: vec![],
         },
         BulkUpdateNoteLabelsInput {
             selector: "project=old".into(),
             set: vec![("target$key".into(), "new".into())],
+            remove: vec![],
+        },
+        BulkUpdateNoteLabelsInput {
+            selector: "project=old".into(),
+            set: vec![],
+            remove: vec!["target$key".into()],
         },
     ] {
         let error = bulk_update_note_labels(&ctx, input).await.unwrap_err();
@@ -440,6 +727,7 @@ async fn zero_matches_roll_back_without_creating_target_catalog_keys() {
             BulkUpdateNoteLabelsInput {
                 selector: selector.into(),
                 set: vec![("new-target".into(), "value".into())],
+                remove: vec![],
             },
         )
         .await
@@ -480,6 +768,7 @@ async fn creates_missing_target_catalog_keys_as_text_when_notes_match() {
         BulkUpdateNoteLabelsInput {
             selector: "type=ietf-rfc".into(),
             set: vec![("new-key".into(), "value".into())],
+            remove: vec![],
         },
     )
     .await
@@ -536,6 +825,7 @@ async fn rejects_values_invalid_for_the_final_catalog_types() {
             BulkUpdateNoteLabelsInput {
                 selector: "type=ietf-rfc".into(),
                 set: vec![(key.into(), value.into())],
+                remove: vec![],
             },
         )
         .await
@@ -578,6 +868,7 @@ async fn updates_all_1001_matches_without_a_page_cap() {
         BulkUpdateNoteLabelsInput {
             selector: "project=done".into(),
             set: vec![("project".into(), "done".into())],
+            remove: vec![],
         },
     )
     .await
@@ -601,6 +892,7 @@ async fn retains_the_fixed_target_ids_when_an_assignment_changes_the_selector() 
         BulkUpdateNoteLabelsInput {
             selector: "project=old".into(),
             set: vec![("project".into(), "new".into())],
+            remove: vec![],
         },
     )
     .await
@@ -634,6 +926,7 @@ async fn multiple_assignments_count_once_and_exact_noops_preserve_the_timestamp(
                 ("project".into(), "new".into()),
                 ("status".into(), "ready".into()),
             ],
+            remove: vec![],
         },
     )
     .await
@@ -658,6 +951,7 @@ async fn multiple_assignments_count_once_and_exact_noops_preserve_the_timestamp(
                 ("project".into(), "new".into()),
                 ("status".into(), "ready".into()),
             ],
+            remove: vec![],
         },
     )
     .await
@@ -709,6 +1003,7 @@ async fn repository_failure_after_label_writes_rolls_back_labels_catalog_and_tim
                 ("project".into(), "new".into()),
                 ("created-in-failed-transaction".into(), "value".into()),
             ],
+            remove: vec![],
         },
     )
     .await
@@ -737,6 +1032,73 @@ async fn repository_failure_after_label_writes_rolls_back_labels_catalog_and_tim
         .unwrap()
         .iter()
         .any(|key| key.key == "created-in-failed-transaction"));
+}
+
+#[tokio::test]
+async fn repository_failure_after_removal_restores_association_and_timestamp() {
+    let (base_ctx, backend, dir) = test_context().await;
+    seed_note(
+        &base_ctx,
+        &backend,
+        "remove-repository-failure",
+        Some("old"),
+        false,
+    )
+    .await;
+    let before = backend
+        .session()
+        .await
+        .unwrap()
+        .get_note("remove-repository-failure")
+        .await
+        .unwrap()
+        .unwrap();
+    let labels_before = backend
+        .session()
+        .await
+        .unwrap()
+        .labels_for_note("remove-repository-failure")
+        .await
+        .unwrap();
+    let events = event_log();
+    let (ctx, traced) = traced_context(backend.clone(), events.clone(), &dir);
+    let ctx = ctx.with_note_mutation_notifier(Arc::new(MutationEventNotifier {
+        events: events.clone(),
+    }));
+    traced.fail_next_repository_call("set_note_label");
+
+    let error = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![("project".into(), "new".into())],
+            remove: vec!["owner".into()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("controlled repository failure at set_note_label"));
+    assert_eq!(traced.repository_call_count("remove_note_label"), 1);
+    assert_eq!(*events.lock().unwrap(), vec!["begin", "rollback"]);
+    let session = backend.session().await.unwrap();
+    assert_eq!(
+        session
+            .labels_for_note("remove-repository-failure")
+            .await
+            .unwrap(),
+        labels_before
+    );
+    assert_eq!(
+        session
+            .get_note("remove-repository-failure")
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        before.updated_at
+    );
 }
 
 #[tokio::test]
@@ -770,6 +1132,7 @@ async fn commit_failure_returns_no_result_and_leaves_no_partial_state() {
                 ("project".into(), "new".into()),
                 ("commit-created-key".into(), "value".into()),
             ],
+            remove: vec![],
         },
     )
     .await
@@ -799,6 +1162,145 @@ async fn commit_failure_returns_no_result_and_leaves_no_partial_state() {
 }
 
 #[tokio::test]
+async fn commit_failure_after_removal_restores_association_and_timestamp() {
+    let (base_ctx, backend, dir) = test_context().await;
+    seed_note(
+        &base_ctx,
+        &backend,
+        "remove-commit-failure",
+        Some("old"),
+        false,
+    )
+    .await;
+    let before = backend
+        .session()
+        .await
+        .unwrap()
+        .get_note("remove-commit-failure")
+        .await
+        .unwrap()
+        .unwrap();
+    let labels_before = backend
+        .session()
+        .await
+        .unwrap()
+        .labels_for_note("remove-commit-failure")
+        .await
+        .unwrap();
+    let events = event_log();
+    let (ctx, traced) = traced_context(backend.clone(), events.clone(), &dir);
+    let ctx = ctx.with_note_mutation_notifier(Arc::new(MutationEventNotifier {
+        events: events.clone(),
+    }));
+    traced.fail_next_commit();
+
+    let error = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![],
+            remove: vec!["owner".into()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("controlled commit failure"));
+    assert_eq!(*events.lock().unwrap(), vec!["begin", "commit_failed"]);
+    let session = backend.session().await.unwrap();
+    assert_eq!(
+        session
+            .labels_for_note("remove-commit-failure")
+            .await
+            .unwrap(),
+        labels_before
+    );
+    assert_eq!(
+        session
+            .get_note("remove-commit-failure")
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        before.updated_at
+    );
+}
+
+#[tokio::test]
+async fn removal_notifier_runs_only_after_changed_commit() {
+    let (base_ctx, backend, dir) = test_context().await;
+    seed_note(&base_ctx, &backend, "remove-notifier", None, false).await;
+    let events = event_log();
+    let (ctx, traced) = traced_context(backend, events.clone(), &dir);
+    let ctx = ctx.with_note_mutation_notifier(Arc::new(MutationEventNotifier {
+        events: events.clone(),
+    }));
+
+    let changed = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![],
+            remove: vec!["owner".into()],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(changed.updated, 1);
+
+    let absent = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![],
+            remove: vec!["owner".into(), "never-known".into()],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(absent.updated, 0);
+    assert_eq!(absent.unchanged, 1);
+
+    let zero = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=missing".into(),
+            set: vec![],
+            remove: vec!["type".into()],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(zero.matched, 0);
+
+    traced.fail_next_commit();
+    let error = bulk_update_note_labels(
+        &ctx,
+        BulkUpdateNoteLabelsInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![],
+            remove: vec!["type".into()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("controlled commit failure"));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "begin",
+            "commit",
+            "note_mutated",
+            "begin",
+            "commit",
+            "begin",
+            "rollback",
+            "begin",
+            "commit_failed",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn mutation_notifier_runs_once_after_changed_commit_and_not_for_other_outcomes() {
     let (base_ctx, backend, dir) = test_context().await;
     seed_note(&base_ctx, &backend, "notifier", Some("old"), false).await;
@@ -813,6 +1315,7 @@ async fn mutation_notifier_runs_once_after_changed_commit_and_not_for_other_outc
         BulkUpdateNoteLabelsInput {
             selector: "type=ietf-rfc".into(),
             set: vec![("project".into(), "new".into())],
+            remove: vec![],
         },
     )
     .await
@@ -828,6 +1331,7 @@ async fn mutation_notifier_runs_once_after_changed_commit_and_not_for_other_outc
         BulkUpdateNoteLabelsInput {
             selector: "type=ietf-rfc".into(),
             set: vec![("project".into(), "new".into())],
+            remove: vec![],
         },
     )
     .await
@@ -839,6 +1343,7 @@ async fn mutation_notifier_runs_once_after_changed_commit_and_not_for_other_outc
         BulkUpdateNoteLabelsInput {
             selector: "type=missing".into(),
             set: vec![("project".into(), "new".into())],
+            remove: vec![],
         },
     )
     .await
@@ -851,6 +1356,7 @@ async fn mutation_notifier_runs_once_after_changed_commit_and_not_for_other_outc
         BulkUpdateNoteLabelsInput {
             selector: "type=ietf-rfc".into(),
             set: vec![("project".into(), "commit-failed".into())],
+            remove: vec![],
         },
     )
     .await

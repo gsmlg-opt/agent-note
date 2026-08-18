@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 pub struct BulkUpdateNoteLabelsInput {
     pub selector: String,
     pub set: Vec<(String, String)>,
+    pub remove: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,8 +25,10 @@ pub struct BulkUpdateNoteLabelsResult {
 pub enum BulkUpdateNoteLabelsValidationError {
     EmptySelector,
     MalformedSelector,
-    EmptySet,
+    EmptyMutations,
     DuplicateKey(String),
+    DuplicateRemoveKey(String),
+    ConflictingKey(String),
 }
 
 impl std::fmt::Display for BulkUpdateNoteLabelsValidationError {
@@ -33,9 +36,17 @@ impl std::fmt::Display for BulkUpdateNoteLabelsValidationError {
         match self {
             Self::EmptySelector => formatter.write_str("selector must not be empty"),
             Self::MalformedSelector => formatter.write_str("label selector is malformed"),
-            Self::EmptySet => formatter.write_str("at least one label assignment is required"),
+            Self::EmptyMutations => {
+                formatter.write_str("at least one label set or remove mutation is required")
+            }
             Self::DuplicateKey(key) => {
                 write!(formatter, "duplicate label assignment key: {key}")
+            }
+            Self::DuplicateRemoveKey(key) => {
+                write!(formatter, "duplicate label removal key: {key}")
+            }
+            Self::ConflictingKey(key) => {
+                write!(formatter, "label key cannot be both set and removed: {key}")
             }
         }
     }
@@ -67,19 +78,37 @@ pub async fn bulk_update_note_labels(
     for selector in &selectors {
         validate_label_key(&selector.key).map_err(anyhow::Error::new)?;
     }
-    if input.set.is_empty() {
+    if input.set.is_empty() && input.remove.is_empty() {
         return Err(anyhow::Error::new(
-            BulkUpdateNoteLabelsValidationError::EmptySet,
+            BulkUpdateNoteLabelsValidationError::EmptyMutations,
         ));
     }
     for (key, _) in &input.set {
         validate_label_key(key).map_err(anyhow::Error::new)?;
     }
-    let mut target_keys = HashSet::new();
+    for key in &input.remove {
+        validate_label_key(key).map_err(anyhow::Error::new)?;
+    }
+    let mut set_keys = HashSet::new();
     for (key, _) in &input.set {
-        if !target_keys.insert(key) {
+        if !set_keys.insert(key.as_str()) {
             return Err(anyhow::Error::new(
                 BulkUpdateNoteLabelsValidationError::DuplicateKey(key.clone()),
+            ));
+        }
+    }
+    let mut remove_keys = HashSet::new();
+    for key in &input.remove {
+        if !remove_keys.insert(key.as_str()) {
+            return Err(anyhow::Error::new(
+                BulkUpdateNoteLabelsValidationError::DuplicateRemoveKey(key.clone()),
+            ));
+        }
+    }
+    for key in &input.remove {
+        if set_keys.contains(key.as_str()) {
+            return Err(anyhow::Error::new(
+                BulkUpdateNoteLabelsValidationError::ConflictingKey(key.clone()),
             ));
         }
     }
@@ -102,34 +131,36 @@ pub async fn bulk_update_note_labels(
 
     let transaction_result = async {
         let matched = note_ids.len();
-        let existing_keys: HashSet<String> = transaction
-            .list_label_keys()
-            .await?
-            .into_iter()
-            .map(|label_key| label_key.key)
-            .collect();
-        for (key, _) in &input.set {
-            if !existing_keys.contains(key) {
-                transaction.insert_label_key_if_missing(key, "").await?;
+        if !input.set.is_empty() {
+            let existing_keys: HashSet<String> = transaction
+                .list_label_keys()
+                .await?
+                .into_iter()
+                .map(|label_key| label_key.key)
+                .collect();
+            for (key, _) in &input.set {
+                if !existing_keys.contains(key) {
+                    transaction.insert_label_key_if_missing(key, "").await?;
+                }
             }
-        }
-        let final_types: HashMap<String, LabelValueType> = transaction
-            .list_label_keys()
-            .await?
-            .into_iter()
-            .map(|label_key| (label_key.key, label_key.value_type))
-            .collect();
-        for (key, value) in &input.set {
-            let value_type = final_types
-                .get(key)
-                .copied()
-                .unwrap_or(LabelValueType::Text);
-            if !validate_label_value(value_type, value) {
-                return Err(anyhow::Error::new(ValidationError::InvalidLabelValue {
-                    key: key.clone(),
-                    value: value.clone(),
-                    value_type,
-                }));
+            let final_types: HashMap<String, LabelValueType> = transaction
+                .list_label_keys()
+                .await?
+                .into_iter()
+                .map(|label_key| (label_key.key, label_key.value_type))
+                .collect();
+            for (key, value) in &input.set {
+                let value_type = final_types
+                    .get(key)
+                    .copied()
+                    .unwrap_or(LabelValueType::Text);
+                if !validate_label_value(value_type, value) {
+                    return Err(anyhow::Error::new(ValidationError::InvalidLabelValue {
+                        key: key.clone(),
+                        value: value.clone(),
+                        value_type,
+                    }));
+                }
             }
         }
         let now = Utc::now().timestamp();
@@ -137,6 +168,9 @@ pub async fn bulk_update_note_labels(
 
         for note_id in note_ids {
             let mut changed = false;
+            for key in &input.remove {
+                changed |= transaction.remove_note_label(&note_id, key).await?;
+            }
             for (key, value) in &input.set {
                 changed |= transaction.set_note_label(&note_id, key, value).await?;
             }
