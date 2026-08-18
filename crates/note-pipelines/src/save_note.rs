@@ -92,19 +92,21 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     let now = chrono::Utc::now().timestamp();
     let note_revision = 1;
     let chunks = crate::chunk::chunk_content(&input.content);
-    let prepared_attachments = ctx.attachments().prepare(&id, &input.attachments).await?;
-    let attachment_metadata = prepared_attachments.metadata().to_vec();
+    let published_attachments = crate::generated_attachments::publish_generated_attachments(
+        ctx.attachments(),
+        &id,
+        &input.attachments,
+    )
+    .await?;
 
     // The note row, labels, chunk hashes, and embedding jobs are committed atomically. Actual
     // embedding is deliberately out-of-process: save returns once the durable queue request exists.
     let transaction = match ctx.storage().begin(TransactionMode::Immediate).await {
         Ok(transaction) => transaction,
         Err(error) => {
-            return Err(crate::note_attachments::abort_with_primary(
-                prepared_attachments,
-                error.into(),
-            )
-            .await);
+            return Err(published_attachments
+                .cleanup_with_primary(ctx.attachments(), error.into())
+                .await);
         }
     };
     let transaction_result = async {
@@ -152,7 +154,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
                 id: &id,
                 title: &input.title,
                 content: &input.content,
-                attachments: &attachment_metadata,
+                attachments: &published_attachments.metadata,
                 created_at: now,
                 updated_at: now,
                 note_revision,
@@ -174,12 +176,11 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
     let (queued, resolved_labels) = match finalized {
         Ok(result) => result,
         Err(error) => {
-            return Err(
-                crate::note_attachments::abort_with_primary(prepared_attachments, error).await,
-            );
+            return Err(published_attachments
+                .cleanup_with_primary(ctx.attachments(), error)
+                .await);
         }
     };
-    prepared_attachments.publish().await?;
     if queued > 0 {
         ctx.wake_embedding_jobs();
     }
@@ -188,7 +189,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
         id,
         title: input.title,
         content: input.content,
-        attachments: input.attachments,
+        attachments: published_attachments.attachments,
         labels: resolved_labels,
         created_at: now,
         updated_at: now,

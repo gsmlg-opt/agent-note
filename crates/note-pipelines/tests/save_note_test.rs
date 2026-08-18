@@ -14,6 +14,7 @@ use note_pipelines::{
     UpdateNoteFieldsInput, TRASH_RETENTION_SECONDS,
 };
 use note_storage::{NoteMutationResult, StorageBackend, TransactionMode};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -28,6 +29,22 @@ use note_core::{
 };
 
 type AttachmentObjects = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
+
+fn regular_file_count(root: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                regular_file_count(&entry.path())
+            } else {
+                usize::from(entry.file_type().is_ok_and(|kind| kind.is_file()))
+            }
+        })
+        .sum()
+}
 
 #[derive(Default)]
 struct RecordingAttachmentStore {
@@ -277,6 +294,40 @@ async fn controlled_context(
     (ctx, raw_backend, attachments, events, dir)
 }
 
+async fn controlled_failure_context() -> (
+    Context,
+    Arc<dyn StorageBackend>,
+    Arc<EventStorageBackend>,
+    Arc<ControlledAttachmentStore>,
+    EventLog,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let raw_backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let events = event_log();
+    let event_backend = Arc::new(EventStorageBackend::new(
+        raw_backend.clone(),
+        events.clone(),
+    ));
+    let backend: Arc<dyn StorageBackend> = event_backend.clone();
+    let attachments = Arc::new(ControlledAttachmentStore::new(
+        backend.clone(),
+        events.clone(),
+    ));
+    let ctx = Context::with_embedding_job_notifier(
+        backend,
+        Arc::new(StubEmbedder),
+        note_embedding::EmbeddingBackendInfo::local_bge_m3(),
+        Arc::new(EventNotifier::new(events.clone())),
+        attachments.clone(),
+    );
+    (ctx, raw_backend, event_backend, attachments, events, dir)
+}
+
 fn one_attachment() -> Vec<NoteAttachment> {
     vec![NoteAttachment {
         id: "file".into(),
@@ -289,7 +340,217 @@ fn one_attachment() -> Vec<NoteAttachment> {
 }
 
 #[tokio::test]
-async fn save_and_update_order_attachment_finalization_around_the_database_transaction() {
+async fn save_uploads_generated_objects_before_begin_and_persists_verified_metadata() {
+    let (ctx, backend, attachments, events, _dir) = controlled_context(true).await;
+    let bytes = vec![0, 159, 146, 150, 255];
+    let checksum = format!("{:x}", Sha256::digest(&bytes));
+
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Generated".into(),
+            content: "Object-first creation".into(),
+            attachments: vec![NoteAttachment {
+                id: "user-id-must-not-appear".into(),
+                path: "private/user-path-must-not-appear.bin".into(),
+                mime: "application/octet-stream".into(),
+                description: "binary".into(),
+                content: bytes.clone(),
+                storage: None,
+            }],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let storage = note.attachments[0].storage.as_ref().unwrap();
+    assert!(storage
+        .object_key
+        .starts_with(&format!("notes/{}/objects/", note.id)));
+    assert!(!storage.object_key.contains("user-id-must-not-appear"));
+    assert!(!storage.object_key.contains("user-path-must-not-appear"));
+    assert!(storage.object_key.ends_with(&checksum[..16]));
+    assert!(uuid::Uuid::parse_str(&storage.storage_generation).is_ok());
+    assert_eq!(storage.size_bytes, bytes.len() as u64);
+    assert_eq!(storage.checksum_sha256, checksum);
+    assert_eq!(note.attachments[0].content, bytes);
+    assert!(attachments.has_object(&storage.object_key));
+
+    let stored = backend
+        .session()
+        .await
+        .unwrap()
+        .get_note(&note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.attachments[0].content.is_empty());
+    assert_eq!(stored.attachments[0].storage, note.attachments[0].storage);
+
+    let events = events.lock().unwrap().clone();
+    let put = events
+        .iter()
+        .position(|event| event.starts_with("put_object:"))
+        .unwrap();
+    let begin = events.iter().position(|event| event == "begin").unwrap();
+    assert!(put < begin);
+    assert_eq!(events.last().map(String::as_str), Some("wake"));
+}
+
+#[tokio::test]
+async fn object_write_failure_opens_no_transaction_persists_no_note_and_does_not_wake() {
+    let (ctx, backend, attachments, events, _dir) = controlled_context(true).await;
+    attachments.fail_put_on_call(1);
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Rejected".into(),
+            content: "Object write must finish first".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "attachment object write failed");
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .list_all_notes()
+        .await
+        .unwrap()
+        .is_empty());
+    let events = events.lock().unwrap().clone();
+    assert!(events.iter().any(|event| event.starts_with("put_object:")));
+    assert!(!events.iter().any(|event| event == "begin"));
+    assert!(!events.iter().any(|event| event == "wake"));
+}
+
+#[tokio::test]
+async fn partial_multi_upload_failure_best_effort_deletes_every_generated_key() {
+    let (ctx, _backend, attachments, events, _dir) = controlled_context(false).await;
+    attachments.fail_put_on_call(2);
+    let mut second = one_attachment().remove(0);
+    second.id = "second".into();
+    second.path = "second.bin".into();
+    second.content = vec![0, 1, 2, 255];
+
+    save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Partial".into(),
+            content: "Clean all attempted generated objects".into(),
+            attachments: vec![one_attachment().remove(0), second],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let events = events.lock().unwrap().clone();
+    let keys: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event.strip_prefix("put_object:"))
+        .collect();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.iter().all(|key| !attachments.has_object(key)));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("delete_object:"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn returned_object_metadata_is_verified_before_opening_a_transaction() {
+    let (ctx, backend, attachments, events, _dir) = controlled_context(false).await;
+    attachments.corrupt_next_put_return();
+
+    let error = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Unverified".into(),
+            content: "Do not activate unverified metadata".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "attachment object verification failed");
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .list_all_notes()
+        .await
+        .unwrap()
+        .is_empty());
+    let events = events.lock().unwrap().clone();
+    assert!(events
+        .iter()
+        .any(|event| event.starts_with("delete_object:")));
+    assert!(!events.iter().any(|event| event == "begin"));
+}
+
+#[tokio::test]
+async fn begin_repository_and_commit_failures_delete_all_new_objects_and_keep_primary_errors() {
+    for failure in ["begin", "insert_note", "commit"] {
+        let (ctx, backend, event_backend, attachments, events, _dir) =
+            controlled_failure_context().await;
+        match failure {
+            "begin" => event_backend.fail_next_begin(),
+            "commit" => event_backend.fail_next_commit(),
+            _ => event_backend.fail_next_repository_call(failure),
+        }
+
+        let error = save_note(
+            &ctx,
+            SaveNoteInput {
+                title: "Database failure".into(),
+                content: "Generated object must become an orphan only if cleanup fails".into(),
+                attachments: one_attachment(),
+                labels: vec![],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains(match failure {
+            "begin" => "controlled begin failure",
+            "commit" => "controlled commit failure",
+            _ => "controlled repository failure at insert_note",
+        }));
+        assert!(backend
+            .session()
+            .await
+            .unwrap()
+            .list_all_notes()
+            .await
+            .unwrap()
+            .is_empty());
+        let events = events.lock().unwrap().clone();
+        let key = events
+            .iter()
+            .find_map(|event| event.strip_prefix("put_object:"))
+            .unwrap();
+        assert!(!attachments.has_object(key));
+        assert!(events
+            .iter()
+            .any(|event| event == &format!("delete_object:{key}")));
+        assert!(!events.iter().any(|event| event == "wake"));
+    }
+}
+
+#[tokio::test]
+async fn save_is_object_first_while_full_update_keeps_its_prepared_publication_order() {
     let (ctx, _backend, _attachments, events, _dir) = controlled_context(true).await;
 
     let note = save_note(
@@ -307,10 +568,12 @@ async fn save_and_update_order_attachment_finalization_around_the_database_trans
     assert_eq!(
         *events.lock().unwrap(),
         vec![
-            format!("prepare:{}:missing", note.id),
+            format!(
+                "put_object:{}",
+                note.attachments[0].storage.as_ref().unwrap().object_key
+            ),
             "begin".into(),
             "commit".into(),
-            format!("publish:{}:Before", note.id),
             "wake".into(),
         ]
     );
@@ -377,7 +640,7 @@ async fn save_existing_duplicate(ctx: &Context) {
 }
 
 #[tokio::test]
-async fn save_transaction_failure_rolls_back_then_aborts_prepared_attachments() {
+async fn save_transaction_failure_rolls_back_then_deletes_generated_objects() {
     let (ctx, _backend, _attachments, events, _dir) = controlled_context(false).await;
     enable_duplicate_series_rule(&ctx).await;
     save_existing_duplicate(&ctx).await;
@@ -397,19 +660,18 @@ async fn save_transaction_failure_rolls_back_then_aborts_prepared_attachments() 
 
     assert!(error.downcast_ref::<DuplicateNoteError>().is_some());
     let events = events.lock().unwrap().clone();
-    assert!(events[0].starts_with("prepare:"));
-    assert!(events[0].ends_with(":missing"));
+    assert!(events[0].starts_with("put_object:"));
     assert_eq!(events[1], "begin");
     assert_eq!(events[2], "rollback");
-    assert!(events[3].starts_with("abort:"));
+    assert!(events[3].starts_with("delete_object:"));
 }
 
 #[tokio::test]
-async fn attachment_publish_failure_keeps_the_committed_note_but_does_not_wake_the_worker() {
+async fn save_does_not_use_the_legacy_prepared_publish_path() {
     let (ctx, backend, attachments, events, _dir) = controlled_context(true).await;
     attachments.fail_publish();
 
-    let error = save_note(
+    save_note(
         &ctx,
         SaveNoteInput {
             title: "Committed".into(),
@@ -419,14 +681,15 @@ async fn attachment_publish_failure_keeps_the_committed_note_but_does_not_wake_t
         },
     )
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(error.to_string(), "controlled publish failure");
     let events = events.lock().unwrap().clone();
+    assert!(events[0].starts_with("put_object:"));
     assert_eq!(events[1], "begin");
     assert_eq!(events[2], "commit");
-    assert!(events[3].contains(":Committed"));
-    assert!(!events.iter().any(|event| event == "wake"));
+    assert_eq!(events[3], "wake");
+    assert!(!events.iter().any(|event| event.starts_with("prepare:")));
+    assert!(!events.iter().any(|event| event.starts_with("publish:")));
     assert_eq!(
         backend
             .session()
@@ -505,12 +768,12 @@ async fn permanent_delete_and_purge_remove_attachments_only_after_database_delet
 }
 
 #[tokio::test]
-async fn abort_failure_adds_context_without_hiding_the_primary_transaction_error() {
+async fn cleanup_failure_adds_safe_context_without_hiding_the_primary_transaction_error() {
     let (ctx, _backend, attachments, events, _dir) = controlled_context(false).await;
     enable_duplicate_series_rule(&ctx).await;
     save_existing_duplicate(&ctx).await;
     events.lock().unwrap().clear();
-    attachments.fail_abort();
+    attachments.fail_delete_object();
 
     let error = save_note(
         &ctx,
@@ -525,15 +788,17 @@ async fn abort_failure_adds_context_without_hiding_the_primary_transaction_error
     .unwrap_err();
 
     let chain = format!("{error:#}");
-    assert!(chain.contains("attachment abort also failed"));
-    assert!(chain.contains("controlled abort failure"));
+    assert!(chain.contains("generated attachment cleanup also failed"));
+    assert!(chain.contains("safe orphan may remain"));
+    assert!(!chain.contains("notes/"));
     assert!(error
         .chain()
         .any(|cause| cause.downcast_ref::<DuplicateNoteError>().is_some()));
     let events = events.lock().unwrap();
+    assert!(events[0].starts_with("put_object:"));
     assert_eq!(events[1], "begin");
     assert_eq!(events[2], "rollback");
-    assert!(events[3].starts_with("abort:"));
+    assert!(events[3].starts_with("delete_object:"));
 }
 
 #[tokio::test]
@@ -912,8 +1177,7 @@ async fn save_persists_attachments() {
     let attachment_path = _dir
         .path()
         .join("attachments")
-        .join(&note.id)
-        .join("meta.json");
+        .join(&note.attachments[0].storage.as_ref().unwrap().object_key);
     assert_eq!(std::fs::read_to_string(attachment_path).unwrap(), "{}");
 
     let hydrated = get_note(&ctx, &note.id).await.unwrap().unwrap();
@@ -947,8 +1211,7 @@ async fn save_and_get_preserve_binary_attachment_bytes() {
         std::fs::read(
             dir.path()
                 .join("attachments")
-                .join(&note.id)
-                .join("blob.bin")
+                .join(&note.attachments[0].storage.as_ref().unwrap().object_key)
         )
         .unwrap(),
         bytes
@@ -987,8 +1250,7 @@ async fn delete_and_restore_preserve_note_data_and_requeue_embeddings() {
         std::fs::read_to_string(
             dir.path()
                 .join("attachments")
-                .join(&note.id)
-                .join("meta.json")
+                .join(&note.attachments[0].storage.as_ref().unwrap().object_key)
         )
         .unwrap(),
         "{}"
@@ -1202,8 +1464,8 @@ async fn lifecycle_writes_report_stale_revisions_and_restore_batch_is_atomic() {
 }
 
 #[tokio::test]
-async fn purge_removes_notes_at_the_ninety_day_boundary_and_their_attachments() {
-    let (ctx, backend, dir) = test_context().await;
+async fn purge_removes_notes_at_the_ninety_day_boundary() {
+    let (ctx, backend, _dir) = test_context().await;
     let expired = save_note(
         &ctx,
         SaveNoteInput {
@@ -1265,9 +1527,6 @@ async fn purge_removes_notes_at_the_ninety_day_boundary_and_their_attachments() 
     let observer = backend.session().await.unwrap();
     assert!(!observer.note_exists(&expired.id).await.unwrap());
     assert!(observer.note_exists(&retained.id).await.unwrap());
-    assert!(!dir.path().join("attachments").join(&expired.id).exists());
-    assert!(dir.path().join("attachments").join(&retained.id).exists());
-
     let deleted = list_deleted_note_summaries(&ctx).await.unwrap();
     assert_eq!(deleted.len(), 1);
     assert_eq!(deleted[0].id, retained.id);
@@ -1427,12 +1686,7 @@ async fn duplicate_rule_rejects_create_with_the_same_composite_labels() {
             .len(),
         1
     );
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("attachments"))
-            .unwrap()
-            .count(),
-        0
-    );
+    assert_eq!(regular_file_count(&dir.path().join("attachments")), 0);
 }
 
 #[tokio::test]

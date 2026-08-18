@@ -1,5 +1,6 @@
 use note_attachments::{
-    AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
+    AttachmentStore, AttachmentStoreInfo, DeleteObjectOutcome, PreparedAttachmentMutation,
+    PreparedAttachmentSet, PutObjectRequest, StoredObject,
 };
 use note_core::{LabelSelector, NoteAttachment};
 use note_pipelines::EmbeddingJobNotifier;
@@ -35,6 +36,7 @@ pub fn event_log() -> EventLog {
 pub struct EventStorageBackend {
     inner: Arc<dyn StorageBackend>,
     events: EventLog,
+    fail_begin: Arc<AtomicBool>,
     fail_commit: Arc<AtomicBool>,
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
     repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
@@ -48,6 +50,7 @@ impl EventStorageBackend {
         Self {
             inner,
             events,
+            fail_begin: Arc::new(AtomicBool::new(false)),
             fail_commit: Arc::new(AtomicBool::new(false)),
             fail_repository_calls: Arc::new(Mutex::new(VecDeque::new())),
             repository_call_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -59,6 +62,10 @@ impl EventStorageBackend {
 
     pub fn fail_next_commit(&self) {
         self.fail_commit.store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_next_begin(&self) {
+        self.fail_begin.store(true, Ordering::SeqCst);
     }
 
     pub fn fail_next_repository_call(&self, name: &str) {
@@ -139,6 +146,13 @@ impl StorageBackend for EventStorageBackend {
     }
 
     async fn begin(&self, mode: TransactionMode) -> StorageResult<Box<dyn StorageTransaction>> {
+        if self.fail_begin.swap(false, Ordering::SeqCst) {
+            self.events.lock().unwrap().push("begin_failed".into());
+            return Err(StorageError::new(
+                StorageErrorKind::Operation,
+                "controlled begin failure",
+            ));
+        }
         let transaction = self.inner.begin(mode).await?;
         self.events.lock().unwrap().push("begin".into());
         Ok(Box::new(EventTransaction {
@@ -509,6 +523,11 @@ pub struct ControlledAttachmentStore {
     read_contents: Mutex<HashMap<(String, String), Vec<u8>>>,
     read_failures: Mutex<HashMap<(String, String), VecDeque<String>>>,
     read_path_races: Mutex<HashMap<(String, String), VecDeque<Vec<(String, String)>>>>,
+    object_contents: Mutex<HashMap<String, Vec<u8>>>,
+    fail_put_on_call: Mutex<Option<usize>>,
+    put_calls: Mutex<usize>,
+    corrupt_put_return: AtomicBool,
+    fail_delete: AtomicBool,
     committed_marker: Mutex<Option<String>>,
     blocked_publish_note: Mutex<Option<String>>,
     publish_started: Arc<Notify>,
@@ -527,6 +546,11 @@ impl ControlledAttachmentStore {
             read_contents: Mutex::new(HashMap::new()),
             read_failures: Mutex::new(HashMap::new()),
             read_path_races: Mutex::new(HashMap::new()),
+            object_contents: Mutex::new(HashMap::new()),
+            fail_put_on_call: Mutex::new(None),
+            put_calls: Mutex::new(0),
+            corrupt_put_return: AtomicBool::new(false),
+            fail_delete: AtomicBool::new(false),
             committed_marker: Mutex::new(None),
             blocked_publish_note: Mutex::new(None),
             publish_started: Arc::new(Notify::new()),
@@ -540,6 +564,32 @@ impl ControlledAttachmentStore {
 
     pub fn fail_abort(&self) {
         self.fail_abort.store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_put_on_call(&self, call: usize) {
+        *self.fail_put_on_call.lock().unwrap() = Some(call);
+    }
+
+    pub fn fail_delete_object(&self) {
+        self.fail_delete.store(true, Ordering::SeqCst);
+    }
+
+    pub fn corrupt_next_put_return(&self) {
+        self.corrupt_put_return.store(true, Ordering::SeqCst);
+    }
+
+    pub fn set_object_content(&self, object_key: &str, content: &[u8]) {
+        self.object_contents
+            .lock()
+            .unwrap()
+            .insert(object_key.to_string(), content.to_vec());
+    }
+
+    pub fn has_object(&self, object_key: &str) -> bool {
+        self.object_contents
+            .lock()
+            .unwrap()
+            .contains_key(object_key)
     }
 
     pub fn race_note_on_prepare(&self, note_id: &str) {
@@ -634,6 +684,70 @@ struct ControlledPreparedMutation {
 
 #[async_trait::async_trait]
 impl AttachmentStore for ControlledAttachmentStore {
+    async fn put_immutable(&self, request: PutObjectRequest) -> anyhow::Result<StoredObject> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("put_object:{}", request.object_key));
+        let call = {
+            let mut calls = self.put_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        if *self.fail_put_on_call.lock().unwrap() == Some(call) {
+            anyhow::bail!("controlled immutable put failure");
+        }
+        self.object_contents
+            .lock()
+            .unwrap()
+            .insert(request.object_key.clone(), request.bytes.clone());
+        let mut stored = StoredObject {
+            object_key: request.object_key,
+            size_bytes: request.bytes.len() as u64,
+            checksum_sha256: request.checksum_sha256,
+        };
+        if self.corrupt_put_return.swap(false, Ordering::SeqCst) {
+            stored.checksum_sha256 = "corrupt-returned-checksum".into();
+        }
+        Ok(stored)
+    }
+
+    async fn read_object(&self, object_key: &str) -> anyhow::Result<Vec<u8>> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("read_object:{object_key}"));
+        self.object_contents
+            .lock()
+            .unwrap()
+            .get(object_key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("controlled immutable object not found"))
+    }
+
+    async fn delete_object(&self, object_key: &str) -> anyhow::Result<DeleteObjectOutcome> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("delete_object:{object_key}"));
+        if self.fail_delete.load(Ordering::SeqCst) {
+            anyhow::bail!("controlled immutable delete failure");
+        }
+        Ok(
+            if self
+                .object_contents
+                .lock()
+                .unwrap()
+                .remove(object_key)
+                .is_some()
+            {
+                DeleteObjectOutcome::Deleted
+            } else {
+                DeleteObjectOutcome::AlreadyAbsent
+            },
+        )
+    }
+
     async fn prepare(
         &self,
         note_id: &str,
@@ -762,6 +876,63 @@ impl AttachmentStore for ControlledAttachmentStore {
             .lock()
             .unwrap()
             .push(format!("read:{note_id}:{path}"));
+        let key = (note_id.to_string(), path.to_string());
+        let content = self
+            .read_contents
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let failure = self
+            .read_failures
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front);
+        let race = self
+            .read_path_races
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .and_then(VecDeque::pop_front);
+        if let Some(replacements) = race {
+            let session = self.backend.session().await?;
+            if let Some(mut note) = session.get_note(note_id).await? {
+                for (attachment_id, replacement_path) in replacements {
+                    if let Some(attachment) = note
+                        .attachments
+                        .iter_mut()
+                        .find(|attachment| attachment.id == attachment_id)
+                    {
+                        attachment.path = replacement_path;
+                    }
+                }
+                session
+                    .update_note_attachments(AttachmentMetadataUpdate {
+                        id: note_id,
+                        expected_revision: note.revision,
+                        attachments: &note.attachments,
+                        updated_at: note.updated_at.saturating_add(1),
+                    })
+                    .await?;
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("race_read_paths:{note_id}:{path}"));
+            }
+        }
+        if let Some(message) = failure {
+            anyhow::bail!(message);
+        }
+        Ok(content)
+    }
+
+    async fn read_legacy(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("read_legacy:{note_id}:{path}"));
         let key = (note_id.to_string(), path.to_string());
         let content = self
             .read_contents

@@ -15,6 +15,8 @@ pub use mutation_error::*;
 pub mod note_attachments;
 pub use note_attachments::*;
 
+mod generated_attachments;
+
 pub mod chunk;
 pub use chunk::*;
 

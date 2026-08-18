@@ -1,10 +1,11 @@
 mod support;
 
-use note_core::{LabelValueType, NoteAttachment, ValidationError};
+use note_core::{AttachmentStorageMetadata, LabelValueType, NoteAttachment, ValidationError};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    chunk_hash, delete_note_attachment, drain_embedding_jobs, get_note_attachment_by_id,
-    put_note_attachment, AttachmentMutationError, Context, NoteMutationError,
+    chunk_hash, delete_note_attachment, drain_embedding_jobs, get_note, get_note_attachment,
+    get_note_attachment_by_id, put_note_attachment, AttachmentMutationError, Context,
+    NoteMutationError,
 };
 use note_storage::{NewNote, StorageBackend, TransactionMode, UpsertNoteChunk};
 use note_storage_turso::TursoStorage;
@@ -139,6 +140,91 @@ async fn controlled_context() -> (
     ));
     let ctx = Context::new(backend.clone(), Arc::new(StubEmbedder), attachments.clone());
     (ctx, backend, event_backend, attachments, events, dir)
+}
+
+#[tokio::test]
+async fn generated_attachment_reads_use_only_the_exact_object_key() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    let object_key = "notes/attachment-note/objects/generation-checksum";
+    let generated = NoteAttachment {
+        storage: Some(AttachmentStorageMetadata {
+            object_key: object_key.into(),
+            storage_generation: "generation".into(),
+            size_bytes: 5,
+            checksum_sha256: "checksum".into(),
+        }),
+        ..attachment(
+            "generated-id",
+            "user/path-must-not-be-read.bin",
+            "application/octet-stream",
+            "generated",
+            b"ignored legacy bytes",
+        )
+    };
+    seed_note(&ctx, &backend, NOTE_ID, &[generated]).await;
+    attachments.set_object_content(object_key, &[0, 1, 2, 254, 255]);
+    events.lock().unwrap().clear();
+
+    let by_path = get_note_attachment(&ctx, NOTE_ID, "user/path-must-not-be-read.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    let by_id = get_note_attachment_by_id(&ctx, NOTE_ID, "generated-id")
+        .await
+        .unwrap()
+        .unwrap();
+    let hydrated = get_note(&ctx, NOTE_ID).await.unwrap().unwrap();
+
+    assert_eq!(by_path.content, vec![0, 1, 2, 254, 255]);
+    assert_eq!(by_id.content, by_path.content);
+    assert_eq!(hydrated.attachments[0].content, by_path.content);
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec![
+            format!("read_object:{object_key}"),
+            format!("read_object:{object_key}"),
+            format!("read_object:{object_key}"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn legacy_attachment_reads_use_note_id_and_user_path() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[attachment(
+            "legacy-id",
+            "legacy/user-path.bin",
+            "application/octet-stream",
+            "legacy",
+            b"legacy bytes",
+        )],
+    )
+    .await;
+    attachments.set_read_content(NOTE_ID, "legacy/user-path.bin", &[0, 255, 3]);
+    events.lock().unwrap().clear();
+
+    get_note_attachment(&ctx, NOTE_ID, "legacy/user-path.bin")
+        .await
+        .unwrap()
+        .unwrap();
+    get_note_attachment_by_id(&ctx, NOTE_ID, "legacy-id")
+        .await
+        .unwrap()
+        .unwrap();
+    get_note(&ctx, NOTE_ID).await.unwrap().unwrap();
+
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec![
+            "read_legacy:attachment-note:legacy/user-path.bin",
+            "read_legacy:attachment-note:legacy/user-path.bin",
+            "read_legacy:attachment-note:legacy/user-path.bin",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -543,9 +629,9 @@ async fn get_by_id_retries_when_the_old_path_is_reassigned_to_another_id() {
     assert_eq!(
         events.lock().unwrap().clone(),
         vec![
-            "read:attachment-note:old.txt",
+            "read_legacy:attachment-note:old.txt",
             "race_read_paths:attachment-note:old.txt",
-            "read:attachment-note:new.txt",
+            "read_legacy:attachment-note:new.txt",
         ]
     );
 }
@@ -582,9 +668,9 @@ async fn get_by_id_retries_a_missing_old_object_when_metadata_moved_to_a_new_pat
     assert_eq!(
         events.lock().unwrap().clone(),
         vec![
-            "read:attachment-note:old.txt",
+            "read_legacy:attachment-note:old.txt",
             "race_read_paths:attachment-note:old.txt",
-            "read:attachment-note:new.txt",
+            "read_legacy:attachment-note:new.txt",
         ]
     );
 }
@@ -609,7 +695,7 @@ async fn get_by_id_preserves_a_read_failure_when_metadata_still_maps_to_the_same
     assert_eq!(format!("{error:#}"), "sentinel unchanged-path read failure");
     assert_eq!(
         events.lock().unwrap().clone(),
-        vec!["read:attachment-note:same.txt"]
+        vec!["read_legacy:attachment-note:same.txt"]
     );
 }
 
@@ -653,9 +739,9 @@ async fn get_by_id_returns_a_typed_conflict_after_a_second_path_reassignment() {
     assert_eq!(
         events.lock().unwrap().clone(),
         vec![
-            "read:attachment-note:first.txt",
+            "read_legacy:attachment-note:first.txt",
             "race_read_paths:attachment-note:first.txt",
-            "read:attachment-note:second.txt",
+            "read_legacy:attachment-note:second.txt",
             "race_read_paths:attachment-note:second.txt",
         ]
     );

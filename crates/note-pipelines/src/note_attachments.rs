@@ -68,9 +68,10 @@ impl std::fmt::Display for AttachmentMutationError {
 impl std::error::Error for AttachmentMutationError {}
 
 pub async fn hydrate_note_attachments(ctx: &Context, note: &mut Note) -> anyhow::Result<()> {
-    ctx.attachments()
-        .hydrate(&note.id, &mut note.attachments)
-        .await
+    for attachment in &mut note.attachments {
+        attachment.content = read_attachment(ctx, &note.id, attachment).await?;
+    }
+    Ok(())
 }
 
 pub async fn get_note_attachment(
@@ -97,7 +98,7 @@ pub async fn get_note_attachment(
         return Ok(None);
     };
 
-    attachment.content = ctx.attachments().read(note_id, &attachment.path).await?;
+    attachment.content = read_attachment(ctx, note_id, &attachment).await?;
     Ok(Some(attachment))
 }
 
@@ -209,8 +210,8 @@ pub async fn get_note_attachment_by_id(
         else {
             return Ok(None);
         };
-        let resolved_path = attachment.path;
-        let content = match ctx.attachments().read(note_id, &resolved_path).await {
+        let resolved_locator = AttachmentReadLocator::from(&attachment);
+        let content = match read_attachment(ctx, note_id, &attachment).await {
             Ok(content) => content,
             Err(read_error) => {
                 let Some(confirmed) =
@@ -218,9 +219,7 @@ pub async fn get_note_attachment_by_id(
                 else {
                     return Ok(None);
                 };
-                if normalize_attachment_path(&confirmed.path)
-                    == normalize_attachment_path(&resolved_path)
-                {
+                if AttachmentReadLocator::from(&confirmed) == resolved_locator {
                     return Err(read_error);
                 }
                 continue;
@@ -230,7 +229,7 @@ pub async fn get_note_attachment_by_id(
         else {
             continue;
         };
-        if normalize_attachment_path(&confirmed.path) == normalize_attachment_path(&resolved_path) {
+        if AttachmentReadLocator::from(&confirmed) == resolved_locator {
             confirmed.content = content;
             return Ok(Some(confirmed));
         }
@@ -240,6 +239,36 @@ pub async fn get_note_attachment_by_id(
             attachment_id: attachment_id.to_string(),
         },
     ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttachmentReadLocator {
+    Object(String),
+    Legacy(String),
+}
+
+impl From<&NoteAttachment> for AttachmentReadLocator {
+    fn from(attachment: &NoteAttachment) -> Self {
+        match &attachment.storage {
+            Some(storage) => Self::Object(storage.object_key.clone()),
+            None => Self::Legacy(normalize_attachment_path(&attachment.path)),
+        }
+    }
+}
+
+async fn read_attachment(
+    ctx: &Context,
+    note_id: &str,
+    attachment: &NoteAttachment,
+) -> anyhow::Result<Vec<u8>> {
+    match &attachment.storage {
+        Some(storage) => ctx.attachments().read_object(&storage.object_key).await,
+        None => {
+            ctx.attachments()
+                .read_legacy(note_id, &attachment.path)
+                .await
+        }
+    }
 }
 
 pub async fn delete_note_attachment(
