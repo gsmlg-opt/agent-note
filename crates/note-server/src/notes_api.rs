@@ -1324,11 +1324,13 @@ mod tests {
     };
     use note_embedding::StubEmbedder;
     use note_storage::{
-        ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, EmbeddingDashboardStatus,
-        EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteFieldsUpdate,
-        NoteMutationResult, NoteUpdate, NotesRepository, OrgRepository, RetrievalRepository,
-        SettingsRepository, StorageBackend, StorageError, StorageErrorKind, StorageResult,
-        StorageSession, StorageTransaction, TransactionMode, UpsertNoteChunk,
+        ActiveNoteSource, AttachmentMetadataUpdate, AttachmentOperation,
+        AttachmentOperationRepository, AttachmentOperationStatus, BackendInfo,
+        EmbeddingDashboardStatus, EmbeddingJob, EmbeddingRepository, LabelRepository,
+        NewAttachmentOperation, NewNote, NoteChunk, NoteFieldsUpdate, NoteMutationResult,
+        NoteUpdate, NotesRepository, OrgRepository, RetrievalRepository, SettingsRepository,
+        StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
+        StorageTransaction, TransactionMode, UpsertNoteChunk,
     };
     use note_storage_turso::TursoStorage;
     use serde_json::Value;
@@ -1441,6 +1443,29 @@ mod tests {
             fn matching_note_ids_for_update(selectors: &[note_core::LabelSelector]) -> Vec<String>;
             fn advance_note_updated_at(id: &str, now: i64) -> u64;
             fn list_active_note_sources() -> Vec<ActiveNoteSource>;
+        }
+    }
+
+    impl_forward_repository! {
+        AttachmentOperationRepository {
+            fn insert_attachment_operation(operation: NewAttachmentOperation) -> AttachmentOperation;
+            fn get_attachment_operation(id: &str) -> Option<AttachmentOperation>;
+            fn list_attachment_operations_for_note(note_id: &str) -> Vec<AttachmentOperation>;
+            fn claim_attachment_operations(
+                owner: &str,
+                now: i64,
+                lease_expires_at: i64,
+                limit: i64,
+            ) -> Vec<AttachmentOperation>;
+            fn complete_attachment_operation(id: &str, owner: &str, updated_at: i64) -> bool;
+            fn fail_attachment_operation(
+                id: &str,
+                owner: &str,
+                status: AttachmentOperationStatus,
+                next_attempt_at: Option<i64>,
+                last_error: &str,
+                updated_at: i64,
+            ) -> bool;
         }
     }
 

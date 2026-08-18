@@ -1,3 +1,4 @@
+mod attachment_operations;
 mod connection;
 mod embedding_jobs;
 mod labels;

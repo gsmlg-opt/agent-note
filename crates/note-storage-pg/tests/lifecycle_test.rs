@@ -87,6 +87,7 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
     for expected in [
         "_sqlx_migrations",
         "app_settings",
+        "attachment_operations",
         "embedding_jobs",
         "label_keys",
         "note_chunk_embeddings",
@@ -133,6 +134,8 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
     .expect("list migrated indexes");
     for (expected, access_method) in [
         ("idx_embedding_jobs_status", "btree"),
+        ("idx_attachment_operations_claim", "btree"),
+        ("idx_attachment_operations_note", "btree"),
         ("idx_note_chunks_hash", "btree"),
         ("idx_note_chunks_status", "btree"),
         ("idx_note_labels_key_value", "btree"),
@@ -161,6 +164,89 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
             .iter()
             .all(|(_, method, _, _, _)| method != "hnsw" && method != "ivfflat"),
         "migration must not create an ANN index"
+    );
+
+    let attachment_checks: Vec<(String, String)> = sqlx::query_as(
+        "SELECT conname, pg_get_constraintdef(oid, true)
+         FROM pg_constraint
+         WHERE conrelid = 'attachment_operations'::regclass AND contype = 'c'
+         ORDER BY conname",
+    )
+    .fetch_all(&inspection)
+    .await
+    .expect("list attachment operation checks");
+    for (name, expected_fragments) in [
+        (
+            "attachment_operations_kind_check",
+            &["kind = 'delete_object'::text"][..],
+        ),
+        (
+            "attachment_operations_status_check",
+            &["pending", "running", "completed", "dead"][..],
+        ),
+        (
+            "attachment_operations_attempts_check",
+            &["attempts >= 0"][..],
+        ),
+        (
+            "attachment_operations_identity_check",
+            &[
+                "btrim(id)",
+                "btrim(note_id)",
+                "btrim(attachment_id)",
+                "btrim(storage_generation)",
+                "btrim(object_key)",
+            ][..],
+        ),
+        (
+            "attachment_operations_lease_pair_check",
+            &["lease_owner IS NULL", "lease_expires_at IS NULL"][..],
+        ),
+        (
+            "attachment_operations_running_lease_check",
+            &["status = 'running'::text", "lease_owner IS NOT NULL"][..],
+        ),
+    ] {
+        let definition = attachment_checks
+            .iter()
+            .find_map(|(actual_name, definition)| (actual_name == name).then_some(definition))
+            .unwrap_or_else(|| panic!("missing attachment operation constraint {name}"));
+        for fragment in expected_fragments {
+            assert!(
+                definition.contains(fragment),
+                "constraint {name} must contain {fragment}: {definition}"
+            );
+        }
+    }
+
+    let attachment_unique_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT attribute.attname
+         FROM pg_constraint constraint_row
+         JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY
+           AS key(attnum, position) ON true
+         JOIN pg_attribute attribute
+           ON attribute.attrelid = constraint_row.conrelid
+          AND attribute.attnum = key.attnum
+         WHERE constraint_row.conrelid = 'attachment_operations'::regclass
+           AND constraint_row.contype = 'u'
+         ORDER BY key.position",
+    )
+    .fetch_all(&inspection)
+    .await
+    .expect("inspect attachment operation idempotency constraint");
+    assert_eq!(attachment_unique_columns, vec!["kind", "object_key"]);
+
+    let attachment_foreign_key_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_constraint
+         WHERE conrelid = 'attachment_operations'::regclass AND contype = 'f'",
+    )
+    .fetch_one(&inspection)
+    .await
+    .expect("inspect attachment operation foreign keys");
+    assert_eq!(
+        attachment_foreign_key_count, 0,
+        "cleanup records must survive permanent note deletion"
     );
 
     for (index, unique, predicate, columns) in [
@@ -398,14 +484,14 @@ async fn ordered_migrations_preserve_existing_notes() {
 
     let migrated = PgStorage::connect(&database.url, 2)
         .await
-        .expect("apply pending PostgreSQL migrations 3 and 4");
+        .expect("apply pending PostgreSQL migrations 3 through 5");
     let inspection = database.inspect_pool().await;
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&inspection)
             .await
             .expect("read ordered migration versions");
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     inspection.close().await;
 
     let session = migrated.connect_session().await.unwrap();

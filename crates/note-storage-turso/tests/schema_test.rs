@@ -5,7 +5,7 @@ use std::path::Path;
 use std::str::FromStr as _;
 
 const APPLICATION_ID: u32 = 0x414E4F54;
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 fn normalize_schema_sql(sql: &str) -> String {
     sql.split_whitespace()
@@ -267,6 +267,44 @@ async fn create_schema_v4_database(path: &Path) {
     while rows.next().await.unwrap().is_some() {}
 }
 
+async fn create_schema_v5_database(path: &Path) {
+    let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/schema-v5.sql"))
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO notes (
+                 id, title, content, attachments, created_at, updated_at, note_revision, deleted_at
+             ) VALUES ('migration-v5-survivor', 'Migration v5 survivor', 'preserved', '[]', 1, 1, 1, NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA application_id = 1095651156", ())
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA user_version = 5", ())
+        .await
+        .unwrap();
+    connection.execute("COMMIT", ()).await.unwrap();
+    connection.cacheflush().unwrap();
+    let mut rows = connection
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+}
+
 fn database_header(path: &Path) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap();
     assert!(bytes.len() >= 100);
@@ -355,7 +393,7 @@ async fn unsupported_marked_schema_is_rejected_without_modification() {
     let path = dir.path().join("future.db");
     drop(TursoStorage::open(&path).await.unwrap());
     let mut before = std::fs::read(&path).unwrap();
-    before[60..64].copy_from_slice(&6_u32.to_be_bytes());
+    before[60..64].copy_from_slice(&7_u32.to_be_bytes());
     std::fs::write(&path, &before).unwrap();
 
     let error = match TursoStorage::open(&path).await {
@@ -608,6 +646,42 @@ async fn schema_v4_is_migrated_without_rewriting_attempts() {
 }
 
 #[tokio::test]
+async fn schema_v5_is_migrated_without_losing_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v5.db");
+    create_schema_v5_database(&path).await;
+
+    let storage = TursoStorage::open(&path).await.unwrap();
+    database_header(&path);
+    let session = storage.connect().await.unwrap();
+    assert_eq!(
+        session
+            .get_note_content("migration-v5-survivor")
+            .await
+            .unwrap(),
+        Some("preserved".to_owned())
+    );
+    drop(session);
+    drop(storage);
+
+    let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    let mut rows = connection
+        .query(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table' AND name = 'attachment_operations'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(rows.next().await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn schema_v1_is_rejected_without_modification() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v1.db");
@@ -674,6 +748,7 @@ async fn fresh_database_contains_current_schema_objects() {
         "embedding_jobs",
         "note_chunk_embeddings",
         "app_settings",
+        "attachment_operations",
         "org_workspaces",
         "org_documents",
         "org_work_items",
@@ -695,6 +770,8 @@ async fn fresh_database_contains_current_schema_objects() {
         "idx_note_chunks_hash",
         "idx_note_chunks_status",
         "idx_embedding_jobs_status",
+        "idx_attachment_operations_note",
+        "idx_attachment_operations_claim",
     ] {
         assert!(
             indexes.iter().any(|index| index == expected),
@@ -832,6 +909,78 @@ async fn fresh_database_contains_current_schema_objects() {
     assert!(!indexes
         .iter()
         .any(|index| index == "idx_note_chunk_embedding"));
+
+    let attachment_schema = connection
+        .query(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'table' AND name = 'attachment_operations'",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    let attachment_schema = normalize_schema_sql(&attachment_schema);
+    for expected in [
+        "id TEXT PRIMARY KEY CHECK (length(trim(id)) > 0)",
+        "kind TEXT NOT NULL CHECK (kind = 'delete_object')",
+        "note_id TEXT NOT NULL CHECK (length(trim(note_id)) > 0)",
+        "attachment_id TEXT NOT NULL CHECK (length(trim(attachment_id)) > 0)",
+        "storage_generation TEXT NOT NULL CHECK (length(trim(storage_generation)) > 0)",
+        "object_key TEXT NOT NULL UNIQUE CHECK (length(trim(object_key)) > 0)",
+        "status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'dead'))",
+        "attempts INTEGER NOT NULL CHECK (attempts >= 0)",
+        "CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL))",
+        "CHECK ((status = 'running') = (lease_owner IS NOT NULL))",
+    ] {
+        assert!(
+            attachment_schema.contains(expected),
+            "missing attachment operation schema constraint: {expected}"
+        );
+    }
+    let note_index = sqlite_index_spec(
+        &connection,
+        "attachment_operations",
+        "idx_attachment_operations_note",
+    )
+    .await;
+    assert_eq!(note_index.0, false);
+    assert_eq!(note_index.2, ["note_id", "created_at", "id"]);
+    let claim_index = sqlite_index_spec(
+        &connection,
+        "attachment_operations",
+        "idx_attachment_operations_claim",
+    )
+    .await;
+    assert_eq!(claim_index.0, false);
+    assert_eq!(
+        claim_index.2,
+        [
+            "status",
+            "next_attempt_at",
+            "lease_expires_at",
+            "created_at",
+            "id",
+        ]
+    );
+    let foreign_key_count: i64 = connection
+        .query(
+            "SELECT count(*) FROM pragma_foreign_key_list('attachment_operations')",
+            (),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(foreign_key_count, 0);
 
     let mut columns = connection
         .query("PRAGMA table_info(org_leases)", ())

@@ -5,6 +5,171 @@ use crate::{StorageError, StorageErrorKind};
 
 pub const EMBEDDING_DIMENSION: usize = 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentOperationKind {
+    DeleteObject,
+}
+
+impl AttachmentOperationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeleteObject => "delete_object",
+        }
+    }
+}
+
+impl fmt::Display for AttachmentOperationKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AttachmentOperationKind {
+    type Err = StorageError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "delete_object" => Ok(Self::DeleteObject),
+            _ => Err(StorageError::new(
+                StorageErrorKind::Corrupt,
+                "attachment operation has an unknown kind",
+            )),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AttachmentOperationKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(|error| serde::de::Error::custom(error.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentOperationStatus {
+    Pending,
+    Running,
+    Completed,
+    Dead,
+}
+
+impl AttachmentOperationStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Dead => "dead",
+        }
+    }
+}
+
+impl fmt::Display for AttachmentOperationStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AttachmentOperationStatus {
+    type Err = StorageError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "dead" => Ok(Self::Dead),
+            _ => Err(StorageError::new(
+                StorageErrorKind::Corrupt,
+                "attachment operation has an unknown status",
+            )),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AttachmentOperationStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(|error| serde::de::Error::custom(error.to_string()))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewAttachmentOperation {
+    pub id: String,
+    pub kind: AttachmentOperationKind,
+    pub note_id: String,
+    pub attachment_id: String,
+    pub storage_generation: String,
+    pub object_key: String,
+    pub status: AttachmentOperationStatus,
+    pub attempts: i64,
+    pub next_attempt_at: Option<i64>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttachmentOperation {
+    pub id: String,
+    pub kind: AttachmentOperationKind,
+    pub note_id: String,
+    pub attachment_id: String,
+    pub storage_generation: String,
+    pub object_key: String,
+    pub status: AttachmentOperationStatus,
+    pub attempts: i64,
+    pub next_attempt_at: Option<i64>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+macro_rules! impl_attachment_operation_debug {
+    ($type:ty) => {
+        impl fmt::Debug for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct(stringify!($type))
+                    .field("id", &self.id)
+                    .field("kind", &self.kind)
+                    .field("note_id", &self.note_id)
+                    .field("attachment_id", &self.attachment_id)
+                    .field("storage_generation", &self.storage_generation)
+                    .field("object_key", &self.object_key)
+                    .field("status", &self.status)
+                    .field("attempts", &self.attempts)
+                    .field("next_attempt_at", &self.next_attempt_at)
+                    .field("lease_owner", &self.lease_owner)
+                    .field("lease_expires_at", &self.lease_expires_at)
+                    .field(
+                        "last_error",
+                        &self.last_error.as_ref().map(|_| "[REDACTED]"),
+                    )
+                    .field("created_at", &self.created_at)
+                    .field("updated_at", &self.updated_at)
+                    .finish()
+            }
+        }
+    };
+}
+
+impl_attachment_operation_debug!(NewAttachmentOperation);
+impl_attachment_operation_debug!(AttachmentOperation);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompareAndSwap<T> {
     Applied(T),

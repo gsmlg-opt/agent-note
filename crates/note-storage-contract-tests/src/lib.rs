@@ -1,3 +1,4 @@
+mod attachment_operations;
 mod bulk_labels;
 mod embedding;
 mod notes;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 /// contain prior data and this function must not be called twice on it.
 pub async fn run_storage_contracts(storage: Arc<dyn StorageBackend>) {
     notes::run(storage.clone()).await;
+    attachment_operations::run(storage.clone()).await;
     org::run(storage.clone()).await;
     embedding::run(storage.clone()).await;
     retrieval::run(storage.clone()).await;

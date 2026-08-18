@@ -1,12 +1,12 @@
 use crate::{
-    ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, CompareAndSwap,
-    EmbeddingDashboardStatus, EmbeddingJob, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent,
-    NewOrgLease, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteMutationResult, NoteUpdate,
-    OrgArtifactReference, OrgAttempt, OrgAttemptNoteReference, OrgAttemptUpdate, OrgDocument,
-    OrgDocumentUpdate, OrgEvent, OrgLease, OrgLeaseEndReason, OrgLeaseKind, OrgOperationalQuery,
-    OrgOperationalRow, OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceOperationalSummary,
-    OrgWorkspaceUpdate, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
-    UpsertNoteChunk,
+    ActiveNoteSource, AttachmentMetadataUpdate, AttachmentOperation, AttachmentOperationStatus,
+    BackendInfo, CompareAndSwap, EmbeddingDashboardStatus, EmbeddingJob, NewAttachmentOperation,
+    NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace, NoteChunk,
+    NoteFieldsUpdate, NoteMutationResult, NoteUpdate, OrgArtifactReference, OrgAttempt,
+    OrgAttemptNoteReference, OrgAttemptUpdate, OrgDocument, OrgDocumentUpdate, OrgEvent, OrgLease,
+    OrgLeaseEndReason, OrgLeaseKind, OrgOperationalQuery, OrgOperationalRow, OrgProjectedWorkItem,
+    OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, StorageError,
+    StorageErrorKind, StorageResult, StoredOrgOperation, UpsertNoteChunk,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -336,6 +336,51 @@ pub trait NotesRepository: Send + Sync {
     /// without changing its content or note revision.
     async fn advance_note_updated_at(&self, id: &str, now: i64) -> StorageResult<u64>;
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>>;
+}
+
+#[async_trait::async_trait]
+pub trait AttachmentOperationRepository: Send + Sync {
+    /// Enqueues an operation in the current transaction. Repeated immutable
+    /// delete intent returns the existing record.
+    async fn insert_attachment_operation(
+        &self,
+        operation: NewAttachmentOperation,
+    ) -> StorageResult<AttachmentOperation>;
+
+    async fn get_attachment_operation(
+        &self,
+        id: &str,
+    ) -> StorageResult<Option<AttachmentOperation>>;
+
+    async fn list_attachment_operations_for_note(
+        &self,
+        note_id: &str,
+    ) -> StorageResult<Vec<AttachmentOperation>>;
+
+    async fn claim_attachment_operations(
+        &self,
+        owner: &str,
+        now: i64,
+        lease_expires_at: i64,
+        limit: i64,
+    ) -> StorageResult<Vec<AttachmentOperation>>;
+
+    async fn complete_attachment_operation(
+        &self,
+        id: &str,
+        owner: &str,
+        updated_at: i64,
+    ) -> StorageResult<bool>;
+
+    async fn fail_attachment_operation(
+        &self,
+        id: &str,
+        owner: &str,
+        status: AttachmentOperationStatus,
+        next_attempt_at: Option<i64>,
+        last_error: &str,
+        updated_at: i64,
+    ) -> StorageResult<bool>;
 }
 
 #[async_trait::async_trait]
@@ -955,6 +1000,7 @@ pub enum TransactionMode {
 
 pub trait StorageSession:
     NotesRepository
+    + AttachmentOperationRepository
     + LabelRepository
     + EmbeddingRepository
     + RetrievalRepository
@@ -967,6 +1013,7 @@ pub trait StorageSession:
 
 impl<T> StorageSession for T where
     T: NotesRepository
+        + AttachmentOperationRepository
         + LabelRepository
         + EmbeddingRepository
         + RetrievalRepository
