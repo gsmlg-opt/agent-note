@@ -78,8 +78,11 @@ pub struct BulkUpdateNoteLabelsRequest {
     /// Label selector used to choose active notes.
     pub selector: String,
     /// Label `(key, value)` pairs to set or replace on every matching note.
-    #[schemars(length(min = 1))]
+    #[serde(default)]
     pub set: Vec<(String, String)>,
+    /// Label keys to remove from every matching note.
+    #[serde(default)]
+    pub remove: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -98,6 +101,7 @@ impl From<BulkUpdateNoteLabelsRequest> for BulkUpdateNoteLabelsToolInput {
         Self {
             selector: request.selector,
             set: request.set,
+            remove: request.remove,
         }
     }
 }
@@ -673,7 +677,7 @@ impl NoteMcpServer {
 impl NoteMcpServer {
     #[tool(
         name = "bulk_update_note_labels",
-        description = "Atomically set or replace labels on active notes matching a label selector while preserving unrelated labels."
+        description = "Atomically set, replace, or remove labels on active notes matching a label selector while preserving unrelated labels."
     )]
     pub async fn bulk_update_note_labels(
         &self,
@@ -1605,12 +1609,11 @@ mod tests {
         );
 
         let bulk_input = tool_schema(&server, "bulk_update_note_labels", false);
-        assert_exact_closed_object(&bulk_input, &bulk_input, &["selector", "set"]);
-        assert_eq!(required_names(&bulk_input), vec!["selector", "set"]);
+        assert_exact_closed_object(&bulk_input, &bulk_input, &["remove", "selector", "set"]);
+        assert_eq!(required_names(&bulk_input), vec!["selector"]);
         assert_eq!(bulk_input["properties"]["selector"]["type"], "string");
         let assignments = &bulk_input["properties"]["set"];
         assert_eq!(assignments["type"], "array");
-        assert_eq!(assignments["minItems"], 1);
         assert_eq!(assignments["items"]["type"], "array");
         assert_eq!(assignments["items"]["minItems"], 2);
         assert_eq!(assignments["items"]["maxItems"], 2);
@@ -1618,6 +1621,9 @@ mod tests {
             assignments["items"]["prefixItems"],
             json!([{"type": "string"}, {"type": "string"}])
         );
+        let removals = &bulk_input["properties"]["remove"];
+        assert_eq!(removals["type"], "array");
+        assert_eq!(removals["items"]["type"], "string");
 
         let bulk_output = tool_schema(&server, "bulk_update_note_labels", true);
         assert_exact_closed_object(
@@ -1888,6 +1894,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bulk_update_note_labels_request_defaults_omitted_mutations() {
+        let request = serde_json::from_value::<BulkUpdateNoteLabelsRequest>(json!({
+            "selector": "type=ietf-rfc"
+        }))
+        .unwrap();
+
+        assert!(request.set.is_empty());
+        assert!(request.remove.is_empty());
+    }
+
     #[tokio::test]
     async fn bulk_update_note_labels_handler_adds_replaces_and_reports_noops() {
         let (ctx, backend, _dir) = test_context().await;
@@ -1918,6 +1935,7 @@ mod tests {
             .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
                 selector: "type=ietf-rfc".into(),
                 set: vec![("project".into(), "new".into())],
+                remove: vec![],
             }))
             .await
             .unwrap()
@@ -1930,6 +1948,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_update_note_labels_handler_removes_labels_and_reports_absent_removals_as_noops() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
+        server
+            .save_note(Parameters(SaveNoteRequest {
+                title: "Remove owner".into(),
+                content: "Body".into(),
+                labels: vec![
+                    ("type".into(), "ietf-rfc".into()),
+                    ("owner".into(), "protocols".into()),
+                ],
+            }))
+            .await
+            .unwrap();
+
+        let removed = server
+            .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
+                selector: "type=ietf-rfc".into(),
+                set: vec![],
+                remove: vec!["owner".into()],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::to_value(removed).unwrap(),
+            json!({"matched": 1, "updated": 1, "unchanged": 0})
+        );
+
+        let absent = server
+            .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
+                selector: "type=ietf-rfc".into(),
+                set: vec![],
+                remove: vec!["owner".into(), "never-known".into()],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::to_value(absent).unwrap(),
+            json!({"matched": 1, "updated": 0, "unchanged": 1})
+        );
+    }
+
+    #[tokio::test]
     async fn bulk_update_note_labels_handler_returns_zero_counts_for_no_matches() {
         let (ctx, backend, _dir) = test_context().await;
         let server = test_server(ctx, backend);
@@ -1938,6 +2001,7 @@ mod tests {
             .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
                 selector: "type=not-present".into(),
                 set: vec![("project".into(), "new".into())],
+                remove: vec![],
             }))
             .await
             .unwrap()
@@ -1973,6 +2037,7 @@ mod tests {
                 BulkUpdateNoteLabelsRequest {
                     selector: "   ".into(),
                     set: vec![("project".into(), "new".into())],
+                    remove: vec![],
                 },
                 "selector must not be empty",
             ),
@@ -1980,6 +2045,7 @@ mod tests {
                 BulkUpdateNoteLabelsRequest {
                     selector: "type=ietf-rfc&&owner=protocols".into(),
                     set: vec![("project".into(), "new".into())],
+                    remove: vec![],
                 },
                 "label selector is malformed",
             ),
@@ -1987,8 +2053,9 @@ mod tests {
                 BulkUpdateNoteLabelsRequest {
                     selector: "type=ietf-rfc".into(),
                     set: vec![],
+                    remove: vec![],
                 },
-                "at least one label assignment is required",
+                "at least one label set or remove mutation is required",
             ),
             (
                 BulkUpdateNoteLabelsRequest {
@@ -1997,13 +2064,31 @@ mod tests {
                         ("project".into(), "new".into()),
                         ("project".into(), "again".into()),
                     ],
+                    remove: vec![],
                 },
                 "duplicate label assignment key: project",
             ),
             (
                 BulkUpdateNoteLabelsRequest {
                     selector: "type=ietf-rfc".into(),
+                    set: vec![],
+                    remove: vec!["owner".into(), "owner".into()],
+                },
+                "duplicate label removal key: owner",
+            ),
+            (
+                BulkUpdateNoteLabelsRequest {
+                    selector: "type=ietf-rfc".into(),
+                    set: vec![("owner".into(), "new".into())],
+                    remove: vec!["owner".into()],
+                },
+                "label key cannot be both set and removed: owner",
+            ),
+            (
+                BulkUpdateNoteLabelsRequest {
+                    selector: "type=ietf-rfc".into(),
                     set: vec![("bad$key".into(), "new".into())],
+                    remove: vec![],
                 },
                 "label key must not contain selector-reserved character: $",
             ),
@@ -2011,6 +2096,7 @@ mod tests {
                 BulkUpdateNoteLabelsRequest {
                     selector: "type=ietf-rfc".into(),
                     set: vec![("priority".into(), "urgent".into())],
+                    remove: vec![],
                 },
                 "invalid value for label priority: urgent is not number",
             ),
@@ -2040,6 +2126,7 @@ mod tests {
                 .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
                     selector: "type=ietf-rfc".into(),
                     set: vec![("project".into(), "new".into())],
+                    remove: vec![],
                 }))
                 .await,
         );
@@ -2084,6 +2171,7 @@ mod tests {
                 .bulk_update_note_labels(Parameters(BulkUpdateNoteLabelsRequest {
                     selector: "type=ietf-rfc".into(),
                     set: vec![("priority".into(), "urgent".into())],
+                    remove: vec![],
                 }))
                 .await,
         );

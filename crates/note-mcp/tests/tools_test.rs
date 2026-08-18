@@ -595,6 +595,7 @@ async fn bulk_update_note_labels_tool_delegates_matching_and_set_semantics() {
         BulkUpdateNoteLabelsToolInput {
             selector: "type=ietf-rfc".into(),
             set: vec![("project".into(), "IETF-RFC".into())],
+            remove: vec![],
         },
     )
     .await
@@ -614,4 +615,44 @@ async fn bulk_update_note_labels_tool_delegates_matching_and_set_semantics() {
             .iter()
             .any(|label| label.key == "owner" && label.value == "protocols"));
     }
+}
+
+#[tokio::test]
+async fn bulk_update_note_labels_tool_delegates_remove_semantics() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let id = save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Remove type".into(),
+            content: "Body".into(),
+            labels: vec![
+                ("type".into(), "ietf-rfc".into()),
+                ("owner".into(), "protocols".into()),
+            ],
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+
+    let output = bulk_update_note_labels_tool(
+        &ctx,
+        BulkUpdateNoteLabelsToolInput {
+            selector: "type=ietf-rfc".into(),
+            set: vec![],
+            remove: vec!["type".into()],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output.matched, 1);
+    assert_eq!(output.updated, 1);
+    assert_eq!(output.unchanged, 0);
+    let note = get_note_tool(&ctx, &id).await.unwrap().unwrap();
+    assert!(!note.labels.iter().any(|label| label.key == "type"));
+    assert!(note
+        .labels
+        .iter()
+        .any(|label| label.key == "owner" && label.value == "protocols"));
 }

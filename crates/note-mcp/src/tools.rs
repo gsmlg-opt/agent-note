@@ -136,7 +136,10 @@ pub async fn save_note_tool(
 #[serde(deny_unknown_fields)]
 pub struct BulkUpdateNoteLabelsToolInput {
     pub selector: String,
+    #[serde(default)]
     pub set: Vec<(String, String)>,
+    #[serde(default)]
+    pub remove: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +158,7 @@ pub async fn bulk_update_note_labels_tool(
         PipelineBulkUpdateNoteLabelsInput {
             selector: input.selector,
             set: input.set,
+            remove: input.remove,
         },
     )
     .await?;

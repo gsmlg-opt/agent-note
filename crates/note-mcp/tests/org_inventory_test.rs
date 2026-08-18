@@ -132,7 +132,7 @@ async fn aggregate_inventory_is_48_and_preserves_the_12_note_tools() {
             .unwrap()
             .description,
         Some(
-            "Atomically set or replace labels on active notes matching a label selector while preserving unrelated labels."
+            "Atomically set, replace, or remove labels on active notes matching a label selector while preserving unrelated labels."
                 .into()
         )
     );
