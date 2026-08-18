@@ -35,7 +35,7 @@ CREATE TABLE attachment_operations (
         CHECK (lease_owner IS NULL OR length(btrim(lease_owner)) > 0),
     CONSTRAINT attachment_operations_timestamps_check
         CHECK (updated_at >= created_at),
-    UNIQUE (kind, object_key)
+    UNIQUE (kind, note_id, object_key)
 );
 
 CREATE INDEX idx_attachment_operations_note

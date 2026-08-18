@@ -234,7 +234,10 @@ async fn connect_runs_migrations_with_all_expected_tables_and_indexes() {
     .fetch_all(&inspection)
     .await
     .expect("inspect attachment operation idempotency constraint");
-    assert_eq!(attachment_unique_columns, vec!["kind", "object_key"]);
+    assert_eq!(
+        attachment_unique_columns,
+        vec!["kind", "note_id", "object_key"]
+    );
 
     let attachment_foreign_key_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)

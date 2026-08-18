@@ -1,6 +1,6 @@
 mod support;
 
-use note_core::{AttachmentStorageMetadata, LabelValueType, NoteAttachment, ValidationError};
+use note_core::{AttachmentStorageMetadata, NoteAttachment, ValidationError};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
     chunk_hash, delete_note_attachment, drain_embedding_jobs, get_note, get_note_attachment,
@@ -91,7 +91,7 @@ async fn seed_note_at(
         .await
         .unwrap();
     transaction
-        .insert_label_key_with_type("status", "", LabelValueType::Text)
+        .insert_label_key_if_missing("status", "")
         .await
         .unwrap();
     transaction
@@ -382,6 +382,63 @@ async fn replacing_legacy_attachment_uses_explicit_legacy_cleanup_and_completes_
     assert_eq!(operations.len(), 1);
     assert_eq!(operations[0].object_key, "legacy/report.txt");
     assert_eq!(operations[0].status, AttachmentOperationStatus::Completed);
+}
+
+#[tokio::test]
+async fn identical_legacy_paths_on_two_notes_have_independent_cleanup_operations() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    for note_id in ["legacy-note-a", "legacy-note-b"] {
+        seed_note(
+            &ctx,
+            &backend,
+            note_id,
+            &[attachment(
+                "report",
+                "report.txt",
+                "text/plain",
+                "old",
+                note_id.as_bytes(),
+            )],
+        )
+        .await;
+        attachments.set_read_content(note_id, "report.txt", note_id.as_bytes());
+    }
+    events.lock().unwrap().clear();
+
+    for note_id in ["legacy-note-a", "legacy-note-b"] {
+        put_note_attachment(
+            &ctx,
+            note_id,
+            NOTE_REVISION,
+            attachment(
+                "report",
+                "report.txt",
+                "text/plain",
+                "new",
+                format!("new-{note_id}").as_bytes(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    for note_id in ["legacy-note-a", "legacy-note-b"] {
+        let operations = backend
+            .session()
+            .await
+            .unwrap()
+            .list_attachment_operations_for_note(note_id)
+            .await
+            .unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].object_key, "report.txt");
+        assert_eq!(operations[0].status, AttachmentOperationStatus::Completed);
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == &format!("delete_legacy:{note_id}:report.txt")));
+    }
 }
 
 #[tokio::test]

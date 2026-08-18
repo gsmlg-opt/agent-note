@@ -36,6 +36,7 @@ async fn insert_note(session: &dyn note_storage::StorageSession, id: &str) {
 pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     let session = storage.session().await.unwrap();
     insert_note(session.as_ref(), "contract-attachment-operations-note").await;
+    insert_note(session.as_ref(), "contract-attachment-operations-note-b").await;
 
     let invalid = operation(
         "",
@@ -83,6 +84,57 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             "timestamp-worker",
             1,
             101,
+        )
+        .await
+        .unwrap());
+
+    let note_scoped_first = session
+        .insert_attachment_operation(operation(
+            "note-scoped-first",
+            "contract-attachment-operations-note",
+            "report.txt",
+            5,
+        ))
+        .await
+        .unwrap();
+    let same_note_duplicate = session
+        .insert_attachment_operation(operation(
+            "note-scoped-duplicate",
+            "contract-attachment-operations-note",
+            "report.txt",
+            6,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(same_note_duplicate.id, note_scoped_first.id);
+    let note_scoped_second = session
+        .insert_attachment_operation(operation(
+            "note-scoped-second",
+            "contract-attachment-operations-note-b",
+            "report.txt",
+            5,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(note_scoped_second.id, note_scoped_first.id);
+    let note_scoped_claimed = session
+        .claim_attachment_operations("note-scoped-worker", 6, 16, 10)
+        .await
+        .unwrap();
+    assert_eq!(note_scoped_claimed.len(), 2);
+    assert!(session
+        .complete_attachment_operation(&note_scoped_first.id, "note-scoped-worker", 1, 7,)
+        .await
+        .unwrap());
+    assert!(session
+        .fail_attachment_operation(
+            &note_scoped_second.id,
+            "note-scoped-worker",
+            1,
+            AttachmentOperationStatus::Pending,
+            Some(500),
+            "independent retry",
+            7,
         )
         .await
         .unwrap());
@@ -138,6 +190,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .map(|operation| operation.id.as_str())
             .collect::<Vec<_>>(),
         vec![
+            note_scoped_first.id.as_str(),
             second.id.as_str(),
             first.id.as_str(),
             "attachment-operation-timestamp-update",
@@ -297,6 +350,17 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .await
             .unwrap()
             .len(),
-        4
+        5
     );
+    let note_scoped_retry = fresh
+        .claim_attachment_operations("note-scoped-retry", 500, 510, 1)
+        .await
+        .unwrap();
+    assert_eq!(note_scoped_retry.len(), 1);
+    assert_eq!(note_scoped_retry[0].id, note_scoped_second.id);
+    assert_eq!(note_scoped_retry[0].attempts, 2);
+    assert!(fresh
+        .complete_attachment_operation(&note_scoped_second.id, "note-scoped-retry", 2, 501,)
+        .await
+        .unwrap());
 }

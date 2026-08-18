@@ -28,7 +28,8 @@ impl AttachmentOperationRepository for TursoSession {
                  status, attempts, next_attempt_at, lease_owner, lease_expires_at,
                  last_error, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, NULL, NULL, NULL, ?8, ?8)
-             ON CONFLICT(object_key) DO UPDATE SET object_key = excluded.object_key
+             ON CONFLICT(kind, note_id, object_key)
+             DO UPDATE SET object_key = excluded.object_key
              RETURNING {OPERATION_COLUMNS}"
         );
         let mut rows = self

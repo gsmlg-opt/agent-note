@@ -27,7 +27,7 @@ impl AttachmentOperationRepository for PgSession {
              ) VALUES (
                  $1, $2, $3, $4, $5, $6, 'pending', 0, $7, NULL, NULL, NULL, $8, $8
              )
-             ON CONFLICT (kind, object_key) DO UPDATE
+             ON CONFLICT (kind, note_id, object_key) DO UPDATE
              SET object_key = attachment_operations.object_key
              RETURNING id, kind, note_id, attachment_id, storage_generation,
                        object_key, status, attempts, next_attempt_at, lease_owner,
