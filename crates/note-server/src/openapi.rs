@@ -29,6 +29,8 @@ impl ToSchema for Binary {}
 #[derive(ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct SystemConfigSchema {
+    /// Ordered, unique, nonblank label keys that must exist in the label catalog.
+    /// Key spelling is exact; leading or trailing whitespace is invalid.
     #[schema(required = false, default = json!([]))]
     pub category_labels: Vec<String>,
     #[schema(

@@ -382,6 +382,15 @@ pub struct DashboardSummary {
     pub recent_updates: Vec<DashboardNote>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum DashboardFetch {
+    Modified {
+        summary: DashboardSummary,
+        etag: Option<String>,
+    },
+    NotModified,
+}
+
 fn notes_list_url(filters: &[LabelFilter], limit: Option<usize>, offset: Option<usize>) -> String {
     let mut params = Vec::new();
     if let Some(selector) = label_filter_selector(filters) {
@@ -447,16 +456,22 @@ pub async fn count_notes_filtered(filters: &[LabelFilter]) -> Result<usize, Stri
     Ok(count.total)
 }
 
-pub async fn dashboard() -> Result<DashboardSummary, String> {
-    let resp = Request::get("/api/dashboard")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    ok_or_body_error(resp)
+pub async fn dashboard(etag: Option<&str>) -> Result<DashboardFetch, String> {
+    let mut request = Request::get("/api/dashboard");
+    if let Some(etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+    let resp = request.send().await.map_err(|e| e.to_string())?;
+    if resp.status() == 304 {
+        return Ok(DashboardFetch::NotModified);
+    }
+    let etag = resp.headers().get("ETag");
+    let summary = ok_or_body_error(resp)
         .await?
         .json()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(DashboardFetch::Modified { summary, etag })
 }
 
 pub async fn list_notes_page(

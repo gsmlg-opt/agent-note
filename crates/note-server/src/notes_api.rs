@@ -4,7 +4,7 @@ use axum::{
         rejection::{JsonRejection, QueryRejection},
         FromRef, FromRequest, FromRequestParts, Path, Query, Request, State,
     },
-    http::{request::Parts, StatusCode},
+    http::{header, request::Parts, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get as route_get,
     Json,
@@ -21,14 +21,15 @@ use note_pipelines::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
         Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -516,17 +517,23 @@ pub struct DashboardDto {
 struct DashboardCacheEntry {
     expires_at: Instant,
     generation: u64,
+    base_hash: u64,
     value: DashboardDto,
 }
 
 static DASHBOARD_CACHE: OnceLock<RwLock<Option<DashboardCacheEntry>>> = OnceLock::new();
 static DASHBOARD_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static DASHBOARD_CACHE_FILL: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[cfg(test)]
 static DASHBOARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 static BULK_DASHBOARD_CACHE_INVALIDATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static DASHBOARD_FULL_LOADS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub struct DashboardCacheInvalidator;
@@ -543,6 +550,10 @@ fn dashboard_cache() -> &'static RwLock<Option<DashboardCacheEntry>> {
     DASHBOARD_CACHE.get_or_init(|| RwLock::new(None))
 }
 
+fn dashboard_cache_fill() -> &'static Mutex<()> {
+    DASHBOARD_CACHE_FILL.get_or_init(|| Mutex::new(()))
+}
+
 fn dashboard_cache_generation() -> u64 {
     DASHBOARD_CACHE_GENERATION.load(AtomicOrdering::Acquire)
 }
@@ -556,8 +567,28 @@ pub(crate) fn invalidate_dashboard_cache() {
     }
 }
 
+#[cfg(test)]
 async fn cached_dashboard(now: Instant) -> Option<DashboardDto> {
     let generation = dashboard_cache_generation();
+    dashboard_cache()
+        .read()
+        .await
+        .as_ref()
+        .filter(|entry| entry.generation == generation && entry.expires_at > now)
+        .map(|entry| entry.value.clone())
+}
+
+async fn cached_dashboard_identity(now: Instant) -> Option<(u64, u64)> {
+    let generation = dashboard_cache_generation();
+    dashboard_cache()
+        .read()
+        .await
+        .as_ref()
+        .filter(|entry| entry.generation == generation && entry.expires_at > now)
+        .map(|entry| (entry.generation, entry.base_hash))
+}
+
+async fn cached_dashboard_for_generation(now: Instant, generation: u64) -> Option<DashboardDto> {
     dashboard_cache()
         .read()
         .await
@@ -576,12 +607,15 @@ async fn publish_dashboard_cache(generation: u64, value: DashboardDto) {
         *cache = Some(DashboardCacheEntry {
             expires_at: Instant::now() + DASHBOARD_CACHE_TTL,
             generation,
+            base_hash: dashboard_base_hash(&value),
             value,
         });
     }
 }
 
 async fn load_dashboard(ctx: &Context) -> anyhow::Result<DashboardDto> {
+    #[cfg(test)]
+    DASHBOARD_FULL_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let note_count = count_notes(ctx, None).await?;
     let labels = list_label_keys(ctx).await?;
     let label_count = labels.len();
@@ -649,6 +683,103 @@ async fn load_dashboard(ctx: &Context) -> anyhow::Result<DashboardDto> {
     Ok(dashboard)
 }
 
+async fn dashboard_embedding(
+    ctx: &Context,
+) -> anyhow::Result<(usize, Option<DashboardEmbeddingNoteDto>)> {
+    let status = embedding_dashboard_status(ctx).await?;
+    Ok((
+        status.embedded_note_count,
+        status
+            .processing_note
+            .map(|note| DashboardEmbeddingNoteDto {
+                id: note.id,
+                title: note.title,
+            }),
+    ))
+}
+
+fn apply_dashboard_embedding(
+    dashboard: &mut DashboardDto,
+    embedded_note_count: usize,
+    embedding_note: Option<DashboardEmbeddingNoteDto>,
+) {
+    dashboard.embedded_note_count = embedded_note_count;
+    dashboard.embedding_note = embedding_note;
+}
+
+fn dashboard_etag(
+    generation: u64,
+    base_hash: u64,
+    embedded_note_count: usize,
+    embedding_note: Option<&DashboardEmbeddingNoteDto>,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    generation.hash(&mut hasher);
+    base_hash.hash(&mut hasher);
+    embedded_note_count.hash(&mut hasher);
+    embedding_note
+        .map(|note| (&note.id, &note.title))
+        .hash(&mut hasher);
+    format!("\"dashboard-{:016x}\"", hasher.finish())
+}
+
+fn dashboard_base_hash(dashboard: &DashboardDto) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    if let Ok(serialized) = serde_json::to_vec(dashboard) {
+        serialized.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn not_modified_dashboard_response(etag: &str) -> Result<Response, (StatusCode, String)> {
+    Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(header::ETAG, etag)
+        .body(Body::empty())
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+fn dashboard_json_response(
+    dashboard: &DashboardDto,
+    etag: &str,
+) -> Result<Response, (StatusCode, String)> {
+    let body = serde_json::to_vec(dashboard)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ETAG, etag)
+        .body(Body::from(body))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+async fn cached_dashboard_response(
+    ctx: &Context,
+    if_none_match: Option<&str>,
+) -> Result<Option<Response>, (StatusCode, String)> {
+    let now = Instant::now();
+    let Some((generation, base_hash)) = cached_dashboard_identity(now).await else {
+        return Ok(None);
+    };
+    let (embedded_note_count, embedding_note) = dashboard_embedding(ctx)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let etag = dashboard_etag(
+        generation,
+        base_hash,
+        embedded_note_count,
+        embedding_note.as_ref(),
+    );
+    if if_none_match == Some(etag.as_str()) {
+        return not_modified_dashboard_response(&etag).map(Some);
+    }
+    let Some(mut dashboard) = cached_dashboard_for_generation(now, generation).await else {
+        return Ok(None);
+    };
+    apply_dashboard_embedding(&mut dashboard, embedded_note_count, embedding_note);
+    dashboard_json_response(&dashboard, &etag).map(Some)
+}
+
 async fn refresh_dashboard_embedding_status(
     ctx: &Context,
     dashboard: &mut DashboardDto,
@@ -670,26 +801,41 @@ async fn refresh_dashboard_embedding_status(
     tag = "dashboard",
     responses(
         (status = 200, description = "Dashboard summary", body = DashboardDto),
+        (status = 304, description = "Dashboard summary unchanged"),
         (status = 500, description = "Server error", body = String, content_type = "text/plain")
     )
 )]
 async fn dashboard_handler(
     State(ctx): State<Arc<Context>>,
-) -> Result<Json<DashboardDto>, (axum::http::StatusCode, String)> {
-    let now = Instant::now();
-    if let Some(mut value) = cached_dashboard(now).await {
-        refresh_dashboard_embedding_status(&ctx, &mut value)
-            .await
-            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        return Ok(Json(value));
+    headers: HeaderMap,
+) -> Result<Response, (axum::http::StatusCode, String)> {
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok());
+    if let Some(response) = cached_dashboard_response(&ctx, if_none_match).await? {
+        return Ok(response);
+    }
+
+    let _fill = dashboard_cache_fill().lock().await;
+    if let Some(response) = cached_dashboard_response(&ctx, if_none_match).await? {
+        return Ok(response);
     }
 
     let generation = dashboard_cache_generation();
     let value = load_dashboard(&ctx)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let etag = dashboard_etag(
+        generation,
+        dashboard_base_hash(&value),
+        value.embedded_note_count,
+        value.embedding_note.as_ref(),
+    );
     publish_dashboard_cache(generation, value.clone()).await;
-    Ok(Json(value))
+    if if_none_match == Some(etag.as_str()) {
+        return not_modified_dashboard_response(&etag);
+    }
+    dashboard_json_response(&value, &etag)
 }
 
 #[utoipa::path(
@@ -2170,6 +2316,15 @@ mod tests {
             .unwrap()
     }
 
+    fn get_with_etag(uri: &str, etag: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header(axum::http::header::IF_NONE_MATCH, etag)
+            .body(Body::empty())
+            .unwrap()
+    }
+
     fn put(uri: &str, body: &str) -> Request<Body> {
         Request::builder()
             .method("PUT")
@@ -2717,6 +2872,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_etag_returns_304_and_changes_after_invalidation() {
+        let _dashboard_guard = DASHBOARD_TEST_LOCK.lock().await;
+        invalidate_dashboard_cache();
+        let (app, _ctx, _dir) = test_app().await;
+
+        let first = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_etag = first.headers()[axum::http::header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let unchanged = app
+            .clone()
+            .oneshot(get_with_etag("/api/dashboard", &first_etag))
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(unchanged.headers()[axum::http::header::ETAG], first_etag);
+        assert!(unchanged
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty());
+
+        let saved = app
+            .clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Changed","content":"Body","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let changed = app
+            .oneshot(get_with_etag("/api/dashboard", &first_etag))
+            .await
+            .unwrap();
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(changed.headers()[axum::http::header::ETAG], first_etag);
+        invalidate_dashboard_cache();
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_dashboard_requests_share_one_full_load() {
+        let _dashboard_guard = DASHBOARD_TEST_LOCK.lock().await;
+        invalidate_dashboard_cache();
+        *dashboard_cache().write().await = None;
+        DASHBOARD_FULL_LOADS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (app, _ctx, _dir) = test_app().await;
+
+        let (first, second) = tokio::join!(
+            app.clone().oneshot(get("/api/dashboard")),
+            app.oneshot(get("/api/dashboard"))
+        );
+        assert_eq!(first.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            DASHBOARD_FULL_LOADS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        invalidate_dashboard_cache();
+    }
+
+    #[tokio::test]
     async fn dashboard_uses_summary_data_and_invalidates_after_note_write() {
         let _dashboard_guard = DASHBOARD_TEST_LOCK.lock().await;
         invalidate_dashboard_cache();
@@ -2744,6 +2966,10 @@ mod tests {
 
         let resp = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let queued_etag = resp.headers()[axum::http::header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_string();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json.get("note_count").and_then(|v| v.as_u64()), Some(1));
@@ -2776,7 +3002,17 @@ mod tests {
             1
         );
         transaction.commit().await.unwrap();
-        let resp = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(get_with_etag("/api/dashboard", &queued_etag))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let processing_etag = resp.headers()[axum::http::header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(processing_etag, queued_etag);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["embedding_note"]["title"].as_str(), Some("Dashboard"));
@@ -2791,7 +3027,12 @@ mod tests {
                 .unwrap(),
             1
         );
-        let resp = app.oneshot(get("/api/dashboard")).await.unwrap();
+        let resp = app
+            .oneshot(get_with_etag("/api/dashboard", &processing_etag))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_ne!(resp.headers()[axum::http::header::ETAG], processing_etag);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["embedding_note"].is_null());

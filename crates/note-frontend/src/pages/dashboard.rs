@@ -13,22 +13,30 @@ pub fn dashboard_page() -> Html {
     let summary = use_state_eq(|| None::<api::DashboardSummary>);
     let loading = use_state_eq(|| true);
     let error = use_state_eq(|| None::<String>);
+    let dashboard_etag = use_mut_ref(|| None::<String>);
 
     {
         let summary = summary.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let dashboard_etag = dashboard_etag.clone();
         use_effect_with((), move |_| {
             let active = Rc::new(Cell::new(true));
             let task_active = active.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 loading.set(true);
                 while task_active.get() {
-                    match api::dashboard().await {
-                        Ok(next) => {
+                    let etag = dashboard_etag.borrow().clone();
+                    match api::dashboard(etag.as_deref()).await {
+                        Ok(api::DashboardFetch::Modified {
+                            summary: next,
+                            etag,
+                        }) => {
+                            *dashboard_etag.borrow_mut() = etag;
                             summary.set(Some(next));
                             error.set(None);
                         }
+                        Ok(api::DashboardFetch::NotModified) => error.set(None),
                         Err(e) => error.set(Some(e)),
                     }
                     loading.set(false);
