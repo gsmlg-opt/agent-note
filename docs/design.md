@@ -389,8 +389,20 @@ and fingerprint.
 
 Strict MVU: single `AppState`, all mutations go through a reducer dispatching typed actions (no direct field mutation from components).
 
-State surface: notes list, retrieval results (with fused score attached — do not label it as
+State surface: notes list, retrieval results (with revision and fused score attached — do not label it as
 "similarity," since it is rank fusion rather than raw distance), loading flag, error slot.
+
+Ordinary note and Trash view models retain the storage `note_revision` returned by their read.
+Existing-note update, soft-delete, restore, permanent-delete, label, and attachment mutations pass
+that value as `expected_revision`; transport code never substitutes a fresh server-side read.
+Storage performs the revision predicate and mutation atomically and reports applied, not-found, or
+conflict through the backend-neutral repository contract. One successful logical mutation advances
+the owning note revision once; derived embedding/index rebuilds do not.
+
+The editor treats `stale_revision` as a user-visible merge decision rather than a retry signal. Its
+mounted local draft is preserved, and an explicit action refetches the latest revision before the
+user deliberately reapplies that draft. Delete and Trash confirmation state is retained on
+conflict, with reload required before another attempt.
 
 The Notes page retrieval bar says “Retrieve by title or content” and renders fused-score results.
 Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than custom equivalents
@@ -426,6 +438,15 @@ one Markdown-note `Context` and one `Arc<OrgContext>` over the same storage back
 those exact contexts into stdio or HTTP. Stdio uses JSON-RPC over process stdin/stdout with logs on
 stderr. Streamable HTTP is stateless JSON POST at the single `/mcp` endpoint; it has no GET/SSE
 transport, MCP sessions, authentication middleware, or legacy two-endpoint HTTP+SSE path.
+
+Markdown-note detail, summary, and search results expose `revision`. Line reads expose both that
+authoritative note-wide revision and a content tag. MCP update, edit, soft-delete, attachment put,
+and attachment delete inputs require `expected_revision`; line edit additionally requires its read
+tag. REST full update requires the field in JSON, delete routes require it as a query parameter, and
+Trash restore carries one expected revision per note. Both transports map ordinary-note conflicts
+to the common structured envelope (`code`, `message`, `details`, `retryable`), with
+`stale_revision` details containing `note_id`, `expected_revision`, and `current_revision`. Clients
+must refetch and merge or deliberately reapply rather than automatically retrying stale data.
 
 ### 8.1 Org REST/OpenAPI Interface
 

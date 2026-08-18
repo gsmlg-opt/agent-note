@@ -65,8 +65,8 @@ async fn json_round_trip_uses_the_selected_s3_attachment_store() {
         json["notes"][0]["attachments"][0]["content_base64"],
         "AJ+Slv8="
     );
-    assert!(delete_note(&ctx, "imported-note").await.unwrap());
-    assert!(permanently_delete_note(&ctx, "imported-note")
+    assert!(delete_note(&ctx, "imported-note", 1).await.unwrap());
+    assert!(permanently_delete_note(&ctx, "imported-note", 2)
         .await
         .unwrap());
     assert!(s3.read("imported-note", "./proof.bin").await.is_err());
@@ -144,8 +144,8 @@ async fn import_can_hold_two_prepared_s3_attachment_sets() {
     );
 
     for note_id in ["note-a", "note-b"] {
-        assert!(delete_note(&ctx, note_id).await.unwrap());
-        assert!(permanently_delete_note(&ctx, note_id).await.unwrap());
+        assert!(delete_note(&ctx, note_id, 1).await.unwrap());
+        assert!(permanently_delete_note(&ctx, note_id, 2).await.unwrap());
     }
     assert!(s3.read("note-a", "./a.bin").await.is_err());
     assert!(s3.read("note-b", "./b.bin").await.is_err());

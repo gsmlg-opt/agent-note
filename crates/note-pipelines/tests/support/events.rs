@@ -7,7 +7,7 @@ use note_storage::{
     ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, CompareAndSwap, ConditionalUpdate,
     EmbeddingDashboardStatus, EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote,
     NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, NoteChunk, NoteFieldsUpdate,
-    NoteUpdate, NotesRepository, OrgAttempt, OrgAttemptUpdate, OrgDocument,
+    NoteMutationResult, NoteUpdate, NotesRepository, OrgAttempt, OrgAttemptUpdate, OrgDocument,
     OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
     OrgLease, OrgOperationalQuery, OrgOperationalRow, OrgProjectedWorkItem, OrgRepository,
     OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, RetrievalRepository,
@@ -182,13 +182,13 @@ impl_forward_repository! {
         fn note_exists(id: &str) -> bool;
         fn get_note(id: &str) -> Option<note_core::Note>;
         fn get_note_content(id: &str) -> Option<String>;
-        fn update_note(note: NoteUpdate<'_>) -> u64;
-        fn update_note_fields(note: NoteFieldsUpdate<'_>) -> u64;
-        fn update_note_attachments(note: AttachmentMetadataUpdate<'_>) -> u64;
-        fn soft_delete_note(id: &str, deleted_at: i64) -> u64;
+        fn update_note(note: NoteUpdate<'_>) -> NoteMutationResult<()>;
+        fn update_note_fields(note: NoteFieldsUpdate<'_>) -> NoteMutationResult<()>;
+        fn update_note_attachments(note: AttachmentMetadataUpdate<'_>) -> NoteMutationResult<()>;
+        fn soft_delete_note(id: &str, expected_revision: i64, deleted_at: i64) -> NoteMutationResult<()>;
         fn get_deleted_note_content_and_revision(id: &str) -> Option<(String, i64)>;
-        fn restore_note(id: &str, note_revision: i64) -> u64;
-        fn permanently_delete_note(id: &str) -> u64;
+        fn restore_note(id: &str, expected_revision: i64) -> NoteMutationResult<()>;
+        fn permanently_delete_note(id: &str, expected_revision: i64) -> NoteMutationResult<()>;
         fn list_expired_deleted_note_ids(cutoff: i64) -> Vec<String>;
         fn clear_note_search_data(id: &str) -> ();
         fn clear_note_labels(id: &str) -> ();
@@ -704,6 +704,7 @@ impl AttachmentStore for ControlledAttachmentStore {
                     session
                         .update_note_attachments(AttachmentMetadataUpdate {
                             id: note_id,
+                            expected_revision: note.revision,
                             attachments: &note.attachments,
                             updated_at: note.updated_at.saturating_add(1),
                         })
@@ -764,6 +765,7 @@ impl AttachmentStore for ControlledAttachmentStore {
                 session
                     .update_note_attachments(AttachmentMetadataUpdate {
                         id: note_id,
+                        expected_revision: note.revision,
                         attachments: &note.attachments,
                         updated_at: note.updated_at.saturating_add(1),
                     })

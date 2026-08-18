@@ -1,9 +1,9 @@
 use note_org::{DocumentId, WorkItemId, WorkspaceId, WorkspacePolicy};
 use note_storage::{
     NewNote, NewOrgAttemptAllocation, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
-    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgEventType, OrgRepository,
-    StorageBackend, StorageErrorKind, StorageTransaction, TransactionMode, UpsertNoteChunk,
-    EMBEDDING_DIMENSION,
+    NoteFieldsUpdate, NoteMutationResult, NotesRepository, OrgDocumentOwnershipMove,
+    OrgDocumentOwnershipMoveResult, OrgEventType, OrgRepository, StorageBackend, StorageErrorKind,
+    StorageTransaction, TransactionMode, UpsertNoteChunk, EMBEDDING_DIMENSION,
 };
 use note_storage_turso::TursoStorage;
 use serde_json::json;
@@ -340,6 +340,75 @@ async fn cancelled_ownership_move_cleans_up_before_releasing_the_session_gate() 
         .unwrap()
         .unwrap();
     assert_eq!(observed.workspace_id, target_workspace);
+    assert_eq!(observed.revision, 2);
+}
+
+#[tokio::test]
+async fn cancelled_note_cas_rolls_back_before_releasing_the_session_gate() {
+    let (_dir, storage) = storage().await;
+    let session = storage.connect().await.unwrap();
+    session
+        .insert_note(NewNote {
+            id: "cancelled-note-cas",
+            title: "Before cancellation",
+            content: "Before cancellation",
+            attachments: &[],
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+
+    let external_writer = storage.begin(TransactionMode::Immediate).await.unwrap();
+    let update = || NoteFieldsUpdate {
+        id: "cancelled-note-cas",
+        expected_revision: 1,
+        title: "Cancelled mutation",
+        content: "Must not commit",
+        updated_at: 2,
+    };
+    let mut cancelled = Box::pin(session.update_note_fields(update()));
+    assert_pending(
+        cancelled.as_mut(),
+        "note CAS did not reach the external writer lock before cancellation",
+    );
+    drop(cancelled);
+
+    let mut read_after_cancellation = Box::pin(session.get_note("cancelled-note-cas"));
+    assert_pending(
+        read_after_cancellation.as_mut(),
+        "cancelled note CAS released the session gate before savepoint cleanup",
+    );
+    external_writer.rollback().await.unwrap();
+    let unchanged = tokio::time::timeout(Duration::from_secs(2), read_after_cancellation.as_mut())
+        .await
+        .expect("note savepoint cleanup did not release the session gate")
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.title, "Before cancellation");
+    assert_eq!(unchanged.revision, 1);
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), session.update_note_fields(update()))
+            .await
+            .expect("session remained stuck after cancelled note CAS cleanup")
+            .unwrap(),
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2,
+        }
+    );
+    let observed = storage
+        .connect()
+        .await
+        .unwrap()
+        .get_note("cancelled-note-cas")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.title, "Cancelled mutation");
     assert_eq!(observed.revision, 2);
 }
 

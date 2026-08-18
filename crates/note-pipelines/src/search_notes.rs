@@ -91,6 +91,7 @@ pub async fn search_notes_filtered(
                     labels: note.labels,
                     created_at: note.created_at,
                     updated_at: note.updated_at,
+                    revision: note.revision,
                     deleted_at: note.deleted_at,
                 },
                 score,

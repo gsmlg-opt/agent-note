@@ -1476,7 +1476,7 @@ async fn note_links_require_active_targets_but_remain_weak_after_deletion() {
         .session()
         .await
         .unwrap()
-        .soft_delete_note(note_id, NOW + 1)
+        .soft_delete_note(note_id, 1, NOW + 1)
         .await
         .unwrap();
     let linked = backend

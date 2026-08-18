@@ -395,6 +395,7 @@ mod tests {
         update_note(
             &write_ctx,
             &note.id,
+            note.revision,
             SaveNoteInput {
                 title: "updated".into(),
                 content: "new content".into(),
@@ -474,6 +475,7 @@ mod tests {
         update_note(
             &write_ctx,
             &note.id,
+            note.revision,
             SaveNoteInput {
                 title: "renamed".into(),
                 content: "stable content".into(),

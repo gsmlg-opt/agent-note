@@ -1,7 +1,10 @@
 //! Plain view-model types shared across pages. (The app is now multi-page via yew-router, so
 //! state lives locally in each page rather than in one global reducer.)
 
+use std::rc::Rc;
+
 use serde::{Deserialize, Serialize};
+use yew::Reducible;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttachmentContent {
@@ -28,6 +31,7 @@ pub struct NoteSummary {
     pub labels: Vec<(String, String)>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,14 +42,71 @@ pub struct DeletedNoteSummary {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: i64,
+    pub revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResultSummary {
     pub id: String,
     pub title: String,
+    pub revision: i64,
     /// Fused RRF rank-fusion score — label it as such in the UI, not "similarity" (docs/design.md §7).
     pub score: f32,
+}
+
+pub fn stale_retry_blocked(pending: bool, has_conflict: bool) -> bool {
+    pending || has_conflict
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleRevisionGateAction {
+    Conflict,
+    Dismiss,
+    RefreshFinished { started_epoch: u64, succeeded: bool },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StaleRevisionGate {
+    conflict_epoch: u64,
+    blocked: bool,
+}
+
+impl StaleRevisionGate {
+    pub fn refresh_epoch(&self) -> u64 {
+        self.conflict_epoch
+    }
+
+    pub fn blocked(&self) -> bool {
+        self.blocked
+    }
+
+    pub fn conflict_notice_visible(&self) -> bool {
+        self.blocked
+    }
+}
+
+impl Reducible for StaleRevisionGate {
+    type Action = StaleRevisionGateAction;
+
+    fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
+        match action {
+            StaleRevisionGateAction::Conflict => Self {
+                conflict_epoch: self.conflict_epoch.saturating_add(1),
+                blocked: true,
+            }
+            .into(),
+            StaleRevisionGateAction::Dismiss => self,
+            StaleRevisionGateAction::RefreshFinished {
+                started_epoch,
+                succeeded: true,
+            } if started_epoch == self.conflict_epoch => Self {
+                conflict_epoch: self.conflict_epoch,
+                blocked: false,
+            }
+            .into(),
+            StaleRevisionGateAction::RefreshFinished { .. } => self,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,7 +163,47 @@ pub struct SystemInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::SystemInfo;
+    use std::rc::Rc;
+
+    use yew::Reducible;
+
+    use super::{stale_retry_blocked, StaleRevisionGate, StaleRevisionGateAction, SystemInfo};
+
+    #[test]
+    fn stale_conflicts_block_retry_until_reload_clears_them() {
+        assert!(stale_retry_blocked(false, true));
+        assert!(stale_retry_blocked(true, false));
+        assert!(!stale_retry_blocked(false, false));
+    }
+
+    #[test]
+    fn stale_conflict_survives_dismiss_and_failed_reload() {
+        let gate = Rc::new(StaleRevisionGate::default());
+        let old_refresh_epoch = gate.refresh_epoch();
+        let gate = gate.reduce(StaleRevisionGateAction::Conflict);
+        let current_refresh_epoch = gate.refresh_epoch();
+        let gate = gate.reduce(StaleRevisionGateAction::Dismiss);
+        assert!(stale_retry_blocked(false, gate.blocked()));
+
+        let gate = gate.reduce(StaleRevisionGateAction::RefreshFinished {
+            started_epoch: old_refresh_epoch,
+            succeeded: false,
+        });
+        assert!(stale_retry_blocked(false, gate.blocked()));
+        let gate = gate.reduce(StaleRevisionGateAction::RefreshFinished {
+            started_epoch: old_refresh_epoch,
+            succeeded: true,
+        });
+        assert!(stale_retry_blocked(false, gate.blocked()));
+        assert!(gate.conflict_notice_visible());
+
+        let gate = gate.reduce(StaleRevisionGateAction::RefreshFinished {
+            started_epoch: current_refresh_epoch,
+            succeeded: true,
+        });
+        assert!(!stale_retry_blocked(false, gate.blocked()));
+        assert!(!gate.conflict_notice_visible());
+    }
 
     #[test]
     fn system_info_accepts_backends_without_filesystem_metadata() {

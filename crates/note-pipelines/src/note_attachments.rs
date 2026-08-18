@@ -11,6 +11,21 @@ use note_storage::{AttachmentMetadataUpdate, StorageTransaction, TransactionMode
 pub struct PutNoteAttachmentResult {
     pub attachment: NoteAttachment,
     pub created: bool,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteNoteAttachmentResult {
+    Applied { revision: i64 },
+    Absent,
+}
+
+impl std::ops::Not for DeleteNoteAttachmentResult {
+    type Output = bool;
+
+    fn not(self) -> Self::Output {
+        matches!(self, Self::Absent)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -89,6 +104,7 @@ pub async fn get_note_attachment(
 pub async fn put_note_attachment(
     ctx: &Context,
     note_id: &str,
+    expected_revision: i64,
     mut attachment: NoteAttachment,
 ) -> anyhow::Result<PutNoteAttachmentResult> {
     validate_attachments(std::slice::from_ref(&attachment)).map_err(anyhow::Error::new)?;
@@ -102,10 +118,16 @@ pub async fn put_note_attachment(
     };
     let transaction_result = async {
         let Some(note) = transaction.get_note(note_id).await? else {
-            return Err(anyhow::Error::new(AttachmentMutationError::NoteNotFound(
-                note_id.to_string(),
-            )));
+            return Err(crate::NoteMutationError::NotFound(note_id.to_string()).into());
         };
+        if note.revision != expected_revision {
+            return Err(crate::NoteMutationError::StaleRevision {
+                note_id: note_id.to_string(),
+                expected_revision,
+                current_revision: note.revision,
+            }
+            .into());
+        }
         let updated_at = attachment_mutation_timestamp(note.updated_at);
         let normalized_path = normalize_attachment_path(&attachment.path);
         let existing_index = note.attachments.iter().position(|existing| {
@@ -146,18 +168,16 @@ pub async fn put_note_attachment(
         let affected = transaction
             .update_note_attachments(AttachmentMetadataUpdate {
                 id: note_id,
+                expected_revision,
                 attachments: &metadata,
                 updated_at,
             })
             .await?;
-        if affected == 0 {
-            return Err(anyhow::Error::new(AttachmentMutationError::NoteNotFound(
-                note_id.to_string(),
-            )));
-        }
+        let revision = crate::mutation_error::mutation_revision(note_id, affected)?;
         anyhow::Ok(PutNoteAttachmentResult {
             attachment: stored_attachment,
             created,
+            revision,
         })
     }
     .await;
@@ -226,11 +246,12 @@ pub async fn delete_note_attachment(
     ctx: &Context,
     note_id: &str,
     attachment_id: &str,
-) -> anyhow::Result<bool> {
+    expected_revision: i64,
+) -> anyhow::Result<DeleteNoteAttachmentResult> {
     let attachment_id = canonical_attachment_id(attachment_id);
     let Some(mut captured_path) = resolve_attachment_path(ctx, note_id, attachment_id).await?
     else {
-        return Ok(false);
+        return Ok(DeleteNoteAttachmentResult::Absent);
     };
 
     for attempt in 0..2 {
@@ -249,11 +270,12 @@ pub async fn delete_note_attachment(
             note_id,
             attachment_id,
             &captured_path,
+            expected_revision,
         )
         .await;
 
         match transaction_result {
-            Ok(DeleteMetadataResult::Deleted) => {
+            Ok(DeleteMetadataResult::Deleted { revision }) => {
                 if let Err(error) = transaction.commit().await {
                     return Err(abort_mutation_with_primary(prepared, error.into()).await);
                 }
@@ -262,11 +284,11 @@ pub async fn delete_note_attachment(
                         "attachment metadata deletion is committed for note {note_id}, attachment {attachment_id}; physical cleanup failed and an orphan object may remain"
                     )
                 })?;
-                return Ok(true);
+                return Ok(DeleteNoteAttachmentResult::Applied { revision });
             }
             Ok(DeleteMetadataResult::Absent) => {
                 rollback_and_abort(transaction, prepared).await?;
-                return Ok(false);
+                return Ok(DeleteNoteAttachmentResult::Absent);
             }
             Ok(DeleteMetadataResult::PathChanged) => {
                 rollback_and_abort(transaction, prepared).await?;
@@ -280,7 +302,7 @@ pub async fn delete_note_attachment(
                 let Some(resolved_path) =
                     resolve_attachment_path(ctx, note_id, attachment_id).await?
                 else {
-                    return Ok(false);
+                    return Ok(DeleteNoteAttachmentResult::Absent);
                 };
                 captured_path = resolved_path;
                 continue;
@@ -300,7 +322,7 @@ pub async fn delete_note_attachment(
 }
 
 enum DeleteMetadataResult {
-    Deleted,
+    Deleted { revision: i64 },
     Absent,
     PathChanged,
 }
@@ -310,9 +332,10 @@ async fn delete_attachment_metadata(
     note_id: &str,
     attachment_id: &str,
     captured_path: &str,
+    expected_revision: i64,
 ) -> anyhow::Result<DeleteMetadataResult> {
     let Some(note) = transaction.get_note(note_id).await? else {
-        return Ok(DeleteMetadataResult::Absent);
+        return Err(crate::NoteMutationError::NotFound(note_id.to_string()).into());
     };
     let Some(existing_index) = note.attachments.iter().position(|attachment| {
         canonical_attachment_id(&attachment.id) == canonical_attachment_id(attachment_id)
@@ -330,14 +353,13 @@ async fn delete_attachment_metadata(
     let affected = transaction
         .update_note_attachments(AttachmentMetadataUpdate {
             id: note_id,
+            expected_revision,
             attachments: &metadata,
             updated_at,
         })
         .await?;
-    if affected == 0 {
-        return Ok(DeleteMetadataResult::Absent);
-    }
-    Ok(DeleteMetadataResult::Deleted)
+    let revision = crate::mutation_error::mutation_revision(note_id, affected)?;
+    Ok(DeleteMetadataResult::Deleted { revision })
 }
 
 async fn resolve_attachment_path(
@@ -345,8 +367,16 @@ async fn resolve_attachment_path(
     note_id: &str,
     attachment_id: &str,
 ) -> anyhow::Result<Option<String>> {
-    Ok(resolve_attachment_metadata(ctx, note_id, attachment_id)
-        .await?
+    let session = ctx.storage().session().await?;
+    let Some(note) = session.get_note(note_id).await? else {
+        return Err(crate::NoteMutationError::NotFound(note_id.to_string()).into());
+    };
+    Ok(note
+        .attachments
+        .into_iter()
+        .find(|attachment| {
+            canonical_attachment_id(&attachment.id) == canonical_attachment_id(attachment_id)
+        })
         .map(|attachment| attachment.path))
 }
 

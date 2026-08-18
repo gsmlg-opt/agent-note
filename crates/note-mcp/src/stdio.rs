@@ -48,6 +48,8 @@ pub struct SaveNoteRequest {
 pub struct SaveNoteResponse {
     /// Id of the newly saved note.
     pub id: String,
+    /// Initial revision for subsequent writes.
+    pub revision: i64,
 }
 
 impl From<SaveNoteRequest> for SaveNoteToolInput {
@@ -62,7 +64,10 @@ impl From<SaveNoteRequest> for SaveNoteToolInput {
 
 impl From<SaveNoteToolOutput> for SaveNoteResponse {
     fn from(output: SaveNoteToolOutput) -> Self {
-        Self { id: output.id }
+        Self {
+            id: output.id,
+            revision: output.revision,
+        }
     }
 }
 
@@ -174,6 +179,8 @@ pub struct NoteSummaryResponse {
     pub created_at: i64,
     /// Unix timestamp when the note was last updated.
     pub updated_at: i64,
+    /// Optimistic concurrency revision for subsequent writes.
+    pub revision: i64,
 }
 
 impl From<NoteSummaryData> for NoteSummaryResponse {
@@ -184,6 +191,7 @@ impl From<NoteSummaryData> for NoteSummaryResponse {
             labels: note.labels.into_iter().map(Into::into).collect(),
             created_at: note.created_at,
             updated_at: note.updated_at,
+            revision: note.revision,
         }
     }
 }
@@ -205,6 +213,8 @@ pub struct NoteDetailResponse {
     pub created_at: i64,
     /// Unix timestamp when the note was last updated.
     pub updated_at: i64,
+    /// Optimistic concurrency revision for subsequent writes.
+    pub revision: i64,
 }
 
 impl From<NoteDetailData> for NoteDetailResponse {
@@ -217,6 +227,7 @@ impl From<NoteDetailData> for NoteDetailResponse {
             labels: note.labels.into_iter().map(Into::into).collect(),
             created_at: note.created_at,
             updated_at: note.updated_at,
+            revision: note.revision,
         }
     }
 }
@@ -241,6 +252,8 @@ pub struct NoteLineSchema {
 pub struct NoteLinesResponse {
     /// Note id.
     pub id: String,
+    /// Optimistic concurrency revision required by `edit_note`.
+    pub revision: i64,
     /// Content hash tag used to guard subsequent `edit_note` calls.
     pub tag: String,
     /// Numbered note body lines.
@@ -260,6 +273,7 @@ impl From<NoteLinesData> for NoteLinesResponse {
     fn from(note: NoteLinesData) -> Self {
         Self {
             id: note.id,
+            revision: note.revision,
             tag: note.tag,
             lines: note.lines.into_iter().map(Into::into).collect(),
         }
@@ -304,6 +318,8 @@ impl From<EditOpSchema> for note_pipelines::EditOp {
 pub struct EditNoteRequest {
     /// Note id.
     pub id: String,
+    /// Revision returned by `read_note_lines`.
+    pub expected_revision: i64,
     /// Tag from `read_note_lines`.
     pub tag: String,
     /// Operations anchored to the original line numbers.
@@ -315,6 +331,8 @@ pub struct EditNoteRequest {
 pub struct UpdateNoteRequest {
     /// Note id.
     pub id: String,
+    /// Revision returned by the latest read.
+    pub expected_revision: i64,
     /// New note title.
     pub title: String,
     /// New note body, formatted as Markdown.
@@ -329,6 +347,7 @@ impl From<UpdateNoteRequest> for UpdateNoteToolInput {
     fn from(request: UpdateNoteRequest) -> Self {
         Self {
             id: request.id,
+            expected_revision: request.expected_revision,
             title: request.title,
             content: request.content,
             labels: request.labels,
@@ -340,6 +359,8 @@ impl From<UpdateNoteRequest> for UpdateNoteToolInput {
 pub struct DeleteNoteRequest {
     /// Note id.
     pub id: String,
+    /// Revision returned by the latest read.
+    pub expected_revision: i64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -403,6 +424,8 @@ pub struct SemanticSearchHit {
     pub id: String,
     /// Title of the matching note.
     pub title: String,
+    /// Optimistic concurrency revision for subsequent writes.
+    pub revision: i64,
     /// Relevance score.
     pub score: f32,
     /// Labels attached to the matching note.
@@ -435,6 +458,7 @@ impl From<SemanticSearchToolResult> for SemanticSearchHit {
         Self {
             id: result.id,
             title: result.title,
+            revision: result.revision,
             score: result.score,
             labels: result.labels.into_iter().map(Into::into).collect(),
             created_at: result.created_at,
@@ -454,6 +478,8 @@ impl From<SemanticSearchToolResult> for SemanticSearchHit {
 pub struct PutNoteAttachmentRequest {
     /// Note id.
     pub note_id: String,
+    /// Revision returned by the latest note read.
+    pub expected_revision: i64,
     /// Attachment id unique within the note.
     pub attachment_id: String,
     /// Relative attachment path.
@@ -490,6 +516,7 @@ impl TryFrom<PutNoteAttachmentRequest> for PutNoteAttachmentToolInput {
         })?;
         Ok(Self {
             note_id: request.note_id,
+            expected_revision: request.expected_revision,
             attachment_id: request.attachment_id,
             path: request.path,
             mime: request.mime,
@@ -504,6 +531,8 @@ impl TryFrom<PutNoteAttachmentRequest> for PutNoteAttachmentToolInput {
 pub struct PutNoteAttachmentResponse {
     /// Whether a new attachment id was created.
     pub created: bool,
+    /// New owning-note revision.
+    pub revision: i64,
     /// Stored attachment metadata.
     pub attachment: AttachmentMetadataSchema,
 }
@@ -512,6 +541,7 @@ impl From<PutNoteAttachmentToolOutput> for PutNoteAttachmentResponse {
     fn from(output: PutNoteAttachmentToolOutput) -> Self {
         Self {
             created: output.created,
+            revision: output.revision,
             attachment: output.attachment.into(),
         }
     }
@@ -600,6 +630,8 @@ pub struct DeleteNoteAttachmentRequest {
     pub note_id: String,
     /// Attachment id within the note.
     pub attachment_id: String,
+    /// Revision returned by the latest note read.
+    pub expected_revision: i64,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -607,6 +639,8 @@ pub struct DeleteNoteAttachmentRequest {
 pub struct DeleteNoteAttachmentResponse {
     /// Whether the attachment existed and was deleted.
     pub deleted: bool,
+    /// New owning-note revision, or null when the attachment was already absent.
+    pub revision: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -708,10 +742,16 @@ impl NoteMcpServer {
         let request = params.0;
         let id = request.id;
         let edits = request.edits.into_iter().map(Into::into).collect();
-        let note = edit_note_tool(&self.ctx, &id, &request.tag, edits)
-            .await
-            .map_err(to_error_data)?
-            .ok_or_else(|| ErrorData::resource_not_found(format!("note not found: {id}"), None))?;
+        let note = edit_note_tool(
+            &self.ctx,
+            &id,
+            request.expected_revision,
+            &request.tag,
+            edits,
+        )
+        .await
+        .map_err(to_error_data)?
+        .ok_or_else(|| ErrorData::resource_not_found(format!("note not found: {id}"), None))?;
         Ok(Json(note.into()))
     }
 
@@ -736,7 +776,7 @@ impl NoteMcpServer {
         &self,
         params: Parameters<DeleteNoteRequest>,
     ) -> Result<Json<DeleteNoteResponse>, ErrorData> {
-        let deleted = delete_note_tool(&self.ctx, &params.0.id)
+        let deleted = delete_note_tool(&self.ctx, &params.0.id, params.0.expected_revision)
             .await
             .map_err(to_error_data)?;
         Ok(Json(DeleteNoteResponse { deleted }))
@@ -830,11 +870,21 @@ impl NoteMcpServer {
         &self,
         params: Parameters<DeleteNoteAttachmentRequest>,
     ) -> Result<Json<DeleteNoteAttachmentResponse>, ErrorData> {
-        let deleted =
-            delete_note_attachment_tool(&self.ctx, &params.0.note_id, &params.0.attachment_id)
-                .await
-                .map_err(to_error_data)?;
-        Ok(Json(DeleteNoteAttachmentResponse { deleted }))
+        let deleted = delete_note_attachment_tool(
+            &self.ctx,
+            &params.0.note_id,
+            &params.0.attachment_id,
+            params.0.expected_revision,
+        )
+        .await
+        .map_err(to_error_data)?;
+        let (deleted, revision) = match deleted {
+            note_pipelines::DeleteNoteAttachmentResult::Applied { revision } => {
+                (true, Some(revision))
+            }
+            note_pipelines::DeleteNoteAttachmentResult::Absent => (false, None),
+        };
+        Ok(Json(DeleteNoteAttachmentResponse { deleted, revision }))
     }
 }
 
@@ -858,6 +908,32 @@ fn to_error_data(error: anyhow::Error) -> ErrorData {
     {
         return ErrorData::invalid_params(error.to_string(), None);
     }
+    if let Some(error) = error.downcast_ref::<note_pipelines::NoteMutationError>() {
+        let message = match error {
+            note_pipelines::NoteMutationError::NotFound(_) => "note not found",
+            note_pipelines::NoteMutationError::StaleRevision { .. } => {
+                "the note changed after it was read"
+            }
+            note_pipelines::NoteMutationError::StaleContentTag { .. } => {
+                "the note content changed after it was read"
+            }
+        };
+        let data = serde_json::json!({
+            "code": error.code(),
+            "message": message,
+            "details": error.details(),
+            "retryable": error.retryable(),
+        });
+        return match error {
+            note_pipelines::NoteMutationError::NotFound(_) => {
+                ErrorData::resource_not_found(message, Some(data))
+            }
+            note_pipelines::NoteMutationError::StaleRevision { .. }
+            | note_pipelines::NoteMutationError::StaleContentTag { .. } => {
+                ErrorData::invalid_request(message, Some(data))
+            }
+        };
+    }
     if let Some(error_kind) = error.downcast_ref::<AttachmentMutationError>() {
         return match error_kind {
             AttachmentMutationError::NoteNotFound(_)
@@ -870,7 +946,7 @@ fn to_error_data(error: anyhow::Error) -> ErrorData {
             }
         };
     }
-    ErrorData::internal_error(error.to_string(), None)
+    ErrorData::internal_error("note operation failed", None)
 }
 
 fn to_bulk_update_note_labels_error_data(error: anyhow::Error) -> ErrorData {
@@ -936,9 +1012,9 @@ mod tests {
     use note_storage::{
         ActiveNoteSource, AttachmentMetadataUpdate, BackendInfo, EmbeddingDashboardStatus,
         EmbeddingJob, EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteFieldsUpdate,
-        NoteUpdate, NotesRepository, OrgRepository, RetrievalRepository, SettingsRepository,
-        StorageBackend, StorageError, StorageErrorKind, StorageResult, StorageSession,
-        StorageTransaction, TransactionMode, UpsertNoteChunk,
+        NoteMutationResult, NoteUpdate, NotesRepository, OrgRepository, RetrievalRepository,
+        SettingsRepository, StorageBackend, StorageError, StorageErrorKind, StorageResult,
+        StorageSession, StorageTransaction, TransactionMode, UpsertNoteChunk,
     };
     use note_storage_turso::TursoStorage;
     use rmcp::model::ErrorCode;
@@ -994,13 +1070,13 @@ mod tests {
             fn note_exists(id: &str) -> bool;
             fn get_note(id: &str) -> Option<note_core::Note>;
             fn get_note_content(id: &str) -> Option<String>;
-            fn update_note(note: NoteUpdate<'_>) -> u64;
-            fn update_note_fields(note: NoteFieldsUpdate<'_>) -> u64;
-            fn update_note_attachments(note: AttachmentMetadataUpdate<'_>) -> u64;
-            fn soft_delete_note(id: &str, deleted_at: i64) -> u64;
+            fn update_note(note: NoteUpdate<'_>) -> NoteMutationResult<()>;
+            fn update_note_fields(note: NoteFieldsUpdate<'_>) -> NoteMutationResult<()>;
+            fn update_note_attachments(note: AttachmentMetadataUpdate<'_>) -> NoteMutationResult<()>;
+            fn soft_delete_note(id: &str, expected_revision: i64, deleted_at: i64) -> NoteMutationResult<()>;
             fn get_deleted_note_content_and_revision(id: &str) -> Option<(String, i64)>;
-            fn restore_note(id: &str, note_revision: i64) -> u64;
-            fn permanently_delete_note(id: &str) -> u64;
+            fn restore_note(id: &str, expected_revision: i64) -> NoteMutationResult<()>;
+            fn permanently_delete_note(id: &str, expected_revision: i64) -> NoteMutationResult<()>;
             fn list_expired_deleted_note_ids(cutoff: i64) -> Vec<String>;
             fn clear_note_search_data(id: &str) -> ();
             fn clear_note_labels(id: &str) -> ();
@@ -1238,6 +1314,7 @@ mod tests {
 
     fn put_request(
         note_id: &str,
+        expected_revision: i64,
         attachment_id: &str,
         path: &str,
         content: Option<&str>,
@@ -1245,6 +1322,7 @@ mod tests {
     ) -> PutNoteAttachmentRequest {
         PutNoteAttachmentRequest {
             note_id: note_id.into(),
+            expected_revision,
             attachment_id: attachment_id.into(),
             path: path.into(),
             mime: "application/octet-stream".into(),
@@ -1490,7 +1568,7 @@ mod tests {
         assert_exact_closed_object(
             &update_input,
             &update_input,
-            &["content", "id", "labels", "title"],
+            &["content", "expected_revision", "id", "labels", "title"],
         );
 
         let bulk_input = tool_schema(&server, "bulk_update_note_labels", false);
@@ -1531,6 +1609,7 @@ mod tests {
                 "content",
                 "content_base64",
                 "description",
+                "expected_revision",
                 "mime",
                 "note_id",
                 "path",
@@ -1548,7 +1627,7 @@ mod tests {
         assert_exact_closed_object(
             &attachment_delete_input,
             &attachment_delete_input,
-            &["attachment_id", "note_id"],
+            &["attachment_id", "expected_revision", "note_id"],
         );
 
         let list_input = tool_schema(&server, "list_notes", false);
@@ -1580,7 +1659,14 @@ mod tests {
         assert_exact_closed_object(
             &list_output,
             summary,
-            &["created_at", "id", "labels", "title", "updated_at"],
+            &[
+                "created_at",
+                "id",
+                "labels",
+                "revision",
+                "title",
+                "updated_at",
+            ],
         );
         let summary_label = resolve_schema(&list_output, &summary["properties"]["labels"]["items"]);
         assert_exact_closed_object(
@@ -1599,6 +1685,7 @@ mod tests {
                 "created_at",
                 "id",
                 "labels",
+                "revision",
                 "title",
                 "updated_at",
             ],
@@ -1622,7 +1709,15 @@ mod tests {
         assert_exact_closed_object(
             &search_output,
             hit,
-            &["created_at", "id", "labels", "score", "title", "updated_at"],
+            &[
+                "created_at",
+                "id",
+                "labels",
+                "revision",
+                "score",
+                "title",
+                "updated_at",
+            ],
         );
 
         let attachment_output = tool_schema(&server, "get_note_attachment_content", true);
@@ -1671,6 +1766,10 @@ mod tests {
     #[test]
     fn response_schema_types_have_exact_fields() {
         assert_eq!(
+            property_names(&serde_json::to_value(schemars::schema_for!(SaveNoteResponse)).unwrap()),
+            vec!["id", "revision"]
+        );
+        assert_eq!(
             property_names(
                 &serde_json::to_value(schemars::schema_for!(AttachmentMetadataSchema)).unwrap()
             ),
@@ -1680,7 +1779,14 @@ mod tests {
             property_names(
                 &serde_json::to_value(schemars::schema_for!(NoteSummaryResponse)).unwrap()
             ),
-            vec!["created_at", "id", "labels", "title", "updated_at"]
+            vec![
+                "created_at",
+                "id",
+                "labels",
+                "revision",
+                "title",
+                "updated_at"
+            ]
         );
         assert_eq!(
             property_names(
@@ -1692,6 +1798,7 @@ mod tests {
                 "created_at",
                 "id",
                 "labels",
+                "revision",
                 "title",
                 "updated_at",
             ]
@@ -1700,7 +1807,21 @@ mod tests {
             property_names(
                 &serde_json::to_value(schemars::schema_for!(SemanticSearchHit)).unwrap()
             ),
-            vec!["created_at", "id", "labels", "score", "title", "updated_at"]
+            vec![
+                "created_at",
+                "id",
+                "labels",
+                "revision",
+                "score",
+                "title",
+                "updated_at"
+            ]
+        );
+        assert_eq!(
+            property_names(
+                &serde_json::to_value(schemars::schema_for!(DeleteNoteAttachmentResponse)).unwrap()
+            ),
+            vec!["deleted", "revision"]
         );
     }
 
@@ -1964,6 +2085,31 @@ mod tests {
         assert_eq!(to_error_data(error).code, ErrorCode::INVALID_PARAMS);
     }
 
+    #[test]
+    fn note_conflicts_preserve_the_shared_structured_error_fields() {
+        let mapped = to_error_data(anyhow::Error::new(
+            note_pipelines::NoteMutationError::StaleRevision {
+                note_id: "note-1".into(),
+                expected_revision: 5,
+                current_revision: 6,
+            },
+        ));
+        assert_eq!(mapped.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(
+            mapped.data,
+            Some(json!({
+                "code": "stale_revision",
+                "message": "the note changed after it was read",
+                "details": {
+                    "note_id": "note-1",
+                    "expected_revision": 5,
+                    "current_revision": 6
+                },
+                "retryable": false
+            }))
+        );
+    }
+
     #[tokio::test]
     async fn standalone_handlers_use_metadata_and_exclusive_content_shapes() {
         let (ctx, backend, dir) = test_context().await;
@@ -1977,9 +2123,11 @@ mod tests {
             .await
             .unwrap()
             .0;
+        assert_eq!(saved.revision, 1);
         let text = server
             .put_note_attachment(Parameters(put_request(
                 &saved.id,
+                1,
                 "text",
                 "./text.txt",
                 Some("plain text\n"),
@@ -1992,6 +2140,7 @@ mod tests {
             serde_json::to_value(text).unwrap(),
             json!({
                 "created": true,
+                "revision": 2,
                 "attachment": {
                     "id": "text",
                     "path": "./text.txt",
@@ -2003,6 +2152,7 @@ mod tests {
         server
             .put_note_attachment(Parameters(put_request(
                 &saved.id,
+                2,
                 "blob",
                 "./blob.bin",
                 None,
@@ -2032,6 +2182,7 @@ mod tests {
                 "created_at",
                 "id",
                 "labels",
+                "revision",
                 "title",
                 "updated_at"
             ]
@@ -2100,6 +2251,7 @@ mod tests {
         let updated = server
             .update_note(Parameters(UpdateNoteRequest {
                 id: saved.id.clone(),
+                expected_revision: 3,
                 title: "Standalone updated".into(),
                 content: "updated searchable body".into(),
                 labels: vec![("topic".into(), "rust".into())],
@@ -2108,6 +2260,32 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(updated.attachments.len(), 2);
+
+        let stale = expect_error(
+            server
+                .update_note(Parameters(UpdateNoteRequest {
+                    id: saved.id.clone(),
+                    expected_revision: 3,
+                    title: "Stale".into(),
+                    content: "stale body".into(),
+                    labels: vec![],
+                }))
+                .await,
+        );
+        assert_eq!(stale.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(
+            stale.data,
+            Some(json!({
+                "code": "stale_revision",
+                "message": "the note changed after it was read",
+                "details": {
+                    "note_id": saved.id.clone(),
+                    "expected_revision": 3,
+                    "current_revision": 4
+                },
+                "retryable": false
+            }))
+        );
 
         let listed = server
             .list_notes(Parameters(ListNotesRequest {
@@ -2126,10 +2304,17 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["created_at", "id", "labels", "title", "updated_at"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
+            [
+                "created_at",
+                "id",
+                "labels",
+                "revision",
+                "title",
+                "updated_at"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
         );
 
         note_pipelines::drain_embedding_jobs(&server.ctx, 10)
@@ -2156,10 +2341,18 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>(),
-            ["created_at", "id", "labels", "score", "title", "updated_at"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
+            [
+                "created_at",
+                "id",
+                "labels",
+                "revision",
+                "score",
+                "title",
+                "updated_at",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
         );
 
         for expected in [true, false] {
@@ -2167,13 +2360,17 @@ mod tests {
                 .delete_note_attachment(Parameters(DeleteNoteAttachmentRequest {
                     note_id: saved.id.clone(),
                     attachment_id: "text".into(),
+                    expected_revision: if expected { 4 } else { 5 },
                 }))
                 .await
                 .unwrap()
                 .0;
             assert_eq!(
                 serde_json::to_value(deleted).unwrap(),
-                json!({"deleted": expected})
+                json!({
+                    "deleted": expected,
+                    "revision": if expected { Some(5) } else { None },
+                })
             );
         }
     }
@@ -2194,19 +2391,33 @@ mod tests {
 
         for (request, expected) in [
             (
-                put_request(&saved.id, "blob", "./blob.bin", None, Some("not base64 !!")),
+                put_request(
+                    &saved.id,
+                    1,
+                    "blob",
+                    "./blob.bin",
+                    None,
+                    Some("not base64 !!"),
+                ),
                 "invalid attachment content_base64",
             ),
             (
-                put_request(&saved.id, "blob", "./blob.bin", None, None),
+                put_request(&saved.id, 1, "blob", "./blob.bin", None, None),
                 "attachment content or content_base64 is required",
             ),
             (
-                put_request(&saved.id, "blob", "./blob.bin", Some("abc"), Some("eHl6")),
+                put_request(
+                    &saved.id,
+                    1,
+                    "blob",
+                    "./blob.bin",
+                    Some("abc"),
+                    Some("eHl6"),
+                ),
                 "attachment content and content_base64 do not match",
             ),
             (
-                put_request(&saved.id, "blob", "../blob.bin", Some("abc"), None),
+                put_request(&saved.id, 1, "blob", "../blob.bin", Some("abc"), None),
                 "attachment path must be relative",
             ),
         ] {
@@ -2235,6 +2446,7 @@ mod tests {
         server
             .put_note_attachment(Parameters(put_request(
                 &saved.id,
+                1,
                 "first",
                 "./first.txt",
                 Some("first"),
@@ -2244,8 +2456,15 @@ mod tests {
             .unwrap();
 
         for request in [
-            put_request(&saved.id, "first", "./moved.txt", Some("moved"), None),
-            put_request(&saved.id, "second", "./first.txt", Some("collision"), None),
+            put_request(&saved.id, 2, "first", "./moved.txt", Some("moved"), None),
+            put_request(
+                &saved.id,
+                2,
+                "second",
+                "./first.txt",
+                Some("collision"),
+                None,
+            ),
         ] {
             let error = expect_error(server.put_note_attachment(Parameters(request)).await);
             assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
@@ -2255,6 +2474,7 @@ mod tests {
             server
                 .put_note_attachment(Parameters(put_request(
                     "missing-note",
+                    1,
                     "blob",
                     "./blob.bin",
                     Some("bytes"),
@@ -2263,7 +2483,37 @@ mod tests {
                 .await,
         );
         assert_eq!(missing_put.code, ErrorCode::RESOURCE_NOT_FOUND);
-        assert!(missing_put.message.contains("note not found: missing-note"));
+        assert_eq!(missing_put.message, "note not found");
+        assert_eq!(
+            missing_put.data,
+            Some(json!({
+                "code": "not_found",
+                "message": "note not found",
+                "details": {"note_id": "missing-note"},
+                "retryable": false
+            }))
+        );
+
+        let missing_delete = expect_error(
+            server
+                .delete_note_attachment(Parameters(DeleteNoteAttachmentRequest {
+                    note_id: "missing-note".into(),
+                    attachment_id: "blob".into(),
+                    expected_revision: 1,
+                }))
+                .await,
+        );
+        assert_eq!(missing_delete.code, ErrorCode::RESOURCE_NOT_FOUND);
+        assert_eq!(missing_delete.message, "note not found");
+        assert_eq!(
+            missing_delete.data,
+            Some(json!({
+                "code": "not_found",
+                "message": "note not found",
+                "details": {"note_id": "missing-note"},
+                "retryable": false
+            }))
+        );
 
         let missing_get = expect_error(
             server

@@ -4,7 +4,7 @@ use note_core::{LabelValueType, NoteAttachment, ValidationError};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
     chunk_hash, delete_note_attachment, drain_embedding_jobs, get_note_attachment_by_id,
-    put_note_attachment, AttachmentMutationError, Context,
+    put_note_attachment, AttachmentMutationError, Context, NoteMutationError,
 };
 use note_storage::{NewNote, StorageBackend, TransactionMode, UpsertNoteChunk};
 use note_storage_turso::TursoStorage;
@@ -148,6 +148,7 @@ async fn put_new_id_with_unique_normalized_path_creates_metadata_and_object() {
     let result = put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment(
             "report",
             "./reports//today.txt",
@@ -196,6 +197,7 @@ async fn put_existing_id_at_same_normalized_path_replaces_bytes_and_metadata() {
     let result = put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment(
             "report",
             "reports/./today.txt",
@@ -238,6 +240,7 @@ async fn standalone_attachment_ids_use_one_trimmed_canonical_identity() {
     let replaced = put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment(" foo ", "./foo.txt", "text/plain", "new", b"new"),
     )
     .await
@@ -254,9 +257,11 @@ async fn standalone_attachment_ids_use_one_trimmed_canonical_identity() {
             .content,
         b"new"
     );
-    assert!(delete_note_attachment(&ctx, NOTE_ID, " foo ")
-        .await
-        .unwrap());
+    assert!(
+        delete_note_attachment(&ctx, NOTE_ID, " foo ", NOTE_REVISION + 1)
+            .await
+            .unwrap()
+    );
 
     let (legacy_ctx, legacy_backend, _dir) = test_context().await;
     seed_note(
@@ -275,6 +280,7 @@ async fn standalone_attachment_ids_use_one_trimmed_canonical_identity() {
     let legacy = put_note_attachment(
         &legacy_ctx,
         "legacy-id-note",
+        NOTE_REVISION,
         attachment("legacy", "./legacy.txt", "text/plain", "new", b"new"),
     )
     .await
@@ -298,6 +304,7 @@ async fn a_new_standalone_attachment_stores_its_trimmed_canonical_id() {
     let result = put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment(" new ", "new.txt", "text/plain", "", b"new"),
     )
     .await
@@ -329,6 +336,7 @@ async fn put_rejects_path_changes_and_normalized_path_collisions_without_mutatio
     let changed_path = put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment("first", "files/moved.txt", "text/plain", "", b"changed"),
     )
     .await
@@ -343,6 +351,7 @@ async fn put_rejects_path_changes_and_normalized_path_collisions_without_mutatio
     let collision = put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment(
             "third",
             "./files//second.txt",
@@ -377,6 +386,40 @@ async fn put_rejects_path_changes_and_normalized_path_collisions_without_mutatio
             .content,
         b"second"
     );
+}
+
+#[tokio::test]
+async fn put_reports_stale_revision_before_errors_derived_from_newer_attachment_state() {
+    let (ctx, backend, _dir) = test_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[
+            attachment("first", "first.txt", "text/plain", "", b"first"),
+            attachment("second", "second.txt", "text/plain", "", b"second"),
+        ],
+    )
+    .await;
+
+    let error = put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        NOTE_REVISION - 1,
+        attachment("first", "second.txt", "text/plain", "", b"stale"),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(&NoteMutationError::StaleRevision {
+            note_id: NOTE_ID.into(),
+            expected_revision: NOTE_REVISION - 1,
+            current_revision: NOTE_REVISION,
+        })
+    );
+    assert_eq!(stored_note(&backend, NOTE_ID).await.revision, NOTE_REVISION);
 }
 
 #[tokio::test]
@@ -420,7 +463,7 @@ async fn put_rejects_invalid_id_mime_and_paths_before_mutation() {
     ];
 
     for (invalid, expected) in cases {
-        let error = put_note_attachment(&ctx, NOTE_ID, invalid)
+        let error = put_note_attachment(&ctx, NOTE_ID, NOTE_REVISION, invalid)
             .await
             .unwrap_err();
         assert_eq!(error.downcast_ref::<ValidationError>(), Some(&expected));
@@ -631,15 +674,23 @@ async fn delete_removes_only_selected_metadata_and_object_and_is_idempotent() {
     )
     .await;
 
-    assert!(delete_note_attachment(&ctx, NOTE_ID, "first")
+    assert!(
+        delete_note_attachment(&ctx, NOTE_ID, "first", NOTE_REVISION)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !delete_note_attachment(&ctx, NOTE_ID, "first", NOTE_REVISION + 1)
+            .await
+            .unwrap()
+    );
+    let error = delete_note_attachment(&ctx, "missing-note", "first", NOTE_REVISION)
         .await
-        .unwrap());
-    assert!(!delete_note_attachment(&ctx, NOTE_ID, "first")
-        .await
-        .unwrap());
-    assert!(!delete_note_attachment(&ctx, "missing-note", "first")
-        .await
-        .unwrap());
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(&NoteMutationError::NotFound("missing-note".into()))
+    );
     assert_eq!(
         get_note_attachment_by_id(&ctx, NOTE_ID, "first")
             .await
@@ -674,12 +725,14 @@ async fn delete_succeeds_when_the_selected_physical_object_is_already_missing() 
         .await
         .unwrap();
 
-    assert!(delete_note_attachment(&ctx, NOTE_ID, "old").await.unwrap());
+    assert!(delete_note_attachment(&ctx, NOTE_ID, "old", NOTE_REVISION)
+        .await
+        .unwrap());
     assert!(stored_note(&backend, NOTE_ID).await.attachments.is_empty());
 }
 
 #[tokio::test]
-async fn put_preserves_revision_chunks_labels_and_embedding_queue() {
+async fn put_advances_revision_once_and_preserves_chunks_labels_and_embedding_queue() {
     let (ctx, backend, _dir) = test_context().await;
     seed_note(&ctx, &backend, NOTE_ID, &[]).await;
     assert_eq!(drain_embedding_jobs(&ctx, 10).await.unwrap(), 1);
@@ -690,6 +743,7 @@ async fn put_preserves_revision_chunks_labels_and_embedding_queue() {
     put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment("new", "new.txt", "text/plain", "", b"new"),
     )
     .await
@@ -697,7 +751,7 @@ async fn put_preserves_revision_chunks_labels_and_embedding_queue() {
 
     assert_eq!(
         observer.get_note_revision(NOTE_ID).await.unwrap(),
-        Some(NOTE_REVISION)
+        Some(NOTE_REVISION + 1)
     );
     assert_eq!(
         observer.list_note_chunks(NOTE_ID).await.unwrap(),
@@ -711,6 +765,42 @@ async fn put_preserves_revision_chunks_labels_and_embedding_queue() {
 }
 
 #[tokio::test]
+async fn stale_put_aborts_prepared_object_and_preserves_metadata_and_revision() {
+    let (ctx, backend, _event_backend, _attachments, events, _dir) = controlled_context().await;
+    seed_note(&ctx, &backend, NOTE_ID, &[]).await;
+    events.lock().unwrap().clear();
+
+    let error = put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        NOTE_REVISION - 1,
+        attachment("new", "new.txt", "text/plain", "", b"new"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(NoteMutationError::StaleRevision {
+            expected_revision: 6,
+            current_revision: NOTE_REVISION,
+            ..
+        })
+    ));
+    let stored = stored_note(&backend, NOTE_ID).await;
+    assert_eq!(stored.revision, NOTE_REVISION);
+    assert!(stored.attachments.is_empty());
+    let logged = events.lock().unwrap().clone();
+    assert!(logged.iter().any(|event| event == "rollback"));
+    assert!(logged
+        .iter()
+        .any(|event| event == "abort_put:attachment-note:new.txt"));
+    assert!(!logged
+        .iter()
+        .any(|event| event == "publish_put:attachment-note:new.txt"));
+}
+
+#[tokio::test]
 async fn put_advances_updated_at_when_the_stored_timestamp_is_the_current_second() {
     let (ctx, backend, _dir) = test_context().await;
     let current_second = chrono::Utc::now().timestamp();
@@ -719,6 +809,7 @@ async fn put_advances_updated_at_when_the_stored_timestamp_is_the_current_second
     put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment("new", "new.txt", "text/plain", "", b"new"),
     )
     .await
@@ -728,7 +819,7 @@ async fn put_advances_updated_at_when_the_stored_timestamp_is_the_current_second
 }
 
 #[tokio::test]
-async fn delete_preserves_revision_chunks_labels_and_embedding_queue() {
+async fn delete_advances_revision_once_and_preserves_chunks_labels_and_embedding_queue() {
     let (ctx, backend, _dir) = test_context().await;
     seed_note(
         &ctx,
@@ -742,11 +833,13 @@ async fn delete_preserves_revision_chunks_labels_and_embedding_queue() {
     let chunks_before = observer.list_note_chunks(NOTE_ID).await.unwrap();
     let labels_before = observer.labels_for_note(NOTE_ID).await.unwrap();
 
-    assert!(delete_note_attachment(&ctx, NOTE_ID, "old").await.unwrap());
+    assert!(delete_note_attachment(&ctx, NOTE_ID, "old", NOTE_REVISION)
+        .await
+        .unwrap());
 
     assert_eq!(
         observer.get_note_revision(NOTE_ID).await.unwrap(),
-        Some(NOTE_REVISION)
+        Some(NOTE_REVISION + 1)
     );
     assert_eq!(
         observer.list_note_chunks(NOTE_ID).await.unwrap(),
@@ -772,7 +865,9 @@ async fn delete_advances_updated_at_when_the_stored_timestamp_is_the_current_sec
     )
     .await;
 
-    assert!(delete_note_attachment(&ctx, NOTE_ID, "old").await.unwrap());
+    assert!(delete_note_attachment(&ctx, NOTE_ID, "old", NOTE_REVISION)
+        .await
+        .unwrap());
 
     assert!(stored_note(&backend, NOTE_ID).await.updated_at > current_second);
 }
@@ -800,14 +895,17 @@ async fn put_and_delete_do_not_hydrate_or_rewrite_sibling_objects() {
     put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment("target", "./target.txt", "text/plain", "", b"replacement"),
     )
     .await
     .unwrap();
     assert!(!sibling_path.exists());
-    assert!(delete_note_attachment(&ctx, NOTE_ID, "target")
-        .await
-        .unwrap());
+    assert!(
+        delete_note_attachment(&ctx, NOTE_ID, "target", NOTE_REVISION + 1)
+            .await
+            .unwrap()
+    );
     assert!(!sibling_path.exists());
     assert_eq!(
         stored_note(&backend, NOTE_ID).await.attachments[0].id,
@@ -816,22 +914,21 @@ async fn put_and_delete_do_not_hydrate_or_rewrite_sibling_objects() {
 }
 
 #[tokio::test]
-async fn missing_note_contract_is_typed_for_put_and_idempotent_for_reads_and_delete() {
+async fn missing_note_contract_is_typed_for_mutations_and_idempotent_for_reads() {
     let (ctx, _backend, _dir) = test_context().await;
 
     let error = put_note_attachment(
         &ctx,
         "missing-note",
+        NOTE_REVISION,
         attachment("file", "file.txt", "text/plain", "", b"file"),
     )
     .await
     .unwrap_err();
 
     assert_eq!(
-        error.downcast_ref::<AttachmentMutationError>(),
-        Some(&AttachmentMutationError::NoteNotFound(
-            "missing-note".into()
-        ))
+        error.downcast_ref::<NoteMutationError>(),
+        Some(&NoteMutationError::NotFound("missing-note".into()))
     );
     assert_eq!(
         get_note_attachment_by_id(&ctx, "missing-note", "file")
@@ -839,9 +936,13 @@ async fn missing_note_contract_is_typed_for_put_and_idempotent_for_reads_and_del
             .unwrap(),
         None
     );
-    assert!(!delete_note_attachment(&ctx, "missing-note", "file")
+    let error = delete_note_attachment(&ctx, "missing-note", "file", NOTE_REVISION)
         .await
-        .unwrap());
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(&NoteMutationError::NotFound("missing-note".into()))
+    );
 }
 
 #[tokio::test]
@@ -855,6 +956,7 @@ async fn transaction_failure_aborts_put_and_preserves_primary_and_abort_context(
     let error = put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment("new", "new.txt", "text/plain", "", b"new"),
     )
     .await
@@ -890,7 +992,7 @@ async fn transaction_failure_aborts_delete_without_publishing_or_removing_metada
     events.lock().unwrap().clear();
     event_backend.fail_next_commit();
 
-    let error = delete_note_attachment(&ctx, NOTE_ID, "old")
+    let error = delete_note_attachment(&ctx, NOTE_ID, "old", NOTE_REVISION)
         .await
         .unwrap_err();
 
@@ -925,11 +1027,16 @@ async fn put_and_delete_publish_only_after_metadata_commit() {
     put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment("new", "new.txt", "text/plain", "", b"new"),
     )
     .await
     .unwrap();
-    assert!(delete_note_attachment(&ctx, NOTE_ID, "old").await.unwrap());
+    assert!(
+        delete_note_attachment(&ctx, NOTE_ID, "old", NOTE_REVISION + 1)
+            .await
+            .unwrap()
+    );
 
     assert_eq!(
         events.lock().unwrap().clone(),
@@ -956,6 +1063,7 @@ async fn put_publication_failure_reports_committed_active_metadata_without_abort
     let error = put_note_attachment(
         &ctx,
         NOTE_ID,
+        NOTE_REVISION,
         attachment("new", "new.txt", "text/plain", "", b"new"),
     )
     .await
@@ -992,7 +1100,7 @@ async fn delete_publication_failure_reports_committed_deletion_and_possible_orph
     events.lock().unwrap().clear();
     attachments.fail_publish();
 
-    let error = delete_note_attachment(&ctx, NOTE_ID, "old")
+    let error = delete_note_attachment(&ctx, NOTE_ID, "old", NOTE_REVISION)
         .await
         .unwrap_err();
 
@@ -1013,7 +1121,7 @@ async fn delete_publication_failure_reports_committed_deletion_and_possible_orph
 }
 
 #[tokio::test]
-async fn delete_retries_once_when_the_path_changes_under_its_prepared_lock() {
+async fn delete_reports_stale_revision_when_metadata_changes_under_its_prepared_lock() {
     let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
     seed_note(
         &ctx,
@@ -1031,11 +1139,22 @@ async fn delete_retries_once_when_the_path_changes_under_its_prepared_lock() {
     events.lock().unwrap().clear();
     attachments.race_attachment_path_on_delete(NOTE_ID, "moving", "second.txt");
 
-    assert!(delete_note_attachment(&ctx, NOTE_ID, "moving")
+    let error = delete_note_attachment(&ctx, NOTE_ID, "moving", NOTE_REVISION)
         .await
-        .unwrap());
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<NoteMutationError>(),
+        Some(NoteMutationError::StaleRevision {
+            expected_revision: NOTE_REVISION,
+            current_revision: 8,
+            ..
+        })
+    ));
 
-    assert!(stored_note(&backend, NOTE_ID).await.attachments.is_empty());
+    assert_eq!(
+        stored_note(&backend, NOTE_ID).await.attachments[0].path,
+        "second.txt"
+    );
     assert_eq!(
         events.lock().unwrap().clone(),
         vec![
@@ -1046,8 +1165,8 @@ async fn delete_retries_once_when_the_path_changes_under_its_prepared_lock() {
             "abort_delete:attachment-note:first.txt",
             "prepare_delete:attachment-note:second.txt",
             "begin",
-            "commit",
-            "publish_delete:attachment-note:second.txt",
+            "rollback",
+            "abort_delete:attachment-note:second.txt",
         ]
     );
 }
@@ -1072,7 +1191,7 @@ async fn delete_rejects_a_second_path_change_without_publishing_the_wrong_object
     attachments.race_attachment_path_on_delete(NOTE_ID, "moving", "second.txt");
     attachments.race_attachment_path_on_delete(NOTE_ID, "moving", "third.txt");
 
-    let error = delete_note_attachment(&ctx, NOTE_ID, "moving")
+    let error = delete_note_attachment(&ctx, NOTE_ID, "moving", NOTE_REVISION)
         .await
         .unwrap_err();
 

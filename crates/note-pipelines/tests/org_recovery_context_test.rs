@@ -234,13 +234,16 @@ async fn context_maps_canonical_relations_attempts_history_and_note_availability
     assert!(!json.to_string().contains("token_hash"));
     assert!(!json.to_string().contains("secret body"));
 
-    session.soft_delete_note(note_id, NOW + 10).await.unwrap();
+    session
+        .soft_delete_note(note_id, 1, NOW + 10)
+        .await
+        .unwrap();
     let deleted = get_item_context(&context, workspace_id, child)
         .await
         .unwrap();
     assert!(!deleted.note_links[0].available);
     assert_eq!(deleted.note_links[0].note_id, note_id);
-    session.permanently_delete_note(note_id).await.unwrap();
+    session.permanently_delete_note(note_id, 2).await.unwrap();
     let permanently_deleted = get_item_context(&context, workspace_id, child)
         .await
         .unwrap();

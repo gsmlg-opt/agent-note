@@ -9,6 +9,9 @@ pub use bulk_update_note_labels::*;
 
 pub mod org;
 
+pub mod mutation_error;
+pub use mutation_error::*;
+
 pub mod note_attachments;
 pub use note_attachments::*;
 

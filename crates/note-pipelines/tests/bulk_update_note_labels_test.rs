@@ -122,7 +122,10 @@ async fn seed_note(
         .await
         .unwrap();
     if deleted {
-        transaction.soft_delete_note(id, 30).await.unwrap();
+        transaction
+            .soft_delete_note(id, NOTE_REVISION, 30)
+            .await
+            .unwrap();
     }
     transaction.commit().await.unwrap();
     prepared.publish().await.unwrap();

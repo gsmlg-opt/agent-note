@@ -65,7 +65,7 @@ async fn title_search_tracks_updates_deletion_and_restoration() {
             content: "body",
             attachments: &[],
             updated_at: 2,
-            note_revision: 2,
+            expected_revision: 1,
         })
         .await
         .unwrap();
@@ -80,7 +80,7 @@ async fn title_search_tracks_updates_deletion_and_restoration() {
         .await
         .unwrap()
         .is_empty());
-    observer.soft_delete_note("note", 3).await.unwrap();
+    observer.soft_delete_note("note", 2, 3).await.unwrap();
 
     let observer = fixture.storage.connect().await.unwrap();
     assert!(observer
@@ -226,7 +226,7 @@ async fn allowed_ids_are_applied_before_title_and_dense_limits() {
         .unwrap();
     fixture
         .session
-        .soft_delete_note("allowed-deleted", 2)
+        .soft_delete_note("allowed-deleted", 1, 2)
         .await
         .unwrap();
 
@@ -385,7 +385,7 @@ async fn dense_search_excludes_soft_deleted_notes_and_restore_reuses_vectors() {
 
     fixture
         .session
-        .soft_delete_note("deleted", 2)
+        .soft_delete_note("deleted", 1, 2)
         .await
         .unwrap();
     assert_eq!(
@@ -530,8 +530,12 @@ async fn deleting_a_note_cascades_chunks_jobs_and_retrieval() {
         vec!["a"]
     );
 
-    fixture.session.soft_delete_note("a", 2).await.unwrap();
-    fixture.session.permanently_delete_note("a").await.unwrap();
+    fixture.session.soft_delete_note("a", 1, 2).await.unwrap();
+    fixture
+        .session
+        .permanently_delete_note("a", 2)
+        .await
+        .unwrap();
 
     let observer = fixture.storage.connect().await.unwrap();
     assert!(observer

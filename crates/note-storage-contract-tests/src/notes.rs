@@ -1,7 +1,7 @@
 use note_core::{parse_label_selectors, LabelValueType, NoteAttachment};
 use note_storage::{
-    ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate, NoteUpdate,
-    StorageBackend, StorageErrorKind,
+    ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate, NoteMutationResult,
+    NoteUpdate, StorageBackend, StorageErrorKind,
 };
 use std::sync::Arc;
 
@@ -37,6 +37,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     assert_eq!(note.content, "Contract body");
     assert_eq!(note.created_at, 100);
     assert_eq!(note.updated_at, 100);
+    assert_eq!(note.revision, 1);
     assert_eq!(note.deleted_at, None);
     assert_eq!(note.attachments.len(), 1);
     assert_eq!(note.attachments[0].id, "meta");
@@ -68,11 +69,14 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                 content: "Updated body",
                 attachments: std::slice::from_ref(&updated_attachment),
                 updated_at: 110,
-                note_revision: 2,
+                expected_revision: 1,
             })
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
     );
     let note = session
         .get_note("contract-notes-active")
@@ -117,11 +121,14 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                 title: "Partial title updated",
                 content: "Partial body updated",
                 updated_at: 120,
-                note_revision: 2,
+                expected_revision: 1,
             })
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
     );
     let partial = session
         .get_note("contract-notes-partial")
@@ -151,11 +158,11 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                 title: "Missing",
                 content: "Missing",
                 updated_at: 120,
-                note_revision: 2,
+                expected_revision: 1,
             })
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
     session
         .insert_note(NewNote {
@@ -177,11 +184,11 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                 title: "Must not update",
                 content: "Must not update",
                 updated_at: 120,
-                note_revision: 2,
+                expected_revision: 1,
             })
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
 
     let partial_attachment = NoteAttachment {
@@ -195,12 +202,16 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         session
             .update_note_attachments(AttachmentMetadataUpdate {
                 id: "contract-notes-partial",
+                expected_revision: 2,
                 attachments: std::slice::from_ref(&partial_attachment),
                 updated_at: 130,
             })
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 3
+        }
     );
     let partial = session
         .get_note("contract-notes-partial")
@@ -225,29 +236,31 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .get_note_revision("contract-notes-partial")
             .await
             .unwrap(),
-        Some(2)
+        Some(3)
     );
     assert_eq!(
         session
             .update_note_attachments(AttachmentMetadataUpdate {
                 id: "contract-notes-missing",
+                expected_revision: 1,
                 attachments: &[],
                 updated_at: 130,
             })
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
     assert_eq!(
         session
             .update_note_attachments(AttachmentMetadataUpdate {
                 id: "contract-notes-partial-deleted",
+                expected_revision: 1,
                 attachments: &[],
                 updated_at: 130,
             })
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
 
     session
@@ -739,16 +752,19 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         "contract-notes-tie-b",
         "contract-notes-tie-c",
     ] {
-        session.soft_delete_note(id, 450).await.unwrap();
-        session.permanently_delete_note(id).await.unwrap();
+        session.soft_delete_note(id, 1, 450).await.unwrap();
+        session.permanently_delete_note(id, 2).await.unwrap();
     }
 
     assert_eq!(
         session
-            .soft_delete_note("contract-notes-active", 500)
+            .soft_delete_note("contract-notes-active", 2, 500)
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 3
+        }
     );
     assert!(session
         .get_note("contract-notes-active")
@@ -789,7 +805,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .get_deleted_note_content_and_revision("contract-notes-active")
             .await
             .unwrap(),
-        Some(("Updated body".to_string(), 2))
+        Some(("Updated body".to_string(), 3))
     );
     let deleted = session.list_deleted_note_summaries().await.unwrap();
     let deleted = deleted
@@ -805,32 +821,35 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                 content: "Must not update",
                 attachments: &[],
                 updated_at: 600,
-                note_revision: 9,
+                expected_revision: 3,
             })
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
     assert_eq!(
         session
             .get_deleted_note_content_and_revision("contract-notes-active")
             .await
             .unwrap(),
-        Some(("Updated body".to_string(), 2))
+        Some(("Updated body".to_string(), 3))
     );
     assert_eq!(
         session
             .restore_note("contract-notes-active", 3)
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 4
+        }
     );
     assert_eq!(
         session
             .get_note_revision("contract-notes-active")
             .await
             .unwrap(),
-        Some(3)
+        Some(4)
     );
     assert!(session
         .get_note("contract-notes-active")
@@ -869,21 +888,24 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
 
     assert_eq!(
         session
-            .permanently_delete_note("contract-notes-newer")
+            .permanently_delete_note("contract-notes-newer", 1)
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
     session
-        .soft_delete_note("contract-notes-other", 800)
+        .soft_delete_note("contract-notes-other", 1, 800)
         .await
         .unwrap();
     assert_eq!(
         session
-            .permanently_delete_note("contract-notes-other")
+            .permanently_delete_note("contract-notes-other", 2)
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
     );
     assert!(session
         .labels_for_note("contract-notes-other")
@@ -904,7 +926,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             ActiveNoteSource {
                 id: "contract-notes-active".into(),
                 content: "Updated body".into(),
-                note_revision: 3,
+                note_revision: 4,
             },
             ActiveNoteSource {
                 id: "contract-notes-middle".into(),
@@ -929,8 +951,236 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             ActiveNoteSource {
                 id: "contract-notes-partial".into(),
                 content: "Partial body updated".into(),
-                note_revision: 2,
+                note_revision: 3,
             },
         ]
     );
+
+    session
+        .insert_note(NewNote {
+            id: "contract-notes-cas-update",
+            title: "Original",
+            content: "Original content",
+            attachments: &[],
+            created_at: 2_000,
+            updated_at: 2_000,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .update_note_fields(NoteFieldsUpdate {
+                id: "contract-notes-cas-update",
+                expected_revision: 1,
+                title: "Winner",
+                content: "Winner content",
+                updated_at: 2_001,
+            })
+            .await
+            .unwrap(),
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2,
+        }
+    );
+    assert_eq!(
+        session
+            .update_note_fields(NoteFieldsUpdate {
+                id: "contract-notes-cas-update",
+                expected_revision: 1,
+                title: "Stale loser",
+                content: "Stale content",
+                updated_at: 2_002,
+            })
+            .await
+            .unwrap(),
+        NoteMutationResult::Conflict {
+            expected_revision: 1,
+            current_revision: 2,
+        }
+    );
+    let cas_note = session
+        .get_note("contract-notes-cas-update")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cas_note.title, "Winner");
+    assert_eq!(cas_note.content, "Winner content");
+    assert_eq!(cas_note.revision, 2);
+
+    session
+        .insert_note(NewNote {
+            id: "contract-notes-cas-attachment",
+            title: "Attachment CAS",
+            content: "Body",
+            attachments: std::slice::from_ref(&attachment),
+            created_at: 2_010,
+            updated_at: 2_010,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .update_note_attachments(AttachmentMetadataUpdate {
+                id: "contract-notes-cas-attachment",
+                expected_revision: 0,
+                attachments: std::slice::from_ref(&partial_attachment),
+                updated_at: 2_011,
+            })
+            .await
+            .unwrap(),
+        NoteMutationResult::Conflict {
+            expected_revision: 0,
+            current_revision: 1,
+        }
+    );
+    let attachment_note = session
+        .get_note("contract-notes-cas-attachment")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(attachment_note.attachments[0].id, "meta");
+    assert_eq!(attachment_note.updated_at, 2_010);
+    assert_eq!(attachment_note.revision, 1);
+
+    session
+        .insert_note(NewNote {
+            id: "contract-notes-cas-lifecycle",
+            title: "Lifecycle CAS",
+            content: "Body",
+            attachments: &[],
+            created_at: 2_020,
+            updated_at: 2_020,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .soft_delete_note("contract-notes-cas-lifecycle", 1, 2_021)
+            .await
+            .unwrap(),
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2,
+        }
+    );
+    let deleted_summary = session
+        .list_deleted_note_summaries()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|note| note.id == "contract-notes-cas-lifecycle")
+        .unwrap();
+    assert_eq!(deleted_summary.revision, 2);
+    assert_eq!(
+        session
+            .restore_note("contract-notes-cas-lifecycle", 1)
+            .await
+            .unwrap(),
+        NoteMutationResult::Conflict {
+            expected_revision: 1,
+            current_revision: 2,
+        }
+    );
+    assert!(session
+        .get_note("contract-notes-cas-lifecycle")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        session
+            .permanently_delete_note("contract-notes-cas-lifecycle", 1)
+            .await
+            .unwrap(),
+        NoteMutationResult::Conflict {
+            expected_revision: 1,
+            current_revision: 2,
+        }
+    );
+    assert!(session
+        .note_exists("contract-notes-cas-lifecycle")
+        .await
+        .unwrap());
+    assert_eq!(
+        session
+            .update_note_fields(NoteFieldsUpdate {
+                id: "contract-notes-cas-missing",
+                expected_revision: 1,
+                title: "Missing",
+                content: "Missing",
+                updated_at: 2_030,
+            })
+            .await
+            .unwrap(),
+        NoteMutationResult::NotFound
+    );
+
+    session
+        .insert_note(NewNote {
+            id: "contract-notes-cas-race",
+            title: "Before race",
+            content: "Before race",
+            attachments: &[],
+            created_at: 2_040,
+            updated_at: 2_040,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    let first = storage.session().await.unwrap();
+    let second = storage.session().await.unwrap();
+    let (first_result, second_result) = tokio::join!(
+        first.update_note_fields(NoteFieldsUpdate {
+            id: "contract-notes-cas-race",
+            expected_revision: 1,
+            title: "First winner candidate",
+            content: "First content",
+            updated_at: 2_041,
+        }),
+        second.update_note_fields(NoteFieldsUpdate {
+            id: "contract-notes-cas-race",
+            expected_revision: 1,
+            title: "Second winner candidate",
+            content: "Second content",
+            updated_at: 2_042,
+        })
+    );
+    let results = [first_result.unwrap(), second_result.unwrap()];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, NoteMutationResult::Applied { revision: 2, .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(
+                result,
+                NoteMutationResult::Conflict {
+                    expected_revision: 1,
+                    current_revision: 2,
+                }
+            ))
+            .count(),
+        1
+    );
+    let raced = session
+        .get_note("contract-notes-cas-race")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(raced.revision, 2);
+    assert!(matches!(
+        raced.title.as_str(),
+        "First winner candidate" | "Second winner candidate"
+    ));
 }

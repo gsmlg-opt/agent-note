@@ -7,7 +7,10 @@ use crate::api;
 use crate::components::icons;
 use crate::components::Modal;
 use crate::routes::{NotesQueryParams, Route};
-use crate::state::{LabelFilter, LabelKey, NoteSummary, SearchResultSummary};
+use crate::state::{
+    stale_retry_blocked, LabelFilter, LabelKey, NoteSummary, SearchResultSummary,
+    StaleRevisionGate, StaleRevisionGateAction,
+};
 
 /// Notes shown per page in the list view.
 const DEFAULT_PAGE_SIZE: usize = 10;
@@ -178,7 +181,8 @@ pub fn notes_page() -> Html {
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
     // The note pending deletion (id, title) — drives the confirm modal.
-    let delete_target = use_state(|| None::<(String, String)>);
+    let delete_target = use_state(|| None::<(String, String, i64)>);
+    let stale_revision_gate = use_reducer(StaleRevisionGate::default);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
     let page_size = use_state(|| DEFAULT_PAGE_SIZE);
@@ -215,8 +219,10 @@ pub fn notes_page() -> Html {
         let label_filters = label_filters.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let stale_revision_gate = stale_revision_gate.clone();
         use_effect_with((url_state.clone(), *refresh_tick), move |(state, _)| {
             let state = state.clone();
+            let refresh_epoch = stale_revision_gate.refresh_epoch();
             notes.set(Vec::new());
             total_notes.set(0);
             results.set(None);
@@ -237,8 +243,22 @@ pub fn notes_page() -> Html {
                         Ok(page) => {
                             notes.set(page.notes);
                             total_notes.set(page.total);
+                            stale_revision_gate.dispatch(
+                                StaleRevisionGateAction::RefreshFinished {
+                                    started_epoch: refresh_epoch,
+                                    succeeded: true,
+                                },
+                            );
                         }
-                        Err(e) => error.set(Some(e)),
+                        Err(e) => {
+                            stale_revision_gate.dispatch(
+                                StaleRevisionGateAction::RefreshFinished {
+                                    started_epoch: refresh_epoch,
+                                    succeeded: false,
+                                },
+                            );
+                            error.set(Some(e));
+                        }
                     }
                 } else {
                     let limit = state
@@ -247,8 +267,24 @@ pub fn notes_page() -> Html {
                         .saturating_mul(state.page_size)
                         .max(state.page_size);
                     match api::search_filtered(&search, limit, &state.labels).await {
-                        Ok(r) => results.set(Some(r)),
-                        Err(e) => error.set(Some(e)),
+                        Ok(r) => {
+                            results.set(Some(r));
+                            stale_revision_gate.dispatch(
+                                StaleRevisionGateAction::RefreshFinished {
+                                    started_epoch: refresh_epoch,
+                                    succeeded: true,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            stale_revision_gate.dispatch(
+                                StaleRevisionGateAction::RefreshFinished {
+                                    started_epoch: refresh_epoch,
+                                    succeeded: false,
+                                },
+                            );
+                            error.set(Some(e));
+                        }
                     }
                 }
                 loading.set(false);
@@ -346,41 +382,76 @@ pub fn notes_page() -> Html {
     // than re-reading `delete_target` inside the click handler) keeps the confirm handler correct.
     let delete_modal = match (*delete_target).clone() {
         None => html! {},
-        Some((id, title)) => {
+        Some((id, title, expected_revision)) => {
             let on_close = {
                 let d = delete_target.clone();
-                Callback::from(move |_: ()| d.set(None))
+                let stale_revision_gate = stale_revision_gate.clone();
+                Callback::from(move |_: ()| {
+                    d.set(None);
+                    stale_revision_gate.dispatch(StaleRevisionGateAction::Dismiss);
+                })
             };
             let on_cancel = {
                 let d = delete_target.clone();
-                Callback::from(move |_: MouseEvent| d.set(None))
+                let stale_revision_gate = stale_revision_gate.clone();
+                Callback::from(move |_: MouseEvent| {
+                    d.set(None);
+                    stale_revision_gate.dispatch(StaleRevisionGateAction::Dismiss);
+                })
             };
             let on_confirm = {
                 let d = delete_target.clone();
                 let reload = reload.clone();
                 let error = error.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_: MouseEvent| {
+                    if stale_revision_gate.conflict_notice_visible() {
+                        return;
+                    }
                     let d = d.clone();
                     let reload = reload.clone();
                     let error = error.clone();
+                    let stale_revision_gate = stale_revision_gate.clone();
                     let id = id.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        match api::delete_note(&id).await {
+                        match api::delete_note(&id, expected_revision).await {
                             Ok(()) => {
                                 d.set(None);
                                 reload.emit(());
                             }
-                            Err(e) => error.set(Some(e)),
+                            Err(e) => {
+                                if e.is_stale_revision() {
+                                    stale_revision_gate.dispatch(StaleRevisionGateAction::Conflict);
+                                } else {
+                                    error.set(Some(e.to_string()));
+                                }
+                            }
                         }
                     });
+                })
+            };
+            let on_reload = {
+                let d = delete_target.clone();
+                let reload = reload.clone();
+                Callback::from(move |_| {
+                    d.set(None);
+                    reload.emit(());
                 })
             };
             html! {
                 <Modal title="Remove note" on_close={on_close}>
                     <p>{ format!("Remove the note \u{201c}{title}\u{201d}? This cannot be undone.") }</p>
+                    if stale_revision_gate.blocked() {
+                        <Alert variant={Some("error".to_string())}>
+                            <span>{ "This note changed after the list was loaded. Reload the notes before deciding whether to retry." }</span>
+                        </Alert>
+                    }
                     <div class="app-modal-actions">
+                        if stale_revision_gate.conflict_notice_visible() {
+                            <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload notes" }</button>
+                        }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel}>{ "Cancel" }</button>
-                        <button type="button" class="btn btn-error" onclick={on_confirm}>{ "Remove note" }</button>
+                        <button type="button" class="btn btn-error" disabled={stale_retry_blocked(false, stale_revision_gate.blocked())} onclick={on_confirm}>{ "Remove note" }</button>
                     </div>
                 </Modal>
             }
@@ -648,7 +719,7 @@ fn list_view(
     total: usize,
     page: &UseStateHandle<usize>,
     page_size: &UseStateHandle<usize>,
-    delete_target: &UseStateHandle<Option<(String, String)>>,
+    delete_target: &UseStateHandle<Option<(String, String, i64)>>,
     notes_query: &NotesQueryParams,
     on_quick_add_filter: Callback<(String, String)>,
     on_page_change: Callback<usize>,
@@ -749,7 +820,7 @@ fn pagination_bar(
 
 fn note_table(
     notes: &[NoteSummary],
-    delete_target: &UseStateHandle<Option<(String, String)>>,
+    delete_target: &UseStateHandle<Option<(String, String, i64)>>,
     notes_query: &NotesQueryParams,
     on_quick_add_filter: Callback<(String, String)>,
 ) -> Html {
@@ -782,7 +853,8 @@ fn note_table(
                             let delete_target = delete_target.clone();
                             let id = note.id.clone();
                             let title = note.title.clone();
-                            Callback::from(move |_| delete_target.set(Some((id.clone(), title.clone()))))
+                            let revision = note.revision;
+                            Callback::from(move |_| delete_target.set(Some((id.clone(), title.clone(), revision))))
                         };
                         html! {
                             <tr key={note.id.clone()}>

@@ -1,7 +1,9 @@
 mod support;
 
 use note_core::{parse_label_selectors, LabelValueType, NoteAttachment};
-use note_storage::{ActiveNoteSource, LabelRepository, NewNote, NoteUpdate, NotesRepository};
+use note_storage::{
+    ActiveNoteSource, LabelRepository, NewNote, NoteMutationResult, NoteUpdate, NotesRepository,
+};
 use note_storage_turso::TursoSession;
 use support::{fixture, insert_test_note};
 
@@ -253,18 +255,21 @@ async fn deleted_notes_are_only_visible_in_trash_until_permanently_deleted() {
     assert_eq!(
         fixture
             .session
-            .soft_delete_note("deleted", 2000)
+            .soft_delete_note("deleted", 1, 2000)
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
     );
     assert_eq!(
         fixture
             .session
-            .soft_delete_note("deleted", 2001)
+            .soft_delete_note("deleted", 2, 2001)
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
     assert!(fixture.session.get_note("deleted").await.unwrap().is_none());
     assert!(fixture.session.note_exists("deleted").await.unwrap());
@@ -274,7 +279,7 @@ async fn deleted_notes_are_only_visible_in_trash_until_permanently_deleted() {
             .get_deleted_note_content_and_revision("deleted")
             .await
             .unwrap(),
-        Some(("Content".to_string(), 1))
+        Some(("Content".to_string(), 2))
     );
 
     let active = fixture.session.list_notes(&[], None, None).await.unwrap();
@@ -294,12 +299,21 @@ async fn deleted_notes_are_only_visible_in_trash_until_permanently_deleted() {
     assert_eq!(deleted[0].id, "deleted");
     assert_eq!(deleted[0].deleted_at, Some(2000));
 
-    assert_eq!(fixture.session.restore_note("deleted", 2).await.unwrap(), 1);
-    assert_eq!(fixture.session.restore_note("deleted", 3).await.unwrap(), 0);
+    assert_eq!(
+        fixture.session.restore_note("deleted", 2).await.unwrap(),
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 3
+        }
+    );
+    assert_eq!(
+        fixture.session.restore_note("deleted", 3).await.unwrap(),
+        NoteMutationResult::NotFound
+    );
     assert!(fixture.session.get_note("deleted").await.unwrap().is_some());
     assert_eq!(
         fixture.session.get_note_revision("deleted").await.unwrap(),
-        Some(2)
+        Some(3)
     );
     assert_eq!(fixture.session.count_notes(&[]).await.unwrap(), 2);
     assert!(fixture
@@ -312,18 +326,24 @@ async fn deleted_notes_are_only_visible_in_trash_until_permanently_deleted() {
     assert_eq!(
         fixture
             .session
-            .soft_delete_note("deleted", 3000)
+            .soft_delete_note("deleted", 3, 3000)
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 4
+        }
     );
     assert_eq!(
         fixture
             .session
-            .permanently_delete_note("deleted")
+            .permanently_delete_note("deleted", 4)
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 4
+        }
     );
     assert!(!fixture.session.note_exists("deleted").await.unwrap());
     assert!(fixture
@@ -335,10 +355,10 @@ async fn deleted_notes_are_only_visible_in_trash_until_permanently_deleted() {
     assert_eq!(
         fixture
             .session
-            .permanently_delete_note("active")
+            .permanently_delete_note("active", 1)
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
 }
 
@@ -350,17 +370,17 @@ async fn expired_deleted_note_ids_include_the_ninety_day_boundary() {
     }
     fixture
         .session
-        .soft_delete_note("older", 999)
+        .soft_delete_note("older", 1, 999)
         .await
         .unwrap();
     fixture
         .session
-        .soft_delete_note("boundary", 1000)
+        .soft_delete_note("boundary", 1, 1000)
         .await
         .unwrap();
     fixture
         .session
-        .soft_delete_note("recent", 1001)
+        .soft_delete_note("recent", 1, 1001)
         .await
         .unwrap();
 
@@ -583,11 +603,14 @@ async fn update_roundtrips_content_attachments_and_revision() {
                 content: "Updated content",
                 attachments: std::slice::from_ref(&attachment),
                 updated_at: 2,
-                note_revision: 2,
+                expected_revision: 1,
             })
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
     );
 
     assert_eq!(
@@ -615,7 +638,7 @@ async fn active_note_sources_are_filtered_and_ordered_by_id() {
     for (id, content, revision) in [("b", "second", 2), ("a", "first", 3), ("c", "deleted", 4)] {
         insert_note(&fixture.session, id, id, content, &[], 1, 1, revision, None).await;
     }
-    fixture.session.soft_delete_note("c", 2).await.unwrap();
+    fixture.session.soft_delete_note("c", 4, 2).await.unwrap();
 
     assert_eq!(
         fixture.session.list_active_note_sources().await.unwrap(),
@@ -648,10 +671,14 @@ async fn deleting_a_note_cascades_note_labels() {
         .attach_label("note-1", "status", "ready")
         .await
         .unwrap();
-    fixture.session.soft_delete_note("note-1", 2).await.unwrap();
     fixture
         .session
-        .permanently_delete_note("note-1")
+        .soft_delete_note("note-1", 1, 2)
+        .await
+        .unwrap();
+    fixture
+        .session
+        .permanently_delete_note("note-1", 2)
         .await
         .unwrap();
 

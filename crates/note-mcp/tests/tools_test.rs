@@ -51,6 +51,7 @@ async fn save(ctx: &Context, title: &str, content: &str) -> String {
 
 fn put_input(
     note_id: &str,
+    expected_revision: i64,
     attachment_id: &str,
     path: &str,
     mime: &str,
@@ -58,6 +59,7 @@ fn put_input(
 ) -> PutNoteAttachmentToolInput {
     PutNoteAttachmentToolInput {
         note_id: note_id.into(),
+        expected_revision,
         attachment_id: attachment_id.into(),
         path: path.into(),
         mime: mime.into(),
@@ -75,6 +77,7 @@ fn tool_input_deserialization_preserves_intended_compatibility() {
     .is_ok());
     assert!(serde_json::from_value::<UpdateNoteToolInput>(json!({
         "id": "note-1",
+        "expected_revision": 1,
         "title": "Title",
         "content": "Body"
     }))
@@ -92,9 +95,16 @@ fn tool_input_deserialization_preserves_intended_compatibility() {
     .is_err());
     assert!(serde_json::from_value::<UpdateNoteToolInput>(json!({
         "id": "note-1",
+        "expected_revision": 1,
         "title": "Title",
         "content": "Body",
         "unknown": true
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<UpdateNoteToolInput>(json!({
+        "id": "note-1",
+        "title": "Title",
+        "content": "Body"
     }))
     .is_err());
     assert!(serde_json::from_value::<SemanticSearchToolInput>(json!({
@@ -122,6 +132,7 @@ async fn save_then_put_text_and_binary_attachments() {
         &ctx,
         put_input(
             &note_id,
+            1,
             "text",
             "./text.txt",
             "text/plain",
@@ -135,6 +146,7 @@ async fn save_then_put_text_and_binary_attachments() {
         &ctx,
         put_input(
             &note_id,
+            2,
             "blob",
             "./blob.bin",
             "application/octet-stream",
@@ -153,6 +165,7 @@ async fn save_then_put_text_and_binary_attachments() {
                 mime,
                 description,
             },
+        revision: _,
     } = text;
     assert!(created);
     assert_eq!(id, "text");
@@ -177,6 +190,7 @@ async fn save_then_put_text_and_binary_attachments() {
         &ctx,
         put_input(
             &note_id,
+            3,
             "blob",
             "./blob.bin",
             "application/new-binary",
@@ -209,6 +223,7 @@ async fn get_update_list_and_line_read_do_not_require_attachment_content() {
         &ctx,
         put_input(
             &note_id,
+            1,
             "missing",
             "./missing.bin",
             "application/octet-stream",
@@ -234,6 +249,7 @@ async fn get_update_list_and_line_read_do_not_require_attachment_content() {
         &ctx,
         UpdateNoteToolInput {
             id: note_id.clone(),
+            expected_revision: fetched.revision,
             title: "Metadata updated".into(),
             content: "Updated line".into(),
             labels: vec![("topic".into(), "rust".into())],
@@ -252,6 +268,7 @@ async fn get_update_list_and_line_read_do_not_require_attachment_content() {
         labels,
         created_at,
         updated_at,
+        revision: _,
     } = updated;
     assert_eq!(id, note_id);
     assert_eq!(title, "Metadata updated");
@@ -275,6 +292,7 @@ async fn get_update_list_and_line_read_do_not_require_attachment_content() {
         labels,
         created_at,
         updated_at,
+        revision: _,
     } = listed.into_iter().next().unwrap();
     assert_eq!(id, note_id);
     assert_eq!(title, "Metadata updated");
@@ -292,6 +310,7 @@ async fn line_edit_preserves_attachment_metadata_without_reading_bytes() {
         &ctx,
         put_input(
             &note_id,
+            1,
             "blob",
             "./blob.bin",
             "application/octet-stream",
@@ -312,6 +331,7 @@ async fn line_edit_preserves_attachment_metadata_without_reading_bytes() {
     let edited = edit_note_tool(
         &ctx,
         &note_id,
+        read.revision,
         &read.tag,
         vec![EditOp::InsertTail {
             lines: vec!["Second line".into()],
@@ -335,6 +355,7 @@ async fn selected_attachment_content_read_does_not_read_siblings() {
         &ctx,
         put_input(
             &note_id,
+            1,
             "selected",
             "./selected.txt",
             "text/plain",
@@ -347,6 +368,7 @@ async fn selected_attachment_content_read_does_not_read_siblings() {
         &ctx,
         put_input(
             &note_id,
+            2,
             "missing-sibling",
             "./missing.bin",
             "application/octet-stream",
@@ -386,15 +408,25 @@ async fn delete_attachment_is_idempotent_and_leaves_siblings_intact() {
         ("remove", "./remove.txt", b"remove".to_vec()),
         ("keep", "./keep.txt", b"keep".to_vec()),
     ] {
-        put_note_attachment_tool(&ctx, put_input(&note_id, id, path, "text/plain", content))
-            .await
-            .unwrap();
+        put_note_attachment_tool(
+            &ctx,
+            put_input(
+                &note_id,
+                if id == "remove" { 1 } else { 2 },
+                id,
+                path,
+                "text/plain",
+                content,
+            ),
+        )
+        .await
+        .unwrap();
     }
 
-    assert!(delete_note_attachment_tool(&ctx, &note_id, "remove")
+    assert!(delete_note_attachment_tool(&ctx, &note_id, "remove", 3)
         .await
         .unwrap());
-    assert!(!delete_note_attachment_tool(&ctx, &note_id, "remove")
+    assert!(!delete_note_attachment_tool(&ctx, &note_id, "remove", 4)
         .await
         .unwrap());
     let sibling = get_note_attachment_content_tool(
@@ -418,8 +450,8 @@ async fn delete_note_tool_soft_deletes_once_and_hides_the_note() {
     let (ctx, backend, _dir) = test_context().await;
     let note_id = save(&ctx, "Delete through MCP", "Content").await;
 
-    assert!(delete_note_tool(&ctx, &note_id).await.unwrap());
-    assert!(!delete_note_tool(&ctx, &note_id).await.unwrap());
+    assert!(delete_note_tool(&ctx, &note_id, 1).await.unwrap());
+    assert!(delete_note_tool(&ctx, &note_id, 1).await.is_err());
     assert!(list_notes_tool(&ctx, None, None, None)
         .await
         .unwrap()

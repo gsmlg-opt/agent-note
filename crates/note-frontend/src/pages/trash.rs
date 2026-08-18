@@ -6,7 +6,9 @@ use yew_duskmoon::Alert;
 
 use crate::api;
 use crate::components::{icons, Modal};
-use crate::state::DeletedNoteSummary;
+use crate::state::{
+    stale_retry_blocked, DeletedNoteSummary, StaleRevisionGate, StaleRevisionGateAction,
+};
 
 #[derive(Clone, PartialEq)]
 enum RestoreTarget {
@@ -162,6 +164,7 @@ pub fn trash_page() -> Html {
     let deleting = use_state(|| false);
     let restoring = use_state(|| false);
     let batch_delete_error = use_state(|| None::<String>);
+    let stale_revision_gate = use_reducer(StaleRevisionGate::default);
     let refresh_tick = use_state(|| 0usize);
     let select_all_ref = use_node_ref();
 
@@ -170,7 +173,10 @@ pub fn trash_page() -> Html {
         let selected = selected.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let batch_delete_error = batch_delete_error.clone();
+        let stale_revision_gate = stale_revision_gate.clone();
         use_effect_with(*refresh_tick, move |_| {
+            let refresh_epoch = stale_revision_gate.refresh_epoch();
             loading.set(true);
             error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
@@ -182,8 +188,20 @@ pub fn trash_page() -> Html {
                             .collect::<HashSet<_>>();
                         selected.dispatch(SelectionAction::RetainVisible(visible));
                         notes.set(next);
+                        error.set(None);
+                        batch_delete_error.set(None);
+                        stale_revision_gate.dispatch(StaleRevisionGateAction::RefreshFinished {
+                            started_epoch: refresh_epoch,
+                            succeeded: true,
+                        });
                     }
-                    Err(message) => error.set(Some(message)),
+                    Err(message) => {
+                        stale_revision_gate.dispatch(StaleRevisionGateAction::RefreshFinished {
+                            started_epoch: refresh_epoch,
+                            succeeded: false,
+                        });
+                        error.set(Some(message));
+                    }
                 }
                 loading.set(false);
             });
@@ -234,7 +252,11 @@ pub fn trash_page() -> Html {
         let notes = notes.clone();
         let selected = selected.clone();
         let restore_target = restore_target.clone();
+        let stale_revision_gate = stale_revision_gate.clone();
         Callback::from(move |_| {
+            if stale_revision_gate.blocked() {
+                return;
+            }
             let ids = notes
                 .iter()
                 .filter(|note| selected.contains(&note.id))
@@ -252,7 +274,11 @@ pub fn trash_page() -> Html {
         let delete_target = delete_target.clone();
         let error = error.clone();
         let batch_delete_error = batch_delete_error.clone();
+        let stale_revision_gate = stale_revision_gate.clone();
         Callback::from(move |_| {
+            if stale_revision_gate.blocked() {
+                return;
+            }
             let ids = selected_note_ids(&notes, &selected);
             error.set(None);
             batch_delete_error.set(None);
@@ -281,18 +307,22 @@ pub fn trash_page() -> Html {
             let on_close = {
                 let restore_target = restore_target.clone();
                 let restoring = restoring.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_: ()| {
                     if !*restoring {
                         restore_target.set(None);
+                        stale_revision_gate.dispatch(StaleRevisionGateAction::Dismiss);
                     }
                 })
             };
             let on_cancel = {
                 let restore_target = restore_target.clone();
                 let restoring = restoring.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_| {
                     if !*restoring {
                         restore_target.set(None);
+                        stale_revision_gate.dispatch(StaleRevisionGateAction::Dismiss);
                     }
                 })
             };
@@ -302,8 +332,10 @@ pub fn trash_page() -> Html {
                 let selected = selected.clone();
                 let error = error.clone();
                 let refresh_tick = refresh_tick.clone();
+                let notes = notes.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_| {
-                    if *restoring {
+                    if stale_retry_blocked(*restoring, stale_revision_gate.blocked()) {
                         return;
                     }
                     restoring.set(true);
@@ -313,27 +345,55 @@ pub fn trash_page() -> Html {
                     let error = error.clone();
                     let refresh_tick = refresh_tick.clone();
                     let ids = ids.clone();
+                    let notes = notes.clone();
+                    let stale_revision_gate = stale_revision_gate.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        match api::restore_deleted_notes(&ids).await {
+                        let selected_notes = ids
+                            .iter()
+                            .filter_map(|id| notes.iter().find(|note| &note.id == id).cloned())
+                            .collect::<Vec<_>>();
+                        match api::restore_deleted_notes(&selected_notes).await {
                             Ok(()) => {
                                 selected.dispatch(SelectionAction::Remove(ids.clone()));
+                                restore_target.set(None);
+                                refresh_tick.set((*refresh_tick).saturating_add(1));
                             }
-                            Err(message) => error.set(Some(message)),
+                            Err(message) => {
+                                if message.is_stale_revision() {
+                                    stale_revision_gate.dispatch(StaleRevisionGateAction::Conflict);
+                                } else {
+                                    error.set(Some(message.to_string()));
+                                }
+                            }
                         }
-                        restore_target.set(None);
                         restoring.set(false);
-                        refresh_tick.set((*refresh_tick).saturating_add(1));
                     });
+                })
+            };
+            let on_reload = {
+                let restore_target = restore_target.clone();
+                let refresh_tick = refresh_tick.clone();
+                Callback::from(move |_| {
+                    restore_target.set(None);
+                    refresh_tick.set((*refresh_tick).saturating_add(1));
                 })
             };
             html! {
                 <Modal title={modal_title} on_close={on_close}>
                     <p>{ message }</p>
+                    if stale_revision_gate.conflict_notice_visible() {
+                        <Alert variant={Some("error".to_string())}>
+                            <span>{ "Trash changed after it was loaded. Reload Trash before retrying this mutation." }</span>
+                        </Alert>
+                    }
                     <div class="app-modal-actions">
+                        if error.is_some() || stale_revision_gate.conflict_notice_visible() {
+                            <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload Trash" }</button>
+                        }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*restoring}>
                             { "Cancel" }
                         </button>
-                        <button type="button" class="btn btn-primary" onclick={on_confirm} disabled={*restoring}>
+                        <button type="button" class="btn btn-primary" onclick={on_confirm} disabled={stale_retry_blocked(*restoring, stale_revision_gate.blocked())}>
                             { if *restoring { "Restoring...".to_string() } else { confirm_label } }
                         </button>
                     </div>
@@ -351,18 +411,22 @@ pub fn trash_page() -> Html {
             let on_close = {
                 let delete_target = delete_target.clone();
                 let deleting = deleting.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_: ()| {
                     if !*deleting {
                         delete_target.set(None);
+                        stale_revision_gate.dispatch(StaleRevisionGateAction::Dismiss);
                     }
                 })
             };
             let on_cancel = {
                 let delete_target = delete_target.clone();
                 let deleting = deleting.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_| {
                     if !*deleting {
                         delete_target.set(None);
+                        stale_revision_gate.dispatch(StaleRevisionGateAction::Dismiss);
                     }
                 })
             };
@@ -373,8 +437,10 @@ pub fn trash_page() -> Html {
                 let batch_delete_error = batch_delete_error.clone();
                 let selected = selected.clone();
                 let refresh_tick = refresh_tick.clone();
+                let notes = notes.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
                 Callback::from(move |_| {
-                    if *deleting {
+                    if *deleting || stale_revision_gate.blocked() {
                         return;
                     }
                     deleting.set(true);
@@ -385,45 +451,105 @@ pub fn trash_page() -> Html {
                     let selected = selected.clone();
                     let refresh_tick = refresh_tick.clone();
                     let ids = ids.clone();
+                    let notes = notes.clone();
+                    let stale_revision_gate = stale_revision_gate.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         if is_batch {
                             let mut failed = HashSet::new();
+                            let mut conflict = false;
                             for id in &ids {
-                                if api::permanently_delete_note(id).await.is_err() {
+                                let Some(revision) = notes
+                                    .iter()
+                                    .find(|note| &note.id == id)
+                                    .map(|note| note.revision)
+                                else {
+                                    failed.insert(id.clone());
+                                    continue;
+                                };
+                                if let Err(delete_error) =
+                                    api::permanently_delete_note(id, revision).await
+                                {
+                                    conflict |= delete_error.is_stale_revision();
                                     failed.insert(id.clone());
                                 }
                             }
                             let failed_count = failed.len();
+                            let failed_ids = ids
+                                .iter()
+                                .filter(|id| failed.contains(*id))
+                                .cloned()
+                                .collect::<Vec<_>>();
                             selected.dispatch(SelectionAction::ReconcileDelete {
                                 attempted: ids.clone(),
                                 failed,
                             });
-                            batch_delete_error
-                                .set(batch_delete_failure_message(ids.len(), failed_count));
-                            delete_target.set(None);
+                            batch_delete_error.set(if conflict {
+                                None
+                            } else {
+                                batch_delete_failure_message(ids.len(), failed_count)
+                            });
+                            if conflict {
+                                stale_revision_gate.dispatch(StaleRevisionGateAction::Conflict);
+                            }
+                            if failed_count == 0 {
+                                delete_target.set(None);
+                            } else {
+                                delete_target.set(Some(DeleteTarget::Batch { ids: failed_ids }));
+                            }
                             deleting.set(false);
-                            refresh_tick.set((*refresh_tick).saturating_add(1));
                         } else {
-                            match api::permanently_delete_note(&ids[0]).await {
+                            let revision = notes
+                                .iter()
+                                .find(|note| note.id == ids[0])
+                                .map(|note| note.revision);
+                            let Some(revision) = revision else {
+                                error.set(Some("The selected note is no longer in Trash.".into()));
+                                deleting.set(false);
+                                return;
+                            };
+                            match api::permanently_delete_note(&ids[0], revision).await {
                                 Ok(()) => {
                                     delete_target.set(None);
                                     refresh_tick.set((*refresh_tick).saturating_add(1));
                                 }
-                                Err(message) => error.set(Some(message)),
+                                Err(message) => {
+                                    if message.is_stale_revision() {
+                                        stale_revision_gate
+                                            .dispatch(StaleRevisionGateAction::Conflict);
+                                    } else {
+                                        error.set(Some(message.to_string()));
+                                    }
+                                }
                             }
                             deleting.set(false);
                         }
                     });
                 })
             };
+            let on_reload = {
+                let delete_target = delete_target.clone();
+                let refresh_tick = refresh_tick.clone();
+                Callback::from(move |_| {
+                    delete_target.set(None);
+                    refresh_tick.set((*refresh_tick).saturating_add(1));
+                })
+            };
             html! {
                 <Modal title={modal_title} on_close={on_close}>
                     <p>{ message }</p>
+                    if stale_revision_gate.conflict_notice_visible() {
+                        <Alert variant={Some("error".to_string())}>
+                            <span>{ "Trash changed after it was loaded. Reload Trash before retrying this mutation." }</span>
+                        </Alert>
+                    }
                     <div class="app-modal-actions">
+                        if error.is_some() || batch_delete_error.is_some() || stale_revision_gate.conflict_notice_visible() {
+                            <button type="button" class="btn btn-outline" onclick={on_reload}>{ "Reload Trash" }</button>
+                        }
                         <button type="button" class="btn btn-ghost" onclick={on_cancel} disabled={*deleting}>
                             { "Cancel" }
                         </button>
-                        <button type="button" class="btn btn-error" onclick={on_confirm} disabled={*deleting}>
+                        <button type="button" class="btn btn-error" onclick={on_confirm} disabled={stale_retry_blocked(*deleting, stale_revision_gate.blocked())}>
                             { if *deleting { "Deleting...".to_string() } else { confirm_label } }
                         </button>
                     </div>
@@ -452,6 +578,12 @@ pub fn trash_page() -> Html {
                 <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
             }
 
+            if stale_revision_gate.conflict_notice_visible() {
+                <Alert variant={Some("error".to_string())}>
+                    <span>{ "Trash changed after it was loaded. Reload Trash before retrying mutations." }</span>
+                </Alert>
+            }
+
             if *loading {
                 <p class="loading">{ "Loading..." }</p>
             } else if notes.is_empty() {
@@ -465,7 +597,7 @@ pub fn trash_page() -> Html {
                         <button
                             type="button"
                             class="btn btn-primary"
-                            disabled={selected.is_empty() || *restoring || *deleting}
+                            disabled={selected.is_empty() || *restoring || *deleting || stale_revision_gate.blocked()}
                             onclick={open_batch_restore}
                         >
                             { icons::restore() }
@@ -474,7 +606,7 @@ pub fn trash_page() -> Html {
                         <button
                             type="button"
                             class="btn btn-error"
-                            disabled={selected.is_empty() || *restoring || *deleting}
+                            disabled={selected.is_empty() || *restoring || *deleting || stale_revision_gate.blocked()}
                             onclick={open_batch_delete}
                         >
                             { icons::trash() }
@@ -489,6 +621,7 @@ pub fn trash_page() -> Html {
                     &delete_target,
                     &error,
                     &batch_delete_error,
+                    stale_revision_gate.blocked(),
                     *deleting,
                     *restoring,
                     &select_all_ref,
@@ -509,13 +642,14 @@ fn trash_table(
     delete_target: &UseStateHandle<Option<DeleteTarget>>,
     error: &UseStateHandle<Option<String>>,
     batch_delete_error: &UseStateHandle<Option<String>>,
+    stale_revision_blocked: bool,
     deleting: bool,
     restoring: bool,
     select_all_ref: &NodeRef,
     on_select_all: Callback<Event>,
 ) -> Html {
     let all_selected = !notes.is_empty() && selected.len() == notes.len();
-    let mutations_disabled = deleting || restoring;
+    let mutations_disabled = deleting || restoring || stale_revision_blocked;
     html! {
         <div class="table-scroll">
             <table class="table note-table">
@@ -662,6 +796,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             deleted_at: 0,
+            revision: 1,
         }
     }
 

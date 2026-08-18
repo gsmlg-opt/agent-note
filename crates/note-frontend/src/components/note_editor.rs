@@ -37,6 +37,9 @@ pub struct NoteEditorProps {
     pub submit_label: String,
     #[prop_or_default]
     pub submitting: bool,
+    /// Prevent submission without showing an in-flight loading state.
+    #[prop_or_default]
+    pub submit_blocked: bool,
 }
 
 #[function_component(NoteEditor)]
@@ -221,7 +224,7 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         let attachment_file_reading = attachment_file_reading.clone();
         let submit_debounce = submit_debounce.clone();
         let submit_locked = submit_locked.clone();
-        let submitting = props.submitting;
+        let submitting = props.submitting || props.submit_blocked;
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
             if submitting || *attachment_file_reading || *submit_locked.borrow() {
@@ -251,7 +254,8 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
         });
     }
 
-    let submit_disabled = props.submitting || *submit_debounce || *attachment_file_reading;
+    let submit_disabled =
+        props.submitting || props.submit_blocked || *submit_debounce || *attachment_file_reading;
     let attachment_add_disabled = *attachment_file_reading
         || attachment_path.trim().is_empty()
         || attachment_path.trim() == "."
@@ -284,7 +288,7 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
                     <Button
                         variant={Some("primary".to_string())}
                         disabled={submit_disabled}
-                        loading={submit_disabled}
+                        loading={props.submitting || *submit_debounce || *attachment_file_reading}
                     >
                         <span>{
                             if props.submitting || *submit_debounce {

@@ -6,8 +6,8 @@ use note_core::{
     LabelValueType, NoteAttachment, SystemConfig,
 };
 use note_storage::{
-    EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteUpdate, NotesRepository,
-    SettingsRepository, StorageErrorKind, TransactionMode, UpsertNoteChunk,
+    EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteMutationResult, NoteUpdate,
+    NotesRepository, SettingsRepository, StorageErrorKind, TransactionMode, UpsertNoteChunk,
 };
 use note_storage_pg::PgStorage;
 use serde_json::Value;
@@ -230,11 +230,14 @@ async fn notes_and_labels_follow_repository_semantics() {
                 content: "updated body",
                 attachments: std::slice::from_ref(&updated_attachment),
                 updated_at: 110,
-                note_revision: 5,
+                expected_revision: 4,
             })
             .await
             .unwrap(),
-        1
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 5
+        }
     );
     assert_eq!(
         session
@@ -244,11 +247,11 @@ async fn notes_and_labels_follow_repository_semantics() {
                 content: "must not change",
                 attachments: &[],
                 updated_at: 800,
-                note_revision: 9,
+                expected_revision: 9,
             })
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
     let note = session.get_note("pg-jsonb").await.unwrap().unwrap();
     assert_eq!(note.title, "Updated");
@@ -510,8 +513,8 @@ async fn notes_and_labels_follow_repository_semantics() {
         vec!["tie-a", "tie-b", "tie-c"]
     );
     for id in ["tie-a", "tie-b", "tie-c"] {
-        session.soft_delete_note(id, 450).await.unwrap();
-        session.permanently_delete_note(id).await.unwrap();
+        session.soft_delete_note(id, 1, 450).await.unwrap();
+        session.permanently_delete_note(id, 2).await.unwrap();
     }
 
     for index in 0..5 {
@@ -557,19 +560,28 @@ async fn notes_and_labels_follow_repository_semantics() {
     );
     for index in 0..5 {
         let id = format!("selector-noise-{index}");
-        session.soft_delete_note(&id, 450).await.unwrap();
-        session.permanently_delete_note(&id).await.unwrap();
+        session.soft_delete_note(&id, 1, 450).await.unwrap();
+        session.permanently_delete_note(&id, 2).await.unwrap();
     }
 
-    assert_eq!(session.soft_delete_note("pg-jsonb", 500).await.unwrap(), 1);
-    assert_eq!(session.soft_delete_note("pg-jsonb", 501).await.unwrap(), 0);
+    assert_eq!(
+        session.soft_delete_note("pg-jsonb", 5, 500).await.unwrap(),
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 6
+        }
+    );
+    assert_eq!(
+        session.soft_delete_note("pg-jsonb", 6, 501).await.unwrap(),
+        NoteMutationResult::NotFound
+    );
     assert!(session.get_note("pg-jsonb").await.unwrap().is_none());
     assert_eq!(
         session
             .get_deleted_note_content_and_revision("pg-jsonb")
             .await
             .unwrap(),
-        Some(("updated body".into(), 5))
+        Some(("updated body".into(), 6))
     );
     let deleted_summaries = session.list_deleted_note_summaries().await.unwrap();
     assert_eq!(deleted_summaries[0].id, "deleted");
@@ -583,11 +595,11 @@ async fn notes_and_labels_follow_repository_semantics() {
                 content: "Must not update",
                 attachments: &[],
                 updated_at: 600,
-                note_revision: 9,
+                expected_revision: 6,
             })
             .await
             .unwrap(),
-        0
+        NoteMutationResult::NotFound
     );
     assert_eq!(session.count_notes(&selectors).await.unwrap(), 3);
     assert_eq!(
@@ -602,11 +614,20 @@ async fn notes_and_labels_follow_repository_semantics() {
         .await
         .unwrap()
         .contains(&("active-only".into(), 0)));
-    assert_eq!(session.restore_note("pg-jsonb", 6).await.unwrap(), 1);
-    assert_eq!(session.restore_note("pg-jsonb", 7).await.unwrap(), 0);
+    assert_eq!(
+        session.restore_note("pg-jsonb", 6).await.unwrap(),
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 7
+        }
+    );
+    assert_eq!(
+        session.restore_note("pg-jsonb", 7).await.unwrap(),
+        NoteMutationResult::NotFound
+    );
     assert_eq!(
         session.get_note_revision("pg-jsonb").await.unwrap(),
-        Some(6)
+        Some(7)
     );
 
     for (id, deleted_at) in [
@@ -634,7 +655,10 @@ async fn notes_and_labels_follow_repository_semantics() {
         vec!["expired-old", "deleted", "expired-a", "expired-b"]
     );
 
-    assert_eq!(session.permanently_delete_note("newer").await.unwrap(), 0);
+    assert_eq!(
+        session.permanently_delete_note("newer", 1).await.unwrap(),
+        NoteMutationResult::NotFound
+    );
     sqlx::query(
         "INSERT INTO note_chunks (
              note_id, chunk_idx, chunk_hash, content, note_revision, status, updated_at
@@ -711,8 +735,14 @@ async fn notes_and_labels_follow_repository_semantics() {
     .execute(&inspection_pool)
     .await
     .unwrap();
-    session.soft_delete_note("other", 800).await.unwrap();
-    assert_eq!(session.permanently_delete_note("other").await.unwrap(), 1);
+    session.soft_delete_note("other", 1, 800).await.unwrap();
+    assert_eq!(
+        session.permanently_delete_note("other", 2).await.unwrap(),
+        NoteMutationResult::Applied {
+            value: (),
+            revision: 2
+        }
+    );
     assert!(session.labels_for_note("other").await.unwrap().is_empty());
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -737,7 +767,7 @@ async fn notes_and_labels_follow_repository_semantics() {
             ("newer".into(), "newer".into(), 1),
             ("numeric-low".into(), "numeric-low".into(), 1),
             ("numeric-ten".into(), "numeric-ten".into(), 1),
-            ("pg-jsonb".into(), "updated body".into(), 6),
+            ("pg-jsonb".into(), "updated body".into(), 7),
         ]
     );
 

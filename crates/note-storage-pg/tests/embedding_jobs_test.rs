@@ -67,7 +67,7 @@ async fn reset_embeddings_requeues_only_active_chunks() {
     insert_test_note(&session, "deleted").await;
     add_chunk(&session, "active", "embedded").await;
     add_chunk(&session, "deleted", "embedded").await;
-    session.soft_delete_note("deleted", 1500).await.unwrap();
+    session.soft_delete_note("deleted", 1, 1500).await.unwrap();
     session
         .insert_chunk_embedding("active", 0, &unit(0))
         .await

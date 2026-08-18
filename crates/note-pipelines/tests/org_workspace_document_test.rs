@@ -1109,7 +1109,7 @@ async fn raw_import_keeps_existing_weak_links_but_rejects_new_links_to_soft_dele
         .session()
         .await
         .unwrap()
-        .soft_delete_note(note_id, NOW + 1)
+        .soft_delete_note(note_id, 1, NOW + 1)
         .await
         .unwrap();
 
