@@ -22,7 +22,10 @@ use note_pipelines::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
@@ -512,10 +515,12 @@ pub struct DashboardDto {
 #[derive(Clone)]
 struct DashboardCacheEntry {
     expires_at: Instant,
+    generation: u64,
     value: DashboardDto,
 }
 
 static DASHBOARD_CACHE: OnceLock<RwLock<Option<DashboardCacheEntry>>> = OnceLock::new();
+static DASHBOARD_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 static DASHBOARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -538,11 +543,41 @@ fn dashboard_cache() -> &'static RwLock<Option<DashboardCacheEntry>> {
     DASHBOARD_CACHE.get_or_init(|| RwLock::new(None))
 }
 
+fn dashboard_cache_generation() -> u64 {
+    DASHBOARD_CACHE_GENERATION.load(AtomicOrdering::Acquire)
+}
+
 pub(crate) fn invalidate_dashboard_cache() {
+    DASHBOARD_CACHE_GENERATION.fetch_add(1, AtomicOrdering::AcqRel);
     if let Some(cache) = DASHBOARD_CACHE.get() {
         if let Ok(mut guard) = cache.try_write() {
             *guard = None;
         }
+    }
+}
+
+async fn cached_dashboard(now: Instant) -> Option<DashboardDto> {
+    let generation = dashboard_cache_generation();
+    dashboard_cache()
+        .read()
+        .await
+        .as_ref()
+        .filter(|entry| entry.generation == generation && entry.expires_at > now)
+        .map(|entry| entry.value.clone())
+}
+
+async fn publish_dashboard_cache(generation: u64, value: DashboardDto) {
+    if dashboard_cache_generation() != generation {
+        return;
+    }
+
+    let mut cache = dashboard_cache().write().await;
+    if dashboard_cache_generation() == generation {
+        *cache = Some(DashboardCacheEntry {
+            expires_at: Instant::now() + DASHBOARD_CACHE_TTL,
+            generation,
+            value,
+        });
     }
 }
 
@@ -642,23 +677,18 @@ async fn dashboard_handler(
     State(ctx): State<Arc<Context>>,
 ) -> Result<Json<DashboardDto>, (axum::http::StatusCode, String)> {
     let now = Instant::now();
-    if let Some(cached) = dashboard_cache().read().await.clone() {
-        if cached.expires_at > now {
-            let mut value = cached.value;
-            refresh_dashboard_embedding_status(&ctx, &mut value)
-                .await
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            return Ok(Json(value));
-        }
+    if let Some(mut value) = cached_dashboard(now).await {
+        refresh_dashboard_embedding_status(&ctx, &mut value)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(Json(value));
     }
 
+    let generation = dashboard_cache_generation();
     let value = load_dashboard(&ctx)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    *dashboard_cache().write().await = Some(DashboardCacheEntry {
-        expires_at: Instant::now() + DASHBOARD_CACHE_TTL,
-        value: value.clone(),
-    });
+    publish_dashboard_cache(generation, value.clone()).await;
     Ok(Json(value))
 }
 
@@ -2017,6 +2047,10 @@ mod tests {
             schemas["DashboardDto"]["properties"]["categories"]["items"]["$ref"],
             "#/components/schemas/DashboardCategoryDto"
         );
+        assert!(schemas["DashboardDto"]["required"]
+            .as_array()
+            .expect("dashboard required fields")
+            .contains(&serde_json::json!("categories")));
 
         let mut category_fields = schemas["DashboardCategoryDto"]["properties"]
             .as_object()
@@ -2026,6 +2060,10 @@ mod tests {
             .collect::<Vec<_>>();
         category_fields.sort_unstable();
         assert_eq!(category_fields, vec!["description", "key", "values"]);
+        assert_eq!(
+            schemas["DashboardCategoryDto"]["required"],
+            serde_json::json!(["key", "description", "values"])
+        );
         assert_eq!(
             schemas["DashboardCategoryDto"]["properties"]["values"]["type"],
             "array"
@@ -2043,6 +2081,10 @@ mod tests {
             .collect::<Vec<_>>();
         value_fields.sort_unstable();
         assert_eq!(value_fields, vec!["count", "value"]);
+        assert_eq!(
+            schemas["DashboardCategoryValueDto"]["required"],
+            serde_json::json!(["value", "count"])
+        );
     }
 
     // Builds the real /api/notes router over a fresh temp DB + stub embedder so tests exercise the
@@ -2586,6 +2628,52 @@ mod tests {
                 "{uri}: {body}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dashboard_cache_invalidation_prevents_stale_fill_publish() {
+        let _dashboard_guard = DASHBOARD_TEST_LOCK.lock().await;
+        invalidate_dashboard_cache();
+        *dashboard_cache().write().await = None;
+        let fill_generation = dashboard_cache_generation();
+
+        let ready = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let fill = tokio::spawn({
+            let ready = ready.clone();
+            let release = release.clone();
+            async move {
+                ready.wait().await;
+                release.wait().await;
+                publish_dashboard_cache(
+                    fill_generation,
+                    DashboardDto {
+                        note_count: 1,
+                        embedded_note_count: 0,
+                        embedding_note: None,
+                        label_count: 0,
+                        last_updated_at: None,
+                        labels: Vec::new(),
+                        categories: Vec::new(),
+                        recent_updates: Vec::new(),
+                    },
+                )
+                .await;
+            }
+        });
+
+        ready.wait().await;
+        invalidate_dashboard_cache();
+        release.wait().await;
+        fill.await.unwrap();
+
+        assert_ne!(fill_generation, dashboard_cache_generation());
+        assert!(
+            cached_dashboard(Instant::now()).await.is_none(),
+            "a fill started before invalidation must not become a valid cache hit"
+        );
+        assert!(dashboard_cache().read().await.is_none());
+        invalidate_dashboard_cache();
     }
 
     #[tokio::test]
