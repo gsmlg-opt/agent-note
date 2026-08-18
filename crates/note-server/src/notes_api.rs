@@ -25,7 +25,7 @@ use std::{
     hash::{Hash, Hasher},
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
-        Arc, OnceLock,
+        Arc, OnceLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -517,7 +517,7 @@ pub struct DashboardDto {
 struct DashboardCacheEntry {
     expires_at: Instant,
     generation: u64,
-    context_id: usize,
+    context: Weak<Context>,
     base_hash: u64,
     value: DashboardDto,
 }
@@ -574,7 +574,12 @@ pub(crate) fn invalidate_dashboard_cache() {
 }
 
 #[cfg(test)]
-async fn cached_dashboard(now: Instant, context_id: usize) -> Option<DashboardDto> {
+fn dashboard_context_matches(entry: &DashboardCacheEntry, context: &Arc<Context>) -> bool {
+    Weak::ptr_eq(&entry.context, &Arc::downgrade(context))
+}
+
+#[cfg(test)]
+async fn cached_dashboard(now: Instant, context: &Arc<Context>) -> Option<DashboardDto> {
     let generation = dashboard_cache_generation();
     dashboard_cache()
         .read()
@@ -582,13 +587,13 @@ async fn cached_dashboard(now: Instant, context_id: usize) -> Option<DashboardDt
         .as_ref()
         .filter(|entry| {
             entry.generation == generation
-                && entry.context_id == context_id
+                && dashboard_context_matches(entry, context)
                 && entry.expires_at > now
         })
         .map(|entry| entry.value.clone())
 }
 
-async fn cached_dashboard_identity(now: Instant, context_id: usize) -> Option<(u64, u64)> {
+async fn cached_dashboard_identity(now: Instant, context: &Arc<Context>) -> Option<(u64, u64)> {
     let generation = dashboard_cache_generation();
     dashboard_cache()
         .read()
@@ -596,7 +601,7 @@ async fn cached_dashboard_identity(now: Instant, context_id: usize) -> Option<(u
         .as_ref()
         .filter(|entry| {
             entry.generation == generation
-                && entry.context_id == context_id
+                && dashboard_context_matches(entry, context)
                 && entry.expires_at > now
         })
         .map(|entry| (entry.generation, entry.base_hash))
@@ -605,7 +610,7 @@ async fn cached_dashboard_identity(now: Instant, context_id: usize) -> Option<(u
 async fn cached_dashboard_for_generation(
     now: Instant,
     generation: u64,
-    context_id: usize,
+    context: &Arc<Context>,
 ) -> Option<DashboardDto> {
     dashboard_cache()
         .read()
@@ -613,13 +618,13 @@ async fn cached_dashboard_for_generation(
         .as_ref()
         .filter(|entry| {
             entry.generation == generation
-                && entry.context_id == context_id
+                && dashboard_context_matches(entry, context)
                 && entry.expires_at > now
         })
         .map(|entry| entry.value.clone())
 }
 
-async fn publish_dashboard_cache(generation: u64, context_id: usize, value: DashboardDto) {
+async fn publish_dashboard_cache(generation: u64, context: Weak<Context>, value: DashboardDto) {
     if dashboard_cache_generation() != generation {
         return;
     }
@@ -629,7 +634,7 @@ async fn publish_dashboard_cache(generation: u64, context_id: usize, value: Dash
         *cache = Some(DashboardCacheEntry {
             expires_at: Instant::now() + DASHBOARD_CACHE_TTL,
             generation,
-            context_id,
+            context,
             base_hash: dashboard_base_hash(&value),
             value,
         });
@@ -794,12 +799,11 @@ fn dashboard_json_response(
 }
 
 async fn cached_dashboard_response(
-    ctx: &Context,
-    context_id: usize,
+    ctx: &Arc<Context>,
     if_none_match: Option<&str>,
 ) -> Result<Option<Response>, (StatusCode, String)> {
     let now = Instant::now();
-    let Some((generation, base_hash)) = cached_dashboard_identity(now, context_id).await else {
+    let Some((generation, base_hash)) = cached_dashboard_identity(now, ctx).await else {
         return Ok(None);
     };
     let (embedded_note_count, embedding_note) = dashboard_embedding(ctx)
@@ -809,8 +813,7 @@ async fn cached_dashboard_response(
     if if_none_match == Some(etag.as_str()) {
         return not_modified_dashboard_response(&etag).map(Some);
     }
-    let Some(mut dashboard) = cached_dashboard_for_generation(now, generation, context_id).await
-    else {
+    let Some(mut dashboard) = cached_dashboard_for_generation(now, generation, ctx).await else {
         return Ok(None);
     };
     apply_dashboard_embedding(&mut dashboard, embedded_note_count, embedding_note);
@@ -850,12 +853,12 @@ async fn dashboard_handler(
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok());
     let context_id = Arc::as_ptr(&ctx) as usize;
-    if let Some(response) = cached_dashboard_response(&ctx, context_id, if_none_match).await? {
+    if let Some(response) = cached_dashboard_response(&ctx, if_none_match).await? {
         return Ok(response);
     }
 
     let _fill = dashboard_cache_fill().lock().await;
-    if let Some(response) = cached_dashboard_response(&ctx, context_id, if_none_match).await? {
+    if let Some(response) = cached_dashboard_response(&ctx, if_none_match).await? {
         return Ok(response);
     }
 
@@ -868,7 +871,7 @@ async fn dashboard_handler(
         value.embedded_note_count,
         value.embedding_note.as_ref(),
     );
-    publish_dashboard_cache(generation, context_id, value.clone()).await;
+    publish_dashboard_cache(generation, Arc::downgrade(&ctx), value.clone()).await;
     if if_none_match == Some(etag.as_str()) {
         return not_modified_dashboard_response(&etag);
     }
@@ -2871,6 +2874,8 @@ mod tests {
         let _dashboard_guard = DASHBOARD_TEST_LOCK.lock().await;
         invalidate_dashboard_cache();
         *dashboard_cache().write().await = None;
+        let (_app, ctx, _dir) = test_app().await;
+        let cache_context = Arc::downgrade(&ctx);
         let fill_generation = dashboard_cache_generation();
 
         let ready = Arc::new(tokio::sync::Barrier::new(2));
@@ -2883,7 +2888,7 @@ mod tests {
                 release.wait().await;
                 publish_dashboard_cache(
                     fill_generation,
-                    1,
+                    cache_context,
                     DashboardDto {
                         note_count: 1,
                         embedded_note_count: 0,
@@ -2906,7 +2911,7 @@ mod tests {
 
         assert_ne!(fill_generation, dashboard_cache_generation());
         assert!(
-            cached_dashboard(Instant::now(), 1).await.is_none(),
+            cached_dashboard(Instant::now(), &ctx).await.is_none(),
             "a fill started before invalidation must not become a valid cache hit"
         );
         assert!(dashboard_cache().read().await.is_none());
@@ -2983,6 +2988,40 @@ mod tests {
             1
         );
         DASHBOARD_LOAD_TEST_CONTEXT.store(0, std::sync::atomic::Ordering::SeqCst);
+        invalidate_dashboard_cache();
+    }
+
+    #[tokio::test]
+    async fn dashboard_cache_never_crosses_sequential_contexts() {
+        let _dashboard_guard = DASHBOARD_TEST_LOCK.lock().await;
+        invalidate_dashboard_cache();
+        let (first_app, first_ctx, first_dir) = test_app().await;
+        let first = first_app.oneshot(get("/api/dashboard")).await.unwrap();
+        let body = first.into_body().collect().await.unwrap().to_bytes();
+        let first_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first_json["note_count"], 0);
+        drop(first_ctx);
+        drop(first_dir);
+
+        let (second_app, _second_ctx, storage, _second_dir) = test_app_with_backend().await;
+        let session = storage.session().await.unwrap();
+        session
+            .insert_note(NewNote {
+                id: "second-context-note",
+                title: "Second context",
+                content: "Body",
+                attachments: &[],
+                created_at: 1,
+                updated_at: 1,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        let second = second_app.oneshot(get("/api/dashboard")).await.unwrap();
+        let body = second.into_body().collect().await.unwrap().to_bytes();
+        let second_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second_json["note_count"], 1);
         invalidate_dashboard_cache();
     }
 
