@@ -180,29 +180,22 @@ static FORCE_OBJECT_FILE_SYNC_FAILURE: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 static FORCE_OBJECT_DIRECTORY_SYNC_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static OBJECT_DIRECTORY_SYNC_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(test)]
+    OBJECT_DIRECTORY_SYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     std::fs::File::open(path)?.sync_all()?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> anyhow::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    // CreateFile requires backup semantics to return a directory handle, and
-    // FlushFileBuffers (used by sync_all) requires GENERIC_WRITE access.
-    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .sync_all()?;
+fn sync_directory(_path: &Path) -> anyhow::Result<()> {
+    // Windows has no supported equivalent of fsync for a directory entry.
+    // The object file itself is still sync_all'd before atomic publication.
     Ok(())
 }
 
@@ -358,10 +351,9 @@ fn ensure_safe_parent_directories_blocking(
     root: &Path,
     relative_path: &str,
 ) -> anyhow::Result<CreatedDirectoriesCleanupGuard> {
-    let mut created = Vec::new();
+    let mut created = CreatedDirectoriesCleanupGuard { paths: Vec::new() };
     if !validate_configured_root_blocking(root)? {
-        std::fs::create_dir_all(root)?;
-        created.push(root.to_path_buf());
+        create_missing_directory_chain_blocking(root, &mut created.paths)?;
     }
     reject_symlink_components_blocking(root, relative_path)?;
     let final_path = attachment_path_on_disk(root, relative_path);
@@ -370,7 +362,7 @@ fn ensure_safe_parent_directories_blocking(
         for component in parent.strip_prefix(root)?.components() {
             current.push(component);
             match std::fs::create_dir(&current) {
-                Ok(()) => created.push(current.clone()),
+                Ok(()) => created.paths.push(current.clone()),
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     let metadata = std::fs::symlink_metadata(&current)?;
                     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -381,7 +373,45 @@ fn ensure_safe_parent_directories_blocking(
             }
         }
     }
-    Ok(CreatedDirectoriesCleanupGuard { paths: created })
+    Ok(created)
+}
+
+fn create_missing_directory_chain_blocking(
+    root: &Path,
+    created: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let mut missing = vec![root.to_path_buf()];
+    let mut current = root;
+    while let Some(parent) = current
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && *parent != current)
+    {
+        match std::fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                anyhow::bail!("attachment root path contains an unsafe directory")
+            }
+            Ok(_) => break,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                missing.push(parent.to_path_buf());
+                current = parent;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    for path in missing.into_iter().rev() {
+        match std::fs::create_dir(&path) {
+            Ok(()) => created.push(path),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!("attachment root path contains an unsafe directory")
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn validate_configured_root_blocking(root: &Path) -> anyhow::Result<bool> {
@@ -402,8 +432,10 @@ mod tests {
 
     static FAULT_INJECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(unix)]
     #[test]
     fn directory_sync_opens_and_flushes_a_directory_handle() {
+        let _lock = FAULT_INJECTION_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
 
         sync_directory(dir.path()).unwrap();
@@ -461,7 +493,7 @@ mod tests {
     fn directory_sync_failure_reports_a_safe_orphan_after_publication() {
         let _lock = FAULT_INJECTION_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("attachments");
+        let root = dir.path().join("one/two/attachments");
         FORCE_OBJECT_DIRECTORY_SYNC_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
 
         let error = put_immutable_blocking(
@@ -480,6 +512,37 @@ mod tests {
             std::fs::read(root.join("objects/orphan-after-sync")).unwrap(),
             b"payload"
         );
+        assert!(dir.path().join("one").is_dir());
+        assert!(dir.path().join("one/two").is_dir());
+        assert!(root.is_dir());
         assert_eq!(std::fs::read_dir(root.join("objects")).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_multilevel_root_syncs_every_created_directory_entry() {
+        let _lock = FAULT_INJECTION_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("one/two/attachments");
+        let before = OBJECT_DIRECTORY_SYNC_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+        put_immutable_blocking(
+            &root,
+            PutObjectRequest {
+                object_key: "objects/durable-chain".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+                    .into(),
+            },
+        )
+        .unwrap();
+
+        let sync_calls =
+            OBJECT_DIRECTORY_SYNC_CALLS.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert_eq!(sync_calls, 5);
+        assert_eq!(
+            std::fs::read(root.join("objects/durable-chain")).unwrap(),
+            b"payload"
+        );
     }
 }

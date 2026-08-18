@@ -235,8 +235,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 #[cfg(test)]
 fn ensure_data_directories(config: &RuntimeConfig) -> anyhow::Result<()> {
-    ensure_database_directory(config)?;
-    ensure_attachment_directory(config)
+    ensure_database_directory(config)
 }
 
 fn ensure_database_directory(config: &RuntimeConfig) -> anyhow::Result<()> {
@@ -247,13 +246,6 @@ fn ensure_database_directory(config: &RuntimeConfig) -> anyhow::Result<()> {
         {
             std::fs::create_dir_all(parent)?;
         }
-    }
-    Ok(())
-}
-
-fn ensure_attachment_directory(config: &RuntimeConfig) -> anyhow::Result<()> {
-    if let AttachmentConfig::Filesystem { path } = &config.attachments {
-        std::fs::create_dir_all(path)?;
     }
     Ok(())
 }
@@ -514,7 +506,6 @@ async fn main() -> anyhow::Result<()> {
     ensure_database_directory(&config)?;
     let storage = build_storage(&config.database).await?;
 
-    ensure_attachment_directory(&config)?;
     let attachments = build_attachment_store(&config.attachments).await?;
     let export_mode = args.iter().any(|a| a == "--export");
     let import_mode = args.iter().any(|a| a == "--import");
@@ -1095,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn data_directories_are_created_only_for_local_adapters() {
+    fn startup_creates_only_the_embedded_database_parent() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("dev-data/notes.db");
         let attachments_dir = temp.path().join("dev-data/attachments");
@@ -1114,7 +1105,7 @@ mod tests {
         ensure_data_directories(&local).unwrap();
 
         assert!(db_path.parent().unwrap().is_dir());
-        assert!(attachments_dir.is_dir());
+        assert!(!attachments_dir.exists());
         assert!(!db_path.exists());
 
         let external_root = temp.path().join("external-only");

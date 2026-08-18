@@ -21,6 +21,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check native workspace
         run: cargo check --workspace --all-targets
+      - name: Test filesystem attachment runtime on Windows
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p note-attachments
       - name: Check frontend wasm
         run: cargo check --manifest-path crates/note-frontend/Cargo.toml --target wasm32-unknown-unknown
 

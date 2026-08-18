@@ -224,10 +224,12 @@ startup reconciliation, an orphan doctor, and cleanup metrics are PR3 work and a
 in PR2.
 
 The filesystem adapter uses atomic no-replace publication, refuses every pre-existing key, durably
-syncs the file and containing directories, and verifies the stored size and SHA-256 checksum. The
-S3 adapter uses conditional `PutObject`, followed by metadata/read verification as needed; on S3, a
-pre-existing key is idempotently accepted only when its size and checksum identify the same bytes.
-The AWS SDK permits four total attempts (the initial request plus at most three retries)
+syncs the file, and verifies the stored size and SHA-256 checksum. On Unix it also syncs every
+created and containing directory entry; Windows directory-entry persistence is best-effort because
+the platform has no supported directory `fsync` equivalent. The S3 adapter uses conditional
+`PutObject`, followed by metadata/read verification as needed; on S3, a pre-existing key is
+idempotently accepted only when its size and checksum identify the same bytes. The AWS SDK permits
+four total attempts (the initial request plus at most three retries)
 for SDK-classified transient failures. A single attachment read issues one `GetObject`; note and
 export hydration read every object declared by note metadata. Backend-neutral System information
 reports only engine `s3` and `s3://bucket/prefix`, never endpoint user information, profiles,
