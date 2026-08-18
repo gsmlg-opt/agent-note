@@ -573,7 +573,6 @@ pub(crate) fn invalidate_dashboard_cache() {
     }
 }
 
-#[cfg(test)]
 fn dashboard_context_matches(entry: &DashboardCacheEntry, context: &Arc<Context>) -> bool {
     Weak::ptr_eq(&entry.context, &Arc::downgrade(context))
 }
@@ -646,6 +645,8 @@ async fn load_dashboard(
     generation: u64,
     context_id: usize,
 ) -> anyhow::Result<DashboardDto> {
+    #[cfg(not(test))]
+    let _ = (generation, context_id);
     #[cfg(test)]
     {
         if DASHBOARD_LOAD_TEST_CONTEXT.load(std::sync::atomic::Ordering::SeqCst) == context_id {
