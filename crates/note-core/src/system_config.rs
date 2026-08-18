@@ -235,6 +235,20 @@ mod tests {
     }
 
     #[test]
+    fn accepts_ordered_category_labels_without_normalizing_keys() {
+        let config = SystemConfig {
+            category_labels: vec!["Project.Team".to_string(), "project".to_string()],
+            ..SystemConfig::default()
+        };
+
+        assert_eq!(validate_system_config(&config), Ok(()));
+        assert_eq!(
+            config.category_labels,
+            vec!["Project.Team".to_string(), "project".to_string()]
+        );
+    }
+
+    #[test]
     fn rejects_invalid_category_label_shapes() {
         for (labels, expected) in [
             (
