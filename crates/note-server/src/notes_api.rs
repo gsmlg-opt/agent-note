@@ -2373,6 +2373,7 @@ mod tests {
         note_pipelines::update_system_config(
             &ctx,
             &note_core::SystemConfig {
+                category_labels: Vec::new(),
                 duplicate_check: note_core::DuplicateCheckConfig {
                     enabled: true,
                     rules: vec![note_core::DuplicateCheckRule {

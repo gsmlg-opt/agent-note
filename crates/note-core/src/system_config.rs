@@ -7,6 +7,8 @@ pub const MAX_DUPLICATE_CHECK_TERMS: usize = 32;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
+    pub category_labels: Vec<String>,
+    #[serde(default)]
     pub duplicate_check: DuplicateCheckConfig,
 }
 
@@ -32,6 +34,9 @@ pub struct DuplicateCheckTerm {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SystemConfigValidationError {
+    EmptyCategoryLabel { index: usize },
+    CategoryLabelHasOuterWhitespace { index: usize },
+    DuplicateCategoryLabel { key: String },
     TooManyRules { count: usize },
     EmptyRule { rule: usize },
     TooManyTerms { rule: usize, count: usize },
@@ -43,6 +48,17 @@ pub enum SystemConfigValidationError {
 impl std::fmt::Display for SystemConfigValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EmptyCategoryLabel { index } => {
+                write!(f, "category label {} must have a label key", index + 1)
+            }
+            Self::CategoryLabelHasOuterWhitespace { index } => write!(
+                f,
+                "category label {} key must not have leading or trailing whitespace",
+                index + 1
+            ),
+            Self::DuplicateCategoryLabel { key } => {
+                write!(f, "category label key {key} is configured more than once")
+            }
             Self::TooManyRules { count } => write!(
                 f,
                 "duplicate check supports at most {MAX_DUPLICATE_CHECK_RULES} rules, got {count}"
@@ -82,7 +98,41 @@ impl std::fmt::Display for SystemConfigValidationError {
 
 impl std::error::Error for SystemConfigValidationError {}
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum CategoryLabelConfigError {
+    UnknownKey { key: String },
+    ConfiguredKeyCannotBeDeleted { key: String },
+}
+
+impl std::fmt::Display for CategoryLabelConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownKey { key } => write!(f, "unknown category label key: {key}"),
+            Self::ConfiguredKeyCannotBeDeleted { key } => write!(
+                f,
+                "label key {key} is configured as a category; remove it from System settings first"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CategoryLabelConfigError {}
+
 pub fn validate_system_config(config: &SystemConfig) -> Result<(), SystemConfigValidationError> {
+    let mut category_keys = HashSet::new();
+    for (index, key) in config.category_labels.iter().enumerate() {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            return Err(SystemConfigValidationError::EmptyCategoryLabel { index });
+        }
+        if trimmed != key {
+            return Err(SystemConfigValidationError::CategoryLabelHasOuterWhitespace { index });
+        }
+        if !category_keys.insert(key.as_str()) {
+            return Err(SystemConfigValidationError::DuplicateCategoryLabel { key: key.clone() });
+        }
+    }
+
     if config.duplicate_check.rules.len() > MAX_DUPLICATE_CHECK_RULES {
         return Err(SystemConfigValidationError::TooManyRules {
             count: config.duplicate_check.rules.len(),
@@ -172,6 +222,66 @@ impl std::error::Error for DuplicateNoteError {}
 mod tests {
     use super::*;
 
+    #[test]
+    fn category_labels_default_to_empty() {
+        assert!(SystemConfig::default().category_labels.is_empty());
+    }
+
+    #[test]
+    fn category_labels_deserialize_when_omitted() {
+        let config: SystemConfig = serde_json::from_str(r#"{"duplicate_check": {}}"#).unwrap();
+
+        assert!(config.category_labels.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_category_label_shapes() {
+        for (labels, expected) in [
+            (
+                vec!["".to_string()],
+                SystemConfigValidationError::EmptyCategoryLabel { index: 0 },
+            ),
+            (
+                vec![" \t ".to_string()],
+                SystemConfigValidationError::EmptyCategoryLabel { index: 0 },
+            ),
+            (
+                vec![" project ".to_string()],
+                SystemConfigValidationError::CategoryLabelHasOuterWhitespace { index: 0 },
+            ),
+            (
+                vec!["project".to_string(), "project".to_string()],
+                SystemConfigValidationError::DuplicateCategoryLabel {
+                    key: "project".to_string(),
+                },
+            ),
+        ] {
+            let config = SystemConfig {
+                category_labels: labels,
+                ..SystemConfig::default()
+            };
+            assert_eq!(validate_system_config(&config), Err(expected));
+        }
+    }
+
+    #[test]
+    fn category_label_config_errors_are_actionable() {
+        assert_eq!(
+            CategoryLabelConfigError::UnknownKey {
+                key: "project".to_string(),
+            }
+            .to_string(),
+            "unknown category label key: project"
+        );
+        assert_eq!(
+            CategoryLabelConfigError::ConfiguredKeyCannotBeDeleted {
+                key: "project".to_string(),
+            }
+            .to_string(),
+            "label key project is configured as a category; remove it from System settings first"
+        );
+    }
+
     fn term(key: &str, value: Option<&str>) -> DuplicateCheckTerm {
         DuplicateCheckTerm {
             key: key.to_string(),
@@ -182,6 +292,7 @@ mod tests {
     #[test]
     fn validates_rule_shape() {
         let config = SystemConfig {
+            category_labels: Vec::new(),
             duplicate_check: DuplicateCheckConfig {
                 enabled: true,
                 rules: vec![DuplicateCheckRule {
@@ -196,6 +307,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_keys_within_a_rule() {
         let config = SystemConfig {
+            category_labels: Vec::new(),
             duplicate_check: DuplicateCheckConfig {
                 enabled: true,
                 rules: vec![DuplicateCheckRule {
@@ -216,6 +328,7 @@ mod tests {
     #[test]
     fn rejects_label_keys_with_outer_whitespace() {
         let config = SystemConfig {
+            category_labels: Vec::new(),
             duplicate_check: DuplicateCheckConfig {
                 enabled: true,
                 rules: vec![DuplicateCheckRule {

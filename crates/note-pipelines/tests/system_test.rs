@@ -13,6 +13,7 @@ async fn config_roundtrips_and_system_info_reports_storage() {
     let database_path = dir.path().join("test.db");
     let attachments_path = dir.path().join("attachments");
     let config = SystemConfig {
+        category_labels: Vec::new(),
         duplicate_check: DuplicateCheckConfig {
             enabled: true,
             rules: vec![DuplicateCheckRule {
@@ -48,6 +49,7 @@ async fn config_roundtrips_and_system_info_reports_storage() {
 async fn invalid_config_is_rejected_before_storage() {
     let (ctx, _backend, _dir) = test_context().await;
     let config = SystemConfig {
+        category_labels: Vec::new(),
         duplicate_check: DuplicateCheckConfig {
             enabled: true,
             rules: vec![DuplicateCheckRule { terms: vec![] }],

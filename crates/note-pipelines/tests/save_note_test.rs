@@ -345,6 +345,7 @@ async fn enable_duplicate_series_rule(ctx: &Context) {
     update_system_config(
         ctx,
         &SystemConfig {
+            category_labels: Vec::new(),
             duplicate_check: DuplicateCheckConfig {
                 enabled: true,
                 rules: vec![DuplicateCheckRule {
@@ -1316,6 +1317,7 @@ async fn empty_title_is_rejected() {
 
 fn duplicate_config(terms: &[(&str, Option<&str>)]) -> SystemConfig {
     SystemConfig {
+        category_labels: Vec::new(),
         duplicate_check: DuplicateCheckConfig {
             enabled: true,
             rules: vec![DuplicateCheckRule {

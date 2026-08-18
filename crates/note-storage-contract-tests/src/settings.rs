@@ -9,6 +9,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         SystemConfig::default()
     );
     let config = SystemConfig {
+        category_labels: Vec::new(),
         duplicate_check: DuplicateCheckConfig {
             enabled: true,
             rules: vec![DuplicateCheckRule {
