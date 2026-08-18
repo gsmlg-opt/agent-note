@@ -38,7 +38,6 @@ pub(crate) async fn publish_generated_attachments(
             &checksum_sha256[..CHECKSUM_PREFIX_LEN]
         );
         let size_bytes = attachment.content.len() as u64;
-        published.object_keys.push(object_key.clone());
 
         let stored = match store
             .put_immutable(PutObjectRequest {
@@ -55,6 +54,7 @@ pub(crate) async fn publish_generated_attachments(
                     .await);
             }
         };
+        published.object_keys.push(object_key.clone());
 
         if stored.object_key != object_key
             || stored.size_bytes != size_bytes

@@ -1405,12 +1405,8 @@ async fn put_object_failure_occurs_before_begin_and_never_activates_metadata() {
     assert!(format!("{error:#}").contains("controlled immutable put failure"));
     assert!(stored_note(&backend, NOTE_ID).await.attachments.is_empty());
     let events = events.lock().unwrap().clone();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 1);
     assert!(events[0].starts_with("put_object:"));
-    assert_eq!(
-        events[1],
-        events[0].replacen("put_object:", "delete_object:", 1)
-    );
 }
 
 #[tokio::test]

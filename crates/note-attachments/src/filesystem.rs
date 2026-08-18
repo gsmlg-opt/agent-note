@@ -124,6 +124,11 @@ fn put_immutable_blocking(root: &Path, request: PutObjectRequest) -> anyhow::Res
         .open(temp.path())?;
     file.write_all(&request.bytes)?;
     file.flush()?;
+    #[cfg(test)]
+    if FORCE_OBJECT_FILE_SYNC_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("attachment object file sync failed");
+    }
+    file.sync_all()?;
     drop(file);
 
     if let Err(error) = rename_noreplace(temp.path(), &final_path) {
@@ -134,7 +139,22 @@ fn put_immutable_blocking(root: &Path, request: PutObjectRequest) -> anyhow::Res
         };
     }
     temp.disarm();
-    created.disarm();
+    let created_directories = created.disarm();
+
+    #[cfg(test)]
+    if FORCE_OBJECT_DIRECTORY_SYNC_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("attachment object directory sync failed");
+    }
+    sync_directory(
+        final_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("attachment object has no parent directory"))?,
+    )?;
+    for directory in created_directories.iter().rev() {
+        if let Some(parent) = directory.parent() {
+            sync_directory(parent)?;
+        }
+    }
 
     #[cfg(test)]
     if FORCE_OBJECT_VERIFICATION_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -154,6 +174,17 @@ fn put_immutable_blocking(root: &Path, request: PutObjectRequest) -> anyhow::Res
 #[cfg(test)]
 static FORCE_OBJECT_VERIFICATION_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_OBJECT_FILE_SYNC_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_OBJECT_DIRECTORY_SYNC_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
 
 fn validate_sha256(value: &str) -> anyhow::Result<String> {
     if value.len() != 64
@@ -235,8 +266,8 @@ struct CreatedDirectoriesCleanupGuard {
 }
 
 impl CreatedDirectoriesCleanupGuard {
-    fn disarm(&mut self) {
-        self.paths.clear();
+    fn disarm(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.paths)
     }
 }
 
@@ -344,8 +375,11 @@ fn validate_configured_root_blocking(root: &Path) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
 
+    static FAULT_INJECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn verification_failure_reports_a_safe_orphan_and_leaves_no_staging_file() {
+        let _lock = FAULT_INJECTION_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("attachments");
         FORCE_OBJECT_VERIFICATION_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -364,6 +398,54 @@ mod tests {
         assert_eq!(error.to_string(), "attachment object verification failed");
         assert_eq!(
             std::fs::read(root.join("objects/orphan")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(std::fs::read_dir(root.join("objects")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn file_sync_failure_does_not_publish_the_object() {
+        let _lock = FAULT_INJECTION_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("attachments");
+        FORCE_OBJECT_FILE_SYNC_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = put_immutable_blocking(
+            &root,
+            PutObjectRequest {
+                object_key: "objects/not-published".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+                    .into(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "attachment object file sync failed");
+        assert!(!root.join("objects/not-published").exists());
+    }
+
+    #[test]
+    fn directory_sync_failure_reports_a_safe_orphan_after_publication() {
+        let _lock = FAULT_INJECTION_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("attachments");
+        FORCE_OBJECT_DIRECTORY_SYNC_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = put_immutable_blocking(
+            &root,
+            PutObjectRequest {
+                object_key: "objects/orphan-after-sync".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+                    .into(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "attachment object directory sync failed");
+        assert_eq!(
+            std::fs::read(root.join("objects/orphan-after-sync")).unwrap(),
             b"payload"
         );
         assert_eq!(std::fs::read_dir(root.join("objects")).unwrap().count(), 1);

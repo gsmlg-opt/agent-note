@@ -368,7 +368,7 @@ async fn object_write_failure_preserves_the_sanitized_adapter_error_chain() {
 }
 
 #[tokio::test]
-async fn partial_multi_upload_failure_best_effort_deletes_every_generated_key() {
+async fn partial_multi_upload_failure_deletes_only_prior_successful_publications() {
     let (ctx, _backend, attachments, events, _dir) = controlled_context(false).await;
     attachments.fail_put_on_call(2);
     let mut second = one_attachment().remove(0);
@@ -400,8 +400,54 @@ async fn partial_multi_upload_failure_best_effort_deletes_every_generated_key() 
             .iter()
             .filter(|event| event.starts_with("delete_object:"))
             .count(),
-        2
+        1
     );
+    assert!(events
+        .iter()
+        .any(|event| event == &format!("delete_object:{}", keys[0])));
+    assert!(!events
+        .iter()
+        .any(|event| event == &format!("delete_object:{}", keys[1])));
+}
+
+#[tokio::test]
+async fn collision_put_failure_keeps_the_colliding_object_and_cleans_prior_publications() {
+    let (ctx, _backend, attachments, events, _dir) = controlled_context(false).await;
+    attachments.collide_put_on_call(2);
+    let mut second = one_attachment().remove(0);
+    second.id = "second".into();
+    second.path = "second.bin".into();
+    second.content = vec![0, 1, 2, 255];
+
+    save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Collision".into(),
+            content: "Never delete an object not created by this publication attempt".into(),
+            attachments: vec![one_attachment().remove(0), second],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    let events = events.lock().unwrap().clone();
+    let keys: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event.strip_prefix("put_object:"))
+        .collect();
+    assert_eq!(keys.len(), 2);
+    assert!(!attachments.has_object(keys[0]));
+    assert_eq!(
+        attachments.object_content(keys[1]).as_deref(),
+        Some(b"pre-existing collision".as_slice())
+    );
+    assert!(events
+        .iter()
+        .any(|event| event == &format!("delete_object:{}", keys[0])));
+    assert!(!events
+        .iter()
+        .any(|event| event == &format!("delete_object:{}", keys[1])));
 }
 
 #[tokio::test]

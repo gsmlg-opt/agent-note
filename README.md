@@ -491,10 +491,11 @@ object metadata.
 ### Filesystem attachments
 
 The filesystem adapter publishes each generated object with an atomic no-replace operation and
-then verifies its size and checksum. An existing object key is accepted only when it identifies the
-same bytes. Reads and cleanup use the persisted object key; legacy reads and deletes use the old
-note-ID/path layout explicitly. The configured root must be exclusively owned by this agent-note
-process: external mutation, symlinks, and multiple writers are unsupported.
+durably syncs the file and containing directories before verifying its size and checksum. It
+refuses every pre-existing object key, even when the existing bytes match. Reads and cleanup use
+the persisted object key; legacy reads and deletes use the old note-ID/path layout explicitly. The
+configured root must be exclusively owned by this agent-note process: external mutation, symlinks,
+and multiple writers are unsupported.
 
 ### S3 attachments
 

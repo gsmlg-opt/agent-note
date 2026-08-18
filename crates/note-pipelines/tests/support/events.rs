@@ -635,6 +635,7 @@ pub struct ControlledAttachmentStore {
     read_path_races: Mutex<HashMap<(String, String), VecDeque<Vec<(String, String)>>>>,
     object_contents: Mutex<HashMap<String, Vec<u8>>>,
     fail_put_on_call: Mutex<Option<usize>>,
+    collision_put_on_call: Mutex<Option<usize>>,
     put_calls: Mutex<usize>,
     corrupt_put_return: AtomicBool,
     fail_delete: AtomicBool,
@@ -652,6 +653,7 @@ impl ControlledAttachmentStore {
             read_path_races: Mutex::new(HashMap::new()),
             object_contents: Mutex::new(HashMap::new()),
             fail_put_on_call: Mutex::new(None),
+            collision_put_on_call: Mutex::new(None),
             put_calls: Mutex::new(0),
             corrupt_put_return: AtomicBool::new(false),
             fail_delete: AtomicBool::new(false),
@@ -664,6 +666,10 @@ impl ControlledAttachmentStore {
 
     pub fn fail_put_on_call(&self, call: usize) {
         *self.fail_put_on_call.lock().unwrap() = Some(call);
+    }
+
+    pub fn collide_put_on_call(&self, call: usize) {
+        *self.collision_put_on_call.lock().unwrap() = Some(call);
     }
 
     pub fn fail_delete_object(&self) {
@@ -686,6 +692,14 @@ impl ControlledAttachmentStore {
             .lock()
             .unwrap()
             .contains_key(object_key)
+    }
+
+    pub fn object_content(&self, object_key: &str) -> Option<Vec<u8>> {
+        self.object_contents
+            .lock()
+            .unwrap()
+            .get(object_key)
+            .cloned()
     }
 
     pub fn race_note_on_next_put(&self, note_id: &str) {
@@ -742,6 +756,13 @@ impl AttachmentStore for ControlledAttachmentStore {
         };
         if *self.fail_put_on_call.lock().unwrap() == Some(call) {
             anyhow::bail!("controlled immutable put failure");
+        }
+        if *self.collision_put_on_call.lock().unwrap() == Some(call) {
+            self.object_contents
+                .lock()
+                .unwrap()
+                .insert(request.object_key, b"pre-existing collision".to_vec());
+            anyhow::bail!("controlled immutable collision");
         }
         self.object_contents
             .lock()

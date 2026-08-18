@@ -217,15 +217,17 @@ hydrates both legacy and generated attachments.
 Replacing or deleting an attachment and permanently deleting a note insert cleanup intent into the
 durable `attachment_operations` table in the same transaction as the authoritative note mutation.
 After commit, the request path makes a best-effort claim and cleanup pass. Failure cannot roll back
-or change the committed user operation; the intent remains pending for another claim. This design
-prefers recoverable orphan objects over metadata that references missing bytes. A recurring cleanup
-worker, startup reconciliation, an orphan doctor, and cleanup metrics are PR3 work and are not
-implemented in PR2.
+or change the committed user operation; the intent remains durable and is reclaimable after a
+claim lease expires even if recording that attempt's failure also fails. This design prefers
+recoverable orphan objects over metadata that references missing bytes. A recurring cleanup worker,
+startup reconciliation, an orphan doctor, and cleanup metrics are PR3 work and are not implemented
+in PR2.
 
-The filesystem adapter uses atomic no-replace publication and verifies the stored size and SHA-256
-checksum. The S3 adapter uses conditional `PutObject`, followed by metadata/read verification as
-needed; a pre-existing key is idempotently accepted only when its size and checksum identify the
-same bytes. The AWS SDK permits four total attempts (the initial request plus at most three retries)
+The filesystem adapter uses atomic no-replace publication, refuses every pre-existing key, durably
+syncs the file and containing directories, and verifies the stored size and SHA-256 checksum. The
+S3 adapter uses conditional `PutObject`, followed by metadata/read verification as needed; on S3, a
+pre-existing key is idempotently accepted only when its size and checksum identify the same bytes.
+The AWS SDK permits four total attempts (the initial request plus at most three retries)
 for SDK-classified transient failures. A single attachment read issues one `GetObject`; note and
 export hydration read every object declared by note metadata. Backend-neutral System information
 reports only engine `s3` and `s3://bucket/prefix`, never endpoint user information, profiles,
