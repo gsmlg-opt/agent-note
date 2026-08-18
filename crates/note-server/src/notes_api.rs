@@ -334,8 +334,15 @@ pub struct SaveNoteResponse {
 struct BulkUpdateNoteLabelsRequest {
     #[schema(min_length = 1)]
     selector: String,
-    #[schema(schema_with = crate::openapi::nonempty_label_pairs_schema)]
+    #[serde(default)]
+    #[schema(
+        schema_with = crate::openapi::label_pairs_with_empty_default_schema,
+        required = false
+    )]
     set: Vec<(String, String)>,
+    #[serde(default)]
+    #[schema(default = json!([]), required = false)]
+    remove: Vec<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -709,6 +716,7 @@ async fn bulk_update_note_labels_handler(
         BulkUpdateNoteLabelsInput {
             selector: req.selector,
             set: req.set,
+            remove: req.remove,
         },
     )
     .await
@@ -1723,19 +1731,26 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
         request_properties.sort_unstable();
-        assert_eq!(request_properties, vec!["selector", "set"]);
+        assert_eq!(request_properties, vec!["remove", "selector", "set"]);
         assert_eq!(request["additionalProperties"], false);
-        assert_eq!(request["required"], serde_json::json!(["selector", "set"]));
+        assert_eq!(request["required"], serde_json::json!(["selector"]));
         assert_eq!(request["properties"]["selector"]["type"], "string");
         assert_eq!(request["properties"]["selector"]["minLength"], 1);
 
         let set = &request["properties"]["set"];
         assert_eq!(set["type"], "array");
-        assert_eq!(set["minItems"], 1);
+        assert_eq!(set["default"], serde_json::json!([]));
+        assert!(set.get("minItems").is_none());
         assert_eq!(set["items"]["type"], "array");
         assert_eq!(set["items"]["minItems"], 2);
         assert_eq!(set["items"]["maxItems"], 2);
         assert_eq!(set["items"]["items"]["type"], "string");
+
+        let remove = &request["properties"]["remove"];
+        assert_eq!(remove["type"], "array");
+        assert_eq!(remove["default"], serde_json::json!([]));
+        assert!(remove.get("minItems").is_none());
+        assert_eq!(remove["items"]["type"], "string");
 
         let mut response_properties = response["properties"]
             .as_object()
@@ -2114,6 +2129,13 @@ mod tests {
             .to_string()
     }
 
+    async fn get_note_json(app: Router, id: &str) -> Value {
+        let response = app.oneshot(get(&format!("/api/notes/{id}"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
     #[tokio::test]
     async fn save_note_returns_200_with_id() {
         let (app, _ctx, _dir) = test_app().await;
@@ -2183,6 +2205,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_label_update_removes_from_active_notes_and_preserves_note_state() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, storage, _dir) = test_app_with_backend().await;
+        let first_id = save_note_id(
+            app.clone(),
+            r#"{"title":"Remove A","content":"Original A","attachments":[{"id":"source","path":"source.txt","mime":"text/plain","description":"source payload","content":"attachment body"}],"labels":[["type","ietf-rfc"],["project","ietf"],["owner","protocols"],["status","ready"]]}"#,
+        )
+        .await;
+        let second_id = save_note_id(
+            app.clone(),
+            r#"{"title":"Remove B","content":"Original B","labels":[["type","ietf-rfc"],["owner","protocols"],["status","ready"]]}"#,
+        )
+        .await;
+        let deleted_id = save_note_id(
+            app.clone(),
+            r#"{"title":"Deleted","content":"Deleted body","labels":[["type","ietf-rfc"],["owner","deleted-owner"]]}"#,
+        )
+        .await;
+        let deleted = app
+            .clone()
+            .oneshot(delete(&format!(
+                "/api/notes/{deleted_id}?expected_revision=1"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+        let first_before = get_note_json(app.clone(), &first_id).await;
+        let second_before = get_note_json(app.clone(), &second_id).await;
+        let session = storage.session().await.unwrap();
+        let first_chunks_before = session.list_note_chunks(&first_id).await.unwrap();
+        let second_chunks_before = session.list_note_chunks(&second_id).await.unwrap();
+        let deleted_labels_before = session.labels_for_note(&deleted_id).await.unwrap();
+        drop(session);
+        let attachment_before = app
+            .clone()
+            .oneshot(get(&format!(
+                "/api/notes/{first_id}/attachments/source.txt"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(attachment_before.status(), StatusCode::OK);
+        let attachment_before = attachment_before
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","remove":["type"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::json!({"matched": 2, "updated": 2, "unchanged": 0})
+        );
+
+        let first_after = get_note_json(app.clone(), &first_id).await;
+        let second_after = get_note_json(app.clone(), &second_id).await;
+        for (before, after) in [
+            (&first_before, &first_after),
+            (&second_before, &second_after),
+        ] {
+            assert_eq!(after["title"], before["title"]);
+            assert_eq!(after["content"], before["content"]);
+            assert_eq!(after["attachments"], before["attachments"]);
+            assert_eq!(after["created_at"], before["created_at"]);
+            assert_eq!(after["revision"], before["revision"]);
+            assert!(after["updated_at"].as_i64().unwrap() > before["updated_at"].as_i64().unwrap());
+            let labels = after["labels"].as_array().unwrap();
+            assert!(!labels.iter().any(|label| label[0] == "type"));
+            assert!(labels.contains(&serde_json::json!(["owner", "protocols"])));
+            assert!(labels.contains(&serde_json::json!(["status", "ready"])));
+        }
+        assert!(first_after["labels"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(["project", "ietf"])));
+
+        let session = storage.session().await.unwrap();
+        assert_eq!(
+            session.list_note_chunks(&first_id).await.unwrap(),
+            first_chunks_before
+        );
+        assert_eq!(
+            session.list_note_chunks(&second_id).await.unwrap(),
+            second_chunks_before
+        );
+        assert_eq!(
+            session.labels_for_note(&deleted_id).await.unwrap(),
+            deleted_labels_before
+        );
+        drop(session);
+
+        let attachment_after = app
+            .oneshot(get(&format!(
+                "/api/notes/{first_id}/attachments/source.txt"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(attachment_after.status(), StatusCode::OK);
+        let attachment_after = attachment_after
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(attachment_after, attachment_before);
+    }
+
+    #[tokio::test]
+    async fn bulk_label_update_counts_mixed_set_and_remove_once_per_note() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, _dir) = test_app().await;
+        let ids = [
+            save_note_id(
+                app.clone(),
+                r#"{"title":"Mixed A","content":"Body","labels":[["type","ietf-rfc"],["owner","protocols"],["project","old"]]}"#,
+            )
+            .await,
+            save_note_id(
+                app.clone(),
+                r#"{"title":"Mixed B","content":"Body","labels":[["type","ietf-rfc"],["owner","protocols"]]}"#,
+            )
+            .await,
+        ];
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","set":[["project","ietf-rfc"]],"remove":["owner"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::json!({"matched": 2, "updated": 2, "unchanged": 0})
+        );
+
+        for id in ids {
+            let note = get_note_json(app.clone(), &id).await;
+            let labels = note["labels"].as_array().unwrap();
+            assert!(labels.contains(&serde_json::json!(["project", "ietf-rfc"])));
+            assert!(labels.contains(&serde_json::json!(["type", "ietf-rfc"])));
+            assert!(!labels.iter().any(|label| label[0] == "owner"));
+        }
+    }
+
+    #[tokio::test]
     async fn bulk_label_update_zero_matches_does_not_create_catalog_entries() {
         let (app, ctx, _dir) = test_app().await;
 
@@ -2229,12 +2410,20 @@ mod tests {
                 "label selector is malformed",
             ),
             (
-                r#"{"selector":"type=ietf-rfc","set":[]}"#,
-                "at least one label assignment is required",
+                r#"{"selector":"type=ietf-rfc","set":[],"remove":[]}"#,
+                "at least one label set or remove mutation is required",
             ),
             (
                 r#"{"selector":"type=ietf-rfc","set":[["project","one"],["project","two"]]}"#,
                 "duplicate label assignment key: project",
+            ),
+            (
+                r#"{"selector":"type=ietf-rfc","remove":["owner","owner"]}"#,
+                "duplicate label removal key: owner",
+            ),
+            (
+                r#"{"selector":"type=ietf-rfc","set":[["owner","new"]],"remove":["owner"]}"#,
+                "label key cannot be both set and removed: owner",
             ),
             (
                 r#"{"selector":"type=ietf-rfc","set":[["bad$key","value"]]}"#,
@@ -2317,6 +2506,26 @@ mod tests {
         );
 
         let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","remove":["owner","never-known"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::json!({"matched": 1, "updated": 0, "unchanged": 1})
+        );
+        assert_eq!(
+            BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
+            invalidations_before
+        );
+
+        let response = app
+            .clone()
             .oneshot(post(
                 "/api/notes/bulk-labels",
                 r#"{"selector":"type=ietf-rfc","set":[["project","changed"]]}"#,
@@ -2327,6 +2536,19 @@ mod tests {
         assert_eq!(
             BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
             invalidations_before + 1
+        );
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/bulk-labels",
+                r#"{"selector":"type=ietf-rfc","remove":["type"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
+            invalidations_before + 2
         );
     }
 

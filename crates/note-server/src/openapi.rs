@@ -92,12 +92,6 @@ pub(crate) fn label_pairs_with_empty_default_schema() -> Array {
         .build()
 }
 
-pub(crate) fn nonempty_label_pairs_schema() -> Array {
-    ArrayBuilder::from(label_pairs_schema())
-        .min_items(Some(1))
-        .build()
-}
-
 pub(crate) fn label_value_type_schema() -> Object {
     ObjectBuilder::new()
         .schema_type(Type::String)

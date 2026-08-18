@@ -137,6 +137,7 @@ async fn seeded_contexts(
             vec![
                 ("type".into(), "ietf-rfc".into()),
                 ("owner".into(), "protocols".into()),
+                ("status".into(), "ready".into()),
             ],
         ),
         (
@@ -145,6 +146,7 @@ async fn seeded_contexts(
                 ("type".into(), "ietf-rfc".into()),
                 ("owner".into(), "protocols".into()),
                 ("project".into(), "old".into()),
+                ("status".into(), "ready".into()),
             ],
         ),
         ("Unmatched", vec![("type".into(), "private-note".into())]),
@@ -165,38 +167,25 @@ async fn seeded_contexts(
     (note, org, storage, dir)
 }
 
-#[tokio::test]
-async fn bulk_note_label_update_has_rest_mcp_transport_parity() {
-    let rest = TransportSide::new_rest().await;
-    let mcp = TransportSide::new_mcp().await;
-    let request = json!({
-        "selector": "type=ietf-rfc",
-        "set": [["project", "IETF-RFC"]]
-    });
-
-    let rest_response = rest
-        .router
+async fn call_rest_bulk_update(router: &Router, request: &Value) -> Value {
+    let response = router
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri("/api/notes/bulk-labels")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .body(Body::from(serde_json::to_vec(request).unwrap()))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(rest_response.status(), StatusCode::OK);
-    let rest_result: Value = serde_json::from_slice(
-        &to_bytes(rest_response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
 
-    let mcp_response = mcp
-        .router
+async fn call_mcp_bulk_update(router: &Router, id: i64, request: &Value) -> Value {
+    let response = router
         .clone()
         .oneshot(
             Request::builder()
@@ -208,7 +197,7 @@ async fn bulk_note_label_update_has_rest_mcp_transport_parity() {
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "jsonrpc": "2.0",
-                        "id": 1,
+                        "id": id,
                         "method": "tools/call",
                         "params": {
                             "name": "bulk_update_note_labels",
@@ -221,19 +210,28 @@ async fn bulk_note_label_update_has_rest_mcp_transport_parity() {
         )
         .await
         .unwrap();
-    assert_eq!(mcp_response.status(), StatusCode::OK);
-    let mcp_body: Value = serde_json::from_slice(
-        &to_bytes(mcp_response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(mcp_body.get("error").is_none(), "{mcp_body}");
-    let mcp_result = &mcp_body["result"]["structuredContent"];
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(body.get("error").is_none(), "{body}");
+    body["result"]["structuredContent"].clone()
+}
+
+#[tokio::test]
+async fn bulk_note_label_update_has_rest_mcp_transport_parity() {
+    let rest = TransportSide::new_rest().await;
+    let mcp = TransportSide::new_mcp().await;
+    let request = json!({
+        "selector": "type=ietf-rfc",
+        "set": [["project", "IETF-RFC"]]
+    });
+
+    let rest_result = call_rest_bulk_update(&rest.router, &request).await;
+    let mcp_result = call_mcp_bulk_update(&mcp.router, 1, &request).await;
 
     let expected = json!({"matched": 2, "updated": 2, "unchanged": 0});
     assert_eq!(rest_result, expected);
-    assert_eq!(mcp_result, &expected);
+    assert_eq!(mcp_result, expected);
 
     let rest_labels = rest.final_labels().await;
     let mcp_labels = mcp.final_labels().await;
@@ -243,6 +241,7 @@ async fn bulk_note_label_update_has_rest_mcp_transport_parity() {
         vec![
             ("owner".into(), "protocols".into()),
             ("project".into(), "IETF-RFC".into()),
+            ("status".into(), "ready".into()),
             ("type".into(), "ietf-rfc".into()),
         ]
     );
@@ -254,7 +253,39 @@ async fn bulk_note_label_update_has_rest_mcp_transport_parity() {
 }
 
 #[tokio::test]
-async fn mcp_bulk_label_update_invalidates_the_shared_dashboard_cache() {
+async fn mixed_bulk_note_label_update_has_rest_mcp_transport_parity() {
+    let rest = TransportSide::new_rest().await;
+    let mcp = TransportSide::new_mcp().await;
+    let request = json!({
+        "selector": "type=ietf-rfc",
+        "set": [["project", "ietf-rfc"]],
+        "remove": ["owner"]
+    });
+
+    let rest_result = call_rest_bulk_update(&rest.router, &request).await;
+    let mcp_result = call_mcp_bulk_update(&mcp.router, 2, &request).await;
+    let expected = json!({"matched": 2, "updated": 2, "unchanged": 0});
+    assert_eq!(rest_result, expected);
+    assert_eq!(mcp_result, expected);
+
+    let rest_labels = rest.final_labels().await;
+    let mcp_labels = mcp.final_labels().await;
+    assert_eq!(rest_labels, mcp_labels);
+    let expected_changed = vec![
+        ("project".into(), "ietf-rfc".into()),
+        ("status".into(), "ready".into()),
+        ("type".into(), "ietf-rfc".into()),
+    ];
+    assert_eq!(rest_labels["Add"], expected_changed);
+    assert_eq!(rest_labels["Replace"], expected_changed);
+    assert_eq!(
+        rest_labels["Unmatched"],
+        vec![("type".into(), "private-note".into())]
+    );
+}
+
+#[tokio::test]
+async fn mcp_bulk_label_removal_invalidates_the_shared_dashboard_cache() {
     let side = SharedHttpSide::new().await;
 
     let before = side
@@ -272,11 +303,13 @@ async fn mcp_bulk_label_update_invalidates_the_shared_dashboard_cache() {
     let before: Value =
         serde_json::from_slice(&to_bytes(before.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(before["label_count"], 1);
-    assert!(before["labels"]
+    let type_before = before["labels"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|label| label["key"] != "project"));
+        .find(|label| label["key"] == "type")
+        .expect("type label is present before MCP removal");
+    assert_eq!(type_before["count"], 1);
     let before_updated_at = before["recent_updates"][0]["updated_at"].as_i64().unwrap();
 
     let mcp_response = side
@@ -298,7 +331,7 @@ async fn mcp_bulk_label_update_invalidates_the_shared_dashboard_cache() {
                             "name": "bulk_update_note_labels",
                             "arguments": {
                                 "selector": "type=ietf-rfc",
-                                "set": [["project", "IETF-RFC"]]
+                                "remove": ["type"]
                             }
                         }
                     }))
@@ -333,13 +366,13 @@ async fn mcp_bulk_label_update_invalidates_the_shared_dashboard_cache() {
     assert_eq!(after.status(), StatusCode::OK);
     let after: Value =
         serde_json::from_slice(&to_bytes(after.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(after["label_count"], 2);
-    let project = after["labels"]
+    assert_eq!(after["label_count"], 1);
+    let type_after = after["labels"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|label| label["key"] == "project")
-        .expect("project label appears after MCP mutation");
-    assert_eq!(project["count"], 1);
+        .find(|label| label["key"] == "type")
+        .expect("type key remains cataloged after MCP removal");
+    assert_eq!(type_after["count"], 0);
     assert!(after["recent_updates"][0]["updated_at"].as_i64().unwrap() > before_updated_at);
 }
