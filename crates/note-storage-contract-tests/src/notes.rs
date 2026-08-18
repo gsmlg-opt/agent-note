@@ -1,7 +1,7 @@
 use note_core::{parse_label_selectors, LabelValueType, NoteAttachment};
 use note_storage::{
-    ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate, NoteMutationResult,
-    NoteUpdate, StorageBackend, StorageErrorKind,
+    ActiveNoteSource, AttachmentMetadataUpdate, LabelValueCount, NewNote, NoteFieldsUpdate,
+    NoteMutationResult, NoteUpdate, StorageBackend, StorageErrorKind,
 };
 use std::sync::Arc;
 
@@ -800,6 +800,39 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     assert!(counts
         .iter()
         .any(|(key, count)| { key == "contract-notes-active-only" && *count == 0 }));
+    assert_eq!(
+        session
+            .label_value_counts(&["contract-notes-status".to_string()])
+            .await
+            .unwrap(),
+        vec![
+            LabelValueCount {
+                key: "contract-notes-status".into(),
+                value: "ready".into(),
+                count: 4,
+            },
+            LabelValueCount {
+                key: "contract-notes-status".into(),
+                value: "blocked".into(),
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        session
+            .label_value_counts(&["contract-notes-priority".to_string()])
+            .await
+            .unwrap(),
+        ["1", "10", "3", "5", "9"]
+            .into_iter()
+            .map(|value| LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: value.into(),
+                count: 1,
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(session.label_value_counts(&[]).await.unwrap().is_empty());
     assert_eq!(
         session
             .get_deleted_note_content_and_revision("contract-notes-active")

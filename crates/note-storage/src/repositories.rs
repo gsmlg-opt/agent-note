@@ -338,6 +338,13 @@ pub trait NotesRepository: Send + Sync {
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelValueCount {
+    pub key: String,
+    pub value: String,
+    pub count: usize,
+}
+
 #[async_trait::async_trait]
 pub trait LabelRepository: Send + Sync {
     async fn insert_label_key(&self, key: &str, description: &str) -> StorageResult<()>;
@@ -363,6 +370,7 @@ pub trait LabelRepository: Send + Sync {
     async fn set_note_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<bool>;
     async fn labels_for_note(&self, note_id: &str) -> StorageResult<Vec<note_core::Label>>;
     async fn label_note_counts(&self) -> StorageResult<Vec<(String, usize)>>;
+    async fn label_value_counts(&self, keys: &[String]) -> StorageResult<Vec<LabelValueCount>>;
     async fn find_note_with_labels(
         &self,
         labels: &[(String, String)],

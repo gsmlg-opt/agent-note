@@ -1,7 +1,9 @@
 use crate::connection::map_turso_error;
 use crate::TursoSession;
 use note_core::{Label, LabelKey, LabelValueType};
-use note_storage::{LabelRepository, StorageError, StorageErrorKind, StorageResult};
+use note_storage::{
+    LabelRepository, LabelValueCount, StorageError, StorageErrorKind, StorageResult,
+};
 use std::str::FromStr;
 
 #[async_trait::async_trait]
@@ -169,6 +171,57 @@ impl LabelRepository for TursoSession {
                     .map_err(|error| map_turso_error("decode label note count", error))?
                     .max(0) as usize,
             ));
+        }
+        Ok(counts)
+    }
+
+    async fn label_value_counts(&self, keys: &[String]) -> StorageResult<Vec<LabelValueCount>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _operation_guard = self.operation_guard().await;
+        let placeholders = (1..=keys.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT lk.key, nl.value, COUNT(n.id)
+             FROM label_keys lk
+             JOIN note_labels nl ON nl.label_key_id = lk.id
+             JOIN notes n ON n.id = nl.note_id AND n.deleted_at IS NULL
+             WHERE lk.key IN ({placeholders})
+             GROUP BY lk.key, nl.value
+             ORDER BY lk.key, COUNT(n.id) DESC, nl.value"
+        );
+        let params = keys
+            .iter()
+            .cloned()
+            .map(turso::Value::from)
+            .collect::<Vec<_>>();
+        let mut rows = self
+            .connection
+            .query(&sql, turso::params_from_iter(params))
+            .await
+            .map_err(|error| map_turso_error("query label value counts", error))?;
+        let mut counts = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read label value counts", error))?
+        {
+            counts.push(LabelValueCount {
+                key: row
+                    .get::<String>(0)
+                    .map_err(|error| map_turso_error("decode counted label key", error))?,
+                value: row
+                    .get::<String>(1)
+                    .map_err(|error| map_turso_error("decode counted label value", error))?,
+                count: row
+                    .get::<i64>(2)
+                    .map_err(|error| map_turso_error("decode label value count", error))?
+                    .max(0) as usize,
+            });
         }
         Ok(counts)
     }

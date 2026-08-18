@@ -1123,6 +1123,7 @@ mod tests {
             fn set_note_label(note_id: &str, key: &str, value: &str) -> bool;
             fn labels_for_note(note_id: &str) -> Vec<note_core::Label>;
             fn label_note_counts() -> Vec<(String, usize)>;
+            fn label_value_counts(keys: &[String]) -> Vec<note_storage::LabelValueCount>;
             fn find_note_with_labels(labels: &[(String, String)]) -> Option<String>;
         }
     }
