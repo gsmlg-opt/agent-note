@@ -151,9 +151,7 @@ fn put_immutable_blocking(root: &Path, request: PutObjectRequest) -> anyhow::Res
             .ok_or_else(|| anyhow::anyhow!("attachment object has no parent directory"))?,
     )?;
     for directory in created_directories.iter().rev() {
-        if let Some(parent) = directory.parent() {
-            sync_directory(parent)?;
-        }
+        sync_directory(directory_entry_parent(directory))?;
     }
 
     #[cfg(test)]
@@ -202,6 +200,12 @@ fn sync_directory(_path: &Path) -> anyhow::Result<()> {
 #[cfg(not(any(unix, windows)))]
 fn sync_directory(_path: &Path) -> anyhow::Result<()> {
     anyhow::bail!("durable attachment directory sync is unsupported on this platform")
+}
+
+fn directory_entry_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn validate_sha256(value: &str) -> anyhow::Result<String> {
@@ -382,10 +386,11 @@ fn create_missing_directory_chain_blocking(
 ) -> anyhow::Result<()> {
     let mut missing = vec![root.to_path_buf()];
     let mut current = root;
-    while let Some(parent) = current
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty() && *parent != current)
-    {
+    loop {
+        let parent = directory_entry_parent(current);
+        if parent == current {
+            break;
+        }
         match std::fs::symlink_metadata(parent) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 anyhow::bail!("attachment root path contains an unsafe directory")
@@ -439,6 +444,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         sync_directory(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn single_component_relative_root_syncs_its_entry_through_current_directory() {
+        assert_eq!(
+            directory_entry_parent(Path::new("attachments")),
+            Path::new(".")
+        );
     }
 
     #[test]
