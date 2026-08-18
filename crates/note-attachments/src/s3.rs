@@ -922,6 +922,22 @@ impl crate::AttachmentStore for S3AttachmentStore {
         Ok(crate::DeleteObjectOutcome::Deleted)
     }
 
+    async fn delete_legacy(
+        &self,
+        note_id: &str,
+        user_path: &str,
+    ) -> anyhow::Result<crate::DeleteObjectOutcome> {
+        validate_note_id(note_id)?;
+        let key = final_key(&self.prefix, note_id, user_path)?;
+        let note_lock = self.coordination.lock_for(note_id);
+        let _guard = note_lock.lock().await;
+        if !self.key_exists(&key).await? {
+            return Ok(crate::DeleteObjectOutcome::AlreadyAbsent);
+        }
+        self.delete_key(&key).await?;
+        Ok(crate::DeleteObjectOutcome::Deleted)
+    }
+
     async fn prepare(
         &self,
         note_id: &str,
@@ -1795,6 +1811,62 @@ mod tests {
             store.delete_object("generations/missing").await.unwrap(),
             crate::DeleteObjectOutcome::AlreadyAbsent
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_delete_targets_only_the_validated_note_path_key() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("legacy-delete-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("legacy-delete-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/configured/note-1/nested/file.txt"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/agent-note/configured/note-1/nested/file.txt"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/configured/note-1/missing.txt"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = S3AttachmentStore::new(S3AttachmentConfig {
+            bucket: "agent-note".into(),
+            prefix: "configured".into(),
+            region: Some("us-east-1".into()),
+            endpoint: Some(server.uri()),
+            force_path_style: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .delete_legacy("note-1", "nested/file.txt")
+                .await
+                .unwrap(),
+            crate::DeleteObjectOutcome::Deleted
+        );
+        assert_eq!(
+            store.delete_legacy("note-1", "missing.txt").await.unwrap(),
+            crate::DeleteObjectOutcome::AlreadyAbsent
+        );
+        assert!(store.delete_legacy("../escape", "file").await.is_err());
+        assert!(store.delete_legacy("note-1", "../escape").await.is_err());
     }
 
     #[tokio::test]

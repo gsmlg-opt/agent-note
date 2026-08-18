@@ -168,6 +168,28 @@ impl AttachmentStore for FilesystemAttachmentStore {
         }
     }
 
+    async fn delete_legacy(
+        &self,
+        note_id: &str,
+        user_path: &str,
+    ) -> anyhow::Result<DeleteObjectOutcome> {
+        let note_dir = note_directory(&self.root, note_id)?;
+        let relative_path = canonical_relative_path(user_path)?;
+        let note_lock = self.coordination.lock_for(&note_dir);
+        let _guard = note_lock.lock().await;
+        if !existing_safe_directory(&note_dir).await? {
+            return Ok(DeleteObjectOutcome::AlreadyAbsent);
+        }
+        reject_symlink_components(&note_dir, &relative_path).await?;
+        match fs::remove_file(attachment_path_on_disk(&note_dir, &relative_path)).await {
+            Ok(()) => Ok(DeleteObjectOutcome::Deleted),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Ok(DeleteObjectOutcome::AlreadyAbsent)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn prepare(
         &self,
         note_id: &str,

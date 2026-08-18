@@ -1,11 +1,9 @@
 use crate::Context;
-use anyhow::Context as _;
-use note_attachments::{PreparedAttachmentMutation, PreparedAttachmentSet};
 use note_core::{
     is_relative_attachment_path, normalize_attachment_path, validate_attachments, Note,
     NoteAttachment,
 };
-use note_storage::{AttachmentMetadataUpdate, StorageTransaction, TransactionMode};
+use note_storage::{AttachmentMetadataUpdate, TransactionMode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutNoteAttachmentResult {
@@ -110,11 +108,18 @@ pub async fn put_note_attachment(
 ) -> anyhow::Result<PutNoteAttachmentResult> {
     validate_attachments(std::slice::from_ref(&attachment)).map_err(anyhow::Error::new)?;
     attachment.id = canonical_attachment_id(&attachment.id).to_string();
-    let prepared = ctx.attachments().prepare_put(note_id, &attachment).await?;
+    let published = crate::generated_attachments::publish_generated_attachments(
+        ctx.attachments(),
+        note_id,
+        std::slice::from_ref(&attachment),
+    )
+    .await?;
     let transaction = match ctx.storage().begin(TransactionMode::Immediate).await {
         Ok(transaction) => transaction,
         Err(error) => {
-            return Err(abort_mutation_with_primary(prepared, error.into()).await);
+            return Err(published
+                .cleanup_with_primary(ctx.attachments(), error.into())
+                .await);
         }
     };
     let transaction_result = async {
@@ -157,8 +162,8 @@ pub async fn put_note_attachment(
         }
 
         let mut metadata = note.attachments;
-        let mut stored_attachment = attachment.clone();
-        stored_attachment.content.clear();
+        let mut stored_attachment = published.metadata[0].clone();
+        let replaced = existing_index.map(|index| metadata[index].clone());
         match existing_index {
             Some(index) => {
                 stored_attachment.id = metadata[index].id.clone();
@@ -175,6 +180,16 @@ pub async fn put_note_attachment(
             })
             .await?;
         let revision = crate::mutation_error::mutation_revision(note_id, affected)?;
+        if let Some(replaced) = replaced {
+            let cleanup_now = chrono::Utc::now().timestamp();
+            crate::generated_attachments::enqueue_attachment_cleanup(
+                transaction.as_ref(),
+                note_id,
+                std::slice::from_ref(&replaced),
+                cleanup_now,
+            )
+            .await?;
+        }
         anyhow::Ok(PutNoteAttachmentResult {
             attachment: stored_attachment,
             created,
@@ -183,19 +198,27 @@ pub async fn put_note_attachment(
     }
     .await;
 
-    let result = crate::save_note::finish_transaction(transaction, transaction_result).await;
-    let result = match result {
-        Ok(result) => result,
+    let result = match transaction_result {
+        Ok(result) => match transaction.commit().await {
+            Ok(()) => result,
+            Err(error) => {
+                return Err(anyhow::Error::from(error).context(
+                    "attachment transaction commit failed; generated object retained because commit outcome is unknown",
+                ));
+            }
+        },
         Err(error) => {
-            return Err(abort_mutation_with_primary(prepared, error).await);
+            return match transaction.rollback().await {
+                Ok(()) => Err(published
+                    .cleanup_with_primary(ctx.attachments(), error)
+                    .await),
+                Err(rollback_error) => Err(error.context(format!(
+                    "transaction rollback failed; generated object retained because rollback outcome is unknown: {rollback_error}"
+                ))),
+            };
         }
     };
-    prepared.publish().await.with_context(|| {
-        format!(
-            "attachment metadata is committed and active for note {note_id}, attachment {}; object publication failed",
-            result.attachment.id
-        )
-    })?;
+    crate::generated_attachments::run_attachment_cleanup_once(ctx).await;
     Ok(result)
 }
 
@@ -278,135 +301,52 @@ pub async fn delete_note_attachment(
     expected_revision: i64,
 ) -> anyhow::Result<DeleteNoteAttachmentResult> {
     let attachment_id = canonical_attachment_id(attachment_id);
-    let Some(mut captured_path) = resolve_attachment_path(ctx, note_id, attachment_id).await?
-    else {
-        return Ok(DeleteNoteAttachmentResult::Absent);
-    };
-
-    for attempt in 0..2 {
-        let prepared = ctx
-            .attachments()
-            .prepare_delete(note_id, &captured_path)
-            .await?;
-        let transaction = match ctx.storage().begin(TransactionMode::Immediate).await {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                return Err(abort_mutation_with_primary(prepared, error.into()).await);
-            }
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let transaction_result = async {
+        let Some(note) = transaction.get_note(note_id).await? else {
+            return Err(crate::NoteMutationError::NotFound(note_id.to_string()).into());
         };
-        let transaction_result = delete_attachment_metadata(
+        if note.revision != expected_revision {
+            return Err(crate::NoteMutationError::StaleRevision {
+                note_id: note_id.to_string(),
+                expected_revision,
+                current_revision: note.revision,
+            }
+            .into());
+        }
+        let Some(existing_index) = note.attachments.iter().position(|attachment| {
+            canonical_attachment_id(&attachment.id) == canonical_attachment_id(attachment_id)
+        }) else {
+            return Ok(DeleteNoteAttachmentResult::Absent);
+        };
+
+        let updated_at = attachment_mutation_timestamp(note.updated_at);
+        let mut metadata = note.attachments;
+        let removed = metadata.remove(existing_index);
+        let affected = transaction
+            .update_note_attachments(AttachmentMetadataUpdate {
+                id: note_id,
+                expected_revision,
+                attachments: &metadata,
+                updated_at,
+            })
+            .await?;
+        let revision = crate::mutation_error::mutation_revision(note_id, affected)?;
+        crate::generated_attachments::enqueue_attachment_cleanup(
             transaction.as_ref(),
             note_id,
-            attachment_id,
-            &captured_path,
-            expected_revision,
+            std::slice::from_ref(&removed),
+            chrono::Utc::now().timestamp(),
         )
-        .await;
-
-        match transaction_result {
-            Ok(DeleteMetadataResult::Deleted { revision }) => {
-                if let Err(error) = transaction.commit().await {
-                    return Err(abort_mutation_with_primary(prepared, error.into()).await);
-                }
-                prepared.publish().await.with_context(|| {
-                    format!(
-                        "attachment metadata deletion is committed for note {note_id}, attachment {attachment_id}; physical cleanup failed and an orphan object may remain"
-                    )
-                })?;
-                return Ok(DeleteNoteAttachmentResult::Applied { revision });
-            }
-            Ok(DeleteMetadataResult::Absent) => {
-                rollback_and_abort(transaction, prepared).await?;
-                return Ok(DeleteNoteAttachmentResult::Absent);
-            }
-            Ok(DeleteMetadataResult::PathChanged) => {
-                rollback_and_abort(transaction, prepared).await?;
-                if attempt == 1 {
-                    return Err(anyhow::Error::new(
-                        AttachmentMutationError::AttachmentPathChange {
-                            attachment_id: attachment_id.to_string(),
-                        },
-                    ));
-                }
-                let Some(resolved_path) =
-                    resolve_attachment_path(ctx, note_id, attachment_id).await?
-                else {
-                    return Ok(DeleteNoteAttachmentResult::Absent);
-                };
-                captured_path = resolved_path;
-                continue;
-            }
-            Err(error) => {
-                let error = rollback_with_primary(transaction, error).await;
-                return Err(abort_mutation_with_primary(prepared, error).await);
-            }
-        }
-    }
-
-    Err(anyhow::Error::new(
-        AttachmentMutationError::AttachmentPathChange {
-            attachment_id: attachment_id.to_string(),
-        },
-    ))
-}
-
-enum DeleteMetadataResult {
-    Deleted { revision: i64 },
-    Absent,
-    PathChanged,
-}
-
-async fn delete_attachment_metadata(
-    transaction: &dyn note_storage::StorageTransaction,
-    note_id: &str,
-    attachment_id: &str,
-    captured_path: &str,
-    expected_revision: i64,
-) -> anyhow::Result<DeleteMetadataResult> {
-    let Some(note) = transaction.get_note(note_id).await? else {
-        return Err(crate::NoteMutationError::NotFound(note_id.to_string()).into());
-    };
-    let Some(existing_index) = note.attachments.iter().position(|attachment| {
-        canonical_attachment_id(&attachment.id) == canonical_attachment_id(attachment_id)
-    }) else {
-        return Ok(DeleteMetadataResult::Absent);
-    };
-    let existing = &note.attachments[existing_index];
-    if normalize_attachment_path(&existing.path) != normalize_attachment_path(captured_path) {
-        return Ok(DeleteMetadataResult::PathChanged);
-    }
-
-    let updated_at = attachment_mutation_timestamp(note.updated_at);
-    let mut metadata = note.attachments;
-    metadata.remove(existing_index);
-    let affected = transaction
-        .update_note_attachments(AttachmentMetadataUpdate {
-            id: note_id,
-            expected_revision,
-            attachments: &metadata,
-            updated_at,
-        })
         .await?;
-    let revision = crate::mutation_error::mutation_revision(note_id, affected)?;
-    Ok(DeleteMetadataResult::Deleted { revision })
-}
-
-async fn resolve_attachment_path(
-    ctx: &Context,
-    note_id: &str,
-    attachment_id: &str,
-) -> anyhow::Result<Option<String>> {
-    let session = ctx.storage().session().await?;
-    let Some(note) = session.get_note(note_id).await? else {
-        return Err(crate::NoteMutationError::NotFound(note_id.to_string()).into());
-    };
-    Ok(note
-        .attachments
-        .into_iter()
-        .find(|attachment| {
-            canonical_attachment_id(&attachment.id) == canonical_attachment_id(attachment_id)
-        })
-        .map(|attachment| attachment.path))
+        Ok(DeleteNoteAttachmentResult::Applied { revision })
+    }
+    .await;
+    let result = crate::save_note::finish_transaction(transaction, transaction_result).await?;
+    if matches!(result, DeleteNoteAttachmentResult::Applied { .. }) {
+        crate::generated_attachments::run_attachment_cleanup_once(ctx).await;
+    }
+    Ok(result)
 }
 
 async fn resolve_attachment_metadata(
@@ -431,48 +371,4 @@ fn attachment_mutation_timestamp(stored_updated_at: i64) -> i64 {
     chrono::Utc::now()
         .timestamp()
         .max(stored_updated_at.saturating_add(1))
-}
-
-async fn rollback_and_abort(
-    transaction: Box<dyn StorageTransaction>,
-    prepared: Box<dyn PreparedAttachmentMutation>,
-) -> anyhow::Result<()> {
-    match transaction.rollback().await {
-        Ok(()) => prepared.abort().await,
-        Err(error) => Err(abort_mutation_with_primary(prepared, error.into()).await),
-    }
-}
-
-async fn rollback_with_primary(
-    transaction: Box<dyn StorageTransaction>,
-    primary: anyhow::Error,
-) -> anyhow::Error {
-    match transaction.rollback().await {
-        Ok(()) => primary,
-        Err(rollback_error) => primary.context(format!(
-            "transaction rollback also failed: {rollback_error}"
-        )),
-    }
-}
-
-async fn abort_mutation_with_primary(
-    prepared: Box<dyn PreparedAttachmentMutation>,
-    primary: anyhow::Error,
-) -> anyhow::Error {
-    match prepared.abort().await {
-        Ok(()) => primary,
-        Err(abort_error) => primary.context(format!(
-            "attachment mutation abort also failed: {abort_error}"
-        )),
-    }
-}
-
-pub(crate) async fn abort_with_primary(
-    prepared: Box<dyn PreparedAttachmentSet>,
-    primary: anyhow::Error,
-) -> anyhow::Error {
-    match prepared.abort().await {
-        Ok(()) => primary,
-        Err(abort_error) => primary.context(format!("attachment abort also failed: {abort_error}")),
-    }
 }

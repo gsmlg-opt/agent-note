@@ -1,5 +1,4 @@
 use crate::{context::Context, SaveNoteInput};
-use note_attachments::PreparedAttachmentSet;
 use note_core::{
     validate_label_key, validate_label_value, validate_note_input, Label, LabelValueType, Note,
     NoteAttachment, NoteInput, ValidationError,
@@ -109,21 +108,37 @@ async fn update_note_inner(
     let expected_revision = input.expected_revision;
     drop(session);
     let chunks = crate::chunk::chunk_content(&input.content);
-    let mut prepared_attachments = match attachments.as_deref() {
-        Some(attachments) => Some(ctx.attachments().prepare(id, attachments).await?),
+    let published_attachments = match attachments.as_deref() {
+        Some(attachments) => Some(
+            crate::generated_attachments::publish_generated_attachments(
+                ctx.attachments(),
+                id,
+                attachments,
+            )
+            .await?,
+        ),
         None => None,
     };
-    let attachment_metadata = prepared_attachments
+    let attachment_metadata = published_attachments
         .as_ref()
-        .map(|prepared| prepared.metadata().to_vec());
+        .map(|published| published.metadata.as_slice());
 
-    let transaction = match ctx.storage().begin(TransactionMode::Deferred).await {
+    let transaction = match ctx.storage().begin(TransactionMode::Immediate).await {
         Ok(transaction) => transaction,
         Err(error) => {
-            return Err(abort_optional(prepared_attachments.take(), error.into()).await);
+            return match published_attachments {
+                Some(published) => Err(published
+                    .cleanup_with_primary(ctx.attachments(), error.into())
+                    .await),
+                None => Err(error.into()),
+            };
         }
     };
     let transaction_result = async {
+        let current = transaction
+            .get_note(id)
+            .await?
+            .ok_or_else(|| crate::NoteMutationError::NotFound(id.to_string()))?;
         let mutation = match attachment_metadata.as_deref() {
             Some(attachments) => {
                 transaction
@@ -150,6 +165,15 @@ async fn update_note_inner(
             }
         };
         let note_revision = crate::mutation_error::mutation_revision(id, mutation)?;
+        if attachment_metadata.is_some() {
+            crate::generated_attachments::enqueue_attachment_cleanup(
+                transaction.as_ref(),
+                id,
+                &current.attachments,
+                now,
+            )
+            .await?;
+        }
         for key in &missing_keys {
             transaction.insert_label_key(key, "").await?;
         }
@@ -165,30 +189,49 @@ async fn update_note_inner(
     }
     .await;
 
-    let transaction_result = match transaction_result {
-        Ok(result) => Ok(result),
-        Err(error) => Err(error),
-    };
-    let finalized = crate::save_note::finish_transaction(transaction, transaction_result).await;
-    let (queued, resolved_labels, note_revision) = match finalized {
-        Ok(result) => result,
+    let (queued, resolved_labels, note_revision) = match transaction_result {
+        Ok(result) => match transaction.commit().await {
+            Ok(()) => result,
+            Err(error) => {
+                let error = anyhow::Error::from(error);
+                return if published_attachments.is_some() {
+                    Err(error.context(
+                        "note transaction commit failed; generated attachment objects retained because commit outcome is unknown",
+                    ))
+                } else {
+                    Err(error)
+                };
+            }
+        },
         Err(error) => {
-            return Err(abort_optional(prepared_attachments.take(), error).await);
+            return match transaction.rollback().await {
+                Ok(()) => match published_attachments {
+                    Some(published) => Err(published
+                        .cleanup_with_primary(ctx.attachments(), error)
+                        .await),
+                    None => Err(error),
+                },
+                Err(rollback_error) => Err(error.context(format!(
+                    "transaction rollback failed; generated attachment objects retained because rollback outcome is unknown: {rollback_error}"
+                ))),
+            };
         }
     };
-    if let Some(prepared) = prepared_attachments.take() {
-        prepared.publish().await?;
+    if published_attachments.is_some() {
+        crate::generated_attachments::run_attachment_cleanup_once(ctx).await;
     }
     if queued > 0 {
         ctx.wake_embedding_jobs();
     }
 
     match attachments {
-        Some(attachments) => Ok(Some(Note {
+        Some(_) => Ok(Some(Note {
             id: id.to_string(),
             title: input.title,
             content: input.content,
-            attachments,
+            attachments: published_attachments
+                .expect("published attachments exist for a full update")
+                .attachments,
             labels: resolved_labels,
             created_at: existing.created_at,
             updated_at: now,
@@ -198,16 +241,6 @@ async fn update_note_inner(
         None => Ok(Some(crate::get_note_metadata(ctx, id).await?.ok_or_else(
             || crate::NoteMutationError::NotFound(id.to_string()),
         )?)),
-    }
-}
-
-async fn abort_optional(
-    prepared: Option<Box<dyn PreparedAttachmentSet>>,
-    primary: anyhow::Error,
-) -> anyhow::Error {
-    match prepared {
-        Some(prepared) => crate::note_attachments::abort_with_primary(prepared, primary).await,
-        None => primary,
     }
 }
 

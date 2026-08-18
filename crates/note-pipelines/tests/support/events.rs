@@ -765,6 +765,33 @@ impl AttachmentStore for ControlledAttachmentStore {
         )
     }
 
+    async fn delete_legacy(
+        &self,
+        note_id: &str,
+        user_path: &str,
+    ) -> anyhow::Result<DeleteObjectOutcome> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("delete_legacy:{note_id}:{user_path}"));
+        if self.fail_delete.load(Ordering::SeqCst) {
+            anyhow::bail!("controlled legacy delete failure");
+        }
+        Ok(
+            if self
+                .read_contents
+                .lock()
+                .unwrap()
+                .remove(&(note_id.to_string(), user_path.to_string()))
+                .is_some()
+            {
+                DeleteObjectOutcome::Deleted
+            } else {
+                DeleteObjectOutcome::AlreadyAbsent
+            },
+        )
+    }
+
     async fn prepare(
         &self,
         note_id: &str,

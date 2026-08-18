@@ -634,7 +634,7 @@ async fn commit_acknowledgement_failure_retains_active_metadata_and_generated_ob
 }
 
 #[tokio::test]
-async fn save_is_object_first_while_full_update_keeps_its_prepared_publication_order() {
+async fn save_and_full_update_publish_objects_before_begin_and_cleanup_after_commit() {
     let (ctx, _backend, _attachments, events, _dir) = controlled_context(true).await;
 
     let note = save_note(
@@ -663,7 +663,7 @@ async fn save_is_object_first_while_full_update_keeps_its_prepared_publication_o
     );
 
     events.lock().unwrap().clear();
-    update_note(
+    let updated = update_note(
         &ctx,
         &note.id,
         note.revision,
@@ -678,13 +678,16 @@ async fn save_is_object_first_while_full_update_keeps_its_prepared_publication_o
     .unwrap()
     .unwrap();
 
+    let new_key = &updated.attachments[0].storage.as_ref().unwrap().object_key;
+    let old_key = &note.attachments[0].storage.as_ref().unwrap().object_key;
+
     assert_eq!(
         *events.lock().unwrap(),
         vec![
-            format!("prepare:{}:Before", note.id),
+            format!("put_object:{new_key}"),
             "begin".into(),
             "commit".into(),
-            format!("publish:{}:After", note.id),
+            format!("delete_object:{old_key}"),
             "wake".into(),
         ]
     );
@@ -2158,7 +2161,7 @@ async fn stale_full_update_rolls_back_all_note_state_and_does_not_wake() {
         SaveNoteInput {
             title: "After".into(),
             content: "changed".into(),
-            attachments: vec![],
+            attachments: one_attachment(),
             labels: vec![("status".into(), "published".into())],
         },
     )
@@ -2185,6 +2188,22 @@ async fn stale_full_update_rolls_back_all_note_state_and_does_not_wake() {
     assert_eq!(stored.content, "original");
     assert_eq!(stored.labels[0].value, "draft");
     assert_eq!(stored.attachments.len(), 1);
+    let old_key = stored.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.starts_with("put_object:")));
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.starts_with("delete_object:") && !event.ends_with(&old_key)));
     assert_eq!(stored.revision, 1);
     let session = backend.session().await.unwrap();
     assert_eq!(
@@ -2199,6 +2218,83 @@ async fn stale_full_update_rolls_back_all_note_state_and_does_not_wake() {
     let logged = events.lock().unwrap().clone();
     assert!(logged.iter().any(|event| event == "rollback"));
     assert!(!logged.iter().any(|event| event == "wake"));
+    assert!(session
+        .list_attachment_operations_for_note(&saved.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn full_update_cleanup_enqueue_failure_rolls_back_metadata_and_new_objects() {
+    let (ctx, backend, event_backend, attachments, events, _dir) =
+        controlled_failure_context().await;
+    let saved = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Before".into(),
+            content: "original".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let old_key = saved.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    events.lock().unwrap().clear();
+    event_backend.fail_next_repository_call("insert_attachment_operation");
+
+    let error = update_note(
+        &ctx,
+        &saved.id,
+        saved.revision,
+        SaveNoteInput {
+            title: "After".into(),
+            content: "changed".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(format!("{error:#}")
+        .contains("controlled repository failure at insert_attachment_operation"));
+    let stored = backend
+        .session()
+        .await
+        .unwrap()
+        .get_note(&saved.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.title, "Before");
+    assert_eq!(stored.revision, saved.revision);
+    assert_eq!(
+        stored.attachments[0].storage.as_ref().unwrap().object_key,
+        old_key
+    );
+    assert!(attachments.has_object(&old_key));
+    let logged = events.lock().unwrap().clone();
+    let new_key = logged
+        .iter()
+        .find_map(|event| event.strip_prefix("put_object:"))
+        .unwrap();
+    assert!(!attachments.has_object(new_key));
+    assert!(logged.iter().any(|event| event == "rollback"));
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&saved.id)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

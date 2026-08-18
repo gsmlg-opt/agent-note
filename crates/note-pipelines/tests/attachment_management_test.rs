@@ -5,9 +5,11 @@ use note_embedding::StubEmbedder;
 use note_pipelines::{
     chunk_hash, delete_note_attachment, drain_embedding_jobs, get_note, get_note_attachment,
     get_note_attachment_by_id, put_note_attachment, AttachmentMutationError, Context,
-    NoteMutationError,
+    DeleteNoteAttachmentResult, NoteMutationError,
 };
-use note_storage::{NewNote, StorageBackend, TransactionMode, UpsertNoteChunk};
+use note_storage::{
+    AttachmentOperationStatus, NewNote, StorageBackend, TransactionMode, UpsertNoteChunk,
+};
 use note_storage_turso::TursoStorage;
 use std::sync::Arc;
 use support::{event_log, test_context, ControlledAttachmentStore, EventLog, EventStorageBackend};
@@ -31,6 +33,24 @@ fn attachment(
         description: description.into(),
         content: content.to_vec(),
         storage: None,
+    }
+}
+
+fn generated_attachment(
+    id: &str,
+    path: &str,
+    object_key: &str,
+    generation: &str,
+    content: &[u8],
+) -> NoteAttachment {
+    NoteAttachment {
+        storage: Some(AttachmentStorageMetadata {
+            object_key: object_key.into(),
+            storage_generation: generation.into(),
+            size_bytes: content.len() as u64,
+            checksum_sha256: "legacy-test-checksum".into(),
+        }),
+        ..attachment(id, path, "text/plain", "generated", content)
     }
 }
 
@@ -251,6 +271,7 @@ async fn put_new_id_with_unique_normalized_path_creates_metadata_and_object() {
     assert_eq!(result.attachment.id, "report");
     assert_eq!(result.attachment.path, "./reports//today.txt");
     assert!(result.attachment.content.is_empty());
+    assert!(result.attachment.storage.is_some());
     let note = stored_note(&backend, NOTE_ID).await;
     assert_eq!(note.attachments, vec![result.attachment]);
     assert!(note.updated_at > OLD_TIMESTAMP);
@@ -311,6 +332,115 @@ async fn put_existing_id_at_same_normalized_path_replaces_bytes_and_metadata() {
             ..result.attachment
         }
     );
+}
+
+#[tokio::test]
+async fn replacing_legacy_attachment_uses_explicit_legacy_cleanup_and_completes_intent() {
+    let (ctx, backend, _event_backend, _attachments, events, _dir) = controlled_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[attachment(
+            "report",
+            "legacy/report.txt",
+            "text/plain",
+            "old",
+            b"old bytes",
+        )],
+    )
+    .await;
+    events.lock().unwrap().clear();
+
+    put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        NOTE_REVISION,
+        attachment(
+            "report",
+            "legacy/report.txt",
+            "text/plain",
+            "new",
+            b"new bytes",
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "delete_legacy:attachment-note:legacy/report.txt"));
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(NOTE_ID)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].object_key, "legacy/report.txt");
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Completed);
+}
+
+#[tokio::test]
+async fn replacing_generated_attachment_activates_new_key_and_completes_old_cleanup() {
+    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+    let old_key = "notes/attachment-note/objects/old-generation";
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[generated_attachment(
+            "report",
+            "report.txt",
+            old_key,
+            "old-generation",
+            b"old",
+        )],
+    )
+    .await;
+    attachments.set_object_content(old_key, b"old");
+    events.lock().unwrap().clear();
+
+    let result = put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        NOTE_REVISION,
+        attachment("report", "report.txt", "text/plain", "new", b"new"),
+    )
+    .await
+    .unwrap();
+
+    let new_key = &result.attachment.storage.as_ref().unwrap().object_key;
+    assert_ne!(new_key, old_key);
+    assert_eq!(
+        stored_note(&backend, NOTE_ID).await.attachments[0]
+            .storage
+            .as_ref()
+            .unwrap()
+            .object_key,
+        *new_key
+    );
+    assert!(!attachments.has_object(old_key));
+    assert!(attachments.has_object(new_key));
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(NOTE_ID)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].storage_generation, "old-generation");
+    assert_eq!(operations[0].object_key, old_key);
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Completed);
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == &format!("delete_object:{old_key}")));
 }
 
 #[tokio::test]
@@ -502,7 +632,7 @@ async fn put_reports_stale_revision_before_errors_derived_from_newer_attachment_
         error.downcast_ref::<NoteMutationError>(),
         Some(&NoteMutationError::StaleRevision {
             note_id: NOTE_ID.into(),
-            expected_revision: NOTE_REVISION - 1,
+            expected_revision: 6,
             current_revision: NOTE_REVISION,
         })
     );
@@ -800,22 +930,35 @@ async fn delete_removes_only_selected_metadata_and_object_and_is_idempotent() {
 
 #[tokio::test]
 async fn delete_succeeds_when_the_selected_physical_object_is_already_missing() {
-    let (ctx, backend, dir) = test_context().await;
+    let (ctx, backend, _dir) = test_context().await;
     seed_note(
         &ctx,
         &backend,
         NOTE_ID,
-        &[attachment("old", "old.txt", "text/plain", "", b"old")],
+        &[generated_attachment(
+            "old",
+            "old.txt",
+            "notes/attachment-note/objects/already-missing",
+            "already-missing",
+            b"old",
+        )],
     )
     .await;
-    tokio::fs::remove_file(dir.path().join("attachments").join(NOTE_ID).join("old.txt"))
-        .await
-        .unwrap();
 
     assert!(delete_note_attachment(&ctx, NOTE_ID, "old", NOTE_REVISION)
         .await
         .unwrap());
     assert!(stored_note(&backend, NOTE_ID).await.attachments.is_empty());
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(NOTE_ID)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].storage_generation, "already-missing");
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Completed);
 }
 
 #[tokio::test]
@@ -852,7 +995,7 @@ async fn put_advances_revision_once_and_preserves_chunks_labels_and_embedding_qu
 }
 
 #[tokio::test]
-async fn stale_put_aborts_prepared_object_and_preserves_metadata_and_revision() {
+async fn stale_put_rolls_back_metadata_and_deletes_the_new_generation() {
     let (ctx, backend, _event_backend, _attachments, events, _dir) = controlled_context().await;
     seed_note(&ctx, &backend, NOTE_ID, &[]).await;
     events.lock().unwrap().clear();
@@ -878,13 +1021,16 @@ async fn stale_put_aborts_prepared_object_and_preserves_metadata_and_revision() 
     assert_eq!(stored.revision, NOTE_REVISION);
     assert!(stored.attachments.is_empty());
     let logged = events.lock().unwrap().clone();
+    let object_key = logged[0]
+        .strip_prefix("put_object:")
+        .expect("first event is immutable publication");
     assert!(logged.iter().any(|event| event == "rollback"));
     assert!(logged
         .iter()
-        .any(|event| event == "abort_put:attachment-note:new.txt"));
+        .any(|event| event == &format!("delete_object:{object_key}")));
     assert!(!logged
         .iter()
-        .any(|event| event == "publish_put:attachment-note:new.txt"));
+        .any(|event| event.starts_with("delete_legacy:")));
 }
 
 #[tokio::test]
@@ -1033,12 +1179,11 @@ async fn missing_note_contract_is_typed_for_mutations_and_idempotent_for_reads()
 }
 
 #[tokio::test]
-async fn transaction_failure_aborts_put_and_preserves_primary_and_abort_context() {
+async fn ambiguous_put_commit_failure_retains_the_new_generation() {
     let (ctx, backend, event_backend, attachments, events, _dir) = controlled_context().await;
     seed_note(&ctx, &backend, NOTE_ID, &[]).await;
     events.lock().unwrap().clear();
     event_backend.fail_next_commit();
-    attachments.fail_abort();
 
     let error = put_note_attachment(
         &ctx,
@@ -1051,23 +1196,58 @@ async fn transaction_failure_aborts_put_and_preserves_primary_and_abort_context(
 
     let message = format!("{error:#}");
     assert!(message.contains("controlled commit failure"));
-    assert!(message.contains("attachment mutation abort also failed"));
-    assert!(message.contains("controlled mutation abort failure"));
+    assert!(message.contains("generated object retained"));
     assert!(stored_note(&backend, NOTE_ID).await.attachments.is_empty());
     let events = events.lock().unwrap().clone();
-    assert_eq!(
-        events,
-        vec![
-            "prepare_put:attachment-note:new.txt",
-            "begin",
-            "commit_failed",
-            "abort_put:attachment-note:new.txt",
-        ]
-    );
+    assert!(events[0].starts_with("put_object:"));
+    assert_eq!(&events[1..], ["begin", "commit_failed"]);
+    let object_key = events[0].strip_prefix("put_object:").unwrap();
+    assert!(attachments.has_object(object_key));
 }
 
 #[tokio::test]
-async fn transaction_failure_aborts_delete_without_publishing_or_removing_metadata() {
+async fn put_cleanup_enqueue_failure_rolls_back_metadata_and_new_generation() {
+    let (ctx, backend, event_backend, attachments, events, _dir) = controlled_context().await;
+    seed_note(
+        &ctx,
+        &backend,
+        NOTE_ID,
+        &[attachment("old", "old.txt", "text/plain", "old", b"old")],
+    )
+    .await;
+    events.lock().unwrap().clear();
+    event_backend.fail_next_repository_call("insert_attachment_operation");
+
+    let error = put_note_attachment(
+        &ctx,
+        NOTE_ID,
+        NOTE_REVISION,
+        attachment("old", "old.txt", "text/plain", "new", b"new"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(format!("{error:#}")
+        .contains("controlled repository failure at insert_attachment_operation"));
+    let stored = stored_note(&backend, NOTE_ID).await;
+    assert_eq!(stored.revision, NOTE_REVISION);
+    assert_eq!(stored.attachments[0].description, "old");
+    let logged = events.lock().unwrap().clone();
+    let new_key = logged[0].strip_prefix("put_object:").unwrap();
+    assert!(!attachments.has_object(new_key));
+    assert!(logged.iter().any(|event| event == "rollback"));
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(NOTE_ID)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn transaction_failure_rolls_back_delete_metadata_and_cleanup_intent() {
     let (ctx, backend, event_backend, _attachments, events, _dir) = controlled_context().await;
     seed_note(
         &ctx,
@@ -1090,17 +1270,12 @@ async fn transaction_failure_aborts_delete_without_publishing_or_removing_metada
     );
     assert_eq!(
         events.lock().unwrap().clone(),
-        vec![
-            "prepare_delete:attachment-note:old.txt",
-            "begin",
-            "commit_failed",
-            "abort_delete:attachment-note:old.txt",
-        ]
+        vec!["begin", "commit_failed"]
     );
 }
 
 #[tokio::test]
-async fn put_and_delete_publish_only_after_metadata_commit() {
+async fn put_is_object_first_and_delete_cleanup_runs_after_commit() {
     let (ctx, backend, _event_backend, _attachments, events, _dir) = controlled_context().await;
     seed_note(
         &ctx,
@@ -1125,27 +1300,26 @@ async fn put_and_delete_publish_only_after_metadata_commit() {
             .unwrap()
     );
 
+    let events = events.lock().unwrap().clone();
+    assert!(events[0].starts_with("put_object:"));
     assert_eq!(
-        events.lock().unwrap().clone(),
-        vec![
-            "prepare_put:attachment-note:new.txt",
+        &events[1..],
+        [
             "begin",
             "commit",
-            "publish_put:attachment-note:new.txt",
-            "prepare_delete:attachment-note:old.txt",
             "begin",
             "commit",
-            "publish_delete:attachment-note:old.txt",
+            "delete_legacy:attachment-note:old.txt",
         ]
     );
 }
 
 #[tokio::test]
-async fn put_publication_failure_reports_committed_active_metadata_without_aborting() {
+async fn put_object_failure_occurs_before_begin_and_never_activates_metadata() {
     let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
     seed_note(&ctx, &backend, NOTE_ID, &[]).await;
     events.lock().unwrap().clear();
-    attachments.fail_publish();
+    attachments.fail_put_on_call(1);
 
     let error = put_note_attachment(
         &ctx,
@@ -1156,26 +1330,19 @@ async fn put_publication_failure_reports_committed_active_metadata_without_abort
     .await
     .unwrap_err();
 
-    let message = format!("{error:#}");
-    assert!(message.contains("attachment metadata is committed"));
-    assert!(message.contains("object publication failed"));
+    assert!(format!("{error:#}").contains("controlled immutable put failure"));
+    assert!(stored_note(&backend, NOTE_ID).await.attachments.is_empty());
+    let events = events.lock().unwrap().clone();
+    assert_eq!(events.len(), 2);
+    assert!(events[0].starts_with("put_object:"));
     assert_eq!(
-        stored_note(&backend, NOTE_ID).await.attachments[0].id,
-        "new"
-    );
-    assert_eq!(
-        events.lock().unwrap().clone(),
-        vec![
-            "prepare_put:attachment-note:new.txt",
-            "begin",
-            "commit",
-            "publish_put:attachment-note:new.txt",
-        ]
+        events[1],
+        events[0].replacen("put_object:", "delete_object:", 1)
     );
 }
 
 #[tokio::test]
-async fn delete_publication_failure_reports_committed_deletion_and_possible_orphan() {
+async fn delete_cleanup_failure_returns_success_and_leaves_a_safe_pending_retry() {
     let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
     seed_note(
         &ctx,
@@ -1185,31 +1352,38 @@ async fn delete_publication_failure_reports_committed_deletion_and_possible_orph
     )
     .await;
     events.lock().unwrap().clear();
-    attachments.fail_publish();
+    attachments.fail_delete_object();
 
-    let error = delete_note_attachment(&ctx, NOTE_ID, "old", NOTE_REVISION)
+    let result = delete_note_attachment(&ctx, NOTE_ID, "old", NOTE_REVISION)
         .await
-        .unwrap_err();
+        .unwrap();
 
-    let message = format!("{error:#}");
-    assert!(message.contains("metadata deletion is committed"));
-    assert!(message.contains("physical cleanup failed"));
-    assert!(message.contains("orphan"));
+    assert_eq!(result, DeleteNoteAttachmentResult::Applied { revision: 8 });
     assert!(stored_note(&backend, NOTE_ID).await.attachments.is_empty());
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(NOTE_ID)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Pending);
+    assert_eq!(
+        operations[0].last_error.as_deref(),
+        Some("attachment cleanup failed; retry pending")
+    );
+    assert_eq!(operations[0].lease_owner, None);
+    assert_eq!(operations[0].lease_expires_at, None);
     assert_eq!(
         events.lock().unwrap().clone(),
-        vec![
-            "prepare_delete:attachment-note:old.txt",
-            "begin",
-            "commit",
-            "publish_delete:attachment-note:old.txt",
-        ]
+        vec!["begin", "commit", "delete_legacy:attachment-note:old.txt",]
     );
 }
 
 #[tokio::test]
-async fn delete_reports_stale_revision_when_metadata_changes_under_its_prepared_lock() {
-    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+async fn delete_checks_revision_inside_the_metadata_transaction() {
+    let (ctx, backend, _event_backend, _attachments, events, _dir) = controlled_context().await;
     seed_note(
         &ctx,
         &backend,
@@ -1224,43 +1398,28 @@ async fn delete_reports_stale_revision_when_metadata_changes_under_its_prepared_
     )
     .await;
     events.lock().unwrap().clear();
-    attachments.race_attachment_path_on_delete(NOTE_ID, "moving", "second.txt");
-
-    let error = delete_note_attachment(&ctx, NOTE_ID, "moving", NOTE_REVISION)
+    let error = delete_note_attachment(&ctx, NOTE_ID, "moving", NOTE_REVISION - 1)
         .await
         .unwrap_err();
     assert!(matches!(
         error.downcast_ref::<NoteMutationError>(),
         Some(NoteMutationError::StaleRevision {
-            expected_revision: NOTE_REVISION,
-            current_revision: 8,
+            expected_revision: 6,
+            current_revision: NOTE_REVISION,
             ..
         })
     ));
 
     assert_eq!(
         stored_note(&backend, NOTE_ID).await.attachments[0].path,
-        "second.txt"
+        "first.txt"
     );
-    assert_eq!(
-        events.lock().unwrap().clone(),
-        vec![
-            "prepare_delete:attachment-note:first.txt",
-            "race_delete_path:attachment-note:moving:second.txt",
-            "begin",
-            "rollback",
-            "abort_delete:attachment-note:first.txt",
-            "prepare_delete:attachment-note:second.txt",
-            "begin",
-            "rollback",
-            "abort_delete:attachment-note:second.txt",
-        ]
-    );
+    assert_eq!(events.lock().unwrap().clone(), vec!["begin", "rollback"]);
 }
 
 #[tokio::test]
-async fn delete_rejects_a_second_path_change_without_publishing_the_wrong_object() {
-    let (ctx, backend, _event_backend, attachments, events, _dir) = controlled_context().await;
+async fn replaying_a_completed_delete_mutation_is_harmless() {
+    let (ctx, backend, _event_backend, _attachments, events, _dir) = controlled_context().await;
     seed_note(
         &ctx,
         &backend,
@@ -1275,32 +1434,32 @@ async fn delete_rejects_a_second_path_change_without_publishing_the_wrong_object
     )
     .await;
     events.lock().unwrap().clear();
-    attachments.race_attachment_path_on_delete(NOTE_ID, "moving", "second.txt");
-    attachments.race_attachment_path_on_delete(NOTE_ID, "moving", "third.txt");
-
-    let error = delete_note_attachment(&ctx, NOTE_ID, "moving", NOTE_REVISION)
+    let first = delete_note_attachment(&ctx, NOTE_ID, "moving", NOTE_REVISION)
         .await
-        .unwrap_err();
+        .unwrap();
+    let replay = delete_note_attachment(&ctx, NOTE_ID, "moving", NOTE_REVISION + 1)
+        .await
+        .unwrap();
 
-    assert_eq!(
-        error.downcast_ref::<AttachmentMutationError>(),
-        Some(&AttachmentMutationError::AttachmentPathChange {
-            attachment_id: "moving".into()
-        })
-    );
-    assert_eq!(
-        stored_note(&backend, NOTE_ID).await.attachments[0].path,
-        "third.txt"
-    );
-    let events = events.lock().unwrap().clone();
+    assert_eq!(first, DeleteNoteAttachmentResult::Applied { revision: 8 });
+    assert_eq!(replay, DeleteNoteAttachmentResult::Absent);
+    assert!(stored_note(&backend, NOTE_ID).await.attachments.is_empty());
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(NOTE_ID)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Completed);
     assert_eq!(
         events
+            .lock()
+            .unwrap()
             .iter()
-            .filter(|event| event.starts_with("abort_delete:"))
+            .filter(|event| event.starts_with("delete_legacy:"))
             .count(),
-        2
+        1
     );
-    assert!(events
-        .iter()
-        .all(|event| !event.starts_with("publish_delete:")));
 }

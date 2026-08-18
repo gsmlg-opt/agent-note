@@ -56,6 +56,34 @@ async fn immutable_object_lifecycle_reports_metadata_and_replays_delete() {
 }
 
 #[tokio::test]
+async fn legacy_delete_is_exact_contained_and_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FilesystemAttachmentStore::new(dir.path().join("attachments"));
+    let prepared = store
+        .prepare("note-1", &[attachment("nested/legacy.txt", b"legacy")])
+        .await
+        .unwrap();
+    prepared.publish().await.unwrap();
+
+    assert_eq!(
+        store
+            .delete_legacy("note-1", "nested/legacy.txt")
+            .await
+            .unwrap(),
+        DeleteObjectOutcome::Deleted
+    );
+    assert_eq!(
+        store
+            .delete_legacy("note-1", "nested/legacy.txt")
+            .await
+            .unwrap(),
+        DeleteObjectOutcome::AlreadyAbsent
+    );
+    assert!(store.delete_legacy("../escape", "file").await.is_err());
+    assert!(store.delete_legacy("note-1", "../escape").await.is_err());
+}
+
+#[tokio::test]
 async fn immutable_object_put_refuses_collisions_without_changing_existing_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let store = FilesystemAttachmentStore::new(dir.path().join("attachments"));

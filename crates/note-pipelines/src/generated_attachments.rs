@@ -1,8 +1,16 @@
 use note_attachments::{AttachmentStore, PutObjectRequest};
-use note_core::{AttachmentStorageMetadata, NoteAttachment};
+use note_core::{normalize_attachment_path, AttachmentStorageMetadata, NoteAttachment};
+use note_storage::{
+    AttachmentOperationKind, AttachmentOperationStatus, NewAttachmentOperation, StorageTransaction,
+};
 use sha2::{Digest, Sha256};
 
 const CHECKSUM_PREFIX_LEN: usize = 16;
+const LEGACY_STORAGE_GENERATION: &str = "legacy-path-v1";
+const CLEANUP_CLAIM_LIMIT: i64 = 32;
+const CLEANUP_LEASE_SECONDS: i64 = 30;
+const CLEANUP_RETRY_SECONDS: i64 = 60;
+const CLEANUP_FAILURE: &str = "attachment cleanup failed; retry pending";
 
 pub(crate) struct PublishedAttachmentSet {
     pub(crate) attachments: Vec<NoteAttachment>,
@@ -97,6 +105,94 @@ impl PublishedAttachmentSet {
             primary.context("generated attachment cleanup also failed; safe orphan may remain")
         } else {
             primary
+        }
+    }
+}
+
+pub(crate) async fn enqueue_attachment_cleanup(
+    transaction: &dyn StorageTransaction,
+    note_id: &str,
+    attachments: &[NoteAttachment],
+    now: i64,
+) -> anyhow::Result<()> {
+    for attachment in attachments {
+        let (storage_generation, object_key) = match &attachment.storage {
+            Some(storage) => (
+                storage.storage_generation.clone(),
+                storage.object_key.clone(),
+            ),
+            None => (
+                LEGACY_STORAGE_GENERATION.to_string(),
+                normalize_attachment_path(&attachment.path),
+            ),
+        };
+        transaction
+            .insert_attachment_operation(NewAttachmentOperation {
+                id: uuid::Uuid::new_v4().to_string(),
+                kind: AttachmentOperationKind::DeleteObject,
+                note_id: note_id.to_string(),
+                attachment_id: attachment.id.clone(),
+                storage_generation,
+                object_key,
+                next_attempt_at: Some(now),
+                created_at: now,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_attachment_cleanup_once(ctx: &crate::Context) {
+    let now = chrono::Utc::now().timestamp();
+    let owner = format!("mutation-cleanup-{}", uuid::Uuid::new_v4());
+    let Ok(session) = ctx.storage().session().await else {
+        return;
+    };
+    let Ok(operations) = session
+        .claim_attachment_operations(
+            &owner,
+            now,
+            now.saturating_add(CLEANUP_LEASE_SECONDS),
+            CLEANUP_CLAIM_LIMIT,
+        )
+        .await
+    else {
+        return;
+    };
+
+    for operation in operations {
+        let deleted = if operation.storage_generation == LEGACY_STORAGE_GENERATION {
+            ctx.attachments()
+                .delete_legacy(&operation.note_id, &operation.object_key)
+                .await
+        } else {
+            ctx.attachments().delete_object(&operation.object_key).await
+        };
+        match deleted {
+            Ok(_) => {
+                let _ = session
+                    .complete_attachment_operation(
+                        &operation.id,
+                        &owner,
+                        operation.attempts,
+                        chrono::Utc::now().timestamp().max(now),
+                    )
+                    .await;
+            }
+            Err(_) => {
+                let failed_at = chrono::Utc::now().timestamp().max(now);
+                let _ = session
+                    .fail_attachment_operation(
+                        &operation.id,
+                        &owner,
+                        operation.attempts,
+                        AttachmentOperationStatus::Pending,
+                        Some(failed_at.saturating_add(CLEANUP_RETRY_SECONDS)),
+                        CLEANUP_FAILURE,
+                        failed_at,
+                    )
+                    .await;
+            }
         }
     }
 }

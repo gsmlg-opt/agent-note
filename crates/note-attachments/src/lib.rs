@@ -72,6 +72,14 @@ pub trait AttachmentStore: Send + Sync {
         anyhow::bail!("immutable attachment objects are not supported by this store")
     }
 
+    async fn delete_legacy(
+        &self,
+        _note_id: &str,
+        _user_path: &str,
+    ) -> anyhow::Result<DeleteObjectOutcome> {
+        anyhow::bail!("legacy attachment objects are not supported by this store")
+    }
+
     async fn prepare(
         &self,
         note_id: &str,
