@@ -145,7 +145,7 @@ pub fn label_filter_selector(filters: &[LabelFilter]) -> Option<String> {
             if filter.operator == "==" {
                 return (!filter.key.is_empty()).then(|| {
                     format!(
-                        "{}=={}",
+                        "~{}=={}",
                         urlencoding::encode(&filter.key),
                         urlencoding::encode(&filter.value)
                     )

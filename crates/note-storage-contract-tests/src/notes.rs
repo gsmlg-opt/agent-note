@@ -1355,7 +1355,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .into_iter()
         .enumerate()
     {
-        let selector = parse_label_selectors(&format!("contract-exact=={encoded}"));
+        let selector = parse_label_selectors(&format!("~contract-exact=={encoded}"));
         assert_eq!(
             session.matching_note_ids(&selector).await.unwrap(),
             vec![format!("contract-exact-{index}")],

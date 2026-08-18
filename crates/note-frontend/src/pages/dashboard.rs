@@ -11,8 +11,8 @@ use crate::state::LabelFilter;
 #[function_component(DashboardPage)]
 pub fn dashboard_page() -> Html {
     let summary = use_state_eq(|| None::<api::DashboardSummary>);
-    let loading = use_state(|| true);
-    let error = use_state(|| None::<String>);
+    let loading = use_state_eq(|| true);
+    let error = use_state_eq(|| None::<String>);
 
     {
         let summary = summary.clone();
@@ -112,8 +112,8 @@ pub fn dashboard_page() -> Html {
                                                 query={Some(category_notes_query(&category.key, &value.value))}
                                                 classes={classes!("chip", "chip-clickable", "chip-primary", "dashboard-category-chip")}
                                             >
-                                                <span class="sr-only">{ format!("{}: ", category.key) }</span>
-                                                { category_chip_text(&value.value, value.count) }
+                                                <span class="sr-only">{ category_chip_accessible_text(&category.key, &value.value, value.count) }</span>
+                                                <span aria-hidden="true">{ category_chip_text(&value.value, value.count) }</span>
                                             </Link<Route, NotesQueryParams>>
                                         }) }
                                     </div>
@@ -201,9 +201,29 @@ pub(crate) fn category_notes_query(key: &str, value: &str) -> NotesQueryParams {
     }
 }
 
+fn category_value_text(value: &str) -> String {
+    if value.is_empty() {
+        "(empty)".into()
+    } else if value.trim() != value {
+        format!("\"{value}\"")
+    } else {
+        value.into()
+    }
+}
+
 fn category_chip_text(value: &str, count: usize) -> String {
     let noun = if count == 1 { "note" } else { "notes" };
-    format!("{value} · {count} {noun}")
+    format!("{} · {count} {noun}", category_value_text(value))
+}
+
+fn category_chip_accessible_text(key: &str, value: &str, count: usize) -> String {
+    let noun = if count == 1 { "note" } else { "notes" };
+    let value = if value.is_empty() {
+        "empty string".into()
+    } else {
+        category_value_text(value)
+    };
+    format!("{key} exact equality {value}, {count} {noun}")
 }
 
 #[cfg(test)]
@@ -222,7 +242,7 @@ mod tests {
         assert_eq!(query.search, None);
         assert_eq!(
             query.labels.as_deref(),
-            Some("project==yellow-dog%20%26%20sigma")
+            Some("~project==yellow-dog%20%26%20sigma")
         );
 
         let serialized = query.to_query().unwrap();
@@ -230,13 +250,19 @@ mod tests {
         assert!(serialized.contains(&format!("page_size={DEFAULT_NOTES_PAGE_SIZE}")));
         assert!(serialized.contains("%3D%3D"));
         assert!(serialized.contains("%2526"));
-        assert!(!serialized.contains("project==yellow-dog%20%26%20sigma"));
+        assert!(!serialized.contains("~project==yellow-dog%20%26%20sigma"));
     }
 
     #[test]
     fn category_chip_text_uses_the_correct_note_noun() {
         assert_eq!(category_chip_text("yellow-dog", 1), "yellow-dog · 1 note");
         assert_eq!(category_chip_text("sigma", 7), "sigma · 7 notes");
+        assert_eq!(category_chip_text("", 1), "(empty) · 1 note");
+        assert_eq!(category_chip_text(" padded ", 1), "\" padded \" · 1 note");
+        assert_eq!(
+            category_chip_accessible_text("project", "", 1),
+            "project exact equality empty string, 1 note"
+        );
     }
 
     #[test]
@@ -257,7 +283,7 @@ mod tests {
             );
             assert_eq!(
                 crate::pages::notes::notes_query_params(&state).labels,
-                Some(format!("project=={}", urlencoding::encode(value))),
+                Some(format!("~project=={}", urlencoding::encode(value))),
                 "value: {value:?}"
             );
         }

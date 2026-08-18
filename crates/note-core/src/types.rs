@@ -112,18 +112,22 @@ pub fn parse_label_selectors(input: &str) -> Vec<LabelSelector> {
                 return None;
             }
 
-            match split_selector_term(term) {
-                Some((key, LabelOperator::ExactEq, value)) => {
-                    let key = decode_exact_selector_component(key);
-                    if key.is_empty() {
-                        return None;
-                    }
-                    Some(LabelSelector {
-                        key,
-                        value: Some(decode_exact_selector_component(value)),
-                        operator: LabelOperator::ExactEq,
-                    })
+            if let Some(exact) = term
+                .strip_prefix('~')
+                .and_then(|term| term.split_once("=="))
+            {
+                let (key, value) = exact;
+                let key = decode_exact_selector_component(key);
+                if key.is_empty() {
+                    return None;
                 }
+                return Some(LabelSelector {
+                    key,
+                    value: Some(decode_exact_selector_component(value)),
+                    operator: LabelOperator::ExactEq,
+                });
+            }
+            match split_selector_term(term) {
                 Some((key, operator, value)) => Some(LabelSelector {
                     key: key.trim().to_string(),
                     value: Some(value.trim().to_string()),
@@ -195,7 +199,6 @@ pub fn compare_label_values(
 
 fn split_selector_term(term: &str) -> Option<(&str, LabelOperator, &str)> {
     let (idx, token, operator) = [
-        ("==", LabelOperator::ExactEq),
         (">=", LabelOperator::Gte),
         ("<=", LabelOperator::Lte),
         ("!=", LabelOperator::NotEq),
@@ -435,13 +438,13 @@ mod tests {
     fn parses_percent_encoded_exact_selectors_without_trimming_operands() {
         assert_eq!(LabelOperator::ExactEq.as_str(), "==");
         for (input, key, value) in [
-            ("project==a%26b", "project", "a&b"),
-            ("project==a%3Db", "project", "a=b"),
-            ("project==%2526", "project", "%26"),
-            ("project==%2B", "project", "+"),
-            ("project==%20padded%20", "project", " padded "),
-            ("project==", "project", ""),
-            ("%E9%A1%B9%E7%9B%AE==%E7%8C%AB", "项目", "猫"),
+            ("~project==a%26b", "project", "a&b"),
+            ("~project==a%3Db", "project", "a=b"),
+            ("~project==%2526", "project", "%26"),
+            ("~project==%2B", "project", "+"),
+            ("~project==%20padded%20", "project", " padded "),
+            ("~project==", "project", ""),
+            ("~%E9%A1%B9%E7%9B%AE==%E7%8C%AB", "项目", "猫"),
         ] {
             assert_eq!(
                 parse_label_selectors(input),
@@ -584,7 +587,8 @@ mod tests {
             ("name~=a^=b$=c", "name", LabelOperator::Regex, "a^=b$=c"),
             ("name~=a==b", "name", LabelOperator::Regex, "a==b"),
             ("env=foo==bar", "env", LabelOperator::Eq, "foo==bar"),
-            ("env==foo%3Dbar", "env", LabelOperator::ExactEq, "foo=bar"),
+            ("env==foo", "env", LabelOperator::Eq, "=foo"),
+            ("~env==foo%3Dbar", "env", LabelOperator::ExactEq, "foo=bar"),
         ] {
             assert_eq!(
                 parse_label_selectors(input),

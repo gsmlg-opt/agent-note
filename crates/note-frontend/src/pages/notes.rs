@@ -17,7 +17,7 @@ const PAGE_SIZE_OPTIONS: [usize; 5] = [10, 30, 50, 100, 1000];
 const RETRIEVAL_PLACEHOLDER: &str = "Retrieve by title or content";
 const RETRIEVE_BUTTON_LABEL: &str = "Retrieve";
 const LABEL_FILTER_PARSER_OPERATORS: [&str; 10] =
-    ["==", ">=", "<=", "!=", "^=", "$=", "~=", "=", ">", "<"];
+    [">=", "<=", "!=", "^=", "$=", "~=", "=", ">", "<"];
 const LABEL_FILTER_DISPLAY_OPERATORS: [&str; 10] =
     ["==", "=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="];
 
@@ -106,6 +106,20 @@ fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
         .split('&')
         .filter_map(|term| {
             let term = term.trim();
+            if let Some((key, value)) = term
+                .strip_prefix('~')
+                .and_then(|term| term.split_once("=="))
+            {
+                let key = decode_exact_selector_component(key);
+                if key.is_empty() {
+                    return None;
+                }
+                return Some(LabelFilter {
+                    key,
+                    operator: "==".to_string(),
+                    value: decode_exact_selector_component(value),
+                });
+            }
             if term.is_empty() {
                 return None;
             }
@@ -118,18 +132,6 @@ fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
                         .then_with(|| right_operator.len().cmp(&left_operator.len()))
                 });
             if let Some((idx, operator)) = operator {
-                if operator == "==" {
-                    let key = decode_exact_selector_component(&term[..idx]);
-                    if key.is_empty() {
-                        return None;
-                    }
-                    return Some(LabelFilter {
-                        key,
-                        operator: operator.to_string(),
-                        value: decode_exact_selector_component(&term[idx + operator.len()..]),
-                    });
-                }
-
                 let key = term[..idx].trim();
                 let value = term[idx + operator.len()..].trim();
                 if key.is_empty() {
@@ -1210,7 +1212,7 @@ mod tests {
     #[test]
     fn parses_string_match_filters_with_operator_text_in_values() {
         let filters = parse_label_filters(
-            "topic~=^ru!=st$&prefix^=a>=b&suffix$=a<=b&name~=a==b&env=foo==bar&env==foo%3Dbar",
+            "topic~=^ru!=st$&prefix^=a>=b&suffix$=a<=b&name~=a==b&env=foo==bar&env==foo&~env==foo%3Dbar",
         );
 
         assert_eq!(
@@ -1240,6 +1242,11 @@ mod tests {
                     key: "env".to_string(),
                     operator: "=".to_string(),
                     value: "foo==bar".to_string(),
+                },
+                LabelFilter {
+                    key: "env".to_string(),
+                    operator: "=".to_string(),
+                    value: "=foo".to_string()
                 },
                 LabelFilter {
                     key: "env".to_string(),

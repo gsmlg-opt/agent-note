@@ -8,7 +8,7 @@ For example, configuring `project` produces chips such as `yellow-dog · 12` and
 
 ## Scope
 
-This feature extends persisted system configuration, label-value aggregation in both storage backends, the dashboard API, the System page, and the Home dashboard. It reuses the existing URL-backed Notes filtering contract and does not change label-selector semantics, note mutation behavior, or the existing dashboard label summary and recent-updates panels.
+This feature extends persisted system configuration, label-value aggregation in both storage backends, the dashboard API, the System page, and the Home dashboard. Category chips use a backward-compatible `~<percent-encoded-key>==<percent-encoded-value>` exact-equality term while legacy selector meanings, note mutation behavior, and the existing dashboard label summary and recent-updates panels remain unchanged.
 
 ## System Configuration
 

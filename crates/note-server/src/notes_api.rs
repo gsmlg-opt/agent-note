@@ -833,8 +833,8 @@ pub struct ListNotesQuery {
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
     /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
-    /// `==` with `<percent-encoded-key>==<percent-encoded-value>`; both operands are
-    /// percent-encoded so reserved characters, empty values, and outer whitespace round-trip.
+    /// `==` with `~<percent-encoded-key>==<percent-encoded-value>`; the reserved prefix
+    /// preserves legacy selector meanings while reserved characters, empty values, and whitespace round-trip.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -846,8 +846,8 @@ struct CountNotesQuery {
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
     /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
-    /// `==` with `<percent-encoded-key>==<percent-encoded-value>`; both operands are
-    /// percent-encoded so reserved characters, empty values, and outer whitespace round-trip.
+    /// `==` with `~<percent-encoded-key>==<percent-encoded-value>`; the reserved prefix
+    /// preserves legacy selector meanings while reserved characters, empty values, and whitespace round-trip.
     #[serde(default)]
     label: Option<String>,
     /// Accepted and validated for compatibility; values do not affect the count.
@@ -1266,8 +1266,8 @@ pub struct SearchQuery {
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
     /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
-    /// `==` with `<percent-encoded-key>==<percent-encoded-value>`; both operands are
-    /// percent-encoded so reserved characters, empty values, and outer whitespace round-trip.
+    /// `==` with `~<percent-encoded-key>==<percent-encoded-value>`; the reserved prefix
+    /// preserves legacy selector meanings while reserved characters, empty values, and whitespace round-trip.
     #[serde(default)]
     pub label: Option<String>,
 }

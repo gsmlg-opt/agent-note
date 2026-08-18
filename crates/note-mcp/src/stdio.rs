@@ -76,7 +76,7 @@ impl From<SaveNoteToolOutput> for SaveNoteResponse {
 #[schemars(deny_unknown_fields)]
 pub struct BulkUpdateNoteLabelsRequest {
     /// Label selector used to choose active notes. Exact raw equality is `==` with
-    /// `<percent-encoded-key>==<percent-encoded-value>` so reserved, empty, and
+    /// `~<percent-encoded-key>==<percent-encoded-value>` so reserved, empty, and
     /// outer-whitespace operands round-trip exactly.
     pub selector: String,
     /// Label `(key, value)` pairs to set or replace on every matching note.
@@ -383,8 +383,8 @@ pub struct ListNotesRequest {
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
     /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
-    /// `==` with `<percent-encoded-key>==<percent-encoded-value>`; both operands are
-    /// percent-encoded so reserved characters, empty values, and outer whitespace round-trip.
+    /// `==` with `~<percent-encoded-key>==<percent-encoded-value>`; the reserved prefix
+    /// preserves legacy selector meanings while reserved characters, empty values, and whitespace round-trip.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -413,8 +413,8 @@ pub struct SemanticSearchRequest {
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
     /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
-    /// `==` with `<percent-encoded-key>==<percent-encoded-value>`; both operands are
-    /// percent-encoded so reserved characters, empty values, and outer whitespace round-trip.
+    /// `==` with `~<percent-encoded-key>==<percent-encoded-value>`; the reserved prefix
+    /// preserves legacy selector meanings while reserved characters, empty values, and whitespace round-trip.
     #[serde(default)]
     pub label: Option<String>,
 }
