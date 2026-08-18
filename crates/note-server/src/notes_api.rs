@@ -517,6 +517,7 @@ pub struct DashboardDto {
 struct DashboardCacheEntry {
     expires_at: Instant,
     generation: u64,
+    context_id: usize,
     base_hash: u64,
     value: DashboardDto,
 }
@@ -535,6 +536,11 @@ static BULK_DASHBOARD_CACHE_INVALIDATIONS: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 static DASHBOARD_FULL_LOADS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static DASHBOARD_LOAD_TEST_CONTEXT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static DASHBOARD_LOAD_TEST_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub struct DashboardCacheInvalidator;
 
@@ -568,36 +574,52 @@ pub(crate) fn invalidate_dashboard_cache() {
 }
 
 #[cfg(test)]
-async fn cached_dashboard(now: Instant) -> Option<DashboardDto> {
+async fn cached_dashboard(now: Instant, context_id: usize) -> Option<DashboardDto> {
     let generation = dashboard_cache_generation();
     dashboard_cache()
         .read()
         .await
         .as_ref()
-        .filter(|entry| entry.generation == generation && entry.expires_at > now)
+        .filter(|entry| {
+            entry.generation == generation
+                && entry.context_id == context_id
+                && entry.expires_at > now
+        })
         .map(|entry| entry.value.clone())
 }
 
-async fn cached_dashboard_identity(now: Instant) -> Option<(u64, u64)> {
+async fn cached_dashboard_identity(now: Instant, context_id: usize) -> Option<(u64, u64)> {
     let generation = dashboard_cache_generation();
     dashboard_cache()
         .read()
         .await
         .as_ref()
-        .filter(|entry| entry.generation == generation && entry.expires_at > now)
+        .filter(|entry| {
+            entry.generation == generation
+                && entry.context_id == context_id
+                && entry.expires_at > now
+        })
         .map(|entry| (entry.generation, entry.base_hash))
 }
 
-async fn cached_dashboard_for_generation(now: Instant, generation: u64) -> Option<DashboardDto> {
+async fn cached_dashboard_for_generation(
+    now: Instant,
+    generation: u64,
+    context_id: usize,
+) -> Option<DashboardDto> {
     dashboard_cache()
         .read()
         .await
         .as_ref()
-        .filter(|entry| entry.generation == generation && entry.expires_at > now)
+        .filter(|entry| {
+            entry.generation == generation
+                && entry.context_id == context_id
+                && entry.expires_at > now
+        })
         .map(|entry| entry.value.clone())
 }
 
-async fn publish_dashboard_cache(generation: u64, value: DashboardDto) {
+async fn publish_dashboard_cache(generation: u64, context_id: usize, value: DashboardDto) {
     if dashboard_cache_generation() != generation {
         return;
     }
@@ -607,15 +629,35 @@ async fn publish_dashboard_cache(generation: u64, value: DashboardDto) {
         *cache = Some(DashboardCacheEntry {
             expires_at: Instant::now() + DASHBOARD_CACHE_TTL,
             generation,
+            context_id,
             base_hash: dashboard_base_hash(&value),
             value,
         });
     }
 }
 
-async fn load_dashboard(ctx: &Context) -> anyhow::Result<DashboardDto> {
+async fn load_dashboard(
+    ctx: &Context,
+    generation: u64,
+    context_id: usize,
+) -> anyhow::Result<DashboardDto> {
     #[cfg(test)]
-    DASHBOARD_FULL_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    {
+        if DASHBOARD_LOAD_TEST_CONTEXT.load(std::sync::atomic::Ordering::SeqCst) == context_id {
+            let observed = DASHBOARD_LOAD_TEST_GENERATION
+                .compare_exchange(
+                    u64::MAX,
+                    generation,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .map(|_| generation)
+                .unwrap_or_else(|observed| observed);
+            if observed == generation {
+                DASHBOARD_FULL_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     let note_count = count_notes(ctx, None).await?;
     let labels = list_label_keys(ctx).await?;
     let label_count = labels.len();
@@ -708,13 +750,11 @@ fn apply_dashboard_embedding(
 }
 
 fn dashboard_etag(
-    generation: u64,
     base_hash: u64,
     embedded_note_count: usize,
     embedding_note: Option<&DashboardEmbeddingNoteDto>,
 ) -> String {
     let mut hasher = DefaultHasher::new();
-    generation.hash(&mut hasher);
     base_hash.hash(&mut hasher);
     embedded_note_count.hash(&mut hasher);
     embedding_note
@@ -755,25 +795,23 @@ fn dashboard_json_response(
 
 async fn cached_dashboard_response(
     ctx: &Context,
+    context_id: usize,
     if_none_match: Option<&str>,
 ) -> Result<Option<Response>, (StatusCode, String)> {
     let now = Instant::now();
-    let Some((generation, base_hash)) = cached_dashboard_identity(now).await else {
+    let Some((generation, base_hash)) = cached_dashboard_identity(now, context_id).await else {
         return Ok(None);
     };
     let (embedded_note_count, embedding_note) = dashboard_embedding(ctx)
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let etag = dashboard_etag(
-        generation,
-        base_hash,
-        embedded_note_count,
-        embedding_note.as_ref(),
-    );
+    let etag = dashboard_etag(base_hash, embedded_note_count, embedding_note.as_ref());
     if if_none_match == Some(etag.as_str()) {
         return not_modified_dashboard_response(&etag).map(Some);
     }
-    let Some(mut dashboard) = cached_dashboard_for_generation(now, generation).await else {
+    let Some(mut dashboard) =
+        cached_dashboard_for_generation(now, generation, context_id).await
+    else {
         return Ok(None);
     };
     apply_dashboard_embedding(&mut dashboard, embedded_note_count, embedding_note);
@@ -812,26 +850,26 @@ async fn dashboard_handler(
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok());
-    if let Some(response) = cached_dashboard_response(&ctx, if_none_match).await? {
+    let context_id = Arc::as_ptr(&ctx) as usize;
+    if let Some(response) = cached_dashboard_response(&ctx, context_id, if_none_match).await? {
         return Ok(response);
     }
 
     let _fill = dashboard_cache_fill().lock().await;
-    if let Some(response) = cached_dashboard_response(&ctx, if_none_match).await? {
+    if let Some(response) = cached_dashboard_response(&ctx, context_id, if_none_match).await? {
         return Ok(response);
     }
 
     let generation = dashboard_cache_generation();
-    let value = load_dashboard(&ctx)
+    let value = load_dashboard(&ctx, generation, context_id)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let etag = dashboard_etag(
-        generation,
         dashboard_base_hash(&value),
         value.embedded_note_count,
         value.embedding_note.as_ref(),
     );
-    publish_dashboard_cache(generation, value.clone()).await;
+    publish_dashboard_cache(generation, context_id, value.clone()).await;
     if if_none_match == Some(etag.as_str()) {
         return not_modified_dashboard_response(&etag);
     }
@@ -2846,6 +2884,7 @@ mod tests {
                 release.wait().await;
                 publish_dashboard_cache(
                     fill_generation,
+                    1,
                     DashboardDto {
                         note_count: 1,
                         embedded_note_count: 0,
@@ -2868,7 +2907,7 @@ mod tests {
 
         assert_ne!(fill_generation, dashboard_cache_generation());
         assert!(
-            cached_dashboard(Instant::now()).await.is_none(),
+            cached_dashboard(Instant::now(), 1).await.is_none(),
             "a fill started before invalidation must not become a valid cache hit"
         );
         assert!(dashboard_cache().read().await.is_none());
@@ -2927,7 +2966,12 @@ mod tests {
         invalidate_dashboard_cache();
         *dashboard_cache().write().await = None;
         DASHBOARD_FULL_LOADS.store(0, std::sync::atomic::Ordering::SeqCst);
-        let (app, _ctx, _dir) = test_app().await;
+        DASHBOARD_LOAD_TEST_GENERATION.store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        let (app, ctx, _dir) = test_app().await;
+        DASHBOARD_LOAD_TEST_CONTEXT.store(
+            Arc::as_ptr(&ctx) as usize,
+            std::sync::atomic::Ordering::SeqCst,
+        );
 
         let (first, second) = tokio::join!(
             app.clone().oneshot(get("/api/dashboard")),
@@ -2939,6 +2983,7 @@ mod tests {
             DASHBOARD_FULL_LOADS.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+        DASHBOARD_LOAD_TEST_CONTEXT.store(0, std::sync::atomic::Ordering::SeqCst);
         invalidate_dashboard_cache();
     }
 
