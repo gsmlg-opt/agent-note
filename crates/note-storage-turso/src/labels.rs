@@ -136,6 +136,21 @@ impl LabelRepository for TursoSession {
         Ok(affected > 0)
     }
 
+    async fn remove_note_label(&self, note_id: &str, key: &str) -> StorageResult<bool> {
+        let _operation_guard = self.operation_guard().await;
+        let affected = self
+            .connection
+            .execute(
+                "DELETE FROM note_labels
+                 WHERE note_id = ?1
+                   AND label_key_id = (SELECT id FROM label_keys WHERE key = ?2)",
+                turso::params![note_id, key],
+            )
+            .await
+            .map_err(|error| map_turso_error("remove note label", error))?;
+        Ok(affected > 0)
+    }
+
     async fn labels_for_note(&self, note_id: &str) -> StorageResult<Vec<Label>> {
         let _operation_guard = self.operation_guard().await;
         labels_for_note_unlocked(self, note_id).await

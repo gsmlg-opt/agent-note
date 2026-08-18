@@ -99,6 +99,43 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .iter()
         .any(|label| { label.key == "contract-bulk-unrelated" && label.value == "preserved" }));
 
+    assert!(session
+        .remove_note_label("contract-bulk-active-a", "contract-bulk-target")
+        .await
+        .unwrap());
+    assert!(!session
+        .remove_note_label("contract-bulk-active-a", "contract-bulk-target")
+        .await
+        .unwrap());
+    assert!(!session
+        .remove_note_label("contract-bulk-active-a", "contract-bulk-unknown")
+        .await
+        .unwrap());
+    let labels = session
+        .labels_for_note("contract-bulk-active-a")
+        .await
+        .unwrap();
+    assert!(!labels
+        .iter()
+        .any(|label| label.key == "contract-bulk-target"));
+    assert!(labels
+        .iter()
+        .any(|label| { label.key == "contract-bulk-unrelated" && label.value == "preserved" }));
+    assert!(session
+        .list_label_keys()
+        .await
+        .unwrap()
+        .iter()
+        .any(|key| key.key == "contract-bulk-target"));
+    assert!(session
+        .set_note_label(
+            "contract-bulk-active-a",
+            "contract-bulk-target",
+            "before-rollback",
+        )
+        .await
+        .unwrap());
+
     assert_eq!(
         session
             .advance_note_updated_at("contract-bulk-active-a", 90)
@@ -158,6 +195,10 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     drop(session);
 
     let rollback = storage.begin(TransactionMode::Immediate).await.unwrap();
+    assert!(rollback
+        .remove_note_label("contract-bulk-active-a", "contract-bulk-target")
+        .await
+        .unwrap());
     rollback
         .insert_label_key_if_missing("contract-bulk-rollback", "Rolled back label")
         .await
@@ -192,6 +233,12 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap()
         .iter()
         .any(|label| label.key == "contract-bulk-rollback"));
+    assert!(observer
+        .labels_for_note("contract-bulk-active-a")
+        .await
+        .unwrap()
+        .iter()
+        .any(|label| { label.key == "contract-bulk-target" && label.value == "before-rollback" }));
     let after_rollback = observer
         .get_note("contract-bulk-active-a")
         .await

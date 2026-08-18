@@ -163,6 +163,21 @@ impl LabelRepository for PgSession {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn remove_note_label(&self, note_id: &str, key: &str) -> StorageResult<bool> {
+        let mut connection = self.connection().await?;
+        let result = sqlx::query(
+            "DELETE FROM note_labels
+             WHERE note_id = $1
+               AND label_key_id = (SELECT id FROM label_keys WHERE key = $2)",
+        )
+        .bind(note_id)
+        .bind(key)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("remove note label", error))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn labels_for_note(&self, note_id: &str) -> StorageResult<Vec<Label>> {
         let mut connection = self.connection().await?;
         let rows = sqlx::query_as::<_, (String, String, String, String)>(

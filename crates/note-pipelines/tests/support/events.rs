@@ -401,6 +401,7 @@ impl_forward_label_repository! {
     ) -> ();
     fn delete_label_key(key: &str) -> ();
     fn attach_label(note_id: &str, key: &str, value: &str) -> ();
+    fn remove_note_label(note_id: &str, key: &str) -> bool;
     fn labels_for_note(note_id: &str) -> Vec<note_core::Label>;
     fn label_note_counts() -> Vec<(String, usize)>;
     fn find_note_with_labels(labels: &[(String, String)]) -> Option<String>;

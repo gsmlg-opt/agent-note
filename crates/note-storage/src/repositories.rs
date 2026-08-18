@@ -413,6 +413,9 @@ pub trait LabelRepository: Send + Sync {
     /// Inserts or replaces one note label, returning whether its desired value
     /// changed.
     async fn set_note_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<bool>;
+    /// Removes one note-label association by key, returning whether a row changed.
+    /// Unknown catalog keys and absent associations are no-ops.
+    async fn remove_note_label(&self, note_id: &str, key: &str) -> StorageResult<bool>;
     async fn labels_for_note(&self, note_id: &str) -> StorageResult<Vec<note_core::Label>>;
     async fn label_note_counts(&self) -> StorageResult<Vec<(String, usize)>>;
     async fn find_note_with_labels(
