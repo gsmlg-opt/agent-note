@@ -1076,6 +1076,9 @@ git commit -m "feat(system): configure category labels"
 
 ### Task 7: Render dashboard category chips with exact Notes filters
 
+Category links use the backward-compatible exact wire term
+`~<percent-encoded-key>==<percent-encoded-value>`; the internal frontend operator is `==`.
+
 **Files:**
 - Modify: `crates/note-frontend/src/pages/dashboard.rs`
 - Modify: `crates/note-frontend/app.css`
@@ -1093,11 +1096,14 @@ fn category_query_opens_page_one_with_an_exact_escaped_filter() {
     assert_eq!(query.current, 1);
     assert_eq!(query.page_size, DEFAULT_NOTES_PAGE_SIZE);
     assert_eq!(query.search, None);
-    assert_eq!(query.labels.as_deref(), Some("project=yellow-dog & sigma"));
+    assert_eq!(
+        query.labels.as_deref(),
+        Some("~project==yellow-dog%20%26%20sigma")
+    );
 
     let encoded = query.to_query().unwrap();
-    assert!(encoded.contains("labels=project%3Dyellow-dog"));
-    assert!(encoded.contains("%26"));
+    assert!(encoded.contains("labels=%7Eproject%3D%3Dyellow-dog"));
+    assert!(encoded.contains("%2526"));
 }
 
 #[test]
@@ -1127,7 +1133,7 @@ fn category_notes_query(key: &str, value: &str) -> NotesQueryParams {
         search: None,
         labels: api::label_filter_selector(&[LabelFilter {
             key: key.to_string(),
-            operator: "=".to_string(),
+            operator: "==".to_string(),
             value: value.to_string(),
         }]),
     }
