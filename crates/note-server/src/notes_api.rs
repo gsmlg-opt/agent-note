@@ -212,6 +212,7 @@ fn note_query_rejection(rejection: QueryRejection) -> NoteMutationApiError {
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 #[schema(
     description = "Each attachment request requires at least one of content or content_base64. If both are present, they must decode to identical bytes."
 )]
@@ -643,7 +644,7 @@ async fn dashboard_handler(
 )]
 async fn save_note_handler(
     State(ctx): State<Arc<Context>>,
-    Json(req): Json<SaveNoteRequest>,
+    NoteJson(req): NoteJson<SaveNoteRequest>,
 ) -> Result<Json<SaveNoteResponse>, (axum::http::StatusCode, String)> {
     let attachments = decode_attachment_requests(req.attachments)?;
     let note = save_note(
