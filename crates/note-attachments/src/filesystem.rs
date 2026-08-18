@@ -181,9 +181,34 @@ static FORCE_OBJECT_FILE_SYNC_FAILURE: std::sync::atomic::AtomicBool =
 static FORCE_OBJECT_DIRECTORY_SYNC_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> anyhow::Result<()> {
     std::fs::File::open(path)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // CreateFile requires backup semantics to return a directory handle, and
+    // FlushFileBuffers (used by sync_all) requires GENERIC_WRITE access.
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(_path: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("durable attachment directory sync is unsupported on this platform")
 }
 
 fn validate_sha256(value: &str) -> anyhow::Result<String> {
@@ -376,6 +401,13 @@ mod tests {
     use super::*;
 
     static FAULT_INJECTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn directory_sync_opens_and_flushes_a_directory_handle() {
+        let dir = tempfile::tempdir().unwrap();
+
+        sync_directory(dir.path()).unwrap();
+    }
 
     #[test]
     fn verification_failure_reports_a_safe_orphan_and_leaves_no_staging_file() {
