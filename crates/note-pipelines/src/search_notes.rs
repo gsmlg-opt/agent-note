@@ -23,16 +23,15 @@ pub async fn search_notes_filtered(
     limit: usize,
     label: Option<String>,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    if limit == 0 || query.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
     let selectors = label
         .as_deref()
         .map(try_parse_label_selectors)
         .transpose()
         .map_err(anyhow::Error::new)?
         .unwrap_or_default();
+    if limit == 0 || query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let allowed_note_ids = if selectors.is_empty() {
         None
     } else {

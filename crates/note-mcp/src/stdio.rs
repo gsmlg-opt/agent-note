@@ -2111,17 +2111,19 @@ mod tests {
         assert_eq!(list_error.code, ErrorCode::INVALID_PARAMS);
         assert_eq!(list_error.message, "malformed exact label selector");
 
-        let search_error = expect_error(
-            server
-                .semantic_search(Parameters(SemanticSearchRequest {
-                    query: "anything".into(),
-                    limit: 10,
-                    label: Some("~project==%ZZ".into()),
-                }))
-                .await,
-        );
-        assert_eq!(search_error.code, ErrorCode::INVALID_PARAMS);
-        assert_eq!(search_error.message, "malformed exact label selector");
+        for (query, limit) in [("anything", 10), ("", 10), ("anything", 0)] {
+            let search_error = expect_error(
+                server
+                    .semantic_search(Parameters(SemanticSearchRequest {
+                        query: query.into(),
+                        limit,
+                        label: Some("~project==%ZZ".into()),
+                    }))
+                    .await,
+            );
+            assert_eq!(search_error.code, ErrorCode::INVALID_PARAMS);
+            assert_eq!(search_error.message, "malformed exact label selector");
+        }
     }
 
     #[test]

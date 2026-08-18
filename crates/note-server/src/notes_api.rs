@@ -2727,16 +2727,20 @@ mod tests {
             assert_eq!(&body[..], b"malformed exact label selector");
         }
 
-        let response = app
-            .oneshot(post(
-                "/api/notes/search",
-                r#"{"query":"anything","limit":10,"label":"status=ready&~==secret"}"#,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"malformed exact label selector");
+        for body in [
+            r#"{"query":"anything","limit":10,"label":"status=ready&~==secret"}"#,
+            r#"{"query":"","limit":10,"label":"~==secret"}"#,
+            r#"{"query":"anything","limit":0,"label":"~==secret"}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post("/api/notes/search", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"malformed exact label selector");
+        }
     }
 
     #[tokio::test]
