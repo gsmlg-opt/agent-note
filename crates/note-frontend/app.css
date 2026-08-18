@@ -452,6 +452,7 @@ a.dashboard-metric-detail:hover {
 }
 
 .dashboard-category-chip {
+    box-sizing: border-box;
     max-width: 100%;
     min-width: 0;
     white-space: normal;

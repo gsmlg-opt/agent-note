@@ -1322,4 +1322,49 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         raced.title.as_str(),
         "First winner candidate" | "Second winner candidate"
     ));
+
+    session
+        .insert_label_key_with_type(
+            "contract-exact",
+            "Exact selector contract",
+            LabelValueType::Text,
+        )
+        .await
+        .unwrap();
+    for (index, value) in ["a&b", "%26", "+", " padded ", ""].into_iter().enumerate() {
+        let id = format!("contract-exact-{index}");
+        session
+            .insert_note(NewNote {
+                id: &id,
+                title: &id,
+                content: &id,
+                attachments: &[],
+                created_at: 3_000 + index as i64,
+                updated_at: 3_000 + index as i64,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        session
+            .attach_label(&id, "contract-exact", value)
+            .await
+            .unwrap();
+    }
+    for (index, encoded) in ["a%26b", "%2526", "%2B", "%20padded%20", ""]
+        .into_iter()
+        .enumerate()
+    {
+        let selector = parse_label_selectors(&format!("contract-exact=={encoded}"));
+        assert_eq!(
+            session.matching_note_ids(&selector).await.unwrap(),
+            vec![format!("contract-exact-{index}")],
+            "selector: {encoded}"
+        );
+    }
+    for index in 0..5 {
+        let id = format!("contract-exact-{index}");
+        session.soft_delete_note(&id, 1, 3_100).await.unwrap();
+        session.permanently_delete_note(&id, 2).await.unwrap();
+    }
 }

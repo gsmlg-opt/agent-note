@@ -3,7 +3,7 @@ use note_core::{label_matches_selector, Label, LabelSelector};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLabelSelector {
     pub key: String,
-    /// `None` means bare-key presence. `Some` is always nonempty.
+    /// `None` means bare-key presence. `Some` contains matching raw values and may include empty strings.
     pub values: Option<Vec<String>>,
 }
 

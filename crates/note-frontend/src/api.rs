@@ -141,12 +141,21 @@ struct SearchResultDto {
 pub fn label_filter_selector(filters: &[LabelFilter]) -> Option<String> {
     let terms = filters
         .iter()
-        .filter(|filter| !filter.key.trim().is_empty())
-        .map(|filter| match filter.value.trim() {
-            "" => filter.key.trim().to_string(),
-            value => {
-                format!("{}{}{}", filter.key.trim(), filter.operator.trim(), value)
+        .filter_map(|filter| {
+            if filter.operator == "==" {
+                return (!filter.key.is_empty()).then(|| {
+                    format!(
+                        "{}=={}",
+                        urlencoding::encode(&filter.key),
+                        urlencoding::encode(&filter.value)
+                    )
+                });
             }
+
+            (!filter.key.trim().is_empty()).then(|| match filter.value.trim() {
+                "" => filter.key.trim().to_string(),
+                value => format!("{}{}{}", filter.key.trim(), filter.operator.trim(), value),
+            })
         })
         .collect::<Vec<_>>();
     if terms.is_empty() {

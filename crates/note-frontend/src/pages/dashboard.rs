@@ -10,7 +10,7 @@ use crate::state::LabelFilter;
 
 #[function_component(DashboardPage)]
 pub fn dashboard_page() -> Html {
-    let summary = use_state(|| None::<api::DashboardSummary>);
+    let summary = use_state_eq(|| None::<api::DashboardSummary>);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
 
@@ -88,12 +88,14 @@ pub fn dashboard_page() -> Html {
                 </div>
 
                 if !summary.categories.is_empty() {
-                    <div class="dashboard-categories">
-                        { for summary.categories.iter().map(|category| html! {
-                            <section class="dashboard-panel dashboard-category" key={category.key.clone()}>
+                    <section class="dashboard-categories" aria-label="Note categories">
+                        { for summary.categories.iter().enumerate().map(|(index, category)| {
+                            let heading_id = format!("dashboard-category-{index}");
+                            html! {
+                            <section class="dashboard-panel dashboard-category" key={category.key.clone()} aria-labelledby={heading_id.clone()}>
                                 <div class="dashboard-panel-head">
                                     <div>
-                                        <h3>{ category.key.clone() }</h3>
+                                        <h3 id={heading_id}>{ category.key.clone() }</h3>
                                         if !category.description.is_empty() {
                                             <p>{ category.description.clone() }</p>
                                         }
@@ -105,18 +107,21 @@ pub fn dashboard_page() -> Html {
                                     <div class="dashboard-category-values">
                                         { for category.values.iter().map(|value| html! {
                                             <Link<Route, NotesQueryParams>
+                                                key={value.value.clone()}
                                                 to={Route::Notes}
                                                 query={Some(category_notes_query(&category.key, &value.value))}
                                                 classes={classes!("chip", "chip-clickable", "chip-primary", "dashboard-category-chip")}
                                             >
+                                                <span class="sr-only">{ format!("{}: ", category.key) }</span>
                                                 { category_chip_text(&value.value, value.count) }
                                             </Link<Route, NotesQueryParams>>
                                         }) }
                                     </div>
                                 }
                             </section>
+                            }
                         }) }
-                    </div>
+                    </section>
                 }
 
                 <div class="dashboard-grid">
@@ -183,14 +188,14 @@ fn format_timestamp(timestamp: i64) -> String {
     datetime.format("%Y-%m-%d %H:%M").to_string()
 }
 
-fn category_notes_query(key: &str, value: &str) -> NotesQueryParams {
+pub(crate) fn category_notes_query(key: &str, value: &str) -> NotesQueryParams {
     NotesQueryParams {
         current: 1,
         page_size: DEFAULT_NOTES_PAGE_SIZE,
         search: None,
         labels: api::label_filter_selector(&[LabelFilter {
             key: key.into(),
-            operator: "=".into(),
+            operator: "==".into(),
             value: value.into(),
         }]),
     }
@@ -215,19 +220,46 @@ mod tests {
         assert_eq!(query.current, 1);
         assert_eq!(query.page_size, DEFAULT_NOTES_PAGE_SIZE);
         assert_eq!(query.search, None);
-        assert_eq!(query.labels.as_deref(), Some("project=yellow-dog & sigma"));
+        assert_eq!(
+            query.labels.as_deref(),
+            Some("project==yellow-dog%20%26%20sigma")
+        );
 
         let serialized = query.to_query().unwrap();
         assert!(serialized.contains("current=1"));
         assert!(serialized.contains(&format!("page_size={DEFAULT_NOTES_PAGE_SIZE}")));
-        assert!(serialized.contains("%3D"));
-        assert!(serialized.contains("%26"));
-        assert!(!serialized.contains("project=yellow-dog & sigma"));
+        assert!(serialized.contains("%3D%3D"));
+        assert!(serialized.contains("%2526"));
+        assert!(!serialized.contains("project==yellow-dog%20%26%20sigma"));
     }
 
     #[test]
     fn category_chip_text_uses_the_correct_note_noun() {
         assert_eq!(category_chip_text("yellow-dog", 1), "yellow-dog · 1 note");
         assert_eq!(category_chip_text("sigma", 7), "sigma · 7 notes");
+    }
+
+    #[test]
+    fn category_queries_round_trip_exact_reserved_values_through_notes_urls() {
+        for value in ["a&b", "a=b", "%26", "+", " padded ", "", "猫"] {
+            let query = category_notes_query("project", value);
+            let outer = query.to_query().unwrap();
+            let state = crate::pages::notes::parse_notes_query(&outer);
+
+            assert_eq!(
+                state.labels,
+                vec![crate::state::LabelFilter {
+                    key: "project".into(),
+                    operator: "==".into(),
+                    value: value.into(),
+                }],
+                "value: {value:?}"
+            );
+            assert_eq!(
+                crate::pages::notes::notes_query_params(&state).labels,
+                Some(format!("project=={}", urlencoding::encode(value))),
+                "value: {value:?}"
+            );
+        }
     }
 }

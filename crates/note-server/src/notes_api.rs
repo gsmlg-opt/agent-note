@@ -832,9 +832,9 @@ pub struct ListNotesQuery {
     pub offset: Option<i64>,
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
-    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
-    /// the `&` separator is also reserved in operands.
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
+    /// `==` with `<percent-encoded-key>==<percent-encoded-value>`; both operands are
+    /// percent-encoded so reserved characters, empty values, and outer whitespace round-trip.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -845,9 +845,9 @@ pub struct ListNotesQuery {
 struct CountNotesQuery {
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
-    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
-    /// the `&` separator is also reserved in operands.
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
+    /// `==` with `<percent-encoded-key>==<percent-encoded-value>`; both operands are
+    /// percent-encoded so reserved characters, empty values, and outer whitespace round-trip.
     #[serde(default)]
     label: Option<String>,
     /// Accepted and validated for compatibility; values do not affect the count.
@@ -1265,9 +1265,9 @@ pub struct SearchQuery {
     pub limit: usize,
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
-    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
-    /// the `&` separator is also reserved in operands.
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
+    /// `==` with `<percent-encoded-key>==<percent-encoded-value>`; both operands are
+    /// percent-encoded so reserved characters, empty values, and outer whitespace round-trip.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -1859,10 +1859,11 @@ mod tests {
             .unwrap_or_default();
 
         for description in [list_label, count_label, search_label] {
-            for operator in ["^=", "$=", "~="] {
+            for operator in ["==", "^=", "$=", "~="] {
                 assert!(description.contains(operator), "{description}");
             }
             assert!(description.contains("case-insensitive"), "{description}");
+            assert!(description.contains("percent-encoded"), "{description}");
         }
     }
 

@@ -16,17 +16,17 @@ const MAX_PAGE_SIZE: usize = 1000;
 const PAGE_SIZE_OPTIONS: [usize; 5] = [10, 30, 50, 100, 1000];
 const RETRIEVAL_PLACEHOLDER: &str = "Retrieve by title or content";
 const RETRIEVE_BUTTON_LABEL: &str = "Retrieve";
-const LABEL_FILTER_PARSER_OPERATORS: [&str; 9] =
-    [">=", "<=", "!=", "^=", "$=", "~=", "=", ">", "<"];
-const LABEL_FILTER_DISPLAY_OPERATORS: [&str; 9] =
-    ["=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="];
+const LABEL_FILTER_PARSER_OPERATORS: [&str; 10] =
+    ["==", ">=", "<=", "!=", "^=", "$=", "~=", "=", ">", "<"];
+const LABEL_FILTER_DISPLAY_OPERATORS: [&str; 10] =
+    ["==", "=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="];
 
 #[derive(Clone, PartialEq)]
-struct NotesUrlState {
+pub(crate) struct NotesUrlState {
     current: usize,
     page_size: usize,
     search: String,
-    labels: Vec<LabelFilter>,
+    pub(crate) labels: Vec<LabelFilter>,
 }
 
 fn default_notes_url_state() -> NotesUrlState {
@@ -38,7 +38,7 @@ fn default_notes_url_state() -> NotesUrlState {
     }
 }
 
-fn parse_notes_query(query: &str) -> NotesUrlState {
+pub(crate) fn parse_notes_query(query: &str) -> NotesUrlState {
     let mut state = default_notes_url_state();
     for pair in query.trim_start_matches('?').split('&') {
         if pair.is_empty() {
@@ -66,7 +66,7 @@ fn parse_notes_query(query: &str) -> NotesUrlState {
     state
 }
 
-fn notes_query_params(state: &NotesUrlState) -> NotesQueryParams {
+pub(crate) fn notes_query_params(state: &NotesUrlState) -> NotesQueryParams {
     NotesQueryParams {
         current: state.current.max(1),
         page_size: normalize_page_size(state.page_size),
@@ -105,6 +105,18 @@ fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
     selector
         .split('&')
         .filter_map(|term| {
+            if let Some((key, value)) = term.split_once("==") {
+                let key = decode_exact_selector_component(key);
+                if key.is_empty() {
+                    return None;
+                }
+                return Some(LabelFilter {
+                    key,
+                    operator: "==".to_string(),
+                    value: decode_exact_selector_component(value),
+                });
+            }
+
             let term = term.trim();
             if term.is_empty() {
                 return None;
@@ -138,10 +150,16 @@ fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
         .collect()
 }
 
+fn decode_exact_selector_component(value: &str) -> String {
+    urlencoding::decode(value)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| value.to_string())
+}
+
 fn quick_label_filters(filters: &[LabelFilter], key: &str, value: &str) -> Vec<LabelFilter> {
     let clicked = LabelFilter {
         key: key.to_string(),
-        operator: "=".to_string(),
+        operator: "==".to_string(),
         value: value.to_string(),
     };
     if filters.contains(&clicked) {
@@ -151,7 +169,7 @@ fn quick_label_filters(filters: &[LabelFilter], key: &str, value: &str) -> Vec<L
     let mut inserted = false;
     let mut next = Vec::with_capacity(filters.len() + 1);
     for filter in filters {
-        if filter.key == key && filter.operator == "=" {
+        if filter.key == key && matches!(filter.operator.as_str(), "=" | "==") {
             if !inserted {
                 next.push(clicked.clone());
                 inserted = true;
@@ -680,7 +698,7 @@ fn label_filter_bar(
 }
 
 fn label_filter_label(filter: &LabelFilter) -> String {
-    if filter.value.is_empty() {
+    if filter.value.is_empty() && filter.operator != "==" {
         filter.key.clone()
     } else {
         format!("{}{}{}", filter.key, filter.operator, filter.value)
@@ -688,7 +706,7 @@ fn label_filter_label(filter: &LabelFilter) -> String {
 }
 
 fn label_value_input_type(value_type: &str, operator: &str) -> &'static str {
-    if matches!(operator, "^=" | "$=" | "~=") {
+    if matches!(operator, "==" | "^=" | "$=" | "~=") {
         return "text";
     }
 
@@ -1078,7 +1096,7 @@ mod tests {
             quick_label_filters(&[], "status", "draft"),
             vec![LabelFilter {
                 key: "status".to_string(),
-                operator: "=".to_string(),
+                operator: "==".to_string(),
                 value: "draft".to_string(),
             }]
         );
@@ -1088,7 +1106,7 @@ mod tests {
     fn quick_label_filter_is_idempotent_for_an_exact_filter() {
         let filters = vec![LabelFilter {
             key: "status".to_string(),
-            operator: "=".to_string(),
+            operator: "==".to_string(),
             value: "draft".to_string(),
         }];
 
@@ -1096,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_label_filter_keeps_a_mixed_filter_list_when_exact_filter_is_active() {
+    fn quick_label_filter_canonicalizes_legacy_equalities_to_exact_equality() {
         let filters = vec![
             LabelFilter {
                 key: "status".into(),
@@ -1110,7 +1128,14 @@ mod tests {
             },
         ];
 
-        assert_eq!(quick_label_filters(&filters, "status", "draft"), filters);
+        assert_eq!(
+            quick_label_filters(&filters, "status", "draft"),
+            vec![LabelFilter {
+                key: "status".into(),
+                operator: "==".into(),
+                value: "draft".into(),
+            }]
+        );
     }
 
     #[test]
@@ -1118,7 +1143,7 @@ mod tests {
         let filters = vec![
             LabelFilter {
                 key: "status".into(),
-                operator: "=".into(),
+                operator: "==".into(),
                 value: "draft".into(),
             },
             LabelFilter {
@@ -1143,7 +1168,7 @@ mod tests {
             vec![
                 LabelFilter {
                     key: "status".into(),
-                    operator: "=".into(),
+                    operator: "==".into(),
                     value: "published".into(),
                 },
                 filters[1].clone(),
@@ -1231,7 +1256,19 @@ mod tests {
     fn label_filter_display_operators_have_expected_order() {
         assert_eq!(
             LABEL_FILTER_DISPLAY_OPERATORS,
-            ["=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="]
+            ["==", "=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="]
+        );
+    }
+
+    #[test]
+    fn exact_empty_label_filter_remains_distinct_from_presence() {
+        assert_eq!(
+            label_filter_label(&LabelFilter {
+                key: "project".into(),
+                operator: "==".into(),
+                value: String::new(),
+            }),
+            "project=="
         );
     }
 

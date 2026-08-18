@@ -67,6 +67,7 @@ pub struct Label {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LabelOperator {
+    ExactEq,
     Eq,
     NotEq,
     Gt,
@@ -81,6 +82,7 @@ pub enum LabelOperator {
 impl LabelOperator {
     pub fn as_str(self) -> &'static str {
         match self {
+            LabelOperator::ExactEq => "==",
             LabelOperator::Eq => "=",
             LabelOperator::NotEq => "!=",
             LabelOperator::Gt => ">",
@@ -105,6 +107,18 @@ pub fn parse_label_selectors(input: &str) -> Vec<LabelSelector> {
     input
         .split('&')
         .filter_map(|term| {
+            if let Some((key, value)) = term.split_once("==") {
+                let key = decode_exact_selector_component(key);
+                if key.is_empty() {
+                    return None;
+                }
+                return Some(LabelSelector {
+                    key,
+                    value: Some(decode_exact_selector_component(value)),
+                    operator: LabelOperator::ExactEq,
+                });
+            }
+
             let term = term.trim();
             if term.is_empty() {
                 return None;
@@ -124,6 +138,12 @@ pub fn parse_label_selectors(input: &str) -> Vec<LabelSelector> {
             }
         })
         .collect()
+}
+
+fn decode_exact_selector_component(component: &str) -> String {
+    urlencoding::decode(component)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| component.to_string())
 }
 
 pub fn label_matches_selector(label: &Label, selector: &LabelSelector) -> bool {
@@ -149,6 +169,7 @@ pub fn compare_label_values(
     right: &str,
 ) -> bool {
     match operator {
+        LabelOperator::ExactEq => return left == right,
         LabelOperator::StartsWith => {
             return left.to_lowercase().starts_with(&right.to_lowercase());
         }
@@ -281,6 +302,7 @@ fn parse_time(value: &str) -> Option<chrono::NaiveTime> {
 
 fn compare_ordering(ordering: std::cmp::Ordering, operator: LabelOperator) -> bool {
     match operator {
+        LabelOperator::ExactEq => false,
         LabelOperator::Eq => ordering.is_eq(),
         LabelOperator::NotEq => !ordering.is_eq(),
         LabelOperator::Gt => ordering.is_gt(),
@@ -407,6 +429,30 @@ mod tests {
                 operator: LabelOperator::Eq,
             }]
         );
+    }
+
+    #[test]
+    fn parses_percent_encoded_exact_selectors_without_trimming_operands() {
+        assert_eq!(LabelOperator::ExactEq.as_str(), "==");
+        for (input, key, value) in [
+            ("project==a%26b", "project", "a&b"),
+            ("project==a%3Db", "project", "a=b"),
+            ("project==%2526", "project", "%26"),
+            ("project==%2B", "project", "+"),
+            ("project==%20padded%20", "project", " padded "),
+            ("project==", "project", ""),
+            ("%E9%A1%B9%E7%9B%AE==%E7%8C%AB", "项目", "猫"),
+        ] {
+            assert_eq!(
+                parse_label_selectors(input),
+                vec![LabelSelector {
+                    key: key.to_string(),
+                    value: Some(value.to_string()),
+                    operator: LabelOperator::ExactEq,
+                }],
+                "selector: {input}"
+            );
+        }
     }
 
     #[test]
@@ -640,6 +686,33 @@ mod tests {
             LabelOperator::EndsWith,
             "nöte"
         ));
+    }
+
+    #[test]
+    fn exact_equality_matches_raw_values_before_typed_normalization() {
+        for (value_type, stored, selector, expected) in [
+            (LabelValueType::Text, " padded ", " padded ", true),
+            (LabelValueType::Text, "", "", true),
+            (LabelValueType::Number, "01", "01", true),
+            (LabelValueType::Number, "01", "1", false),
+        ] {
+            assert_eq!(
+                label_matches_selector(
+                    &Label {
+                        key: "project".into(),
+                        value: stored.into(),
+                        description: String::new(),
+                        value_type,
+                    },
+                    &LabelSelector {
+                        key: "project".into(),
+                        value: Some(selector.into()),
+                        operator: LabelOperator::ExactEq,
+                    },
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
