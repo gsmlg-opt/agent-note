@@ -25,7 +25,7 @@ impl AttachmentOperationRepository for PgSession {
                  status, attempts, next_attempt_at, lease_owner, lease_expires_at,
                  last_error, created_at, updated_at
              ) VALUES (
-                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+                 $1, $2, $3, $4, $5, $6, 'pending', 0, $7, NULL, NULL, NULL, $8, $8
              )
              ON CONFLICT (kind, object_key) DO UPDATE
              SET object_key = attachment_operations.object_key
@@ -39,14 +39,8 @@ impl AttachmentOperationRepository for PgSession {
         .bind(operation.attachment_id)
         .bind(operation.storage_generation)
         .bind(operation.object_key)
-        .bind(operation.status.as_str())
-        .bind(operation.attempts)
         .bind(operation.next_attempt_at)
-        .bind(operation.lease_owner)
-        .bind(operation.lease_expires_at)
-        .bind(operation.last_error)
         .bind(operation.created_at)
-        .bind(operation.updated_at)
         .fetch_one(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("insert attachment operation", error))?;
@@ -155,6 +149,7 @@ impl AttachmentOperationRepository for PgSession {
         &self,
         id: &str,
         owner: &str,
+        expected_attempt: i64,
         updated_at: i64,
     ) -> StorageResult<bool> {
         let mut connection = self.connection().await?;
@@ -163,18 +158,20 @@ impl AttachmentOperationRepository for PgSession {
                  UPDATE attachment_operations
                  SET status = 'completed', next_attempt_at = NULL,
                      lease_owner = NULL, lease_expires_at = NULL,
-                     last_error = NULL, updated_at = $3
+                     last_error = NULL, updated_at = $4
                  WHERE id = $1 AND status = 'running' AND lease_owner = $2
+                   AND attempts = $3
                  RETURNING id
              )
              SELECT EXISTS(SELECT 1 FROM updated)
                  OR EXISTS(
                      SELECT 1 FROM attachment_operations
-                     WHERE id = $1 AND status = 'completed'
+                     WHERE id = $1 AND status = 'completed' AND attempts = $3
                  )",
         )
         .bind(id)
         .bind(owner)
+        .bind(expected_attempt)
         .bind(updated_at)
         .fetch_one(&mut *connection)
         .await
@@ -186,6 +183,7 @@ impl AttachmentOperationRepository for PgSession {
         &self,
         id: &str,
         owner: &str,
+        expected_attempt: i64,
         status: AttachmentOperationStatus,
         next_attempt_at: Option<i64>,
         last_error: &str,
@@ -210,13 +208,15 @@ impl AttachmentOperationRepository for PgSession {
         let mut connection = self.connection().await?;
         let result = sqlx::query(
             "UPDATE attachment_operations
-             SET status = $3, next_attempt_at = $4,
+             SET status = $4, next_attempt_at = $5,
                  lease_owner = NULL, lease_expires_at = NULL,
-                 last_error = $5, updated_at = $6
-             WHERE id = $1 AND status = 'running' AND lease_owner = $2",
+                 last_error = $6, updated_at = $7
+             WHERE id = $1 AND status = 'running' AND lease_owner = $2
+               AND attempts = $3",
         )
         .bind(id)
         .bind(owner)
+        .bind(expected_attempt)
         .bind(status.as_str())
         .bind(next_attempt_at)
         .bind(last_error)

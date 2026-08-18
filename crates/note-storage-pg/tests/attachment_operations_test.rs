@@ -26,14 +26,8 @@ fn operation(id: &str, note_id: &str, created_at: i64) -> NewAttachmentOperation
         attachment_id: format!("attachment-{id}"),
         storage_generation: format!("generation-{id}"),
         object_key: format!("notes/{note_id}/{id}"),
-        status: AttachmentOperationStatus::Pending,
-        attempts: 0,
         next_attempt_at: None,
-        lease_owner: None,
-        lease_expires_at: None,
-        last_error: None,
         created_at,
-        updated_at: created_at,
     }
 }
 
@@ -129,15 +123,15 @@ async fn claims_ready_and_expired_operations_with_owner_fencing() {
     assert_eq!(reclaimed[0].lease_owner.as_deref(), Some("worker-b"));
 
     assert!(!session
-        .complete_attachment_operation("ready", "worker-a", 160)
+        .complete_attachment_operation("ready", "worker-a", 1, 160)
         .await
         .unwrap());
     assert!(session
-        .complete_attachment_operation("ready", "worker-b", 160)
+        .complete_attachment_operation("ready", "worker-b", 2, 160)
         .await
         .unwrap());
     assert!(session
-        .complete_attachment_operation("ready", "worker-b", 170)
+        .complete_attachment_operation("ready", "worker-b", 2, 170)
         .await
         .unwrap());
     let completed = session
@@ -174,6 +168,7 @@ async fn failure_requeues_or_dead_letters_only_the_owners_claim() {
         .fail_attachment_operation(
             "retry",
             "other-worker",
+            1,
             AttachmentOperationStatus::Pending,
             Some(50),
             "temporary",
@@ -185,6 +180,7 @@ async fn failure_requeues_or_dead_letters_only_the_owners_claim() {
         .fail_attachment_operation(
             "retry",
             "worker",
+            1,
             AttachmentOperationStatus::Pending,
             Some(50),
             "temporary",
@@ -211,6 +207,7 @@ async fn failure_requeues_or_dead_letters_only_the_owners_claim() {
         .fail_attachment_operation(
             "retry",
             "worker",
+            2,
             AttachmentOperationStatus::Completed,
             None,
             "invalid transition",
@@ -223,6 +220,7 @@ async fn failure_requeues_or_dead_letters_only_the_owners_claim() {
         .fail_attachment_operation(
             "retry",
             "worker",
+            2,
             AttachmentOperationStatus::Pending,
             None,
             "missing retry time",
@@ -235,6 +233,7 @@ async fn failure_requeues_or_dead_letters_only_the_owners_claim() {
         .fail_attachment_operation(
             "retry",
             "worker",
+            2,
             AttachmentOperationStatus::Dead,
             None,
             "permanent",

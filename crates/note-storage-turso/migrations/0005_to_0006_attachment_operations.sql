@@ -13,6 +13,7 @@ CREATE TABLE attachment_operations (
     last_error TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    CHECK (updated_at >= created_at),
     CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL)),
     CHECK (lease_owner IS NULL OR length(trim(lease_owner)) > 0),
     CHECK ((status = 'running') = (lease_owner IS NOT NULL))

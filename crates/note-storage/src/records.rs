@@ -110,14 +110,8 @@ pub struct NewAttachmentOperation {
     pub attachment_id: String,
     pub storage_generation: String,
     pub object_key: String,
-    pub status: AttachmentOperationStatus,
-    pub attempts: i64,
     pub next_attempt_at: Option<i64>,
-    pub lease_owner: Option<String>,
-    pub lease_expires_at: Option<i64>,
-    pub last_error: Option<String>,
     pub created_at: i64,
-    pub updated_at: i64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -138,37 +132,46 @@ pub struct AttachmentOperation {
     pub updated_at: i64,
 }
 
-macro_rules! impl_attachment_operation_debug {
-    ($type:ty) => {
-        impl fmt::Debug for $type {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter
-                    .debug_struct(stringify!($type))
-                    .field("id", &self.id)
-                    .field("kind", &self.kind)
-                    .field("note_id", &self.note_id)
-                    .field("attachment_id", &self.attachment_id)
-                    .field("storage_generation", &self.storage_generation)
-                    .field("object_key", &self.object_key)
-                    .field("status", &self.status)
-                    .field("attempts", &self.attempts)
-                    .field("next_attempt_at", &self.next_attempt_at)
-                    .field("lease_owner", &self.lease_owner)
-                    .field("lease_expires_at", &self.lease_expires_at)
-                    .field(
-                        "last_error",
-                        &self.last_error.as_ref().map(|_| "[REDACTED]"),
-                    )
-                    .field("created_at", &self.created_at)
-                    .field("updated_at", &self.updated_at)
-                    .finish()
-            }
-        }
-    };
+impl fmt::Debug for NewAttachmentOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewAttachmentOperation")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("note_id", &self.note_id)
+            .field("attachment_id", &self.attachment_id)
+            .field("storage_generation", &self.storage_generation)
+            .field("object_key", &self.object_key)
+            .field("next_attempt_at", &self.next_attempt_at)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
-impl_attachment_operation_debug!(NewAttachmentOperation);
-impl_attachment_operation_debug!(AttachmentOperation);
+impl fmt::Debug for AttachmentOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachmentOperation")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("note_id", &self.note_id)
+            .field("attachment_id", &self.attachment_id)
+            .field("storage_generation", &self.storage_generation)
+            .field("object_key", &self.object_key)
+            .field("status", &self.status)
+            .field("attempts", &self.attempts)
+            .field("next_attempt_at", &self.next_attempt_at)
+            .field("lease_owner", &self.lease_owner)
+            .field("lease_expires_at", &self.lease_expires_at)
+            .field(
+                "last_error",
+                &self.last_error.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompareAndSwap<T> {

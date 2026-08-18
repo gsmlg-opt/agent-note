@@ -369,6 +369,7 @@ pub trait AttachmentOperationRepository: Send + Sync {
         &self,
         id: &str,
         owner: &str,
+        expected_attempt: i64,
         updated_at: i64,
     ) -> StorageResult<bool>;
 
@@ -376,6 +377,7 @@ pub trait AttachmentOperationRepository: Send + Sync {
         &self,
         id: &str,
         owner: &str,
+        expected_attempt: i64,
         status: AttachmentOperationStatus,
         next_attempt_at: Option<i64>,
         last_error: &str,

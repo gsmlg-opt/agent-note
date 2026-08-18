@@ -672,13 +672,20 @@ async fn schema_v5_is_migrated_without_losing_notes() {
     let connection = database.connect().unwrap();
     let mut rows = connection
         .query(
-            "SELECT name FROM sqlite_schema
+            "SELECT sql FROM sqlite_schema
              WHERE type = 'table' AND name = 'attachment_operations'",
             (),
         )
         .await
         .unwrap();
-    assert!(rows.next().await.unwrap().is_some());
+    let migrated_schema = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    assert!(normalize_schema_sql(&migrated_schema).contains("CHECK (updated_at >= created_at)"));
 }
 
 #[tokio::test]
@@ -934,6 +941,7 @@ async fn fresh_database_contains_current_schema_objects() {
         "object_key TEXT NOT NULL UNIQUE CHECK (length(trim(object_key)) > 0)",
         "status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'dead'))",
         "attempts INTEGER NOT NULL CHECK (attempts >= 0)",
+        "CHECK (updated_at >= created_at)",
         "CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL))",
         "CHECK ((status = 'running') = (lease_owner IS NOT NULL))",
     ] {

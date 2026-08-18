@@ -227,10 +227,16 @@ impl_forward_repository! {
             lease_expires_at: i64,
             limit: i64,
         ) -> Vec<AttachmentOperation>;
-        fn complete_attachment_operation(id: &str, owner: &str, updated_at: i64) -> bool;
+        fn complete_attachment_operation(
+            id: &str,
+            owner: &str,
+            expected_attempt: i64,
+            updated_at: i64,
+        ) -> bool;
         fn fail_attachment_operation(
             id: &str,
             owner: &str,
+            expected_attempt: i64,
             status: AttachmentOperationStatus,
             next_attempt_at: Option<i64>,
             last_error: &str,

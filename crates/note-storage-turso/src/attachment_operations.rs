@@ -27,7 +27,7 @@ impl AttachmentOperationRepository for TursoSession {
                  id, kind, note_id, attachment_id, storage_generation, object_key,
                  status, attempts, next_attempt_at, lease_owner, lease_expires_at,
                  last_error, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, NULL, NULL, NULL, ?8, ?8)
              ON CONFLICT(object_key) DO UPDATE SET object_key = excluded.object_key
              RETURNING {OPERATION_COLUMNS}"
         );
@@ -42,14 +42,8 @@ impl AttachmentOperationRepository for TursoSession {
                     operation.attachment_id,
                     operation.storage_generation,
                     operation.object_key,
-                    operation.status.as_str(),
-                    operation.attempts,
                     operation.next_attempt_at,
-                    operation.lease_owner,
-                    operation.lease_expires_at,
-                    operation.last_error,
                     operation.created_at,
-                    operation.updated_at,
                 ],
             )
             .await
@@ -172,6 +166,7 @@ impl AttachmentOperationRepository for TursoSession {
         &self,
         id: &str,
         owner: &str,
+        expected_attempt: i64,
         updated_at: i64,
     ) -> StorageResult<bool> {
         let _operation_guard = self.operation_guard().await;
@@ -184,10 +179,11 @@ impl AttachmentOperationRepository for TursoSession {
                      lease_owner = NULL,
                      lease_expires_at = NULL,
                      last_error = CASE WHEN status = 'completed' THEN last_error ELSE NULL END,
-                     updated_at = CASE WHEN status = 'completed' THEN updated_at ELSE ?3 END
+                     updated_at = CASE WHEN status = 'completed' THEN updated_at ELSE ?4 END
                  WHERE id = ?1
+                   AND attempts = ?3
                    AND ((status = 'running' AND lease_owner = ?2) OR status = 'completed')",
-                turso::params![id, owner, updated_at],
+                turso::params![id, owner, expected_attempt, updated_at],
             )
             .await
             .map_err(|error| map_turso_error("complete attachment operation", error))?;
@@ -198,6 +194,7 @@ impl AttachmentOperationRepository for TursoSession {
         &self,
         id: &str,
         owner: &str,
+        expected_attempt: i64,
         status: AttachmentOperationStatus,
         next_attempt_at: Option<i64>,
         last_error: &str,
@@ -225,16 +222,18 @@ impl AttachmentOperationRepository for TursoSession {
             .connection
             .execute(
                 "UPDATE attachment_operations
-                 SET status = ?3,
-                     next_attempt_at = ?4,
+                 SET status = ?4,
+                     next_attempt_at = ?5,
                      lease_owner = NULL,
                      lease_expires_at = NULL,
-                     last_error = ?5,
-                     updated_at = ?6
-                 WHERE id = ?1 AND status = 'running' AND lease_owner = ?2",
+                     last_error = ?6,
+                     updated_at = ?7
+                 WHERE id = ?1 AND status = 'running' AND lease_owner = ?2
+                   AND attempts = ?3",
                 turso::params![
                     id,
                     owner,
+                    expected_attempt,
                     status.as_str(),
                     next_attempt_at,
                     last_error,

@@ -12,14 +12,8 @@ fn operation(id: &str, note_id: &str, object_key: &str, now: i64) -> NewAttachme
         attachment_id: "attachment-1".into(),
         storage_generation: "generation-1".into(),
         object_key: object_key.into(),
-        status: AttachmentOperationStatus::Pending,
-        attempts: 0,
         next_attempt_at: Some(now),
-        lease_owner: None,
-        lease_expires_at: None,
-        last_error: None,
         created_at: now,
-        updated_at: now,
     }
 }
 
@@ -55,6 +49,64 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .unwrap_err();
     assert!(!format!("{invalid_error:?}").contains("ATTACHMENT-OBJECT-SECRET"));
 
+    let timestamp_update = operation(
+        "attachment-operation-timestamp-update",
+        "contract-attachment-operations-note",
+        "objects/timestamp-update",
+        100,
+    );
+    session
+        .insert_attachment_operation(timestamp_update)
+        .await
+        .unwrap();
+    let timestamp_claim = session
+        .claim_attachment_operations("timestamp-worker", 100, 110, 1)
+        .await
+        .unwrap();
+    assert_eq!(timestamp_claim.len(), 1);
+    let timestamp_error = session
+        .complete_attachment_operation(
+            "attachment-operation-timestamp-update",
+            "timestamp-worker",
+            1,
+            99,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        timestamp_error.kind(),
+        note_storage::StorageErrorKind::Constraint
+    );
+    assert!(session
+        .complete_attachment_operation(
+            "attachment-operation-timestamp-update",
+            "timestamp-worker",
+            1,
+            101,
+        )
+        .await
+        .unwrap());
+
+    let mut timestamp_regression = operation(
+        "attachment-operation-timestamp-regression",
+        "contract-attachment-operations-note",
+        "objects/timestamp-regression",
+        200,
+    );
+    timestamp_regression.next_attempt_at = Some(199);
+    session
+        .insert_attachment_operation(timestamp_regression)
+        .await
+        .unwrap();
+    let timestamp_error = session
+        .claim_attachment_operations("timestamp-worker", 199, 210, 1)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        timestamp_error.kind(),
+        note_storage::StorageErrorKind::Constraint
+    );
+
     let first = session
         .insert_attachment_operation(operation(
             "attachment-operation-2",
@@ -85,7 +137,12 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .iter()
             .map(|operation| operation.id.as_str())
             .collect::<Vec<_>>(),
-        vec![second.id.as_str(), first.id.as_str()]
+        vec![
+            second.id.as_str(),
+            first.id.as_str(),
+            "attachment-operation-timestamp-update",
+            "attachment-operation-timestamp-regression",
+        ]
     );
 
     let duplicate = session
@@ -134,29 +191,46 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
 
     let first_id = first.id.as_str();
     assert!(!session
-        .complete_attachment_operation(first_id, "worker-b", 26)
+        .complete_attachment_operation(first_id, "worker-b", 1, 26)
         .await
         .unwrap());
     assert!(session
-        .complete_attachment_operation(first_id, "worker-a", 27)
+        .complete_attachment_operation(first_id, "worker-a", 1, 27)
         .await
         .unwrap());
     assert!(session
-        .complete_attachment_operation(first_id, "worker-a", 28)
+        .complete_attachment_operation(first_id, "worker-a", 1, 28)
         .await
         .unwrap());
 
     let reclaimed = session
-        .claim_attachment_operations("worker-b", 31, 40, 10)
+        .claim_attachment_operations("worker-a", 31, 40, 10)
         .await
         .unwrap();
     assert_eq!(reclaimed.len(), 1);
     assert_eq!(reclaimed[0].id, second.id);
     assert_eq!(reclaimed[0].attempts, 2);
     assert!(!session
+        .complete_attachment_operation(&second.id, "worker-a", 1, 31)
+        .await
+        .unwrap());
+    assert!(!session
         .fail_attachment_operation(
             &second.id,
             "worker-a",
+            1,
+            AttachmentOperationStatus::Dead,
+            None,
+            "stale attempt",
+            31,
+        )
+        .await
+        .unwrap());
+    assert!(!session
+        .fail_attachment_operation(
+            &second.id,
+            "worker-b",
+            2,
             AttachmentOperationStatus::Pending,
             Some(50),
             "wrong owner",
@@ -167,7 +241,8 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     assert!(session
         .fail_attachment_operation(
             &second.id,
-            "worker-b",
+            "worker-a",
+            2,
             AttachmentOperationStatus::Pending,
             Some(50),
             "temporary failure",
@@ -193,6 +268,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .fail_attachment_operation(
             &second.id,
             "worker-c",
+            3,
             AttachmentOperationStatus::Dead,
             None,
             "permanent failure",
@@ -221,6 +297,6 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .await
             .unwrap()
             .len(),
-        2
+        4
     );
 }
