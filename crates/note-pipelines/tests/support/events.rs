@@ -113,7 +113,49 @@ struct EventTransaction {
     set_note_label_note_ids: Arc<Mutex<Vec<String>>>,
 }
 
+struct EventSession {
+    inner: Box<dyn StorageSession>,
+    fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
+    repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
+    matching_note_ids_for_update_override: Arc<Mutex<Option<Vec<String>>>>,
+    noop_set_note_label_ids: Arc<Mutex<HashSet<String>>>,
+    set_note_label_note_ids: Arc<Mutex<Vec<String>>>,
+}
+
 impl EventTransaction {
+    fn fail_if_requested(&self, name: &str) -> StorageResult<()> {
+        *self
+            .repository_call_counts
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_default() += 1;
+        let mut failures = self.fail_repository_calls.lock().unwrap();
+        if failures.front().is_some_and(|failure| failure == name) {
+            failures.pop_front();
+            return Err(StorageError::new(
+                StorageErrorKind::Operation,
+                format!("controlled repository failure at {name}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn repository_override<T: 'static>(&self, name: &str) -> Option<T> {
+        if name != "matching_note_ids_for_update" {
+            return None;
+        }
+        let note_ids = self
+            .matching_note_ids_for_update_override
+            .lock()
+            .unwrap()
+            .clone()?;
+        let value: Box<dyn Any> = Box::new(note_ids);
+        value.downcast::<T>().ok().map(|value| *value)
+    }
+}
+
+impl EventSession {
     fn fail_if_requested(&self, name: &str) -> StorageResult<()> {
         *self
             .repository_call_counts
@@ -149,7 +191,16 @@ impl EventTransaction {
 #[async_trait::async_trait]
 impl StorageBackend for EventStorageBackend {
     async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
-        self.inner.session().await
+        Ok(Box::new(EventSession {
+            inner: self.inner.session().await?,
+            fail_repository_calls: self.fail_repository_calls.clone(),
+            repository_call_counts: self.repository_call_counts.clone(),
+            matching_note_ids_for_update_override: self
+                .matching_note_ids_for_update_override
+                .clone(),
+            noop_set_note_label_ids: self.noop_set_note_label_ids.clone(),
+            set_note_label_note_ids: self.set_note_label_note_ids.clone(),
+        }))
     }
 
     async fn begin(&self, mode: TransactionMode) -> StorageResult<Box<dyn StorageTransaction>> {
@@ -182,10 +233,10 @@ impl StorageBackend for EventStorageBackend {
     }
 }
 
-macro_rules! impl_forward_repository {
-    ($repository:path { $(fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty;)* }) => {
+macro_rules! impl_forward_repository_for {
+    ($target:ty, $repository:path { $(fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty;)* }) => {
         #[async_trait::async_trait]
-        impl $repository for EventTransaction {
+        impl $repository for $target {
             $(
                 async fn $name(&self, $($arg: $ty),*) -> StorageResult<$result> {
                     self.fail_if_requested(stringify!($name))?;
@@ -195,6 +246,21 @@ macro_rules! impl_forward_repository {
                     self.inner.$name($($arg),*).await
                 }
             )*
+        }
+    };
+}
+
+macro_rules! impl_forward_repository {
+    ($repository:path { $(fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty;)* }) => {
+        impl_forward_repository_for! {
+            EventTransaction, $repository {
+                $(fn $name($($arg: $ty),*) -> $result;)*
+            }
+        }
+        impl_forward_repository_for! {
+            EventSession, $repository {
+                $(fn $name($($arg: $ty),*) -> $result;)*
+            }
         }
     };
 }
@@ -268,10 +334,10 @@ impl_forward_repository! {
     }
 }
 
-macro_rules! impl_forward_label_repository {
-    ($(fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty;)*) => {
+macro_rules! impl_forward_label_repository_for {
+    ($target:ty, $(fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty;)*) => {
         #[async_trait::async_trait]
-        impl LabelRepository for EventTransaction {
+        impl LabelRepository for $target {
             $(
                 async fn $name(&self, $($arg: $ty),*) -> StorageResult<$result> {
                     self.fail_if_requested(stringify!($name))?;
@@ -295,6 +361,19 @@ macro_rules! impl_forward_label_repository {
                 }
                 self.inner.set_note_label(note_id, key, value).await
             }
+        }
+    };
+}
+
+macro_rules! impl_forward_label_repository {
+    ($(fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty;)*) => {
+        impl_forward_label_repository_for! {
+            EventTransaction,
+            $(fn $name($($arg: $ty),*) -> $result;)*
+        }
+        impl_forward_label_repository_for! {
+            EventSession,
+            $(fn $name($($arg: $ty),*) -> $result;)*
         }
     };
 }

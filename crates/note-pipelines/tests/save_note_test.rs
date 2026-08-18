@@ -928,6 +928,183 @@ async fn permanent_delete_cleanup_failure_keeps_committed_success_pending_for_re
 }
 
 #[tokio::test]
+async fn permanent_delete_succeeds_when_postcommit_cleanup_claim_fails() {
+    let (ctx, backend, event_backend, attachments, events, _dir) =
+        controlled_failure_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete".into(),
+            content: "Claim failure".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    delete_note(&ctx, &note.id, note.revision).await.unwrap();
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    events.lock().unwrap().clear();
+    event_backend.fail_next_repository_call("claim_attachment_operations");
+
+    assert!(permanently_delete_note(&ctx, &note.id, note.revision + 1)
+        .await
+        .unwrap());
+    assert!(!backend
+        .session()
+        .await
+        .unwrap()
+        .note_exists(&note.id)
+        .await
+        .unwrap());
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Pending);
+    assert_eq!(operations[0].attempts, 0);
+    assert!(operations[0].lease_owner.is_none());
+    assert!(attachments.has_object(&object_key));
+    assert_eq!(*events.lock().unwrap(), vec!["begin", "commit"]);
+    assert_eq!(
+        event_backend.repository_call_count("claim_attachment_operations"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn permanent_delete_succeeds_when_postcommit_cleanup_completion_fails() {
+    let (ctx, backend, event_backend, attachments, events, _dir) =
+        controlled_failure_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete".into(),
+            content: "Completion failure".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    delete_note(&ctx, &note.id, note.revision).await.unwrap();
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    events.lock().unwrap().clear();
+    event_backend.fail_next_repository_call("complete_attachment_operation");
+
+    assert!(permanently_delete_note(&ctx, &note.id, note.revision + 1)
+        .await
+        .unwrap());
+    assert!(!backend
+        .session()
+        .await
+        .unwrap()
+        .note_exists(&note.id)
+        .await
+        .unwrap());
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Running);
+    assert_eq!(operations[0].attempts, 1);
+    assert!(operations[0].lease_owner.is_some());
+    assert!(!attachments.has_object(&object_key));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "begin".to_string(),
+            "commit".to_string(),
+            format!("delete_object:{object_key}")
+        ]
+    );
+    assert_eq!(
+        event_backend.repository_call_count("complete_attachment_operation"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn permanent_delete_succeeds_when_postcommit_cleanup_failure_recording_fails() {
+    let (ctx, backend, event_backend, attachments, events, _dir) =
+        controlled_failure_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete".into(),
+            content: "Failure recording failure".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    delete_note(&ctx, &note.id, note.revision).await.unwrap();
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    events.lock().unwrap().clear();
+    attachments.fail_delete_object();
+    event_backend.fail_next_repository_call("fail_attachment_operation");
+
+    assert!(permanently_delete_note(&ctx, &note.id, note.revision + 1)
+        .await
+        .unwrap());
+    assert!(!backend
+        .session()
+        .await
+        .unwrap()
+        .note_exists(&note.id)
+        .await
+        .unwrap());
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Running);
+    assert_eq!(operations[0].attempts, 1);
+    assert!(operations[0].lease_owner.is_some());
+    assert!(attachments.has_object(&object_key));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "begin".to_string(),
+            "commit".to_string(),
+            format!("delete_object:{object_key}")
+        ]
+    );
+    assert_eq!(
+        event_backend.repository_call_count("fail_attachment_operation"),
+        1
+    );
+}
+
+#[tokio::test]
 async fn permanent_delete_commit_acknowledgement_failure_retains_object_with_durable_operation() {
     let (ctx, backend, event_backend, attachments, _events, _dir) =
         controlled_failure_context().await;

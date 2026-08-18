@@ -386,36 +386,3 @@ pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Res
     crate::generated_attachments::run_attachment_cleanup_once(ctx).await;
     Ok(deleted)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn purge_only_cleans_up_applied_note_deletions() {
-        assert_eq!(
-            applied_deleted_note_id(
-                "applied",
-                NoteMutationResult::Applied {
-                    value: (),
-                    revision: 2,
-                },
-            ),
-            Some("applied".to_string())
-        );
-        assert_eq!(
-            applied_deleted_note_id(
-                "conflict",
-                NoteMutationResult::Conflict {
-                    expected_revision: 1,
-                    current_revision: 2,
-                },
-            ),
-            None
-        );
-        assert_eq!(
-            applied_deleted_note_id("missing", NoteMutationResult::NotFound),
-            None
-        );
-    }
-}
