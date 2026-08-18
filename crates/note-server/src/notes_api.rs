@@ -518,6 +518,9 @@ struct DashboardCacheEntry {
 static DASHBOARD_CACHE: OnceLock<RwLock<Option<DashboardCacheEntry>>> = OnceLock::new();
 
 #[cfg(test)]
+static DASHBOARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
 static BULK_DASHBOARD_CACHE_INVALIDATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -2587,6 +2590,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_uses_summary_data_and_invalidates_after_note_write() {
+        let _dashboard_guard = DASHBOARD_TEST_LOCK.lock().await;
         invalidate_dashboard_cache();
         let (app, ctx, storage, _dir) = test_app_with_backend().await;
 
@@ -2669,6 +2673,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_categories_reflect_config_and_invalidate_cache() {
+        let _dashboard_guard = DASHBOARD_TEST_LOCK.lock().await;
         invalidate_dashboard_cache();
         let dir = tempfile::tempdir().unwrap();
         let storage: Arc<dyn StorageBackend> =
