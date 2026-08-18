@@ -5,6 +5,7 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
+use http_body_util::BodyExt;
 use note_attachments::FilesystemAttachmentStore;
 use note_embedding::StubEmbedder;
 use note_pipelines::{
@@ -85,6 +86,17 @@ async fn save_rejects_internal_attachment_storage_fields_before_writing() {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "field: {field}");
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/plain; charset=utf-8",
+            "field: {field}"
+        );
+        let response_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &response_body[..],
+            b"invalid note request",
+            "field: {field}"
+        );
     }
 
     let session = storage.session().await.unwrap();
@@ -107,4 +119,9 @@ fn openapi_closes_attachment_requests_to_unknown_fields() {
     };
 
     assert_eq!(object["additionalProperties"], false);
+    assert_eq!(
+        document["paths"]["/api/notes"]["post"]["responses"]["400"]["content"]["text/plain"]
+            ["schema"]["type"],
+        "string"
+    );
 }

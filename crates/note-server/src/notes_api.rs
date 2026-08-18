@@ -644,8 +644,14 @@ async fn dashboard_handler(
 )]
 async fn save_note_handler(
     State(ctx): State<Arc<Context>>,
-    NoteJson(req): NoteJson<SaveNoteRequest>,
+    req: Result<Json<SaveNoteRequest>, JsonRejection>,
 ) -> Result<Json<SaveNoteResponse>, (axum::http::StatusCode, String)> {
+    let Json(req) = req.map_err(|_| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid note request".into(),
+        )
+    })?;
     let attachments = decode_attachment_requests(req.attachments)?;
     let note = save_note(
         &ctx,
