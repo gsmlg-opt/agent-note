@@ -174,10 +174,16 @@ behind an authenticating reverse proxy.
 ### Bulk note label updates
 
 The MCP tool `bulk_update_note_labels` and REST endpoint `POST /api/notes/bulk-labels` call the
-same pipeline and accept the same request:
+same pipeline. A set-only request adds or replaces a label:
 
 ```json
-{"selector":"type=ietf-rfc","set":[["project","IETF-RFC"]]}
+{"selector":"type=ietf-rfc","set":[["project","ietf-rfc"]]}
+```
+
+A remove-only request removes a label:
+
+```json
+{"selector":"type=bear_note","remove":["type"]}
 ```
 
 They return only bounded aggregate counts, never a per-note result list:
@@ -187,18 +193,24 @@ They return only bounded aggregate counts, never a per-note result list:
 ```
 
 `matched` is the number of matching active notes. `updated` counts matched notes where at least one
-requested assignment changed, and `unchanged` is `matched - updated`. A note with one no-op
-assignment and one changed assignment counts once as updated.
+requested mutation changed, and `unchanged` is `matched - updated`. A note with one no-op mutation
+and one changed mutation counts once as updated.
 
 The operation fixes the unpaginated set of matching active note IDs before any label changes, then
-applies the entire update atomically; a blank selector is rejected. Each assignment expresses
-desired state: a missing label is added, a different value is replaced, and an exact existing value
-is a no-op. Unrelated labels are preserved. Missing target catalog keys are created as text only
-when at least one note matches, while values for existing typed catalog keys are validated. A
-zero-match request returns zero counts and creates nothing.
+applies the entire set/replace/remove update atomically (all-or-nothing). `set` and `remove` are
+individually optional, but at least one mutation is required. A blank selector, invalid or duplicate
+keys, duplicate `remove` entries, and a key present in both `set` and `remove` are rejected. Each
+assignment expresses desired state: a missing label is added, a different value is replaced, an
+exact existing value is a no-op, and removing an absent label is a no-op. Missing `set` target
+catalog keys are created as text only when at least one note matches, while values for existing typed
+catalog keys are validated. `remove` never creates or deletes catalog keys.
 
-Only changed notes advance `updated_at`. Their content, note revision, attachments, and derived
-embedding state remain unchanged; exact no-ops do not advance the timestamp.
+Absent intervening changes to the matching set or its requested label state, exact replays are
+no-ops. Matched notes for which no requested mutation changes state contribute to `unchanged`. If a
+request removes the selector label, replay returns zero only absent intervening changes that make
+notes match the selector again. Unrelated labels, content, attachments, revision, chunks, and
+embeddings are preserved. Only changed notes advance `updated_at`; no-op and zero-match requests do
+not change timestamps or create catalog keys.
 
 ### Org Web operations console and workspace management
 

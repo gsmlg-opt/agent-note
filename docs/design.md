@@ -363,13 +363,21 @@ them unambiguously.
 **list_label_keys**: read-only → return the full label-key catalog (`key` + `description`), used by
 clients and the UI to populate suggestions and explain known keys.
 
-**bulk_update_note_labels**: validate a non-blank label `selector` and a non-empty set of
-desired-state `[key, value]` assignments with unique target keys → fix all matching active note IDs
-before writes →
-atomically add or replace the requested labels while preserving unrelated labels → return
-note-level `matched`, `updated`, and `unchanged` counts. `matched` is the number of matching active
-notes; `updated` counts a matched note once when at least one assignment changes; `unchanged` is
-`matched - updated`, so a note with both a no-op and a change is updated.
+**bulk_update_note_labels** (`POST /api/notes/bulk-labels`): validate a non-blank label `selector`
+and optional `set` desired-state `[key, value]` assignments plus optional `remove` keys, requiring at
+least one mutation and valid unique keys; reject duplicate removals and any key shared by `set` and
+`remove` → fix all matching active note IDs before writes → atomically add, replace, or remove
+the requested labels while preserving unrelated labels, content, attachments, revision, chunks, and
+embeddings → advance `updated_at` only for changed notes → return note-level `matched`,
+`updated`, and `unchanged` counts. `matched` is the number of matching active notes; `updated` counts
+a matched note once when at least one mutation changes it; `unchanged` is `matched - updated`, so a
+note with both a no-op and a change is updated. Absent intervening changes to the matching set or its
+requested label state, exact replays are no-ops. If `remove` deletes the selector label, replay
+returns zero only absent intervening changes that make notes match the selector again. The MCP tool
+name and REST operation path are unchanged, and the complete transaction remains all-or-nothing.
+Set-only
+`{"selector":"type=ietf-rfc","set":[["project","ietf-rfc"]]}` and remove-only
+`{"selector":"type=bear_note","remove":["type"]}` requests use this same contract.
 
 **save_note**: validate non-empty title/content and typed label values → create opaque immutable
 attachment generations → publish and verify every generated object → atomically persist the note,
