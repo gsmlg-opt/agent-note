@@ -30,6 +30,14 @@ pub(crate) fn canonical_relative_path(value: &str) -> anyhow::Result<String> {
     Ok(parts.join("/"))
 }
 
+pub(crate) fn canonical_object_key(value: &str) -> anyhow::Result<String> {
+    let canonical = canonical_relative_path(value)?;
+    if canonical != value {
+        anyhow::bail!("object key must be a canonical relative path");
+    }
+    Ok(canonical)
+}
+
 pub(crate) fn note_directory(root: &Path, note_id: &str) -> anyhow::Result<PathBuf> {
     let mut components = Path::new(note_id).components();
     let Some(Component::Normal(note_id)) = components.next() else {

@@ -1,11 +1,13 @@
 use crate::{
-    path::{canonical_relative_path, note_directory},
-    AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
+    path::{canonical_object_key, canonical_relative_path, note_directory},
+    AttachmentStore, AttachmentStoreInfo, DeleteObjectOutcome, ObjectMetadata,
+    PreparedAttachmentMutation, PreparedAttachmentSet, PutObjectRequest, StoredObject,
 };
 use note_core::NoteAttachment;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    io::ErrorKind,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex, Weak},
 };
@@ -125,6 +127,47 @@ impl FilesystemAttachmentStore {
 
 #[async_trait::async_trait]
 impl AttachmentStore for FilesystemAttachmentStore {
+    async fn put_immutable(&self, request: PutObjectRequest) -> anyhow::Result<StoredObject> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || put_immutable_blocking(&root, request))
+            .await
+            .map_err(|_| anyhow::anyhow!("attachment object put task failed"))?
+    }
+
+    async fn read_object(&self, object_key: &str) -> anyhow::Result<Vec<u8>> {
+        let object_key = canonical_object_key(object_key)?;
+        if !existing_safe_directory(&self.root).await? {
+            anyhow::bail!("attachment object root does not exist");
+        }
+        reject_symlink_components(&self.root, &object_key).await?;
+        Ok(fs::read(attachment_path_on_disk(&self.root, &object_key)).await?)
+    }
+
+    async fn head_object(&self, object_key: &str) -> anyhow::Result<ObjectMetadata> {
+        let object_key = canonical_object_key(object_key)?;
+        if !existing_safe_directory(&self.root).await? {
+            anyhow::bail!("attachment object root does not exist");
+        }
+        reject_symlink_components(&self.root, &object_key).await?;
+        let bytes = fs::read(attachment_path_on_disk(&self.root, &object_key)).await?;
+        Ok(object_metadata(&bytes))
+    }
+
+    async fn delete_object(&self, object_key: &str) -> anyhow::Result<DeleteObjectOutcome> {
+        let object_key = canonical_object_key(object_key)?;
+        if !existing_safe_directory(&self.root).await? {
+            return Ok(DeleteObjectOutcome::AlreadyAbsent);
+        }
+        reject_symlink_components(&self.root, &object_key).await?;
+        match fs::remove_file(attachment_path_on_disk(&self.root, &object_key)).await {
+            Ok(()) => Ok(DeleteObjectOutcome::Deleted),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Ok(DeleteObjectOutcome::AlreadyAbsent)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn prepare(
         &self,
         note_id: &str,
@@ -284,6 +327,101 @@ impl AttachmentStore for FilesystemAttachmentStore {
             location: Some(self.root.to_string_lossy().into_owned()),
         }
     }
+}
+
+fn put_immutable_blocking(root: &Path, request: PutObjectRequest) -> anyhow::Result<StoredObject> {
+    let object_key = canonical_object_key(&request.object_key)?;
+    let expected_checksum = validate_sha256(&request.checksum_sha256)?;
+    let actual = object_metadata(&request.bytes);
+    if actual.checksum_sha256 != expected_checksum {
+        anyhow::bail!("attachment object checksum does not match expected SHA-256");
+    }
+
+    let mut created = ensure_safe_parent_directories_blocking(root, &object_key)?;
+    let final_path = attachment_path_on_disk(root, &object_key);
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid attachment object key"))?;
+    let temp_path = final_path.with_file_name(format!(".{file_name}-{}.tmp", uuid::Uuid::new_v4()));
+    let mut temp = FileCleanupGuard::new(temp_path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp.path())?;
+    file.write_all(&request.bytes)?;
+    file.flush()?;
+    drop(file);
+
+    if let Err(error) = rename_noreplace(temp.path(), &final_path) {
+        return if error.kind() == ErrorKind::AlreadyExists {
+            Err(anyhow::anyhow!("attachment object already exists"))
+        } else {
+            Err(error.into())
+        };
+    }
+    temp.disarm();
+    created.disarm();
+
+    let verified = object_metadata(&std::fs::read(&final_path)?);
+    if verified != actual {
+        let _ = std::fs::remove_file(&final_path);
+        anyhow::bail!("attachment object verification failed");
+    }
+    Ok(StoredObject {
+        object_key,
+        size_bytes: verified.size_bytes,
+        checksum_sha256: verified.checksum_sha256,
+    })
+}
+
+fn validate_sha256(value: &str) -> anyhow::Result<String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("invalid expected SHA-256 checksum");
+    }
+    Ok(value.to_string())
+}
+
+fn object_metadata(bytes: &[u8]) -> ObjectMetadata {
+    ObjectMetadata {
+        size_bytes: bytes.len() as u64,
+        checksum_sha256: format!("{:x}", Sha256::digest(bytes)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid source path"))?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "invalid destination path"))?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(source, destination)?;
+    std::fs::remove_file(source)
 }
 
 #[async_trait::async_trait]

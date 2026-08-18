@@ -8,7 +8,9 @@ anyhow = "1.0.103"
 async-trait = "0.1.89"
 aws-config = "=1.9.0"
 aws-sdk-s3 = "=1.138.1"
+libc = "0.2"
 note-core = { version = "0.1.0", path = "../note-core" }
+sha2 = "0.10"
 tokio = { version = "1.52.3", features = ["fs", "rt", "sync"] }
 url = "2"
 urlencoding = "2.1.3"

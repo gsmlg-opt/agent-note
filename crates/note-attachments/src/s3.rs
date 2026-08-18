@@ -6,6 +6,7 @@ use aws_sdk_s3::{
     Client,
 };
 use note_core::NoteAttachment;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -329,6 +330,54 @@ impl S3AttachmentStore {
             .await
             .map_err(|_| anyhow::anyhow!("S3 get object body failed (stream)"))?;
         Ok(bytes.into_bytes().to_vec())
+    }
+
+    async fn head_key(&self, key: &str) -> anyhow::Result<Option<crate::ObjectMetadata>> {
+        let output = match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound" | "404")) => {
+                return Ok(None)
+            }
+            Err(error) => return Err(safe_sdk_error("head object", &error)),
+        };
+        let size_bytes = output
+            .content_length()
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(|| anyhow::anyhow!("S3 head object failed (invalid content length)"))?;
+        let checksum_sha256 = output
+            .metadata()
+            .and_then(|metadata| metadata.get("checksum-sha256"))
+            .filter(|checksum| valid_sha256(checksum))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("S3 head object failed (missing checksum metadata)"))?;
+        Ok(Some(crate::ObjectMetadata {
+            size_bytes,
+            checksum_sha256,
+        }))
+    }
+
+    async fn key_exists(&self, key: &str) -> anyhow::Result<bool> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if matches!(error.code(), Some("NoSuchKey" | "NotFound" | "404")) => {
+                Ok(false)
+            }
+            Err(error) => Err(safe_sdk_error("head object", &error)),
+        }
     }
 
     async fn delete_keys(&self, keys: &[String]) -> anyhow::Result<()> {
@@ -759,6 +808,69 @@ impl crate::PreparedAttachmentMutation for PreparedS3Mutation {
 
 #[async_trait::async_trait]
 impl crate::AttachmentStore for S3AttachmentStore {
+    async fn put_immutable(
+        &self,
+        request: crate::PutObjectRequest,
+    ) -> anyhow::Result<crate::StoredObject> {
+        let object_key = crate::path::canonical_object_key(&request.object_key)?;
+        if !valid_sha256(&request.checksum_sha256) {
+            anyhow::bail!("invalid expected SHA-256 checksum");
+        }
+        let actual_checksum = format!("{:x}", Sha256::digest(&request.bytes));
+        if actual_checksum != request.checksum_sha256 {
+            anyhow::bail!("attachment object checksum does not match expected SHA-256");
+        }
+        let key = object_key_with_prefix(&self.prefix, &object_key)?;
+        if self.key_exists(&key).await? {
+            anyhow::bail!("attachment object already exists");
+        }
+        let expected = crate::ObjectMetadata {
+            size_bytes: request.bytes.len() as u64,
+            checksum_sha256: request.checksum_sha256,
+        };
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .metadata("checksum-sha256", &expected.checksum_sha256)
+            .body(ByteStream::from(request.bytes))
+            .send()
+            .await
+            .map_err(|error| safe_sdk_error("put object", &error))?;
+        let verified = self
+            .head_key(&key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("S3 put object verification failed (missing object)"))?;
+        if verified != expected {
+            anyhow::bail!("S3 put object verification failed (metadata mismatch)");
+        }
+        Ok(crate::StoredObject {
+            object_key,
+            size_bytes: verified.size_bytes,
+            checksum_sha256: verified.checksum_sha256,
+        })
+    }
+
+    async fn read_object(&self, object_key: &str) -> anyhow::Result<Vec<u8>> {
+        self.read_key(&object_key_with_prefix(&self.prefix, object_key)?)
+            .await
+    }
+
+    async fn head_object(&self, object_key: &str) -> anyhow::Result<crate::ObjectMetadata> {
+        self.head_key(&object_key_with_prefix(&self.prefix, object_key)?)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("attachment object does not exist"))
+    }
+
+    async fn delete_object(&self, object_key: &str) -> anyhow::Result<crate::DeleteObjectOutcome> {
+        let key = object_key_with_prefix(&self.prefix, object_key)?;
+        if !self.key_exists(&key).await? {
+            return Ok(crate::DeleteObjectOutcome::AlreadyAbsent);
+        }
+        self.delete_key(&key).await?;
+        Ok(crate::DeleteObjectOutcome::Deleted)
+    }
+
     async fn prepare(
         &self,
         note_id: &str,
@@ -937,6 +1049,19 @@ fn join_key(prefix: &str, suffix: &str) -> String {
     }
 }
 
+fn object_key_with_prefix(prefix: &str, object_key: &str) -> anyhow::Result<String> {
+    let prefix = normalize_prefix(prefix)?;
+    let object_key = crate::path::canonical_object_key(object_key)?;
+    Ok(join_key(&prefix, &object_key))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn final_prefix(prefix: &str, note_id: &str) -> anyhow::Result<String> {
     validate_note_id(note_id)?;
     let prefix = normalize_prefix(prefix)?;
@@ -1106,6 +1231,25 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct MissingThenObjectMetadata {
+        calls: Arc<AtomicUsize>,
+        checksum: String,
+        size_bytes: u64,
+    }
+
+    impl Respond for MissingThenObjectMetadata {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(404)
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", self.size_bytes.to_string())
+                    .insert_header("x-amz-meta-checksum-sha256", self.checksum.as_str())
+            }
+        }
+    }
+
+    #[derive(Clone)]
     struct BlockFirstResponse {
         calls: Arc<AtomicUsize>,
         reached: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
@@ -1244,6 +1388,184 @@ mod tests {
         assert_eq!(
             copy_source("agent note", "attachments/note+1/100%.txt"),
             "agent%20note/attachments/note%2B1/100%25.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn immutable_put_uses_prefixed_object_key_metadata_and_head_verification() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("object-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("object-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        let head_calls = Arc::new(AtomicUsize::new(0));
+
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/configured/generations/key.bin"))
+            .respond_with(MissingThenObjectMetadata {
+                calls: head_calls.clone(),
+                checksum: checksum.to_string(),
+                size_bytes: 7,
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/configured/generations/key.bin"))
+            .and(header_regex("x-amz-meta-checksum-sha256", checksum))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = S3AttachmentStore::new(S3AttachmentConfig {
+            bucket: "agent-note".into(),
+            prefix: "configured".into(),
+            region: Some("us-east-1".into()),
+            endpoint: Some(server.uri()),
+            force_path_style: true,
+        })
+        .await
+        .unwrap();
+        let stored = store
+            .put_immutable(crate::PutObjectRequest {
+                object_key: "generations/key.bin".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: checksum.into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stored.object_key, "generations/key.bin");
+        assert_eq!(stored.size_bytes, 7);
+        assert_eq!(stored.checksum_sha256, checksum);
+        assert_eq!(head_calls.load(Ordering::SeqCst), 2);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "PUT")
+                .count(),
+            1
+        );
+        assert!(requests.iter().all(|request| {
+            !request.url.path().contains("note-1") && !request.url.path().contains(".staging")
+        }));
+    }
+
+    #[tokio::test]
+    async fn immutable_collision_is_rejected_before_put() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("collision-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("collision-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/collision"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "7")
+                    .insert_header("x-amz-meta-checksum-sha256", checksum),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = test_store(server.uri())
+            .await
+            .put_immutable(crate::PutObjectRequest {
+                object_key: "generations/collision".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: checksum.into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"));
+        assert!(server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method.as_str() != "PUT"));
+    }
+
+    #[tokio::test]
+    async fn immutable_read_head_and_delete_target_one_exact_key_and_report_missing_delete() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("lifecycle-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("lifecycle-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/key"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "7")
+                    .insert_header("x-amz-meta-checksum-sha256", checksum),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/agent-note/generations/key"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let store = test_store(server.uri()).await;
+        assert_eq!(
+            store.read_object("generations/key").await.unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            store.head_object("generations/key").await.unwrap(),
+            crate::ObjectMetadata {
+                size_bytes: 7,
+                checksum_sha256: checksum.into(),
+            }
+        );
+        assert_eq!(
+            store.delete_object("generations/key").await.unwrap(),
+            crate::DeleteObjectOutcome::Deleted
+        );
+        assert_eq!(
+            store.delete_object("generations/missing").await.unwrap(),
+            crate::DeleteObjectOutcome::AlreadyAbsent
         );
     }
 
