@@ -107,24 +107,23 @@ pub fn parse_label_selectors(input: &str) -> Vec<LabelSelector> {
     input
         .split('&')
         .filter_map(|term| {
-            if let Some((key, value)) = term.split_once("==") {
-                let key = decode_exact_selector_component(key);
-                if key.is_empty() {
-                    return None;
-                }
-                return Some(LabelSelector {
-                    key,
-                    value: Some(decode_exact_selector_component(value)),
-                    operator: LabelOperator::ExactEq,
-                });
-            }
-
             let term = term.trim();
             if term.is_empty() {
                 return None;
             }
 
             match split_selector_term(term) {
+                Some((key, LabelOperator::ExactEq, value)) => {
+                    let key = decode_exact_selector_component(key);
+                    if key.is_empty() {
+                        return None;
+                    }
+                    Some(LabelSelector {
+                        key,
+                        value: Some(decode_exact_selector_component(value)),
+                        operator: LabelOperator::ExactEq,
+                    })
+                }
                 Some((key, operator, value)) => Some(LabelSelector {
                     key: key.trim().to_string(),
                     value: Some(value.trim().to_string()),
@@ -196,6 +195,7 @@ pub fn compare_label_values(
 
 fn split_selector_term(term: &str) -> Option<(&str, LabelOperator, &str)> {
     let (idx, token, operator) = [
+        ("==", LabelOperator::ExactEq),
         (">=", LabelOperator::Gte),
         ("<=", LabelOperator::Lte),
         ("!=", LabelOperator::NotEq),
@@ -577,16 +577,19 @@ mod tests {
 
     #[test]
     fn parses_first_operator_when_values_contain_operator_tokens() {
-        for (input, operator, value) in [
-            ("name~=^a!=b$", LabelOperator::Regex, "^a!=b$"),
-            ("name^=a>=b", LabelOperator::StartsWith, "a>=b"),
-            ("name$=a<=b", LabelOperator::EndsWith, "a<=b"),
-            ("name~=a^=b$=c", LabelOperator::Regex, "a^=b$=c"),
+        for (input, key, operator, value) in [
+            ("name~=^a!=b$", "name", LabelOperator::Regex, "^a!=b$"),
+            ("name^=a>=b", "name", LabelOperator::StartsWith, "a>=b"),
+            ("name$=a<=b", "name", LabelOperator::EndsWith, "a<=b"),
+            ("name~=a^=b$=c", "name", LabelOperator::Regex, "a^=b$=c"),
+            ("name~=a==b", "name", LabelOperator::Regex, "a==b"),
+            ("env=foo==bar", "env", LabelOperator::Eq, "foo==bar"),
+            ("env==foo%3Dbar", "env", LabelOperator::ExactEq, "foo=bar"),
         ] {
             assert_eq!(
                 parse_label_selectors(input),
                 vec![LabelSelector {
-                    key: "name".to_string(),
+                    key: key.to_string(),
                     value: Some(value.to_string()),
                     operator,
                 }]

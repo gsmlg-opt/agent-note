@@ -105,18 +105,6 @@ fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
     selector
         .split('&')
         .filter_map(|term| {
-            if let Some((key, value)) = term.split_once("==") {
-                let key = decode_exact_selector_component(key);
-                if key.is_empty() {
-                    return None;
-                }
-                return Some(LabelFilter {
-                    key,
-                    operator: "==".to_string(),
-                    value: decode_exact_selector_component(value),
-                });
-            }
-
             let term = term.trim();
             if term.is_empty() {
                 return None;
@@ -130,6 +118,18 @@ fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
                         .then_with(|| right_operator.len().cmp(&left_operator.len()))
                 });
             if let Some((idx, operator)) = operator {
+                if operator == "==" {
+                    let key = decode_exact_selector_component(&term[..idx]);
+                    if key.is_empty() {
+                        return None;
+                    }
+                    return Some(LabelFilter {
+                        key,
+                        operator: operator.to_string(),
+                        value: decode_exact_selector_component(&term[idx + operator.len()..]),
+                    });
+                }
+
                 let key = term[..idx].trim();
                 let value = term[idx + operator.len()..].trim();
                 if key.is_empty() {
@@ -1209,7 +1209,9 @@ mod tests {
 
     #[test]
     fn parses_string_match_filters_with_operator_text_in_values() {
-        let filters = parse_label_filters("topic~=^ru!=st$&prefix^=a>=b&suffix$=a<=b");
+        let filters = parse_label_filters(
+            "topic~=^ru!=st$&prefix^=a>=b&suffix$=a<=b&name~=a==b&env=foo==bar&env==foo%3Dbar",
+        );
 
         assert_eq!(
             filters,
@@ -1228,6 +1230,21 @@ mod tests {
                     key: "suffix".to_string(),
                     operator: "$=".to_string(),
                     value: "a<=b".to_string(),
+                },
+                LabelFilter {
+                    key: "name".to_string(),
+                    operator: "~=".to_string(),
+                    value: "a==b".to_string(),
+                },
+                LabelFilter {
+                    key: "env".to_string(),
+                    operator: "=".to_string(),
+                    value: "foo==bar".to_string(),
+                },
+                LabelFilter {
+                    key: "env".to_string(),
+                    operator: "==".to_string(),
+                    value: "foo=bar".to_string(),
                 },
             ]
         );
