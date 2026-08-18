@@ -907,6 +907,9 @@ fn to_error_data(error: anyhow::Error) -> ErrorData {
         || error
             .downcast_ref::<note_core::LabelKeyValidationError>()
             .is_some()
+        || error
+            .downcast_ref::<note_core::LabelSelectorParseError>()
+            .is_some()
     {
         return ErrorData::invalid_params(error.to_string(), None);
     }
@@ -2087,6 +2090,38 @@ mod tests {
     fn label_key_validation_faults_are_invalid_params() {
         let error = anyhow::Error::new(note_core::LabelKeyValidationError::ReservedCharacter('$'));
         assert_eq!(to_error_data(error).code, ErrorCode::INVALID_PARAMS);
+        let error = anyhow::Error::new(note_core::LabelSelectorParseError::MalformedExactSelector);
+        assert_eq!(to_error_data(error).code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn malformed_exact_selectors_are_invalid_params_for_read_tools() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
+
+        let list_error = expect_error(
+            server
+                .list_notes(Parameters(ListNotesRequest {
+                    limit: None,
+                    offset: None,
+                    label: Some("status=ready&~==secret".into()),
+                }))
+                .await,
+        );
+        assert_eq!(list_error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(list_error.message, "malformed exact label selector");
+
+        let search_error = expect_error(
+            server
+                .semantic_search(Parameters(SemanticSearchRequest {
+                    query: "anything".into(),
+                    limit: 10,
+                    label: Some("~project==%ZZ".into()),
+                }))
+                .await,
+        );
+        assert_eq!(search_error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(search_error.message, "malformed exact label selector");
     }
 
     #[test]

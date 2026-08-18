@@ -865,6 +865,7 @@ struct CountNotesQuery {
     params(ListNotesQuery),
     responses(
         (status = 200, description = "Notes", body = Vec<NoteListDto>),
+        (status = 400, description = "Invalid label selector", body = String, content_type = "text/plain"),
         (status = 500, description = "Server error", body = String, content_type = "text/plain")
     )
 )]
@@ -881,7 +882,7 @@ async fn list_notes_handler(
         },
     )
     .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(map_note_read_error)?;
     Ok(Json(notes.into_iter().map(Into::into).collect()))
 }
 
@@ -907,7 +908,7 @@ async fn count_notes_handler(
 ) -> Result<Json<CountNotesResponse>, (axum::http::StatusCode, String)> {
     let total = count_notes(&ctx, req.label)
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(map_note_read_error)?;
     Ok(Json(CountNotesResponse { total }))
 }
 
@@ -1287,6 +1288,7 @@ pub struct SearchResultDto {
     request_body = SearchQuery,
     responses(
         (status = 200, description = "Search results", body = Vec<SearchResultDto>),
+        (status = 400, description = "Invalid label selector", body = String, content_type = "text/plain"),
         (status = 500, description = "Server error", body = String, content_type = "text/plain")
     )
 )]
@@ -1296,7 +1298,7 @@ async fn search_handler(
 ) -> Result<Json<Vec<SearchResultDto>>, (axum::http::StatusCode, String)> {
     let results = search_notes_filtered(&ctx, &req.query, req.limit, req.label)
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(map_note_read_error)?;
     Ok(Json(
         results
             .into_iter()
@@ -1308,6 +1310,18 @@ async fn search_handler(
             })
             .collect(),
     ))
+}
+
+fn map_note_read_error(error: anyhow::Error) -> (axum::http::StatusCode, String) {
+    let status = if error
+        .downcast_ref::<note_core::LabelSelectorParseError>()
+        .is_some()
+    {
+        axum::http::StatusCode::BAD_REQUEST
+    } else {
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, error.to_string())
 }
 
 #[utoipa::path(
@@ -2543,6 +2557,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn malformed_exact_label_selectors_return_400_without_broadening_reads() {
+        let (app, _ctx, _dir) = test_app().await;
+        for uri in [
+            "/api/notes?label=~%3D%3Dsecret",
+            "/api/notes/count?label=status%3Dready%26~project%3D%3D%25ZZ",
+        ] {
+            let response = app.clone().oneshot(get(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"malformed exact label selector");
+        }
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/search",
+                r#"{"query":"anything","limit":10,"label":"status=ready&~==secret"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"malformed exact label selector");
     }
 
     #[tokio::test]

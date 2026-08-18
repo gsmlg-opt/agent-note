@@ -27,6 +27,7 @@ pub(crate) struct NotesUrlState {
     page_size: usize,
     search: String,
     pub(crate) labels: Vec<LabelFilter>,
+    pub(crate) invalid_labels: bool,
 }
 
 fn default_notes_url_state() -> NotesUrlState {
@@ -35,6 +36,7 @@ fn default_notes_url_state() -> NotesUrlState {
         page_size: DEFAULT_NOTES_PAGE_SIZE,
         search: String::new(),
         labels: Vec::new(),
+        invalid_labels: false,
     }
 }
 
@@ -59,7 +61,13 @@ pub(crate) fn parse_notes_query(query: &str) -> NotesUrlState {
                 }
             }
             "search" => state.search = value,
-            "labels" => state.labels.extend(parse_label_filters(&value)),
+            "labels" => match parse_label_filters(&value) {
+                Ok(filters) => state.labels.extend(filters),
+                Err(()) => {
+                    state.labels.clear();
+                    state.invalid_labels = true;
+                }
+            },
             _ => {}
         }
     }
@@ -101,61 +109,75 @@ fn decode_query_component(value: &str) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
-fn parse_label_filters(selector: &str) -> Vec<LabelFilter> {
-    selector
-        .split('&')
-        .filter_map(|term| {
-            let term = term.trim();
-            if let Some((key, value)) = term
-                .strip_prefix('~')
-                .and_then(|term| term.split_once("=="))
-            {
-                let key = decode_exact_selector_component(key);
-                if key.is_empty() {
-                    return None;
-                }
-                return Some(LabelFilter {
-                    key,
-                    operator: "==".to_string(),
-                    value: decode_exact_selector_component(value),
-                });
+fn parse_label_filters(selector: &str) -> Result<Vec<LabelFilter>, ()> {
+    let mut filters = Vec::new();
+    for term in selector.split('&') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        if let Some(encoded) = term.strip_prefix('~') {
+            let (key, value) = encoded.split_once("==").ok_or(())?;
+            let key = decode_exact_selector_component(key)?;
+            if key.is_empty() {
+                return Err(());
             }
-            if term.is_empty() {
-                return None;
+            filters.push(LabelFilter {
+                key,
+                operator: "==".to_string(),
+                value: decode_exact_selector_component(value)?,
+            });
+            continue;
+        }
+        let operator = LABEL_FILTER_PARSER_OPERATORS
+            .iter()
+            .filter_map(|operator| term.find(operator).map(|idx| (idx, *operator)))
+            .min_by(|(left_idx, left_operator), (right_idx, right_operator)| {
+                left_idx
+                    .cmp(right_idx)
+                    .then_with(|| right_operator.len().cmp(&left_operator.len()))
+            });
+        if let Some((idx, operator)) = operator {
+            let key = term[..idx].trim();
+            let value = term[idx + operator.len()..].trim();
+            if key.is_empty() {
+                continue;
             }
-            let operator = LABEL_FILTER_PARSER_OPERATORS
-                .iter()
-                .filter_map(|operator| term.find(operator).map(|idx| (idx, *operator)))
-                .min_by(|(left_idx, left_operator), (right_idx, right_operator)| {
-                    left_idx
-                        .cmp(right_idx)
-                        .then_with(|| right_operator.len().cmp(&left_operator.len()))
-                });
-            if let Some((idx, operator)) = operator {
-                let key = term[..idx].trim();
-                let value = term[idx + operator.len()..].trim();
-                if key.is_empty() {
-                    return None;
-                }
-                return Some(LabelFilter {
-                    key: key.to_string(),
-                    operator: operator.to_string(),
-                    value: value.to_string(),
-                });
-            }
-            Some(LabelFilter {
-                key: term.to_string(),
-                operator: "=".to_string(),
-                value: String::new(),
-            })
-        })
-        .collect()
+            filters.push(LabelFilter {
+                key: key.to_string(),
+                operator: operator.to_string(),
+                value: value.to_string(),
+            });
+            continue;
+        }
+        filters.push(LabelFilter {
+            key: term.to_string(),
+            operator: "=".to_string(),
+            value: String::new(),
+        });
+    }
+    Ok(filters)
 }
 
-fn decode_exact_selector_component(value: &str) -> String {
+fn decode_exact_selector_component(value: &str) -> Result<String, ()> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(());
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
     urlencoding::decode(value)
         .map(|value| value.into_owned())
-        .unwrap_or_else(|_| value.to_string())
+        .map_err(|_| ())
 }
 
 fn quick_label_filters(filters: &[LabelFilter], key: &str, value: &str) -> Vec<LabelFilter> {
@@ -184,6 +206,22 @@ fn quick_label_filters(filters: &[LabelFilter], key: &str, value: &str) -> Vec<L
         next.push(clicked);
     }
     next
+}
+
+fn build_label_filter(key: &str, operator: &str, value: &str) -> Option<LabelFilter> {
+    let (key, value) = if operator == "==" {
+        (key.to_string(), value.to_string())
+    } else {
+        (key.trim().to_string(), value.trim().to_string())
+    };
+    if key.is_empty() {
+        return None;
+    }
+    Some(LabelFilter {
+        key,
+        operator: operator.to_string(),
+        value,
+    })
 }
 
 /// Default page: a table of all notes (title, labels, per-row view/edit/remove actions), with a
@@ -250,63 +288,72 @@ pub fn notes_page() -> Html {
             label_filters.set(state.labels.clone());
             loading.set(true);
             error.set(None);
-            wasm_bindgen_futures::spawn_local(async move {
-                let search = state.search.trim().to_string();
-                if search.is_empty() {
-                    let offset = state
-                        .current
-                        .saturating_sub(1)
-                        .saturating_mul(state.page_size);
-                    match api::list_notes_page(&state.labels, state.page_size, offset).await {
-                        Ok(page) => {
-                            notes.set(page.notes);
-                            total_notes.set(page.total);
-                            stale_revision_gate.dispatch(
-                                StaleRevisionGateAction::RefreshFinished {
-                                    started_epoch: refresh_epoch,
-                                    succeeded: true,
-                                },
-                            );
-                        }
-                        Err(e) => {
-                            stale_revision_gate.dispatch(
-                                StaleRevisionGateAction::RefreshFinished {
-                                    started_epoch: refresh_epoch,
-                                    succeeded: false,
-                                },
-                            );
-                            error.set(Some(e));
-                        }
-                    }
-                } else {
-                    let limit = state
-                        .current
-                        .saturating_add(1)
-                        .saturating_mul(state.page_size)
-                        .max(state.page_size);
-                    match api::search_filtered(&search, limit, &state.labels).await {
-                        Ok(r) => {
-                            results.set(Some(r));
-                            stale_revision_gate.dispatch(
-                                StaleRevisionGateAction::RefreshFinished {
-                                    started_epoch: refresh_epoch,
-                                    succeeded: true,
-                                },
-                            );
-                        }
-                        Err(e) => {
-                            stale_revision_gate.dispatch(
-                                StaleRevisionGateAction::RefreshFinished {
-                                    started_epoch: refresh_epoch,
-                                    succeeded: false,
-                                },
-                            );
-                            error.set(Some(e));
-                        }
-                    }
-                }
+            if state.invalid_labels {
                 loading.set(false);
-            });
+                error.set(Some("Invalid label filter in URL.".to_string()));
+                stale_revision_gate.dispatch(StaleRevisionGateAction::RefreshFinished {
+                    started_epoch: refresh_epoch,
+                    succeeded: false,
+                });
+            } else {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let search = state.search.trim().to_string();
+                    if search.is_empty() {
+                        let offset = state
+                            .current
+                            .saturating_sub(1)
+                            .saturating_mul(state.page_size);
+                        match api::list_notes_page(&state.labels, state.page_size, offset).await {
+                            Ok(page) => {
+                                notes.set(page.notes);
+                                total_notes.set(page.total);
+                                stale_revision_gate.dispatch(
+                                    StaleRevisionGateAction::RefreshFinished {
+                                        started_epoch: refresh_epoch,
+                                        succeeded: true,
+                                    },
+                                );
+                            }
+                            Err(e) => {
+                                stale_revision_gate.dispatch(
+                                    StaleRevisionGateAction::RefreshFinished {
+                                        started_epoch: refresh_epoch,
+                                        succeeded: false,
+                                    },
+                                );
+                                error.set(Some(e));
+                            }
+                        }
+                    } else {
+                        let limit = state
+                            .current
+                            .saturating_add(1)
+                            .saturating_mul(state.page_size)
+                            .max(state.page_size);
+                        match api::search_filtered(&search, limit, &state.labels).await {
+                            Ok(r) => {
+                                results.set(Some(r));
+                                stale_revision_gate.dispatch(
+                                    StaleRevisionGateAction::RefreshFinished {
+                                        started_epoch: refresh_epoch,
+                                        succeeded: true,
+                                    },
+                                );
+                            }
+                            Err(e) => {
+                                stale_revision_gate.dispatch(
+                                    StaleRevisionGateAction::RefreshFinished {
+                                        started_epoch: refresh_epoch,
+                                        succeeded: false,
+                                    },
+                                );
+                                error.set(Some(e));
+                            }
+                        }
+                    }
+                    loading.set(false);
+                });
+            }
             || ()
         });
     }
@@ -369,6 +416,7 @@ pub fn notes_page() -> Html {
                 page_size: *page_size,
                 search: (*query).trim().to_string(),
                 labels: (*label_filters).clone(),
+                invalid_labels: false,
             });
         })
     };
@@ -392,6 +440,7 @@ pub fn notes_page() -> Html {
                 page_size: *page_size,
                 search: String::new(),
                 labels: Vec::new(),
+                invalid_labels: false,
             });
         })
     };
@@ -490,15 +539,9 @@ pub fn notes_page() -> Html {
         let page_size = page_size.clone();
         let replace_notes_url = replace_notes_url.clone();
         Callback::from(move |_: MouseEvent| {
-            let key = (*filter_key).trim().to_string();
-            let value = (*filter_value).trim().to_string();
-            if key.is_empty() {
+            let Some(filter) = build_label_filter(&filter_key, &filter_operator, &filter_value)
+            else {
                 return;
-            }
-            let filter = LabelFilter {
-                key,
-                operator: (*filter_operator).clone(),
-                value,
             };
             let mut filters = (*label_filters).clone();
             if !filters.iter().any(|item| item == &filter) {
@@ -511,6 +554,7 @@ pub fn notes_page() -> Html {
                 page_size: *page_size,
                 search: (*query).trim().to_string(),
                 labels: filters,
+                invalid_labels: false,
             });
         })
     };
@@ -531,6 +575,7 @@ pub fn notes_page() -> Html {
                 page_size: *page_size,
                 search: (*query).trim().to_string(),
                 labels: filters,
+                invalid_labels: false,
             });
         })
     };
@@ -550,6 +595,7 @@ pub fn notes_page() -> Html {
                     page_size: *page_size,
                     search: (*query).trim().to_string(),
                     labels: filters,
+                    invalid_labels: false,
                 });
             }
         })
@@ -681,11 +727,13 @@ fn label_filter_bar(
                     { for filters.iter().enumerate().map(|(idx, filter)| {
                         let on_remove = on_remove.clone();
                         let label = label_filter_label(filter);
+                        let aria_label = remove_filter_aria_label(filter);
                         html! {
                             <button
                                 type="button"
                                 class="chip chip-primary active-label-filter"
                                 title="Remove filter"
+                                aria-label={aria_label}
                                 onclick={Callback::from(move |_: MouseEvent| on_remove.emit(idx))}
                             >
                                 <span>{ label }</span>
@@ -700,11 +748,25 @@ fn label_filter_bar(
 }
 
 fn label_filter_label(filter: &LabelFilter) -> String {
+    if filter.operator == "==" {
+        let value = if filter.value.is_empty() {
+            "(empty)".to_string()
+        } else if filter.value.trim() != filter.value {
+            format!("\"{}\"", filter.value)
+        } else {
+            filter.value.clone()
+        };
+        return format!("{}=={value}", filter.key);
+    }
     if filter.value.is_empty() && filter.operator != "==" {
         filter.key.clone()
     } else {
         format!("{}{}{}", filter.key, filter.operator, filter.value)
     }
+}
+
+fn remove_filter_aria_label(filter: &LabelFilter) -> String {
+    format!("Remove label filter {}", label_filter_label(filter))
 }
 
 fn label_value_input_type(value_type: &str, operator: &str) -> &'static str {
@@ -1079,6 +1141,7 @@ mod tests {
                 operator: "=".to_string(),
                 value: "draft".to_string(),
             }],
+            invalid_labels: false,
         };
 
         assert_eq!(
@@ -1182,7 +1245,7 @@ mod tests {
     #[test]
     fn parses_and_serializes_string_match_filters() {
         let selector = "topic^=Rust&topic$=LANG&topic~=^ru.*t$";
-        let filters = parse_label_filters(selector);
+        let filters = parse_label_filters(selector).unwrap();
         assert_eq!(
             filters,
             vec![
@@ -1213,7 +1276,8 @@ mod tests {
     fn parses_string_match_filters_with_operator_text_in_values() {
         let filters = parse_label_filters(
             "topic~=^ru!=st$&prefix^=a>=b&suffix$=a<=b&name~=a==b&env=foo==bar&env==foo&~env==foo%3Dbar",
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             filters,
@@ -1260,7 +1324,7 @@ mod tests {
     #[test]
     fn parses_longest_operator_at_the_same_offset() {
         assert_eq!(
-            parse_label_filters("priority>=10&date<=2026-07-20"),
+            parse_label_filters("priority>=10&date<=2026-07-20").unwrap(),
             vec![
                 LabelFilter {
                     key: "priority".to_string(),
@@ -1292,8 +1356,61 @@ mod tests {
                 operator: "==".into(),
                 value: String::new(),
             }),
-            "project=="
+            "project==(empty)"
         );
+    }
+
+    #[test]
+    fn malformed_exact_url_filters_are_explicitly_invalid() {
+        for selector in ["~==secret", "status=ready&~project==%ZZ", "~project"] {
+            let encoded = urlencoding::encode(selector);
+            let state = parse_notes_query(&format!("labels={encoded}"));
+            assert!(state.invalid_labels, "selector: {selector}");
+            assert!(state.labels.is_empty(), "selector: {selector}");
+        }
+    }
+
+    #[test]
+    fn exact_filter_builder_preserves_raw_values_while_legacy_filters_trim() {
+        for value in ["", " ", " padded ", "01"] {
+            assert_eq!(
+                build_label_filter("project", "==", value),
+                Some(LabelFilter {
+                    key: "project".into(),
+                    operator: "==".into(),
+                    value: value.into(),
+                })
+            );
+        }
+        assert_eq!(
+            build_label_filter(" project ", "=", " ready "),
+            Some(LabelFilter {
+                key: "project".into(),
+                operator: "=".into(),
+                value: "ready".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn exact_filter_chips_describe_empty_and_whitespace_values() {
+        for (value, expected) in [
+            ("", "project==(empty)"),
+            (" ", "project==\" \""),
+            (" padded ", "project==\" padded \""),
+            ("ready", "project==ready"),
+        ] {
+            let filter = LabelFilter {
+                key: "project".into(),
+                operator: "==".into(),
+                value: value.into(),
+            };
+            assert_eq!(label_filter_label(&filter), expected);
+            assert_eq!(
+                remove_filter_aria_label(&filter),
+                format!("Remove label filter {expected}")
+            );
+        }
     }
 
     #[test]

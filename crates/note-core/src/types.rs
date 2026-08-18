@@ -103,50 +103,92 @@ pub struct LabelSelector {
     pub operator: LabelOperator,
 }
 
-pub fn parse_label_selectors(input: &str) -> Vec<LabelSelector> {
-    input
-        .split('&')
-        .filter_map(|term| {
-            let term = term.trim();
-            if term.is_empty() {
-                return None;
-            }
-
-            if let Some(exact) = term
-                .strip_prefix('~')
-                .and_then(|term| term.split_once("=="))
-            {
-                let (key, value) = exact;
-                let key = decode_exact_selector_component(key);
-                if key.is_empty() {
-                    return None;
-                }
-                return Some(LabelSelector {
-                    key,
-                    value: Some(decode_exact_selector_component(value)),
-                    operator: LabelOperator::ExactEq,
-                });
-            }
-            match split_selector_term(term) {
-                Some((key, operator, value)) => Some(LabelSelector {
-                    key: key.trim().to_string(),
-                    value: Some(value.trim().to_string()),
-                    operator,
-                }),
-                None => Some(LabelSelector {
-                    key: term.to_string(),
-                    value: None,
-                    operator: LabelOperator::Eq,
-                }),
-            }
-        })
-        .collect()
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelSelectorParseError {
+    MalformedExactSelector,
 }
 
-fn decode_exact_selector_component(component: &str) -> String {
+impl std::fmt::Display for LabelSelectorParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedExactSelector => formatter.write_str("malformed exact label selector"),
+        }
+    }
+}
+
+impl std::error::Error for LabelSelectorParseError {}
+
+pub fn parse_label_selectors(input: &str) -> Vec<LabelSelector> {
+    try_parse_label_selectors(input).unwrap_or_else(|_| {
+        vec![LabelSelector {
+            key: String::new(),
+            value: Some(String::new()),
+            operator: LabelOperator::ExactEq,
+        }]
+    })
+}
+
+pub fn try_parse_label_selectors(
+    input: &str,
+) -> Result<Vec<LabelSelector>, LabelSelectorParseError> {
+    let mut selectors = Vec::new();
+    for term in input.split('&') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+
+        if let Some(encoded) = term.strip_prefix('~') {
+            let (key, value) = encoded
+                .split_once("==")
+                .ok_or(LabelSelectorParseError::MalformedExactSelector)?;
+            let key = decode_exact_selector_component(key)?;
+            if key.is_empty() {
+                return Err(LabelSelectorParseError::MalformedExactSelector);
+            }
+            selectors.push(LabelSelector {
+                key,
+                value: Some(decode_exact_selector_component(value)?),
+                operator: LabelOperator::ExactEq,
+            });
+            continue;
+        }
+
+        selectors.push(match split_selector_term(term) {
+            Some((key, operator, value)) => LabelSelector {
+                key: key.trim().to_string(),
+                value: Some(value.trim().to_string()),
+                operator,
+            },
+            None => LabelSelector {
+                key: term.to_string(),
+                value: None,
+                operator: LabelOperator::Eq,
+            },
+        });
+    }
+    Ok(selectors)
+}
+
+fn decode_exact_selector_component(component: &str) -> Result<String, LabelSelectorParseError> {
+    let bytes = component.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(LabelSelectorParseError::MalformedExactSelector);
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
     urlencoding::decode(component)
         .map(|value| value.into_owned())
-        .unwrap_or_else(|_| component.to_string())
+        .map_err(|_| LabelSelectorParseError::MalformedExactSelector)
 }
 
 pub fn label_matches_selector(label: &Label, selector: &LabelSelector) -> bool {
@@ -455,6 +497,26 @@ mod tests {
                 }],
                 "selector: {input}"
             );
+        }
+    }
+
+    #[test]
+    fn malformed_exact_selectors_are_rejected_as_a_whole_and_fail_closed() {
+        for input in [
+            "~==secret",
+            "~project",
+            "~project==%ZZ",
+            "status=ready&~==secret",
+        ] {
+            assert_eq!(
+                try_parse_label_selectors(input),
+                Err(LabelSelectorParseError::MalformedExactSelector),
+                "selector: {input}"
+            );
+            let selectors = parse_label_selectors(input);
+            assert_eq!(selectors.len(), 1, "selector: {input}");
+            assert!(selectors[0].key.is_empty(), "selector: {input}");
+            assert_eq!(selectors[0].operator, LabelOperator::ExactEq);
         }
     }
 
