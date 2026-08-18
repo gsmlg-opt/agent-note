@@ -59,9 +59,10 @@ pub async fn update_system_config(ctx: &Context, config: &SystemConfig) -> anyho
 }
 
 pub async fn category_label_summaries(ctx: &Context) -> anyhow::Result<Vec<CategoryLabelSummary>> {
-    let transaction = ctx.storage().begin(TransactionMode::Deferred).await?;
+    let transaction = ctx.storage().begin(TransactionMode::Snapshot).await?;
     let result = async {
         let config = transaction.get_system_config().await?;
+        validate_system_config(&config).map_err(anyhow::Error::new)?;
         if config.category_labels.is_empty() {
             return Ok(Vec::new());
         }

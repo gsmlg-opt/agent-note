@@ -88,15 +88,35 @@ impl PgSession {
         immediate_gate: Arc<Mutex<()>>,
         lock_timeout: Duration,
     ) -> StorageResult<Self> {
-        if mode == TransactionMode::Deferred {
-            let transaction = pool
-                .begin()
-                .await
-                .map_err(|error| map_transaction_error("begin PostgreSQL transaction", error))?;
-            return Ok(Self {
-                state: Mutex::new(Some(PgConnectionState::Transaction(transaction))),
-                immediate_guard: None,
-            });
+        match mode {
+            TransactionMode::Deferred => {
+                let transaction = pool.begin().await.map_err(|error| {
+                    map_transaction_error("begin PostgreSQL transaction", error)
+                })?;
+                return Ok(Self {
+                    state: Mutex::new(Some(PgConnectionState::Transaction(transaction))),
+                    immediate_guard: None,
+                });
+            }
+            TransactionMode::Snapshot => {
+                let mut transaction = pool.begin().await.map_err(|error| {
+                    map_transaction_error("begin PostgreSQL snapshot transaction", error)
+                })?;
+                sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| {
+                        map_transaction_error(
+                            "set PostgreSQL snapshot transaction isolation level",
+                            error,
+                        )
+                    })?;
+                return Ok(Self {
+                    state: Mutex::new(Some(PgConnectionState::Transaction(transaction))),
+                    immediate_guard: None,
+                });
+            }
+            TransactionMode::Immediate => {}
         }
 
         let deadline = Instant::now() + lock_timeout;

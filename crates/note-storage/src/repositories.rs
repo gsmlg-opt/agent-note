@@ -958,6 +958,8 @@ pub trait OrgRepository: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionMode {
     Deferred,
+    /// Provides a consistent multi-statement read snapshot. This mode does not serialize writers.
+    Snapshot,
     Immediate,
 }
 

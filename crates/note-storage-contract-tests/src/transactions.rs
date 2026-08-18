@@ -1,12 +1,12 @@
 use crate::unit;
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_storage::{
-    CompareAndSwap, ConditionalUpdate, NewNote, NewOrgAttempt, NewOrgAttemptAllocation,
-    NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace, OrgAttemptStatus,
-    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
-    OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof,
-    OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StorageTransaction,
-    StoredOrgOperation, TransactionMode, UpsertNoteChunk,
+    CompareAndSwap, ConditionalUpdate, LabelValueCount, NewNote, NewOrgAttempt,
+    NewOrgAttemptAllocation, NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace,
+    NoteMutationResult, OrgAttemptStatus, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult,
+    OrgDocumentUpdate, OrgEventType, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseKind,
+    OrgLeaseOwnershipMove, OrgLeaseProof, OrgProjectedWorkItem, OrgWorkspaceUpdate, StorageBackend,
+    StorageErrorKind, StorageTransaction, StoredOrgOperation, TransactionMode, UpsertNoteChunk,
 };
 use serde_json::json;
 use std::str::FromStr as _;
@@ -81,6 +81,95 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .note_exists("contract-transactions-dropped")
         .await
         .unwrap());
+
+    let snapshot_key = "contract-transactions-snapshot-label";
+    let snapshot_first_note = "contract-transactions-snapshot-first";
+    let snapshot_second_note = "contract-transactions-snapshot-second";
+    let snapshot_seed = storage.begin(TransactionMode::Immediate).await.unwrap();
+    snapshot_seed
+        .insert_label_key(snapshot_key, "Snapshot label")
+        .await
+        .unwrap();
+    insert_note(snapshot_seed.as_ref(), snapshot_first_note).await;
+    snapshot_seed
+        .attach_label(snapshot_first_note, snapshot_key, "stable")
+        .await
+        .unwrap();
+    snapshot_seed.commit().await.unwrap();
+
+    let snapshot = storage.begin(TransactionMode::Snapshot).await.unwrap();
+    let snapshot_keys = vec![snapshot_key.to_string()];
+    let first_counts = snapshot.label_value_counts(&snapshot_keys).await.unwrap();
+    assert_eq!(
+        first_counts,
+        vec![LabelValueCount {
+            key: snapshot_key.to_string(),
+            value: "stable".to_string(),
+            count: 1,
+        }]
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let writer = storage.begin(TransactionMode::Immediate).await.unwrap();
+        insert_note(writer.as_ref(), snapshot_second_note).await;
+        writer
+            .attach_label(snapshot_second_note, snapshot_key, "stable")
+            .await
+            .unwrap();
+        writer.commit().await.unwrap();
+    })
+    .await
+    .expect("snapshot blocked an independent writer");
+
+    let stable_counts = snapshot.label_value_counts(&snapshot_keys).await.unwrap();
+    assert_eq!(
+        stable_counts,
+        vec![LabelValueCount {
+            key: snapshot_key.to_string(),
+            value: "stable".to_string(),
+            count: 1,
+        }]
+    );
+    snapshot.commit().await.unwrap();
+
+    let observer_counts = storage
+        .session()
+        .await
+        .unwrap()
+        .label_value_counts(&snapshot_keys)
+        .await
+        .unwrap();
+    assert_eq!(
+        observer_counts,
+        vec![LabelValueCount {
+            key: snapshot_key.to_string(),
+            value: "stable".to_string(),
+            count: 2,
+        }]
+    );
+
+    let snapshot_cleanup = storage.begin(TransactionMode::Immediate).await.unwrap();
+    for note_id in [snapshot_first_note, snapshot_second_note] {
+        assert!(matches!(
+            snapshot_cleanup
+                .soft_delete_note(note_id, 1, 2)
+                .await
+                .unwrap(),
+            NoteMutationResult::Applied { revision: 2, .. }
+        ));
+        assert!(matches!(
+            snapshot_cleanup
+                .permanently_delete_note(note_id, 2)
+                .await
+                .unwrap(),
+            NoteMutationResult::Applied { revision: 2, .. }
+        ));
+    }
+    snapshot_cleanup
+        .delete_label_key(snapshot_key)
+        .await
+        .unwrap();
+    snapshot_cleanup.commit().await.unwrap();
 
     let session = storage.session().await.unwrap();
     session

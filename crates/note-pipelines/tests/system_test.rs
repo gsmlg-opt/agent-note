@@ -226,3 +226,32 @@ async fn category_summaries_reject_stale_configured_keys() {
         })
     );
 }
+
+#[tokio::test]
+async fn category_summaries_reject_duplicate_keys_from_stored_config() {
+    let (ctx, backend, _dir) = test_context().await;
+    define_label_key(&ctx, "project", "Project").await.unwrap();
+    let session = backend.session().await.unwrap();
+    session
+        .set_system_config(&SystemConfig {
+            category_labels: vec!["project".to_string(), "project".to_string()],
+            ..SystemConfig::default()
+        })
+        .await
+        .unwrap();
+
+    let error = category_label_summaries(&ctx).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<SystemConfigValidationError>(),
+        Some(&SystemConfigValidationError::DuplicateCategoryLabel {
+            key: "project".to_string(),
+        })
+    );
+
+    let valid = SystemConfig {
+        category_labels: vec!["project".to_string()],
+        ..SystemConfig::default()
+    };
+    update_system_config(&ctx, &valid).await.unwrap();
+    assert_eq!(get_system_config(&ctx).await.unwrap(), valid);
+}
