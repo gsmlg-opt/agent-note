@@ -16,7 +16,7 @@ const MAX_PAGE_SIZE: usize = 1000;
 const PAGE_SIZE_OPTIONS: [usize; 5] = [10, 30, 50, 100, 1000];
 const RETRIEVAL_PLACEHOLDER: &str = "Retrieve by title or content";
 const RETRIEVE_BUTTON_LABEL: &str = "Retrieve";
-const LABEL_FILTER_PARSER_OPERATORS: [&str; 10] =
+const LABEL_FILTER_PARSER_OPERATORS: [&str; 9] =
     [">=", "<=", "!=", "^=", "$=", "~=", "=", ">", "<"];
 const LABEL_FILTER_DISPLAY_OPERATORS: [&str; 10] =
     ["==", "=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="];

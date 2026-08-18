@@ -230,7 +230,7 @@ fn category_chip_accessible_text(key: &str, value: &str, count: usize) -> String
 mod tests {
     use yew_router::query::ToQuery;
 
-    use super::{category_chip_text, category_notes_query};
+    use super::{category_chip_accessible_text, category_chip_text, category_notes_query};
     use crate::routes::DEFAULT_NOTES_PAGE_SIZE;
 
     #[test]
@@ -262,6 +262,10 @@ mod tests {
         assert_eq!(
             category_chip_accessible_text("project", "", 1),
             "project exact equality empty string, 1 note"
+        );
+        assert_eq!(
+            category_chip_accessible_text("project", " padded ", 2),
+            "project exact equality \" padded \", 2 notes"
         );
     }
 
