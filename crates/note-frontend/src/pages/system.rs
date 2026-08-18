@@ -77,6 +77,7 @@ pub fn system_page() -> Html {
         Callback::from(move |event: Event| {
             let select: HtmlSelectElement = event.target_unchecked_into();
             let key = select.value();
+            select.set_value("");
             if let Some(mut next) = (*config).clone() {
                 if add_category_label(&mut next.category_labels, &key) {
                     config.set(Some(next));
@@ -142,7 +143,6 @@ pub fn system_page() -> Html {
                         <select
                             class="select category-label-select"
                             aria-label="Add category label"
-                            value=""
                             disabled={*saving || !labels.iter().any(|label| !current.category_labels.iter().any(|key| key == &label.key))}
                             onchange={on_add_category_label}
                         >
