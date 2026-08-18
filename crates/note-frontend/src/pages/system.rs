@@ -11,6 +11,7 @@ pub fn system_page() -> Html {
     let config = use_state(|| None::<SystemConfig>);
     let info = use_state(|| None::<SystemInfo>);
     let labels = use_state(Vec::<LabelKey>::new);
+    let labels_error = use_state(|| None::<String>);
     let loading = use_state(|| true);
     let saving = use_state(|| false);
     let error = use_state(|| None::<String>);
@@ -20,6 +21,7 @@ pub fn system_page() -> Html {
         let config = config.clone();
         let info = info.clone();
         let labels = labels.clone();
+        let labels_error = labels_error.clone();
         let loading = loading.clone();
         let error = error.clone();
         use_effect_with((), move |_| {
@@ -32,8 +34,12 @@ pub fn system_page() -> Html {
                     Ok(next) => info.set(Some(next)),
                     Err(message) => error.set(Some(message)),
                 }
-                if let Ok(next) = api::list_labels().await {
-                    labels.set(next);
+                match api::list_labels().await {
+                    Ok(next) => {
+                        labels.set(next);
+                        labels_error.set(None);
+                    }
+                    Err(message) => labels_error.set(Some(message)),
                 }
                 loading.set(false);
             });
@@ -140,10 +146,18 @@ pub fn system_page() -> Html {
                     </div>
 
                     <div class="category-label-controls">
+                        if let Some(message) = &*labels_error {
+                            <Alert variant={Some("error".to_string())}>
+                                <span>{ format!("Label catalog unavailable: {message}") }</span>
+                            </Alert>
+                        } else if labels.is_empty() {
+                            <p class="empty compact">{ "No label keys available. Create one on Labels first." }</p>
+                        }
+
                         <select
                             class="select category-label-select"
                             aria-label="Add category label"
-                            disabled={*saving || !labels.iter().any(|label| !current.category_labels.iter().any(|key| key == &label.key))}
+                            disabled={category_label_select_disabled((*labels_error).is_some(), *saving, &*labels, &current.category_labels)}
                             onchange={on_add_category_label}
                         >
                             <option value="" disabled=true>{ "Add category label" }</option>
@@ -497,6 +511,19 @@ fn remove_category_label(keys: &mut Vec<String>, key: &str) -> bool {
     keys.len() != before
 }
 
+fn category_label_select_disabled(
+    labels_error: bool,
+    saving: bool,
+    labels: &[LabelKey],
+    selected: &[String],
+) -> bool {
+    labels_error
+        || saving
+        || !labels
+            .iter()
+            .any(|label| !selected.iter().any(|key| key == &label.key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +561,46 @@ mod tests {
         assert!(remove_category_label(&mut keys, "project"));
         assert_eq!(keys, vec!["team"]);
         assert!(!remove_category_label(&mut keys, "missing"));
+    }
+
+    #[test]
+    fn category_label_picker_is_disabled_when_catalog_is_unavailable() {
+        let labels = vec![label_key("project")];
+
+        assert!(category_label_select_disabled(false, true, &labels, &[]));
+        assert!(category_label_select_disabled(true, false, &labels, &[]));
+    }
+
+    #[test]
+    fn category_label_picker_is_disabled_when_catalog_is_empty_or_all_selected() {
+        let labels = vec![label_key("project")];
+
+        assert!(category_label_select_disabled(false, false, &[], &[]));
+        assert!(category_label_select_disabled(
+            false,
+            false,
+            &labels,
+            &["project".to_string()]
+        ));
+    }
+
+    #[test]
+    fn category_label_picker_is_enabled_for_an_unselected_catalog_key() {
+        let labels = vec![label_key("project"), label_key("team")];
+
+        assert!(!category_label_select_disabled(
+            false,
+            false,
+            &labels,
+            &["project".to_string()]
+        ));
+    }
+
+    fn label_key(key: &str) -> LabelKey {
+        LabelKey {
+            key: key.to_string(),
+            description: String::new(),
+            value_type: "string".to_string(),
+        }
     }
 }

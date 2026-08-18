@@ -1272,6 +1272,19 @@ a.dashboard-metric-detail:hover {
     display: inline-flex;
     align-items: center;
     gap: 0.35rem;
+    max-width: 100%;
+    min-width: 0;
+}
+
+.category-label-selection-chip > span:first-child {
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-align: left;
+}
+
+.category-label-selection-chip > span:last-child {
+    flex: 0 0 auto;
 }
 
 .system-info {
