@@ -809,8 +809,7 @@ async fn cached_dashboard_response(
     if if_none_match == Some(etag.as_str()) {
         return not_modified_dashboard_response(&etag).map(Some);
     }
-    let Some(mut dashboard) =
-        cached_dashboard_for_generation(now, generation, context_id).await
+    let Some(mut dashboard) = cached_dashboard_for_generation(now, generation, context_id).await
     else {
         return Ok(None);
     };
