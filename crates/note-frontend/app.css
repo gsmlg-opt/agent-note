@@ -427,6 +427,43 @@ a.dashboard-metric-detail:hover {
     text-decoration: underline;
 }
 
+.dashboard-categories {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr));
+    gap: 1rem;
+}
+
+.dashboard-category .dashboard-panel-head > div {
+    min-width: 0;
+}
+
+.dashboard-category .dashboard-panel-head p {
+    margin: 0.2rem 0 0;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.82rem;
+    overflow-wrap: anywhere;
+}
+
+.dashboard-category-values {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.55rem;
+    padding: 0.9rem;
+}
+
+.dashboard-category-chip {
+    max-width: 100%;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    text-decoration: none;
+}
+
+.dashboard-category .empty.compact {
+    margin: 0;
+    padding: 0.9rem;
+}
+
 .dashboard-grid {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);

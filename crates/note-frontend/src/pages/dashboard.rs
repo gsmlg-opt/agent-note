@@ -5,7 +5,8 @@ use yew_duskmoon::Alert;
 use yew_router::prelude::*;
 
 use crate::api;
-use crate::routes::Route;
+use crate::routes::{NotesQueryParams, Route, DEFAULT_NOTES_PAGE_SIZE};
+use crate::state::LabelFilter;
 
 #[function_component(DashboardPage)]
 pub fn dashboard_page() -> Html {
@@ -43,7 +44,7 @@ pub fn dashboard_page() -> Html {
             <div class="page-head">
                 <div>
                     <h2 class="page-title">{ "Dashboard" }</h2>
-                    <p class="page-hint">{ "Current note inventory, embedding status, label usage, and recent updates." }</p>
+                    <p class="page-hint">{ "Current note inventory, embedding status, category navigation, label usage, and recent updates." }</p>
                 </div>
                 <Link<Route> to={Route::Notes} classes={classes!("btn", "btn-primary")}>{ "Open notes" }</Link<Route>>
             </div>
@@ -85,6 +86,38 @@ pub fn dashboard_page() -> Html {
                         <strong>{ summary.last_updated_at.map(format_timestamp).unwrap_or_else(|| "-".to_string()) }</strong>
                     </div>
                 </div>
+
+                if !summary.categories.is_empty() {
+                    <div class="dashboard-categories">
+                        { for summary.categories.iter().map(|category| html! {
+                            <section class="dashboard-panel dashboard-category" key={category.key.clone()}>
+                                <div class="dashboard-panel-head">
+                                    <div>
+                                        <h3>{ category.key.clone() }</h3>
+                                        if !category.description.is_empty() {
+                                            <p>{ category.description.clone() }</p>
+                                        }
+                                    </div>
+                                </div>
+                                if category.values.is_empty() {
+                                    <p class="empty compact">{ "No notes in this category." }</p>
+                                } else {
+                                    <div class="dashboard-category-values">
+                                        { for category.values.iter().map(|value| html! {
+                                            <Link<Route, NotesQueryParams>
+                                                to={Route::Notes}
+                                                query={Some(category_notes_query(&category.key, &value.value))}
+                                                classes={classes!("chip", "chip-clickable", "chip-primary", "dashboard-category-chip")}
+                                            >
+                                                { category_chip_text(&value.value, value.count) }
+                                            </Link<Route, NotesQueryParams>>
+                                        }) }
+                                    </div>
+                                }
+                            </section>
+                        }) }
+                    </div>
+                }
 
                 <div class="dashboard-grid">
                     <section class="dashboard-panel">
@@ -148,4 +181,53 @@ fn format_timestamp(timestamp: i64) -> String {
         return "-".to_string();
     };
     datetime.format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn category_notes_query(key: &str, value: &str) -> NotesQueryParams {
+    NotesQueryParams {
+        current: 1,
+        page_size: DEFAULT_NOTES_PAGE_SIZE,
+        search: None,
+        labels: api::label_filter_selector(&[LabelFilter {
+            key: key.into(),
+            operator: "=".into(),
+            value: value.into(),
+        }]),
+    }
+}
+
+fn category_chip_text(value: &str, count: usize) -> String {
+    let noun = if count == 1 { "note" } else { "notes" };
+    format!("{value} · {count} {noun}")
+}
+
+#[cfg(test)]
+mod tests {
+    use yew_router::query::ToQuery;
+
+    use super::{category_chip_text, category_notes_query};
+    use crate::routes::DEFAULT_NOTES_PAGE_SIZE;
+
+    #[test]
+    fn category_notes_query_uses_an_exact_first_page_filter() {
+        let query = category_notes_query("project", "yellow-dog & sigma");
+
+        assert_eq!(query.current, 1);
+        assert_eq!(query.page_size, DEFAULT_NOTES_PAGE_SIZE);
+        assert_eq!(query.search, None);
+        assert_eq!(query.labels.as_deref(), Some("project=yellow-dog & sigma"));
+
+        let serialized = query.to_query().unwrap();
+        assert!(serialized.contains("current=1"));
+        assert!(serialized.contains(&format!("page_size={DEFAULT_NOTES_PAGE_SIZE}")));
+        assert!(serialized.contains("%3D"));
+        assert!(serialized.contains("%26"));
+        assert!(!serialized.contains("project=yellow-dog & sigma"));
+    }
+
+    #[test]
+    fn category_chip_text_uses_the_correct_note_noun() {
+        assert_eq!(category_chip_text("yellow-dog", 1), "yellow-dog · 1 note");
+        assert_eq!(category_chip_text("sigma", 7), "sigma · 7 notes");
+    }
 }
