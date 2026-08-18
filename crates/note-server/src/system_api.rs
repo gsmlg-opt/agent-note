@@ -463,6 +463,7 @@ mod tests {
                     mime: "text/plain".into(),
                     description: "Backup details".into(),
                     content: b"attachment content".to_vec(),
+                    storage: None,
                 }],
                 labels: vec![("status".into(), "ready".into())],
             },

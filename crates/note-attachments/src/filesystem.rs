@@ -183,6 +183,7 @@ impl AttachmentStore for FilesystemAttachmentStore {
                 mime: attachment.mime.clone(),
                 description: attachment.description.clone(),
                 content: Vec::new(),
+                storage: attachment.storage.clone(),
             })
             .collect();
 
@@ -1182,6 +1183,7 @@ mod tests {
             mime: "text/plain".to_string(),
             description: String::new(),
             content: content.to_vec(),
+            storage: None,
         }
     }
 

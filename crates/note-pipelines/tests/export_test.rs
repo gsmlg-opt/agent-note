@@ -264,6 +264,7 @@ async fn export_import_roundtrips_notes_and_label_keys() {
                     mime: "application/json".into(),
                     description: "metadata".into(),
                     content: b"{}".to_vec(),
+                    storage: None,
                 },
                 NoteAttachment {
                     id: "binary".into(),
@@ -271,6 +272,7 @@ async fn export_import_roundtrips_notes_and_label_keys() {
                     mime: "application/octet-stream".into(),
                     description: "binary data".into(),
                     content: vec![0, 159, 146, 150],
+                    storage: None,
                 },
             ],
             labels: vec![("status".into(), "done".into())],

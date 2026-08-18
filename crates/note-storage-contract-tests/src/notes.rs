@@ -1,4 +1,4 @@
-use note_core::{parse_label_selectors, LabelValueType, NoteAttachment};
+use note_core::{parse_label_selectors, AttachmentStorageMetadata, LabelValueType, NoteAttachment};
 use note_storage::{
     ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate, NoteMutationResult,
     NoteUpdate, StorageBackend, StorageErrorKind,
@@ -13,6 +13,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         mime: "application/json".into(),
         description: "metadata".into(),
         content: b"not stored".to_vec(),
+        storage: Some(AttachmentStorageMetadata {
+            object_key: "notes/contract-notes-active/meta.json/generation-1".into(),
+            storage_generation: "generation-1".into(),
+            size_bytes: 10,
+            checksum_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .into(),
+        }),
     };
     session
         .insert_note(NewNote {
@@ -45,6 +52,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     assert_eq!(note.attachments[0].mime, "application/json");
     assert_eq!(note.attachments[0].description, "metadata");
     assert!(note.attachments[0].content.is_empty());
+    assert_eq!(note.attachments[0].storage, attachment.storage);
     assert_eq!(
         session
             .get_note_revision("contract-notes-active")
@@ -60,6 +68,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         mime: "text/plain".into(),
         description: "updated metadata".into(),
         content: b"not stored either".to_vec(),
+        storage: Some(AttachmentStorageMetadata {
+            object_key: "notes/contract-notes-active/updated.txt/generation-2".into(),
+            storage_generation: "generation-2".into(),
+            size_bytes: 17,
+            checksum_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .into(),
+        }),
     };
     assert_eq!(
         session
@@ -93,6 +108,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
     assert_eq!(note.attachments[0].mime, "text/plain");
     assert_eq!(note.attachments[0].description, "updated metadata");
     assert!(note.attachments[0].content.is_empty());
+    assert_eq!(note.attachments[0].storage, updated_attachment.storage);
     assert_eq!(
         session
             .get_note_revision("contract-notes-active")
@@ -197,6 +213,7 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         mime: "text/plain".into(),
         description: "partial updated metadata".into(),
         content: b"must not be stored".to_vec(),
+        storage: None,
     };
     assert_eq!(
         session

@@ -63,6 +63,7 @@ async fn seed_note(
         mime: "text/plain".into(),
         description: "original payload".into(),
         content: format!("payload for {id}").into_bytes(),
+        storage: None,
     }];
     let prepared = ctx.attachments().prepare(id, &attachments).await.unwrap();
     let metadata = prepared.metadata().to_vec();

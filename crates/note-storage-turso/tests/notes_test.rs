@@ -1,6 +1,6 @@
 mod support;
 
-use note_core::{parse_label_selectors, LabelValueType, NoteAttachment};
+use note_core::{parse_label_selectors, AttachmentStorageMetadata, LabelValueType, NoteAttachment};
 use note_storage::{
     ActiveNoteSource, LabelRepository, NewNote, NoteMutationResult, NoteUpdate, NotesRepository,
 };
@@ -76,6 +76,13 @@ async fn insert_with_attachments_roundtrips_metadata_without_content() {
             mime: "application/json".into(),
             description: "metadata".into(),
             content: b"{}".to_vec(),
+            storage: Some(AttachmentStorageMetadata {
+                object_key: "notes/note-1/meta.json/generation-1".into(),
+                storage_generation: "generation-1".into(),
+                size_bytes: 2,
+                checksum_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .into(),
+            }),
         }],
         1000,
         1000,
@@ -105,6 +112,13 @@ async fn insert_with_attachments_roundtrips_metadata_without_content() {
         .unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert!(metadata[0].get("content").is_none());
+    assert!(metadata[0].get("content_base64").is_none());
+    assert_eq!(
+        metadata[0]["object_key"],
+        "notes/note-1/meta.json/generation-1"
+    );
+    assert_eq!(metadata[0]["storage_generation"], "generation-1");
+    assert_eq!(metadata[0]["size_bytes"], 2);
 
     let fetched = fixture
         .session
@@ -118,6 +132,14 @@ async fn insert_with_attachments_roundtrips_metadata_without_content() {
     assert_eq!(fetched.attachments[0].path, "./meta.json");
     assert_eq!(fetched.attachments[0].description, "metadata");
     assert!(fetched.attachments[0].content.is_empty());
+    assert_eq!(
+        fetched.attachments[0]
+            .storage
+            .as_ref()
+            .unwrap()
+            .storage_generation,
+        "generation-1"
+    );
 }
 
 #[tokio::test]
@@ -146,7 +168,7 @@ async fn reads_legacy_attachment_metadata_with_empty_content() {
             "UPDATE notes SET attachments = ?2 WHERE id = ?1",
             turso::params![
                 "note-1",
-                r#"[{"id":"meta","path":"./meta.json","mime":"application/json","description":"metadata","content":""}]"#
+                r#"[{"id":"meta","path":"./meta.json","mime":"application/json","description":"metadata"}]"#
             ],
         )
         .await
@@ -162,6 +184,32 @@ async fn reads_legacy_attachment_metadata_with_empty_content() {
     assert_eq!(fetched.attachments[0].id, "meta");
     assert_eq!(fetched.attachments[0].description, "metadata");
     assert!(fetched.attachments[0].content.is_empty());
+    assert_eq!(fetched.attachments[0].storage, None);
+}
+
+#[tokio::test]
+async fn partial_generated_attachment_metadata_is_an_operation_error() {
+    let fixture = fixture().await;
+    insert_test_note(&fixture.session, "note-1").await;
+
+    let database = turso::Builder::new_local(fixture._dir.path().join("test.db").to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE notes SET attachments = ?2 WHERE id = ?1",
+            turso::params![
+                "note-1",
+                r#"[{"id":"partial","path":"partial.txt","mime":"text/plain","description":"Partial","object_key":"notes/note-1/partial.txt/generation-1"}]"#
+            ],
+        )
+        .await
+        .unwrap();
+
+    let error = fixture.session.get_note("note-1").await.unwrap_err();
+    assert_eq!(error.kind(), note_storage::StorageErrorKind::Operation);
 }
 
 #[tokio::test]
@@ -592,6 +640,13 @@ async fn update_roundtrips_content_attachments_and_revision() {
         mime: "text/plain".into(),
         description: "updated attachment".into(),
         content: b"body".to_vec(),
+        storage: Some(AttachmentStorageMetadata {
+            object_key: "notes/note-1/updated.txt/generation-2".into(),
+            storage_generation: "generation-2".into(),
+            size_bytes: 4,
+            checksum_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .into(),
+        }),
     };
 
     assert_eq!(
@@ -630,6 +685,7 @@ async fn update_roundtrips_content_attachments_and_revision() {
     assert_eq!(note.title, "Updated");
     assert_eq!(note.attachments[0].id, "updated");
     assert!(note.attachments[0].content.is_empty());
+    assert_eq!(note.attachments[0].storage, attachment.storage);
 }
 
 #[tokio::test]

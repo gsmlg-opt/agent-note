@@ -79,6 +79,7 @@ impl ExportAttachment {
             mime: self.mime,
             description: self.description,
             content,
+            storage: None,
         })
     }
 }

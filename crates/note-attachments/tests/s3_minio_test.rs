@@ -117,6 +117,7 @@ fn attachment(path: &str, content: &[u8]) -> NoteAttachment {
         mime: "application/octet-stream".into(),
         description: "integration test".into(),
         content: content.to_vec(),
+        storage: None,
     }
 }
 

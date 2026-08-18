@@ -306,6 +306,7 @@ impl S3AttachmentStore {
                 mime: attachment.mime.clone(),
                 description: attachment.description.clone(),
                 content: Vec::new(),
+                storage: attachment.storage.clone(),
             });
         }
 
@@ -1362,6 +1363,7 @@ mod tests {
             mime: "application/octet-stream".into(),
             description: String::new(),
             content: content.to_vec(),
+            storage: None,
         }
     }
 
@@ -1906,6 +1908,7 @@ mod tests {
             mime: "text/plain".into(),
             description: String::new(),
             content: b"private content".to_vec(),
+            storage: None,
         };
         let error = store
             .prepare_set("note-1".into(), vec![attachment])
@@ -2718,6 +2721,7 @@ mod tests {
                     mime: "text/plain".into(),
                     description: String::new(),
                     content: b"old".to_vec(),
+                    storage: None,
                 }],
             )
             .await
@@ -2744,6 +2748,7 @@ mod tests {
                         mime: "text/plain".into(),
                         description: String::new(),
                         content: b"new".to_vec(),
+                        storage: None,
                     }],
                 )
                 .await
@@ -2812,6 +2817,7 @@ mod tests {
                     mime: "text/plain".into(),
                     description: String::new(),
                     content: b"payload".to_vec(),
+                    storage: None,
                 }],
             )
             .await
@@ -2888,6 +2894,7 @@ mod tests {
                     mime: "text/plain".into(),
                     description: String::new(),
                     content: b"payload".to_vec(),
+                    storage: None,
                 }],
             )
             .await
@@ -2961,6 +2968,7 @@ mod tests {
                     mime: "text/plain".into(),
                     description: String::new(),
                     content: b"private content".to_vec(),
+                    storage: None,
                 }],
             )
             .await
@@ -3024,6 +3032,7 @@ mod tests {
                     mime: "text/plain".into(),
                     description: String::new(),
                     content: b"private content".to_vec(),
+                    storage: None,
                 }],
             )
             .await
@@ -3108,6 +3117,7 @@ mod tests {
                     mime: "text/plain".into(),
                     description: String::new(),
                     content: b"payload".to_vec(),
+                    storage: None,
                 }],
             )
             .await
@@ -3338,6 +3348,7 @@ mod tests {
                         mime: "text/plain".into(),
                         description: String::new(),
                         content: b"first".to_vec(),
+                        storage: None,
                     },
                     NoteAttachment {
                         id: "second".into(),
@@ -3345,6 +3356,7 @@ mod tests {
                         mime: "text/plain".into(),
                         description: String::new(),
                         content: b"second".to_vec(),
+                        storage: None,
                     },
                 ],
             )

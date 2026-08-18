@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::{convert::Infallible, fmt, str::FromStr};
 
+use crate::{StorageError, StorageErrorKind};
+
 pub const EMBEDDING_DIMENSION: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,6 +701,259 @@ pub struct AttachmentMetadataUpdate<'a> {
     pub expected_revision: i64,
     pub attachments: &'a [note_core::NoteAttachment],
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PersistedAttachment {
+    pub id: String,
+    pub path: String,
+    pub mime: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PersistedAttachmentJson {
+    id: String,
+    path: String,
+    mime: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    object_key: PresentField<String>,
+    #[serde(default)]
+    storage_generation: PresentField<String>,
+    #[serde(default)]
+    size_bytes: PresentField<u64>,
+    #[serde(default)]
+    checksum_sha256: PresentField<String>,
+}
+
+enum PresentField<T> {
+    Missing,
+    Value(T),
+}
+
+impl<T> Default for PresentField<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<T> PresentField<T> {
+    fn into_option(self) -> Option<T> {
+        match self {
+            Self::Missing => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+}
+
+impl<'de, T> serde::Deserialize<'de> for PresentField<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(Self::Value)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PersistedAttachment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let attachment =
+            <PersistedAttachmentJson as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            object_key: attachment.object_key.into_option(),
+            storage_generation: attachment.storage_generation.into_option(),
+            size_bytes: attachment.size_bytes.into_option(),
+            checksum_sha256: attachment.checksum_sha256.into_option(),
+        })
+    }
+}
+
+impl From<&note_core::NoteAttachment> for PersistedAttachment {
+    fn from(attachment: &note_core::NoteAttachment) -> Self {
+        let (object_key, storage_generation, size_bytes, checksum_sha256) = attachment
+            .storage
+            .as_ref()
+            .map(|storage| {
+                (
+                    Some(storage.object_key.clone()),
+                    Some(storage.storage_generation.clone()),
+                    Some(storage.size_bytes),
+                    Some(storage.checksum_sha256.clone()),
+                )
+            })
+            .unwrap_or((None, None, None, None));
+
+        Self {
+            id: attachment.id.clone(),
+            path: attachment.path.clone(),
+            mime: attachment.mime.clone(),
+            description: attachment.description.clone(),
+            object_key,
+            storage_generation,
+            size_bytes,
+            checksum_sha256,
+        }
+    }
+}
+
+impl TryFrom<PersistedAttachment> for note_core::NoteAttachment {
+    type Error = StorageError;
+
+    fn try_from(attachment: PersistedAttachment) -> Result<Self, Self::Error> {
+        let storage = match (
+            attachment.object_key,
+            attachment.storage_generation,
+            attachment.size_bytes,
+            attachment.checksum_sha256,
+        ) {
+            (None, None, None, None) => None,
+            (
+                Some(object_key),
+                Some(storage_generation),
+                Some(size_bytes),
+                Some(checksum_sha256),
+            ) => Some(note_core::AttachmentStorageMetadata {
+                object_key,
+                storage_generation,
+                size_bytes,
+                checksum_sha256,
+            }),
+            _ => {
+                return Err(StorageError::new(
+                    StorageErrorKind::Operation,
+                    "persisted attachment has partial generated storage metadata",
+                ));
+            }
+        };
+
+        Ok(Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content: Vec::new(),
+            storage,
+        })
+    }
+}
+
+#[cfg(test)]
+mod attachment_record_tests {
+    use super::*;
+    use note_core::{AttachmentStorageMetadata, NoteAttachment};
+
+    fn generated_attachment() -> NoteAttachment {
+        NoteAttachment {
+            id: "generated".into(),
+            path: "generated.bin".into(),
+            mime: "application/octet-stream".into(),
+            description: "Generated".into(),
+            content: b"must not be persisted".to_vec(),
+            storage: Some(AttachmentStorageMetadata {
+                object_key: "notes/note-1/generated.bin/generation-1".into(),
+                storage_generation: "generation-1".into(),
+                size_bytes: 23,
+                checksum_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn persisted_attachment_roundtrips_generated_metadata_without_content() {
+        let attachment = generated_attachment();
+        let record = PersistedAttachment::from(&attachment);
+        let json = serde_json::to_value(&record).unwrap();
+
+        assert!(json.get("content").is_none());
+        assert!(json.get("content_base64").is_none());
+        assert_eq!(
+            json["object_key"],
+            attachment.storage.as_ref().unwrap().object_key
+        );
+
+        let roundtrip = NoteAttachment::try_from(record).unwrap();
+        assert_eq!(roundtrip.id, attachment.id);
+        assert_eq!(roundtrip.path, attachment.path);
+        assert_eq!(roundtrip.mime, attachment.mime);
+        assert_eq!(roundtrip.description, attachment.description);
+        assert!(roundtrip.content.is_empty());
+        assert_eq!(roundtrip.storage, attachment.storage);
+    }
+
+    #[test]
+    fn persisted_attachment_legacy_shape_omits_generated_fields() {
+        let record: PersistedAttachment = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "path": "legacy.txt",
+            "mime": "text/plain",
+            "description": "Legacy"
+        }))
+        .unwrap();
+
+        let attachment = NoteAttachment::try_from(record.clone()).unwrap();
+        assert_eq!(attachment.storage, None);
+        let json = serde_json::to_value(record).unwrap();
+        for field in [
+            "object_key",
+            "storage_generation",
+            "size_bytes",
+            "checksum_sha256",
+            "content",
+            "content_base64",
+        ] {
+            assert!(json.get(field).is_none(), "unexpected {field}");
+        }
+    }
+
+    #[test]
+    fn persisted_attachment_rejects_partial_generated_metadata() {
+        let record: PersistedAttachment = serde_json::from_value(serde_json::json!({
+            "id": "partial",
+            "path": "partial.txt",
+            "mime": "text/plain",
+            "description": "Partial",
+            "object_key": "notes/note-1/partial.txt/generation-1"
+        }))
+        .unwrap();
+
+        let error = NoteAttachment::try_from(record).unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Operation);
+    }
+
+    #[test]
+    fn persisted_attachment_rejects_explicit_null_generated_metadata() {
+        let result = serde_json::from_value::<PersistedAttachment>(serde_json::json!({
+            "id": "partial",
+            "path": "partial.txt",
+            "mime": "text/plain",
+            "description": "Partial",
+            "object_key": null
+        }));
+
+        assert!(result.is_err());
+    }
 }
 
 pub struct UpsertNoteChunk<'a> {

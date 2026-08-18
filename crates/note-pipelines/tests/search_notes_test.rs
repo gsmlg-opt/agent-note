@@ -161,6 +161,7 @@ async fn search_returns_note_summaries_without_attachment_io() {
                 mime: "text/plain".into(),
                 description: "search proof".into(),
                 content: b"payload".to_vec(),
+                storage: None,
             }],
             labels: vec![("topic".into(), "metadata".into())],
         },

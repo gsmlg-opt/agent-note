@@ -11,6 +11,7 @@ fn attachment(path: &str, content: &[u8]) -> NoteAttachment {
         mime: "text/plain".to_string(),
         description: "test attachment".to_string(),
         content: content.to_vec(),
+        storage: None,
     }
 }
 

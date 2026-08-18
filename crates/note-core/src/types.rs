@@ -292,6 +292,14 @@ fn compare_ordering(ordering: std::cmp::Ordering, operator: LabelOperator) -> bo
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentStorageMetadata {
+    pub object_key: String,
+    pub storage_generation: String,
+    pub size_bytes: u64,
+    pub checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteAttachment {
     pub id: String,
     pub path: String,
@@ -299,6 +307,8 @@ pub struct NoteAttachment {
     #[serde(default)]
     pub description: String,
     pub content: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<AttachmentStorageMetadata>,
 }
 
 #[derive(Debug)]
@@ -755,5 +765,40 @@ mod tests {
     #[test]
     fn attachment_content_encoding_is_canonical_base64() {
         assert_eq!(encode_attachment_content(&[0, 255]), "AP8=");
+    }
+
+    #[test]
+    fn attachment_serde_reads_legacy_json_without_storage_metadata() {
+        let attachment: NoteAttachment = serde_json::from_str(
+            r#"{"id":"legacy","path":"legacy.txt","mime":"text/plain","description":"Legacy","content":[]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(attachment.storage, None);
+        let serialized = serde_json::to_value(attachment).unwrap();
+        assert!(serialized.get("storage").is_none());
+    }
+
+    #[test]
+    fn attachment_serde_roundtrips_generated_storage_metadata() {
+        let attachment = NoteAttachment {
+            id: "generated".into(),
+            path: "report.bin".into(),
+            mime: "application/octet-stream".into(),
+            description: "Generated report".into(),
+            content: Vec::new(),
+            storage: Some(AttachmentStorageMetadata {
+                object_key: "notes/note-1/report.bin/generation-1".into(),
+                storage_generation: "generation-1".into(),
+                size_bytes: 42,
+                checksum_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .into(),
+            }),
+        };
+
+        let json = serde_json::to_string(&attachment).unwrap();
+        let roundtrip: NoteAttachment = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(roundtrip, attachment);
     }
 }

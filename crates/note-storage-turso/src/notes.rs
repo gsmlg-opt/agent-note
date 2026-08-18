@@ -4,8 +4,8 @@ use crate::TursoSession;
 use note_core::{LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
     resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate,
-    NoteMutationResult, NoteUpdate, NotesRepository, ResolvedLabelSelector, StorageError,
-    StorageErrorKind, StorageResult,
+    NoteMutationResult, NoteUpdate, NotesRepository, PersistedAttachment, ResolvedLabelSelector,
+    StorageError, StorageErrorKind, StorageResult,
 };
 use tokio::sync::OwnedMutexGuard;
 
@@ -1191,12 +1191,7 @@ fn decode_summary_row(row: &turso::Row) -> StorageResult<SummaryRow> {
 fn serialize_attachments(attachments: &[NoteAttachment]) -> StorageResult<String> {
     let metadata = attachments
         .iter()
-        .map(|attachment| StoredAttachment {
-            id: attachment.id.clone(),
-            path: attachment.path.clone(),
-            mime: attachment.mime.clone(),
-            description: attachment.description.clone(),
-        })
+        .map(PersistedAttachment::from)
         .collect::<Vec<_>>();
     serde_json::to_string(&metadata).map_err(|error| {
         StorageError::with_source(
@@ -1208,32 +1203,14 @@ fn serialize_attachments(attachments: &[NoteAttachment]) -> StorageResult<String
 }
 
 fn deserialize_attachments(value: &str) -> StorageResult<Vec<NoteAttachment>> {
-    let metadata: Vec<StoredAttachment> = serde_json::from_str(value).map_err(|error| {
+    let metadata: Vec<PersistedAttachment> = serde_json::from_str(value).map_err(|error| {
         StorageError::with_source(
             StorageErrorKind::Operation,
             "deserialize note attachment metadata",
             error,
         )
     })?;
-    Ok(metadata
-        .into_iter()
-        .map(|attachment| NoteAttachment {
-            id: attachment.id,
-            path: attachment.path,
-            mime: attachment.mime,
-            description: attachment.description,
-            content: Vec::new(),
-        })
-        .collect())
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct StoredAttachment {
-    id: String,
-    path: String,
-    mime: String,
-    #[serde(default)]
-    description: String,
+    metadata.into_iter().map(NoteAttachment::try_from).collect()
 }
 
 #[cfg(test)]

@@ -355,6 +355,7 @@ pub async fn put_note_attachment_tool(
             mime: input.mime,
             description: input.description,
             content: input.content,
+            storage: None,
         },
     )
     .await?;
@@ -392,6 +393,7 @@ pub async fn get_note_attachment_content_tool(
                     mime,
                     description,
                     content,
+                    storage: _,
                 } = attachment;
                 AttachmentContentData {
                     attachment: AttachmentMetadataData {

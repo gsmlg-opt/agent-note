@@ -645,6 +645,7 @@ impl AttachmentStore for ControlledAttachmentStore {
                     mime: attachment.mime.clone(),
                     description: attachment.description.clone(),
                     content: Vec::new(),
+                    storage: attachment.storage.clone(),
                 })
                 .collect(),
             backend: self.backend.clone(),

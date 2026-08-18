@@ -29,6 +29,7 @@ fn attachment(
         mime: mime.into(),
         description: description.into(),
         content: content.to_vec(),
+        storage: None,
     }
 }
 

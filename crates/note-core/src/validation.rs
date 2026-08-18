@@ -260,6 +260,7 @@ mod tests {
             mime: "application/json".to_string(),
             description: "metadata".to_string(),
             content: b"{}".to_vec(),
+            storage: None,
         }];
         assert_eq!(validate_note_input(&input, &[]), Ok(()));
 
@@ -269,6 +270,7 @@ mod tests {
             mime: "application/json".to_string(),
             description: String::new(),
             content: b"{}".to_vec(),
+            storage: None,
         });
         assert_eq!(
             validate_note_input(&input, &[]),
@@ -303,6 +305,7 @@ mod tests {
                 mime: "application/json".to_string(),
                 description: String::new(),
                 content: b"first".to_vec(),
+                storage: None,
             },
             NoteAttachment {
                 id: "second".to_string(),
@@ -310,6 +313,7 @@ mod tests {
                 mime: "application/json".to_string(),
                 description: String::new(),
                 content: b"second".to_vec(),
+                storage: None,
             },
         ];
 
@@ -330,6 +334,7 @@ mod tests {
                 mime: "text/plain".to_string(),
                 description: String::new(),
                 content: Vec::new(),
+                storage: None,
             };
 
             assert_eq!(

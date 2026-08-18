@@ -2,8 +2,8 @@
 mod support;
 
 use note_core::{
-    parse_label_selectors, DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm,
-    LabelValueType, NoteAttachment, SystemConfig,
+    parse_label_selectors, AttachmentStorageMetadata, DuplicateCheckConfig, DuplicateCheckRule,
+    DuplicateCheckTerm, LabelValueType, NoteAttachment, SystemConfig,
 };
 use note_storage::{
     EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteMutationResult, NoteUpdate,
@@ -143,6 +143,13 @@ async fn notes_and_labels_follow_repository_semantics() {
         mime: "application/json".into(),
         description: "metadata".into(),
         content: b"must not be stored".to_vec(),
+        storage: Some(AttachmentStorageMetadata {
+            object_key: "notes/pg-jsonb/meta.json/generation-1".into(),
+            storage_generation: "generation-1".into(),
+            size_bytes: 18,
+            checksum_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .into(),
+        }),
     };
     session
         .insert_note(NewNote {
@@ -196,6 +203,7 @@ async fn notes_and_labels_follow_repository_semantics() {
     assert_eq!(note.attachments[0].mime, "application/json");
     assert_eq!(note.attachments[0].description, "metadata");
     assert!(note.attachments[0].content.is_empty());
+    assert_eq!(note.attachments[0].storage, attachment.storage);
 
     let inspection_pool = database.inspect_pool().await;
     let (kind, path, stored): (Option<String>, Option<String>, Value) = sqlx::query_as(
@@ -214,6 +222,16 @@ async fn notes_and_labels_follow_repository_semantics() {
         .expect("stored attachment object");
     assert!(!object.contains_key("content"));
     assert!(!object.contains_key("content_base64"));
+    assert_eq!(
+        object["object_key"],
+        "notes/pg-jsonb/meta.json/generation-1"
+    );
+    assert_eq!(object["storage_generation"], "generation-1");
+    assert_eq!(object["size_bytes"], 18);
+    assert_eq!(
+        object["checksum_sha256"],
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
 
     let updated_attachment = NoteAttachment {
         id: "updated".into(),
@@ -221,6 +239,13 @@ async fn notes_and_labels_follow_repository_semantics() {
         mime: "text/plain".into(),
         description: "updated metadata".into(),
         content: b"also not stored".to_vec(),
+        storage: Some(AttachmentStorageMetadata {
+            object_key: "notes/pg-jsonb/updated.txt/generation-2".into(),
+            storage_generation: "generation-2".into(),
+            size_bytes: 15,
+            checksum_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .into(),
+        }),
     };
     assert_eq!(
         session
@@ -260,6 +285,7 @@ async fn notes_and_labels_follow_repository_semantics() {
     assert_eq!(note.updated_at, 110);
     assert_eq!(note.attachments[0].id, "updated");
     assert!(note.attachments[0].content.is_empty());
+    assert_eq!(note.attachments[0].storage, updated_attachment.storage);
 
     session
         .insert_label_key_with_type("priority", "Priority", LabelValueType::Number)
@@ -831,6 +857,26 @@ async fn malformed_attachment_json_is_an_operation_error() {
         .await
         .unwrap()
         .is_empty());
+    let error = session.get_note("malformed").await.unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Operation);
+
+    sqlx::query(
+        r#"UPDATE notes SET attachments = '[{"id":"legacy","path":"legacy.txt","mime":"text/plain","description":"Legacy"}]'::jsonb WHERE id = $1"#,
+    )
+    .bind("malformed")
+    .execute(&inspection_pool)
+    .await
+    .unwrap();
+    let legacy = session.get_note("malformed").await.unwrap().unwrap();
+    assert_eq!(legacy.attachments[0].storage, None);
+
+    sqlx::query(
+        r#"UPDATE notes SET attachments = '[{"id":"partial","path":"partial.txt","mime":"text/plain","description":"Partial","object_key":"notes/malformed/partial.txt/generation-1"}]'::jsonb WHERE id = $1"#,
+    )
+    .bind("malformed")
+    .execute(&inspection_pool)
+    .await
+    .unwrap();
     let error = session.get_note("malformed").await.unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::Operation);
 

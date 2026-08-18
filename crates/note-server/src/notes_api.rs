@@ -318,6 +318,7 @@ impl TryFrom<AttachmentRequest> for NoteAttachment {
             mime: attachment.mime,
             description: attachment.description,
             content,
+            storage: None,
         })
     }
 }
