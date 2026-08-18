@@ -828,15 +828,28 @@ impl crate::AttachmentStore for S3AttachmentStore {
             size_bytes: request.bytes.len() as u64,
             checksum_sha256: request.checksum_sha256,
         };
-        self.client
+        match self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
+            .if_none_match("*")
             .metadata("checksum-sha256", &expected.checksum_sha256)
             .body(ByteStream::from(request.bytes))
             .send()
             .await
-            .map_err(|error| safe_sdk_error("put object", &error))?;
+        {
+            Ok(_) => {}
+            Err(error)
+                if error.code() == Some("PreconditionFailed")
+                    || error
+                        .raw_response()
+                        .is_some_and(|response| response.status().as_u16() == 412) =>
+            {
+                anyhow::bail!("attachment object already exists")
+            }
+            Err(error) => return Err(safe_sdk_error("put object", &error)),
+        }
         let verified = self
             .head_key(&key)
             .await?
@@ -1502,6 +1515,54 @@ mod tests {
             .unwrap()
             .iter()
             .all(|request| request.method.as_str() != "PUT"));
+    }
+
+    #[tokio::test]
+    async fn immutable_put_conditionally_rejects_a_collision_after_absent_preflight() {
+        let _lock = AWS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = AwsEnvGuard::apply(&[
+            ("AWS_ACCESS_KEY_ID", Some("conditional-access")),
+            ("AWS_SECRET_ACCESS_KEY", Some("conditional-secret")),
+            ("AWS_SESSION_TOKEN", None),
+            ("AWS_EC2_METADATA_DISABLED", Some("true")),
+            ("AWS_ENDPOINT_URL_S3", None),
+        ]);
+        let server = MockServer::start().await;
+        let checksum = "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5";
+        Mock::given(method("HEAD"))
+            .and(path("/agent-note/generations/raced"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/agent-note/generations/raced"))
+            .and(header_regex("if-none-match", r"^\*$"))
+            .respond_with(ResponseTemplate::new(412).set_body_raw(
+                "<Error><Code>PreconditionFailed</Code><Message>private collision detail</Message></Error>",
+                "application/xml",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = test_store(server.uri())
+            .await
+            .put_immutable(crate::PutObjectRequest {
+                object_key: "generations/raced".into(),
+                bytes: b"payload".to_vec(),
+                checksum_sha256: checksum.into(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "attachment object already exists");
+        assert!(!error.contains("private collision detail"));
+        assert!(!error.contains("conditional-access"));
+        assert!(!error.contains("conditional-secret"));
     }
 
     #[tokio::test]
