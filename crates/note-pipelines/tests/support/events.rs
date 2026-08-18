@@ -6,7 +6,7 @@ use note_core::{LabelSelector, NoteAttachment};
 use note_pipelines::EmbeddingJobNotifier;
 use note_storage::{
     ActiveNoteSource, AttachmentMetadataUpdate, AttachmentOperation, AttachmentOperationRepository,
-    AttachmentOperationStatus, BackendInfo, CompareAndSwap, ConditionalUpdate,
+    AttachmentOperationStatus, BackendInfo, CompareAndSwap, ConditionalUpdate, DeletedNoteSnapshot,
     EmbeddingDashboardStatus, EmbeddingJob, EmbeddingRepository, LabelRepository,
     NewAttachmentOperation, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgWorkspace,
     NoteChunk, NoteFieldsUpdate, NoteMutationResult, NoteUpdate, NotesRepository, OrgAttempt,
@@ -211,6 +211,7 @@ impl_forward_repository! {
         fn update_note_attachments(note: AttachmentMetadataUpdate<'_>) -> NoteMutationResult<()>;
         fn soft_delete_note(id: &str, expected_revision: i64, deleted_at: i64) -> NoteMutationResult<()>;
         fn get_deleted_note_content_and_revision(id: &str) -> Option<(String, i64)>;
+        fn get_deleted_note_snapshot(id: &str) -> Option<DeletedNoteSnapshot>;
         fn restore_note(id: &str, expected_revision: i64) -> NoteMutationResult<()>;
         fn permanently_delete_note(id: &str, expected_revision: i64) -> NoteMutationResult<()>;
         fn list_expired_deleted_note_ids(cutoff: i64) -> Vec<String>;

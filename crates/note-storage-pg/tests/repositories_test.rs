@@ -879,6 +879,19 @@ async fn malformed_attachment_json_is_an_operation_error() {
     .unwrap();
     let error = session.get_note("malformed").await.unwrap_err();
     assert_eq!(error.kind(), StorageErrorKind::Operation);
+    sqlx::query("UPDATE notes SET deleted_at = 1 WHERE id = 'malformed'")
+        .execute(&inspection_pool)
+        .await
+        .unwrap();
+    let error = session
+        .get_deleted_note_snapshot("malformed")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Operation);
+    sqlx::query("UPDATE notes SET deleted_at = NULL WHERE id = 'malformed'")
+        .execute(&inspection_pool)
+        .await
+        .unwrap();
 
     session
         .insert_label_key("malformed-type", "Malformed type")

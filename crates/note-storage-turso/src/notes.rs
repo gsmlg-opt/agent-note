@@ -3,9 +3,9 @@ use crate::labels::labels_for_note_unlocked;
 use crate::TursoSession;
 use note_core::{LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
-    resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate,
-    NoteMutationResult, NoteUpdate, NotesRepository, PersistedAttachment, ResolvedLabelSelector,
-    StorageError, StorageErrorKind, StorageResult,
+    resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, DeletedNoteSnapshot,
+    NewNote, NoteFieldsUpdate, NoteMutationResult, NoteUpdate, NotesRepository,
+    PersistedAttachment, ResolvedLabelSelector, StorageError, StorageErrorKind, StorageResult,
 };
 use tokio::sync::OwnedMutexGuard;
 
@@ -663,6 +663,42 @@ impl NotesRepository for TursoSession {
             row.get::<i64>(1)
                 .map_err(|error| map_turso_error("decode deleted note revision", error))?,
         )))
+    }
+
+    async fn get_deleted_note_snapshot(
+        &self,
+        id: &str,
+    ) -> StorageResult<Option<DeletedNoteSnapshot>> {
+        let _operation_guard = self.operation_guard().await;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT content, note_revision, attachments
+                 FROM notes
+                 WHERE id = ?1 AND deleted_at IS NOT NULL",
+                turso::params![id],
+            )
+            .await
+            .map_err(|error| map_turso_error("query deleted note snapshot", error))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read deleted note snapshot", error))?
+        else {
+            return Ok(None);
+        };
+        let attachments = row
+            .get::<String>(2)
+            .map_err(|error| map_turso_error("decode deleted note attachments", error))?;
+        Ok(Some(DeletedNoteSnapshot {
+            content: row
+                .get(0)
+                .map_err(|error| map_turso_error("decode deleted note content", error))?,
+            revision: row
+                .get(1)
+                .map_err(|error| map_turso_error("decode deleted note revision", error))?,
+            attachments: deserialize_attachments(&attachments)?,
+        }))
     }
 
     async fn restore_note(

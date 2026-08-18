@@ -1077,6 +1077,7 @@ mod tests {
             fn update_note_attachments(note: AttachmentMetadataUpdate<'_>) -> NoteMutationResult<()>;
             fn soft_delete_note(id: &str, expected_revision: i64, deleted_at: i64) -> NoteMutationResult<()>;
             fn get_deleted_note_content_and_revision(id: &str) -> Option<(String, i64)>;
+            fn get_deleted_note_snapshot(id: &str) -> Option<note_storage::DeletedNoteSnapshot>;
             fn restore_note(id: &str, expected_revision: i64) -> NoteMutationResult<()>;
             fn permanently_delete_note(id: &str, expected_revision: i64) -> NoteMutationResult<()>;
             fn list_expired_deleted_note_ids(cutoff: i64) -> Vec<String>;

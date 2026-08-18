@@ -2,9 +2,9 @@ use crate::connection::map_sqlx_error;
 use crate::PgSession;
 use note_core::{LabelSelector, Note, NoteAttachment, NoteListItem};
 use note_storage::{
-    resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate,
-    NoteMutationResult, NoteUpdate, NotesRepository, PersistedAttachment, ResolvedLabelSelector,
-    StorageError, StorageErrorKind, StorageResult,
+    resolve_label_selectors, ActiveNoteSource, AttachmentMetadataUpdate, DeletedNoteSnapshot,
+    NewNote, NoteFieldsUpdate, NoteMutationResult, NoteUpdate, NotesRepository,
+    PersistedAttachment, ResolvedLabelSelector, StorageError, StorageErrorKind, StorageResult,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -398,6 +398,30 @@ impl NotesRepository for PgSession {
         .fetch_optional(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("query deleted note", error))
+    }
+
+    async fn get_deleted_note_snapshot(
+        &self,
+        id: &str,
+    ) -> StorageResult<Option<DeletedNoteSnapshot>> {
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, (String, i64, Value)>(
+            "SELECT content, note_revision, attachments
+             FROM notes
+             WHERE id = $1 AND deleted_at IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query deleted note snapshot", error))?;
+        row.map(|(content, revision, attachments)| {
+            Ok(DeletedNoteSnapshot {
+                content,
+                revision,
+                attachments: deserialize_attachments(attachments)?,
+            })
+        })
+        .transpose()
     }
 
     async fn restore_note(

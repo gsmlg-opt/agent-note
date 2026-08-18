@@ -263,15 +263,30 @@ pub async fn permanently_delete_note(
     id: &str,
     expected_revision: i64,
 ) -> anyhow::Result<bool> {
-    let session = ctx.storage().session().await?;
-    crate::mutation_error::mutation_revision(
-        id,
-        session
-            .permanently_delete_note(id, expected_revision)
-            .await?,
-    )?;
-    drop(session);
-    ctx.attachments().remove_note(id).await?;
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let transaction_result = async {
+        let snapshot = transaction
+            .get_deleted_note_snapshot(id)
+            .await?
+            .ok_or_else(|| crate::NoteMutationError::NotFound(id.to_string()))?;
+        crate::mutation_error::mutation_revision(
+            id,
+            transaction
+                .permanently_delete_note(id, expected_revision)
+                .await?,
+        )?;
+        crate::generated_attachments::enqueue_attachment_cleanup(
+            transaction.as_ref(),
+            id,
+            &snapshot.attachments,
+            chrono::Utc::now().timestamp(),
+        )
+        .await?;
+        anyhow::Ok(())
+    }
+    .await;
+    crate::save_note::finish_transaction(transaction, transaction_result).await?;
+    crate::generated_attachments::run_attachment_cleanup_once(ctx).await;
     Ok(true)
 }
 
@@ -345,33 +360,31 @@ pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Res
     let transaction_result = async {
         let cutoff = now.saturating_sub(TRASH_RETENTION_SECONDS);
         let candidates = transaction.list_expired_deleted_note_ids(cutoff).await?;
-        let mut deleted_ids = Vec::with_capacity(candidates.len());
+        let mut deleted = 0;
         for id in &candidates {
-            let Some((_, expected_revision)) = transaction
-                .get_deleted_note_content_and_revision(id)
-                .await?
-            else {
+            let Some(snapshot) = transaction.get_deleted_note_snapshot(id).await? else {
                 continue;
             };
             let result = transaction
-                .permanently_delete_note(id, expected_revision)
+                .permanently_delete_note(id, snapshot.revision)
                 .await?;
-            if let Some(id) = applied_deleted_note_id(id, result) {
-                deleted_ids.push(id);
+            if matches!(result, NoteMutationResult::Applied { .. }) {
+                crate::generated_attachments::enqueue_attachment_cleanup(
+                    transaction.as_ref(),
+                    id,
+                    &snapshot.attachments,
+                    now,
+                )
+                .await?;
+                deleted += 1;
             }
         }
-        anyhow::Ok(deleted_ids)
+        anyhow::Ok(deleted)
     }
     .await;
-    let ids = crate::save_note::finish_transaction(transaction, transaction_result).await?;
-    for id in &ids {
-        ctx.attachments().remove_note(id).await?;
-    }
-    Ok(ids.len())
-}
-
-fn applied_deleted_note_id(id: &str, result: NoteMutationResult<()>) -> Option<String> {
-    matches!(result, NoteMutationResult::Applied { .. }).then(|| id.to_string())
+    let deleted = crate::save_note::finish_transaction(transaction, transaction_result).await?;
+    crate::generated_attachments::run_attachment_cleanup_once(ctx).await;
+    Ok(deleted)
 }
 
 #[cfg(test)]

@@ -210,6 +210,19 @@ async fn partial_generated_attachment_metadata_is_an_operation_error() {
 
     let error = fixture.session.get_note("note-1").await.unwrap_err();
     assert_eq!(error.kind(), note_storage::StorageErrorKind::Operation);
+    connection
+        .execute(
+            "UPDATE notes SET deleted_at = 1 WHERE id = ?1",
+            turso::params!["note-1"],
+        )
+        .await
+        .unwrap();
+    let error = fixture
+        .session
+        .get_deleted_note_snapshot("note-1")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), note_storage::StorageErrorKind::Operation);
 }
 
 #[tokio::test]

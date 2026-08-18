@@ -871,6 +871,13 @@ pub struct AttachmentMetadataUpdate<'a> {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedNoteSnapshot {
+    pub content: String,
+    pub revision: i64,
+    pub attachments: Vec<note_core::NoteAttachment>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PersistedAttachment {
     pub id: String,

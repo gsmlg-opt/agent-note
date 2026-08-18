@@ -3,7 +3,9 @@ mod support;
 use note_attachments::{
     AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
 };
-use note_core::{LabelKeyValidationError, LabelValueType, NoteAttachment};
+use note_core::{
+    AttachmentStorageMetadata, LabelKeyValidationError, LabelValueType, NoteAttachment,
+};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
     compute_tag, define_label_key, define_label_key_with_type, delete_note, drain_embedding_jobs,
@@ -13,7 +15,9 @@ use note_pipelines::{
     update_system_config, Context, EditOp, NoteMutationError, RestoreNoteInput, SaveNoteInput,
     UpdateNoteFieldsInput, TRASH_RETENTION_SECONDS,
 };
-use note_storage::{NoteMutationResult, StorageBackend, TransactionMode};
+use note_storage::{
+    AttachmentOperationStatus, NewNote, NoteMutationResult, StorageBackend, TransactionMode,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -791,8 +795,8 @@ async fn save_does_not_use_the_legacy_prepared_publish_path() {
 }
 
 #[tokio::test]
-async fn permanent_delete_and_purge_remove_attachments_only_after_database_deletion() {
-    let (ctx, backend, _attachments, events, _dir) = controlled_context(false).await;
+async fn permanent_delete_and_purge_enqueue_durable_cleanup_after_database_deletion() {
+    let (ctx, backend, attachments, events, _dir) = controlled_context(false).await;
     let note = save_note(
         &ctx,
         SaveNoteInput {
@@ -812,15 +816,32 @@ async fn permanent_delete_and_purge_remove_attachments_only_after_database_delet
             .await
             .unwrap()
     );
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
     assert_eq!(
         *events.lock().unwrap(),
-        vec![format!("remove:{}:absent=true", note.id)]
+        vec!["begin", "commit", &format!("delete_object:{object_key}")]
     );
+    assert!(!attachments.has_object(&object_key));
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].object_key, object_key);
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Completed);
     events.lock().unwrap().clear();
     assert!(note_pipelines::permanently_delete_note(&ctx, "missing", 1)
         .await
         .is_err());
-    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(*events.lock().unwrap(), vec!["begin", "rollback"]);
 
     let expired = save_note(
         &ctx,
@@ -844,14 +865,401 @@ async fn permanent_delete_and_purge_remove_attachments_only_after_database_delet
     events.lock().unwrap().clear();
 
     assert_eq!(purge_expired_deleted_notes(&ctx, now).await.unwrap(), 1);
+    let expired_key = expired.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
     assert_eq!(
         *events.lock().unwrap(),
-        vec![
-            "begin".into(),
-            "commit".into(),
-            format!("remove:{}:absent=true", expired.id),
-        ]
+        vec!["begin", "commit", &format!("delete_object:{expired_key}")]
     );
+    assert_eq!(
+        backend
+            .session()
+            .await
+            .unwrap()
+            .list_attachment_operations_for_note(&expired.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn permanent_delete_cleanup_failure_keeps_committed_success_pending_for_retry() {
+    let (ctx, backend, attachments, _events, _dir) = controlled_context(false).await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete".into(),
+            content: "Durable cleanup".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    delete_note(&ctx, &note.id, note.revision).await.unwrap();
+    attachments.fail_delete_object();
+
+    assert!(permanently_delete_note(&ctx, &note.id, note.revision + 1)
+        .await
+        .unwrap());
+    assert!(!backend
+        .session()
+        .await
+        .unwrap()
+        .note_exists(&note.id)
+        .await
+        .unwrap());
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Pending);
+    assert!(attachments.has_object(&operations[0].object_key));
+}
+
+#[tokio::test]
+async fn permanent_delete_commit_acknowledgement_failure_retains_object_with_durable_operation() {
+    let (ctx, backend, event_backend, attachments, _events, _dir) =
+        controlled_failure_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete".into(),
+            content: "Ambiguous commit".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    delete_note(&ctx, &note.id, note.revision).await.unwrap();
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    event_backend.fail_next_commit_acknowledgement();
+
+    assert!(permanently_delete_note(&ctx, &note.id, note.revision + 1)
+        .await
+        .is_err());
+    assert!(attachments.has_object(&object_key));
+    assert_eq!(
+        backend
+            .session()
+            .await
+            .unwrap()
+            .list_attachment_operations_for_note(&note.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn permanent_delete_enqueues_generated_and_legacy_snapshots_before_removing_the_note() {
+    let (ctx, backend, attachments, _events, _dir) = controlled_context(false).await;
+    let generated_key = "notes/snapshot/objects/generation-checksum";
+    let captured = vec![
+        NoteAttachment {
+            id: "generated".into(),
+            path: "generated.bin".into(),
+            mime: "application/octet-stream".into(),
+            description: String::new(),
+            content: vec![],
+            storage: Some(AttachmentStorageMetadata {
+                object_key: generated_key.into(),
+                storage_generation: "generation".into(),
+                size_bytes: 3,
+                checksum_sha256: "checksum".into(),
+            }),
+        },
+        NoteAttachment {
+            id: "legacy".into(),
+            path: "./legacy.txt".into(),
+            mime: "text/plain".into(),
+            description: String::new(),
+            content: vec![],
+            storage: None,
+        },
+    ];
+    backend
+        .session()
+        .await
+        .unwrap()
+        .insert_note(NewNote {
+            id: "snapshot",
+            title: "Snapshot",
+            content: "body",
+            attachments: &captured,
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 1,
+            deleted_at: Some(1),
+        })
+        .await
+        .unwrap();
+    attachments.set_object_content(generated_key, b"new");
+    attachments.set_read_content("snapshot", "legacy.txt", b"old");
+
+    assert!(permanently_delete_note(&ctx, "snapshot", 1).await.unwrap());
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note("snapshot")
+        .await
+        .unwrap();
+    assert_eq!(operations.len(), 2);
+    assert_eq!(
+        operations
+            .iter()
+            .map(|operation| operation.object_key.as_str())
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([generated_key, "legacy.txt"])
+    );
+    assert!(operations
+        .iter()
+        .all(|operation| operation.status == AttachmentOperationStatus::Completed));
+}
+
+#[tokio::test]
+async fn stale_delete_and_cleanup_enqueue_failure_preserve_note_objects_and_operations() {
+    let (ctx, backend, event_backend, attachments, _events, _dir) =
+        controlled_failure_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete".into(),
+            content: "Rollback cleanup".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    delete_note(&ctx, &note.id, note.revision).await.unwrap();
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+
+    assert!(permanently_delete_note(&ctx, &note.id, note.revision)
+        .await
+        .is_err());
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .note_exists(&note.id)
+        .await
+        .unwrap());
+    assert!(attachments.has_object(&object_key));
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    event_backend.fail_next_repository_call("insert_attachment_operation");
+    assert!(permanently_delete_note(&ctx, &note.id, note.revision + 1)
+        .await
+        .is_err());
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .note_exists(&note.id)
+        .await
+        .unwrap());
+    assert!(attachments.has_object(&object_key));
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn already_missing_physical_object_completes_permanent_delete_cleanup() {
+    let (ctx, backend, attachments, _events, _dir) = controlled_context(false).await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Delete".into(),
+            content: "Already gone".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    delete_note(&ctx, &note.id, note.revision).await.unwrap();
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    attachments.delete_object(&object_key).await.unwrap();
+
+    assert!(permanently_delete_note(&ctx, &note.id, note.revision + 1)
+        .await
+        .unwrap());
+    let operations = backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap();
+    assert_eq!(operations[0].status, AttachmentOperationStatus::Completed);
+}
+
+#[tokio::test]
+async fn soft_delete_and_restore_preserve_attachment_objects_without_cleanup_operations() {
+    let (ctx, backend, attachments, _events, _dir) = controlled_context(false).await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Restore".into(),
+            content: "Keep attachments".into(),
+            attachments: one_attachment(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    delete_note(&ctx, &note.id, note.revision).await.unwrap();
+    assert!(attachments.has_object(&object_key));
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert!(restore_notes(
+        &ctx,
+        &[RestoreNoteInput {
+            id: note.id.clone(),
+            expected_revision: note.revision + 1
+        }]
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        get_note_attachment(&ctx, &note.id, "file.txt")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        b"payload"
+    );
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .list_attachment_operations_for_note(&note.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn purge_rolls_back_all_notes_on_cleanup_enqueue_failure_then_records_exact_operations() {
+    let (ctx, backend, event_backend, attachments, _events, _dir) =
+        controlled_failure_context().await;
+    let mut notes = Vec::new();
+    for title in ["First", "Second"] {
+        let note = save_note(
+            &ctx,
+            SaveNoteInput {
+                title: title.into(),
+                content: "Expired".into(),
+                attachments: one_attachment(),
+                labels: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        notes.push(note);
+    }
+    let now = 1_900_000_000;
+    for note in &notes {
+        backend
+            .session()
+            .await
+            .unwrap()
+            .soft_delete_note(&note.id, note.revision, now - TRASH_RETENTION_SECONDS)
+            .await
+            .unwrap();
+    }
+
+    event_backend.fail_next_repository_call("insert_attachment_operation");
+    assert!(purge_expired_deleted_notes(&ctx, now).await.is_err());
+    for note in &notes {
+        assert!(backend
+            .session()
+            .await
+            .unwrap()
+            .note_exists(&note.id)
+            .await
+            .unwrap());
+        assert!(backend
+            .session()
+            .await
+            .unwrap()
+            .list_attachment_operations_for_note(&note.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(attachments.has_object(&note.attachments[0].storage.as_ref().unwrap().object_key));
+    }
+
+    assert_eq!(purge_expired_deleted_notes(&ctx, now).await.unwrap(), 2);
+    for note in &notes {
+        let operations = backend
+            .session()
+            .await
+            .unwrap()
+            .list_attachment_operations_for_note(&note.id)
+            .await
+            .unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(
+            operations[0].object_key,
+            note.attachments[0].storage.as_ref().unwrap().object_key
+        );
+    }
 }
 
 #[tokio::test]

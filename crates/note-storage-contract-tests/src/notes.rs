@@ -824,6 +824,58 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .unwrap(),
         Some(("Updated body".to_string(), 3))
     );
+    let snapshot = session
+        .get_deleted_note_snapshot("contract-notes-active")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.content, "Updated body");
+    assert_eq!(snapshot.revision, 3);
+    assert_eq!(snapshot.attachments.len(), 1);
+    assert_eq!(snapshot.attachments[0].id, updated_attachment.id);
+    assert_eq!(snapshot.attachments[0].path, updated_attachment.path);
+    assert_eq!(snapshot.attachments[0].mime, updated_attachment.mime);
+    assert_eq!(
+        snapshot.attachments[0].description,
+        updated_attachment.description
+    );
+    assert_eq!(snapshot.attachments[0].storage, updated_attachment.storage);
+    assert!(snapshot.attachments[0].content.is_empty());
+    assert!(session
+        .get_deleted_note_snapshot("contract-notes-newer")
+        .await
+        .unwrap()
+        .is_none());
+    let legacy_attachment = NoteAttachment {
+        id: "legacy".into(),
+        path: "legacy.txt".into(),
+        mime: "text/plain".into(),
+        description: "legacy metadata".into(),
+        content: Vec::new(),
+        storage: None,
+    };
+    session
+        .insert_note(NewNote {
+            id: "contract-notes-deleted-legacy",
+            title: "Legacy",
+            content: "legacy body",
+            attachments: std::slice::from_ref(&legacy_attachment),
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 7,
+            deleted_at: Some(900),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .get_deleted_note_snapshot("contract-notes-deleted-legacy")
+            .await
+            .unwrap()
+            .unwrap()
+            .attachments,
+        vec![legacy_attachment]
+    );
     let deleted = session.list_deleted_note_summaries().await.unwrap();
     let deleted = deleted
         .iter()

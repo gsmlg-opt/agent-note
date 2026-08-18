@@ -1,12 +1,13 @@
 use crate::{
     ActiveNoteSource, AttachmentMetadataUpdate, AttachmentOperation, AttachmentOperationStatus,
-    BackendInfo, CompareAndSwap, EmbeddingDashboardStatus, EmbeddingJob, NewAttachmentOperation,
-    NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace, NoteChunk,
-    NoteFieldsUpdate, NoteMutationResult, NoteUpdate, OrgArtifactReference, OrgAttempt,
-    OrgAttemptNoteReference, OrgAttemptUpdate, OrgDocument, OrgDocumentUpdate, OrgEvent, OrgLease,
-    OrgLeaseEndReason, OrgLeaseKind, OrgOperationalQuery, OrgOperationalRow, OrgProjectedWorkItem,
-    OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, StorageError,
-    StorageErrorKind, StorageResult, StoredOrgOperation, UpsertNoteChunk,
+    BackendInfo, CompareAndSwap, DeletedNoteSnapshot, EmbeddingDashboardStatus, EmbeddingJob,
+    NewAttachmentOperation, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgLease,
+    NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteMutationResult, NoteUpdate,
+    OrgArtifactReference, OrgAttempt, OrgAttemptNoteReference, OrgAttemptUpdate, OrgDocument,
+    OrgDocumentUpdate, OrgEvent, OrgLease, OrgLeaseEndReason, OrgLeaseKind, OrgOperationalQuery,
+    OrgOperationalRow, OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceOperationalSummary,
+    OrgWorkspaceUpdate, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
+    UpsertNoteChunk,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -286,6 +287,10 @@ pub trait NotesRepository: Send + Sync {
         &self,
         id: &str,
     ) -> StorageResult<Option<(String, i64)>>;
+    async fn get_deleted_note_snapshot(
+        &self,
+        id: &str,
+    ) -> StorageResult<Option<DeletedNoteSnapshot>>;
     async fn restore_note(
         &self,
         id: &str,
