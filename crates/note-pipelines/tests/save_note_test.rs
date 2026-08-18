@@ -1,7 +1,8 @@
 mod support;
 
 use note_attachments::{
-    AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
+    AttachmentStore, AttachmentStoreInfo, DeleteObjectOutcome, PreparedAttachmentMutation,
+    PreparedAttachmentSet, PutObjectRequest, StoredObject,
 };
 use note_core::{
     AttachmentStorageMetadata, LabelKeyValidationError, LabelValueType, NoteAttachment,
@@ -162,6 +163,47 @@ impl PreparedAttachmentMutation for RecordingPreparedMutation {
 
 #[async_trait::async_trait]
 impl AttachmentStore for RecordingAttachmentStore {
+    async fn put_immutable(&self, request: PutObjectRequest) -> anyhow::Result<StoredObject> {
+        self.objects.lock().unwrap().insert(
+            ("object".to_string(), request.object_key.clone()),
+            request.bytes.clone(),
+        );
+        Ok(StoredObject {
+            object_key: request.object_key,
+            size_bytes: request.bytes.len() as u64,
+            checksum_sha256: request.checksum_sha256,
+        })
+    }
+
+    async fn read_object(&self, object_key: &str) -> anyhow::Result<Vec<u8>> {
+        self.reads
+            .lock()
+            .unwrap()
+            .push(("object".to_string(), object_key.to_string()));
+        self.objects
+            .lock()
+            .unwrap()
+            .get(&("object".to_string(), object_key.to_string()))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing generated test attachment"))
+    }
+
+    async fn delete_object(&self, object_key: &str) -> anyhow::Result<DeleteObjectOutcome> {
+        Ok(
+            if self
+                .objects
+                .lock()
+                .unwrap()
+                .remove(&("object".to_string(), object_key.to_string()))
+                .is_some()
+            {
+                DeleteObjectOutcome::Deleted
+            } else {
+                DeleteObjectOutcome::AlreadyAbsent
+            },
+        )
+    }
+
     async fn prepare(
         &self,
         note_id: &str,
@@ -369,9 +411,11 @@ async fn save_uploads_generated_objects_before_begin_and_persists_verified_metad
     .unwrap();
 
     let storage = note.attachments[0].storage.as_ref().unwrap();
+    let note_namespace = format!("{:x}", Sha256::digest(note.id.as_bytes()));
     assert!(storage
         .object_key
-        .starts_with(&format!("notes/{}/objects/", note.id)));
+        .starts_with(&format!("notes/{note_namespace}/objects/")));
+    assert!(!storage.object_key.contains(&note.id));
     assert!(!storage.object_key.contains("user-id-must-not-appear"));
     assert!(!storage.object_key.contains("user-path-must-not-appear"));
     assert!(storage.object_key.ends_with(&checksum[..16]));
@@ -1504,9 +1548,15 @@ async fn get_note_hydrates_attachments_through_the_injected_store() {
     let note = get_note(&ctx, "note-1").await.unwrap().unwrap();
 
     assert_eq!(note.attachments[0].content, b"payload");
+    let object_key = note.attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
     assert_eq!(
         *attachments.reads.lock().unwrap(),
-        vec![("note-1".into(), "./file.txt".into())]
+        vec![("object".into(), object_key)]
     );
 }
 
@@ -1582,9 +1632,10 @@ async fn get_note_attachment_reads_only_the_selected_object() {
 
     assert_eq!(attachment.path, "./file.txt");
     assert_eq!(attachment.content, b"payload");
+    let object_key = attachment.storage.as_ref().unwrap().object_key.clone();
     assert_eq!(
         *attachments.reads.lock().unwrap(),
-        vec![("note-1".into(), "./file.txt".into())]
+        vec![("object".into(), object_key)]
     );
     assert!(get_note_attachment(&ctx, "note-1", "missing.txt")
         .await
@@ -1650,12 +1701,11 @@ async fn get_note_attachment_matches_forward_and_backslash_separators() {
 
     assert_eq!(forward.content, b"forward");
     assert_eq!(back.content, b"back");
+    let forward_key = forward.storage.as_ref().unwrap().object_key.clone();
+    let back_key = back.storage.as_ref().unwrap().object_key.clone();
     assert_eq!(
         *attachments.reads.lock().unwrap(),
-        vec![
-            ("forward-note".into(), "./dir/file.txt".into()),
-            ("back-note".into(), r".\dir\file.txt".into()),
-        ]
+        vec![("object".into(), forward_key), ("object".into(), back_key),]
     );
 }
 

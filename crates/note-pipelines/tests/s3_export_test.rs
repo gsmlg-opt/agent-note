@@ -73,7 +73,7 @@ async fn json_round_trip_uses_the_selected_s3_attachment_store() {
 }
 
 #[tokio::test]
-async fn import_can_hold_two_prepared_s3_attachment_sets() {
+async fn import_publishes_two_s3_attachment_sets_object_first() {
     let Some((ctx, s3, _dir)) = s3_context().await else {
         return;
     };

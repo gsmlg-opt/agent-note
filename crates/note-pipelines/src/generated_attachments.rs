@@ -28,12 +28,13 @@ pub(crate) async fn publish_generated_attachments(
         metadata: Vec::with_capacity(attachments.len()),
         object_keys: Vec::with_capacity(attachments.len()),
     };
+    let note_namespace = format!("{:x}", Sha256::digest(note_id.as_bytes()));
 
     for attachment in attachments {
         let checksum_sha256 = format!("{:x}", Sha256::digest(&attachment.content));
         let storage_generation = uuid::Uuid::new_v4().to_string();
         let object_key = format!(
-            "notes/{note_id}/objects/{storage_generation}-{}",
+            "notes/{note_namespace}/objects/{storage_generation}-{}",
             &checksum_sha256[..CHECKSUM_PREFIX_LEN]
         );
         let size_bytes = attachment.content.len() as u64;
@@ -90,6 +91,12 @@ pub(crate) async fn publish_generated_attachments(
 }
 
 impl PublishedAttachmentSet {
+    pub(crate) async fn cleanup_best_effort(self, store: &dyn AttachmentStore) {
+        for object_key in self.object_keys {
+            let _ = store.delete_object(&object_key).await;
+        }
+    }
+
     pub(crate) async fn cleanup_with_primary(
         self,
         store: &dyn AttachmentStore,

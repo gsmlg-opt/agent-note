@@ -39,6 +39,7 @@ pub struct EventStorageBackend {
     fail_begin: Arc<AtomicBool>,
     fail_commit: Arc<AtomicBool>,
     fail_commit_ack: Arc<AtomicBool>,
+    fail_rollback: Arc<AtomicBool>,
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
     repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
     matching_note_ids_for_update_override: Arc<Mutex<Option<Vec<String>>>>,
@@ -54,6 +55,7 @@ impl EventStorageBackend {
             fail_begin: Arc::new(AtomicBool::new(false)),
             fail_commit: Arc::new(AtomicBool::new(false)),
             fail_commit_ack: Arc::new(AtomicBool::new(false)),
+            fail_rollback: Arc::new(AtomicBool::new(false)),
             fail_repository_calls: Arc::new(Mutex::new(VecDeque::new())),
             repository_call_counts: Arc::new(Mutex::new(HashMap::new())),
             matching_note_ids_for_update_override: Arc::new(Mutex::new(None)),
@@ -68,6 +70,10 @@ impl EventStorageBackend {
 
     pub fn fail_next_commit_acknowledgement(&self) {
         self.fail_commit_ack.store(true, Ordering::SeqCst);
+    }
+
+    pub fn fail_next_rollback(&self) {
+        self.fail_rollback.store(true, Ordering::SeqCst);
     }
 
     pub fn fail_next_begin(&self) {
@@ -106,6 +112,7 @@ struct EventTransaction {
     events: EventLog,
     fail_commit: Arc<AtomicBool>,
     fail_commit_ack: Arc<AtomicBool>,
+    fail_rollback: Arc<AtomicBool>,
     fail_repository_calls: Arc<Mutex<VecDeque<String>>>,
     repository_call_counts: Arc<Mutex<HashMap<String, usize>>>,
     matching_note_ids_for_update_override: Arc<Mutex<Option<Vec<String>>>>,
@@ -218,6 +225,7 @@ impl StorageBackend for EventStorageBackend {
             events: self.events.clone(),
             fail_commit: self.fail_commit.clone(),
             fail_commit_ack: self.fail_commit_ack.clone(),
+            fail_rollback: self.fail_rollback.clone(),
             fail_repository_calls: self.fail_repository_calls.clone(),
             repository_call_counts: self.repository_call_counts.clone(),
             matching_note_ids_for_update_override: self
@@ -566,6 +574,7 @@ impl StorageTransaction for EventTransaction {
             events,
             fail_commit,
             fail_commit_ack,
+            fail_rollback: _,
             fail_repository_calls: _,
             repository_call_counts: _,
             matching_note_ids_for_update_override: _,
@@ -598,12 +607,20 @@ impl StorageTransaction for EventTransaction {
             events,
             fail_commit: _,
             fail_commit_ack: _,
+            fail_rollback,
             fail_repository_calls: _,
             repository_call_counts: _,
             matching_note_ids_for_update_override: _,
             noop_set_note_label_ids: _,
             set_note_label_note_ids: _,
         } = *self;
+        if fail_rollback.swap(false, Ordering::SeqCst) {
+            events.lock().unwrap().push("rollback_failed".into());
+            return Err(StorageError::new(
+                StorageErrorKind::Transaction,
+                "controlled rollback failure",
+            ));
+        }
         inner.rollback().await?;
         events.lock().unwrap().push("rollback".into());
         Ok(())
@@ -616,6 +633,7 @@ pub struct ControlledAttachmentStore {
     fail_publish: AtomicBool,
     fail_abort: AtomicBool,
     race_note_ids: Mutex<HashSet<String>>,
+    race_note_on_next_put: Mutex<Option<String>>,
     delete_path_races: Mutex<HashMap<String, VecDeque<(String, String)>>>,
     read_contents: Mutex<HashMap<(String, String), Vec<u8>>>,
     read_failures: Mutex<HashMap<(String, String), VecDeque<String>>>,
@@ -639,6 +657,7 @@ impl ControlledAttachmentStore {
             fail_publish: AtomicBool::new(false),
             fail_abort: AtomicBool::new(false),
             race_note_ids: Mutex::new(HashSet::new()),
+            race_note_on_next_put: Mutex::new(None),
             delete_path_races: Mutex::new(HashMap::new()),
             read_contents: Mutex::new(HashMap::new()),
             read_failures: Mutex::new(HashMap::new()),
@@ -694,6 +713,10 @@ impl ControlledAttachmentStore {
             .lock()
             .unwrap()
             .insert(note_id.to_string());
+    }
+
+    pub fn race_note_on_next_put(&self, note_id: &str) {
+        *self.race_note_on_next_put.lock().unwrap() = Some(note_id.to_string());
     }
 
     pub fn race_attachment_path_on_delete(&self, note_id: &str, attachment_id: &str, path: &str) {
@@ -798,6 +821,26 @@ impl AttachmentStore for ControlledAttachmentStore {
             .lock()
             .unwrap()
             .insert(request.object_key.clone(), request.bytes.clone());
+        let raced_note_id = self.race_note_on_next_put.lock().unwrap().take();
+        if let Some(note_id) = raced_note_id {
+            let session = self.backend.session().await?;
+            session
+                .insert_note(NewNote {
+                    id: &note_id,
+                    title: "Raced",
+                    content: "Inserted during immutable object publication",
+                    attachments: &[],
+                    created_at: 1,
+                    updated_at: 1,
+                    note_revision: 1,
+                    deleted_at: None,
+                })
+                .await?;
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("race_note_on_put:{note_id}"));
+        }
         let mut stored = StoredObject {
             object_key: request.object_key,
             size_bytes: request.bytes.len() as u64,

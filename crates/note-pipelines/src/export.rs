@@ -1,6 +1,7 @@
 use crate::{enqueue_missing_chunk_embeddings, parse_label_value_type, Context};
-use note_attachments::PreparedAttachmentSet;
-use note_core::{decode_attachment_content, encode_attachment_content, NoteAttachment};
+use note_core::{
+    decode_attachment_content, encode_attachment_content, validate_attachments, NoteAttachment,
+};
 use note_storage::{NewNote, TransactionMode};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -92,9 +93,9 @@ pub struct ImportStats {
     pub embedding_jobs_queued: usize,
 }
 
-struct PreparedImportNote {
+struct PublishedImportNote {
     note: ExportNote,
-    attachments: Box<dyn PreparedAttachmentSet>,
+    attachments: crate::generated_attachments::PublishedAttachmentSet,
 }
 
 pub async fn export_data(ctx: &Context) -> anyhow::Result<ExportData> {
@@ -182,7 +183,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
     }
     drop(session);
 
-    let mut prepared_notes = Vec::with_capacity(candidate_notes.len());
+    let mut published_notes = Vec::with_capacity(candidate_notes.len());
     for mut note in candidate_notes {
         let encoded_attachments = std::mem::take(&mut note.attachments);
         let attachments = match encoded_attachments
@@ -192,28 +193,37 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
         {
             Ok(attachments) => attachments,
             Err(error) => {
-                return Err(abort_import_notes(prepared_notes, error).await);
+                return Err(cleanup_import_notes(ctx, published_notes, error).await);
             }
         };
-        let prepared = match ctx.attachments().prepare(&note.id, &attachments).await {
-            Ok(prepared) => prepared,
+        if let Err(error) = validate_attachments(&attachments) {
+            return Err(cleanup_import_notes(ctx, published_notes, error.into()).await);
+        }
+        let published = match crate::generated_attachments::publish_generated_attachments(
+            ctx.attachments(),
+            &note.id,
+            &attachments,
+        )
+        .await
+        {
+            Ok(published) => published,
             Err(error) => {
-                return Err(abort_import_notes(prepared_notes, error).await);
+                return Err(cleanup_import_notes(ctx, published_notes, error).await);
             }
         };
-        prepared_notes.push(PreparedImportNote {
+        published_notes.push(PublishedImportNote {
             note,
-            attachments: prepared,
+            attachments: published,
         });
     }
 
     let transaction = match ctx.storage().begin(TransactionMode::Deferred).await {
         Ok(transaction) => transaction,
         Err(error) => {
-            return Err(abort_import_notes(prepared_notes, error.into()).await);
+            return Err(cleanup_import_notes(ctx, published_notes, error.into()).await);
         }
     };
-    let mut inserted = Vec::with_capacity(prepared_notes.len());
+    let mut inserted = Vec::with_capacity(published_notes.len());
     let transaction_result = async {
         for label_key in label_keys {
             if known_keys.insert(label_key.key.clone()) {
@@ -225,8 +235,8 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
             }
         }
 
-        for prepared in &prepared_notes {
-            let note = &prepared.note;
+        for published in &published_notes {
+            let note = &published.note;
             if transaction.note_exists(&note.id).await? {
                 stats.notes_skipped += 1;
                 inserted.push(false);
@@ -245,7 +255,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
                     id: &note.id,
                     title: &note.title,
                     content: &note.content,
-                    attachments: prepared.attachments.metadata(),
+                    attachments: &published.attachments.metadata,
                     created_at: note.created_at,
                     updated_at: note.updated_at,
                     note_revision: 1,
@@ -262,46 +272,35 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
     }
     .await;
 
-    if let Err(error) = crate::save_note::finish_transaction(transaction, transaction_result).await
-    {
-        return Err(abort_import_notes(prepared_notes, error).await);
+    match transaction_result {
+        Ok(()) => {
+            if let Err(error) = transaction.commit().await {
+                return Err(anyhow::Error::from(error).context(
+                    "import transaction commit failed; generated attachment objects retained because commit outcome is unknown",
+                ));
+            }
+        }
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => return Err(cleanup_import_notes(ctx, published_notes, error).await),
+            Err(rollback_error) => {
+                return Err(error.context(format!(
+                    "import transaction rollback failed; generated attachment objects retained because rollback outcome is unknown: {rollback_error}"
+                )))
+            }
+        },
     }
 
-    // A Tokio task keeps running when its JoinHandle is dropped. Spawn the whole post-commit
-    // batch so cancellation of the import caller cannot strand later prepared attachment sets.
-    let finalization = tokio::spawn(finalize_import_attachments(prepared_notes, inserted));
-    finalization
-        .await
-        .map_err(|_| anyhow::anyhow!("attachment finalization task failed"))??;
+    for (published, was_inserted) in published_notes.into_iter().zip(inserted) {
+        if !was_inserted {
+            published
+                .attachments
+                .cleanup_best_effort(ctx.attachments())
+                .await;
+        }
+    }
 
     stats.embedding_jobs_queued = enqueue_missing_chunk_embeddings(ctx).await?;
     Ok(stats)
-}
-
-async fn finalize_import_attachments(
-    prepared_notes: Vec<PreparedImportNote>,
-    inserted: Vec<bool>,
-) -> anyhow::Result<()> {
-    let mut attachment_error: Option<anyhow::Error> = None;
-    for (prepared, should_publish) in prepared_notes.into_iter().zip(inserted) {
-        let result = if should_publish {
-            prepared.attachments.publish().await
-        } else {
-            prepared.attachments.abort().await
-        };
-        if let Err(error) = result {
-            attachment_error = Some(match attachment_error {
-                None => error,
-                Some(primary) => primary.context(format!(
-                    "additional attachment finalization failure: {error}"
-                )),
-            });
-        }
-    }
-    if let Some(error) = attachment_error {
-        return Err(error);
-    }
-    Ok(())
 }
 
 pub async fn export_json(ctx: &Context) -> anyhow::Result<String> {
@@ -339,17 +338,16 @@ fn default_label_value_type() -> String {
     "text".to_string()
 }
 
-async fn abort_import_notes(
-    prepared_notes: Vec<PreparedImportNote>,
+async fn cleanup_import_notes(
+    ctx: &Context,
+    published_notes: Vec<PublishedImportNote>,
     mut primary: anyhow::Error,
 ) -> anyhow::Error {
-    for prepared in prepared_notes {
-        if let Err(abort_error) = prepared.attachments.abort().await {
-            primary = primary.context(format!(
-                "attachment abort also failed for note {}: {abort_error}",
-                prepared.note.id
-            ));
-        }
+    for published in published_notes {
+        primary = published
+            .attachments
+            .cleanup_with_primary(ctx.attachments(), primary)
+            .await;
     }
     primary
 }
