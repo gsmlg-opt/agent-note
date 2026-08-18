@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use note_attachments::{AttachmentStore, S3AttachmentConfig, S3AttachmentStore};
 use note_embedding::StubEmbedder;
-use note_pipelines::{delete_note, export_json, import_json, permanently_delete_note, Context};
+use note_pipelines::{
+    delete_note, export_json, get_note_metadata, import_json, permanently_delete_note, Context,
+};
 use note_storage::StorageBackend;
 
 async fn s3_context() -> Option<(Context, S3AttachmentStore, tempfile::TempDir)> {
@@ -59,6 +61,16 @@ async fn json_round_trip_uses_the_selected_s3_attachment_store() {
 
     let stats = import_json(&ctx, input).await.unwrap();
     assert_eq!(stats.notes_added, 1);
+    let object_key = get_note_metadata(&ctx, "imported-note")
+        .await
+        .unwrap()
+        .unwrap()
+        .attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
     let exported = export_json(&ctx).await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&exported).unwrap();
     assert_eq!(
@@ -69,7 +81,7 @@ async fn json_round_trip_uses_the_selected_s3_attachment_store() {
     assert!(permanently_delete_note(&ctx, "imported-note", 2)
         .await
         .unwrap());
-    assert!(s3.read("imported-note", "./proof.bin").await.is_err());
+    assert!(s3.read_object(&object_key).await.is_err());
 }
 
 #[tokio::test]
@@ -119,8 +131,28 @@ async fn import_publishes_two_s3_attachment_sets_object_first() {
         .expect("two-note S3 import must not deadlock")
         .unwrap();
     assert_eq!(stats.notes_added, 2);
-    assert_eq!(s3.read("note-a", "./a.bin").await.unwrap(), vec![0, 255]);
-    assert_eq!(s3.read("note-b", "./b.bin").await.unwrap(), vec![128, 254]);
+    let note_a_key = get_note_metadata(&ctx, "note-a")
+        .await
+        .unwrap()
+        .unwrap()
+        .attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    let note_b_key = get_note_metadata(&ctx, "note-b")
+        .await
+        .unwrap()
+        .unwrap()
+        .attachments[0]
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    assert_eq!(s3.read_object(&note_a_key).await.unwrap(), vec![0, 255]);
+    assert_eq!(s3.read_object(&note_b_key).await.unwrap(), vec![128, 254]);
 
     let exported = export_json(&ctx).await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&exported).unwrap();
@@ -147,6 +179,6 @@ async fn import_publishes_two_s3_attachment_sets_object_first() {
         assert!(delete_note(&ctx, note_id, 1).await.unwrap());
         assert!(permanently_delete_note(&ctx, note_id, 2).await.unwrap());
     }
-    assert!(s3.read("note-a", "./a.bin").await.is_err());
-    assert!(s3.read("note-b", "./b.bin").await.is_err());
+    assert!(s3.read_object(&note_a_key).await.is_err());
+    assert!(s3.read_object(&note_b_key).await.is_err());
 }

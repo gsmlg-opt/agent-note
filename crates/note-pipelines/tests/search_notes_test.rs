@@ -1,8 +1,6 @@
 mod support;
 
-use note_attachments::{
-    AttachmentStore, AttachmentStoreInfo, PreparedAttachmentMutation, PreparedAttachmentSet,
-};
+use note_attachments::{AttachmentStore, AttachmentStoreInfo};
 use note_core::{NoteAttachment, NoteListItem};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
@@ -16,44 +14,8 @@ struct PanicAttachmentStore;
 
 #[async_trait::async_trait]
 impl AttachmentStore for PanicAttachmentStore {
-    async fn prepare(
-        &self,
-        _note_id: &str,
-        _attachments: &[NoteAttachment],
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
-        panic!("search must not prepare attachments")
-    }
-
-    async fn prepare_put(
-        &self,
-        _note_id: &str,
-        _attachment: &NoteAttachment,
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-        panic!("search must not prepare an attachment put")
-    }
-
-    async fn prepare_delete(
-        &self,
-        _note_id: &str,
-        _path: &str,
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-        panic!("search must not prepare an attachment delete")
-    }
-
-    async fn read(&self, _note_id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
+    async fn read_legacy(&self, _note_id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
         panic!("search must not read attachments")
-    }
-
-    async fn hydrate(
-        &self,
-        _note_id: &str,
-        _attachments: &mut [NoteAttachment],
-    ) -> anyhow::Result<()> {
-        panic!("search must not hydrate attachments")
-    }
-
-    async fn remove_note(&self, _note_id: &str) -> anyhow::Result<()> {
-        panic!("search must not remove attachments")
     }
 
     fn info(&self) -> AttachmentStoreInfo {

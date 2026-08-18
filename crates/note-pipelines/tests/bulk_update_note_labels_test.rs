@@ -65,8 +65,22 @@ async fn seed_note(
         content: format!("payload for {id}").into_bytes(),
         storage: None,
     }];
-    let prepared = ctx.attachments().prepare(id, &attachments).await.unwrap();
-    let metadata = prepared.metadata().to_vec();
+    let store_info = ctx.attachments().info();
+    if store_info.engine == "filesystem" {
+        let path = std::path::PathBuf::from(store_info.location.unwrap())
+            .join(id)
+            .join("source.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &attachments[0].content).unwrap();
+    }
+    let metadata = attachments
+        .iter()
+        .cloned()
+        .map(|mut attachment| {
+            attachment.content.clear();
+            attachment
+        })
+        .collect::<Vec<_>>();
     let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
     for key in ["type", "project", "owner"] {
         transaction
@@ -129,7 +143,6 @@ async fn seed_note(
             .unwrap();
     }
     transaction.commit().await.unwrap();
-    prepared.publish().await.unwrap();
 }
 
 async fn preservation_snapshot(

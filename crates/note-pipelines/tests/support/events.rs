@@ -1,8 +1,7 @@
 use note_attachments::{
-    AttachmentStore, AttachmentStoreInfo, DeleteObjectOutcome, PreparedAttachmentMutation,
-    PreparedAttachmentSet, PutObjectRequest, StoredObject,
+    AttachmentStore, AttachmentStoreInfo, DeleteObjectOutcome, PutObjectRequest, StoredObject,
 };
-use note_core::{LabelSelector, NoteAttachment};
+use note_core::LabelSelector;
 use note_pipelines::EmbeddingJobNotifier;
 use note_storage::{
     ActiveNoteSource, AttachmentMetadataUpdate, AttachmentOperation, AttachmentOperationRepository,
@@ -25,7 +24,6 @@ use std::{
         Arc, Mutex,
     },
 };
-use tokio::sync::Notify;
 
 pub type EventLog = Arc<Mutex<Vec<String>>>;
 
@@ -631,10 +629,7 @@ pub struct ControlledAttachmentStore {
     backend: Arc<dyn StorageBackend>,
     events: EventLog,
     fail_publish: AtomicBool,
-    fail_abort: AtomicBool,
-    race_note_ids: Mutex<HashSet<String>>,
     race_note_on_next_put: Mutex<Option<String>>,
-    delete_path_races: Mutex<HashMap<String, VecDeque<(String, String)>>>,
     read_contents: Mutex<HashMap<(String, String), Vec<u8>>>,
     read_failures: Mutex<HashMap<(String, String), VecDeque<String>>>,
     read_path_races: Mutex<HashMap<(String, String), VecDeque<Vec<(String, String)>>>>,
@@ -643,10 +638,6 @@ pub struct ControlledAttachmentStore {
     put_calls: Mutex<usize>,
     corrupt_put_return: AtomicBool,
     fail_delete: AtomicBool,
-    committed_marker: Mutex<Option<String>>,
-    blocked_publish_note: Mutex<Option<String>>,
-    publish_started: Arc<Notify>,
-    publish_release: Arc<Notify>,
 }
 
 impl ControlledAttachmentStore {
@@ -655,10 +646,7 @@ impl ControlledAttachmentStore {
             backend,
             events,
             fail_publish: AtomicBool::new(false),
-            fail_abort: AtomicBool::new(false),
-            race_note_ids: Mutex::new(HashSet::new()),
             race_note_on_next_put: Mutex::new(None),
-            delete_path_races: Mutex::new(HashMap::new()),
             read_contents: Mutex::new(HashMap::new()),
             read_failures: Mutex::new(HashMap::new()),
             read_path_races: Mutex::new(HashMap::new()),
@@ -667,19 +655,11 @@ impl ControlledAttachmentStore {
             put_calls: Mutex::new(0),
             corrupt_put_return: AtomicBool::new(false),
             fail_delete: AtomicBool::new(false),
-            committed_marker: Mutex::new(None),
-            blocked_publish_note: Mutex::new(None),
-            publish_started: Arc::new(Notify::new()),
-            publish_release: Arc::new(Notify::new()),
         }
     }
 
     pub fn fail_publish(&self) {
         self.fail_publish.store(true, Ordering::SeqCst);
-    }
-
-    pub fn fail_abort(&self) {
-        self.fail_abort.store(true, Ordering::SeqCst);
     }
 
     pub fn fail_put_on_call(&self, call: usize) {
@@ -708,24 +688,8 @@ impl ControlledAttachmentStore {
             .contains_key(object_key)
     }
 
-    pub fn race_note_on_prepare(&self, note_id: &str) {
-        self.race_note_ids
-            .lock()
-            .unwrap()
-            .insert(note_id.to_string());
-    }
-
     pub fn race_note_on_next_put(&self, note_id: &str) {
         *self.race_note_on_next_put.lock().unwrap() = Some(note_id.to_string());
-    }
-
-    pub fn race_attachment_path_on_delete(&self, note_id: &str, attachment_id: &str, path: &str) {
-        self.delete_path_races
-            .lock()
-            .unwrap()
-            .entry(note_id.to_string())
-            .or_default()
-            .push_back((attachment_id.to_string(), path.to_string()));
     }
 
     pub fn set_read_content(&self, note_id: &str, path: &str, content: &[u8]) {
@@ -762,44 +726,6 @@ impl ControlledAttachmentStore {
                     .collect(),
             );
     }
-
-    pub fn observe_committed_label_on_abort(&self, key: &str) {
-        *self.committed_marker.lock().unwrap() = Some(key.to_string());
-    }
-
-    pub fn block_publish(&self, note_id: &str) {
-        *self.blocked_publish_note.lock().unwrap() = Some(note_id.to_string());
-    }
-
-    pub async fn wait_for_blocked_publish(&self) {
-        self.publish_started.notified().await;
-    }
-
-    pub fn release_blocked_publish(&self) {
-        self.publish_release.notify_one();
-    }
-}
-
-struct ControlledPreparedSet {
-    note_id: String,
-    metadata: Vec<NoteAttachment>,
-    backend: Arc<dyn StorageBackend>,
-    events: EventLog,
-    fail_publish: bool,
-    fail_abort: bool,
-    committed_marker: Option<String>,
-    block_publish: bool,
-    publish_started: Arc<Notify>,
-    publish_release: Arc<Notify>,
-}
-
-struct ControlledPreparedMutation {
-    note_id: String,
-    path: String,
-    operation: &'static str,
-    events: EventLog,
-    fail_publish: bool,
-    fail_abort: bool,
 }
 
 #[async_trait::async_trait]
@@ -915,186 +841,6 @@ impl AttachmentStore for ControlledAttachmentStore {
         )
     }
 
-    async fn prepare(
-        &self,
-        note_id: &str,
-        attachments: &[NoteAttachment],
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
-        let session = self.backend.session().await?;
-        let state = session
-            .list_all_notes()
-            .await?
-            .into_iter()
-            .find(|note| note.id == note_id)
-            .map_or_else(|| "missing".to_string(), |note| note.title);
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("prepare:{note_id}:{state}"));
-
-        if self.race_note_ids.lock().unwrap().remove(note_id) {
-            session
-                .insert_note(NewNote {
-                    id: note_id,
-                    title: "Raced",
-                    content: "Inserted during attachment preparation",
-                    attachments: &[],
-                    created_at: 1,
-                    updated_at: 1,
-                    note_revision: 1,
-                    deleted_at: None,
-                })
-                .await?;
-        }
-
-        Ok(Box::new(ControlledPreparedSet {
-            note_id: note_id.to_string(),
-            metadata: attachments
-                .iter()
-                .map(|attachment| NoteAttachment {
-                    id: attachment.id.clone(),
-                    path: attachment.path.clone(),
-                    mime: attachment.mime.clone(),
-                    description: attachment.description.clone(),
-                    content: Vec::new(),
-                    storage: attachment.storage.clone(),
-                })
-                .collect(),
-            backend: self.backend.clone(),
-            events: self.events.clone(),
-            fail_publish: self.fail_publish.load(Ordering::SeqCst),
-            fail_abort: self.fail_abort.load(Ordering::SeqCst),
-            committed_marker: self.committed_marker.lock().unwrap().clone(),
-            block_publish: self.blocked_publish_note.lock().unwrap().as_deref() == Some(note_id),
-            publish_started: self.publish_started.clone(),
-            publish_release: self.publish_release.clone(),
-        }))
-    }
-
-    async fn prepare_put(
-        &self,
-        note_id: &str,
-        attachment: &NoteAttachment,
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("prepare_put:{note_id}:{}", attachment.path));
-        Ok(Box::new(ControlledPreparedMutation {
-            note_id: note_id.to_string(),
-            path: attachment.path.clone(),
-            operation: "put",
-            events: self.events.clone(),
-            fail_publish: self.fail_publish.load(Ordering::SeqCst),
-            fail_abort: self.fail_abort.load(Ordering::SeqCst),
-        }))
-    }
-
-    async fn prepare_delete(
-        &self,
-        note_id: &str,
-        path: &str,
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("prepare_delete:{note_id}:{path}"));
-        let race = self
-            .delete_path_races
-            .lock()
-            .unwrap()
-            .get_mut(note_id)
-            .and_then(VecDeque::pop_front);
-        if let Some((attachment_id, replacement_path)) = race {
-            let session = self.backend.session().await?;
-            if let Some(mut note) = session.get_note(note_id).await? {
-                if let Some(attachment) = note
-                    .attachments
-                    .iter_mut()
-                    .find(|attachment| attachment.id == attachment_id)
-                {
-                    attachment.path = replacement_path.clone();
-                    session
-                        .update_note_attachments(AttachmentMetadataUpdate {
-                            id: note_id,
-                            expected_revision: note.revision,
-                            attachments: &note.attachments,
-                            updated_at: note.updated_at.saturating_add(1),
-                        })
-                        .await?;
-                    self.events.lock().unwrap().push(format!(
-                        "race_delete_path:{note_id}:{attachment_id}:{replacement_path}"
-                    ));
-                }
-            }
-        }
-        Ok(Box::new(ControlledPreparedMutation {
-            note_id: note_id.to_string(),
-            path: path.to_string(),
-            operation: "delete",
-            events: self.events.clone(),
-            fail_publish: self.fail_publish.load(Ordering::SeqCst),
-            fail_abort: self.fail_abort.load(Ordering::SeqCst),
-        }))
-    }
-
-    async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("read:{note_id}:{path}"));
-        let key = (note_id.to_string(), path.to_string());
-        let content = self
-            .read_contents
-            .lock()
-            .unwrap()
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
-        let failure = self
-            .read_failures
-            .lock()
-            .unwrap()
-            .get_mut(&key)
-            .and_then(VecDeque::pop_front);
-        let race = self
-            .read_path_races
-            .lock()
-            .unwrap()
-            .get_mut(&key)
-            .and_then(VecDeque::pop_front);
-        if let Some(replacements) = race {
-            let session = self.backend.session().await?;
-            if let Some(mut note) = session.get_note(note_id).await? {
-                for (attachment_id, replacement_path) in replacements {
-                    if let Some(attachment) = note
-                        .attachments
-                        .iter_mut()
-                        .find(|attachment| attachment.id == attachment_id)
-                    {
-                        attachment.path = replacement_path;
-                    }
-                }
-                session
-                    .update_note_attachments(AttachmentMetadataUpdate {
-                        id: note_id,
-                        expected_revision: note.revision,
-                        attachments: &note.attachments,
-                        updated_at: note.updated_at.saturating_add(1),
-                    })
-                    .await?;
-                self.events
-                    .lock()
-                    .unwrap()
-                    .push(format!("race_read_paths:{note_id}:{path}"));
-            }
-        }
-        if let Some(message) = failure {
-            anyhow::bail!(message);
-        }
-        Ok(content)
-    }
-
     async fn read_legacy(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
         self.events
             .lock()
@@ -1152,100 +898,11 @@ impl AttachmentStore for ControlledAttachmentStore {
         Ok(content)
     }
 
-    async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {
-        let session = self.backend.session().await?;
-        let absent = session
-            .list_all_notes()
-            .await?
-            .iter()
-            .all(|note| note.id != note_id);
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("remove:{note_id}:absent={absent}"));
-        Ok(())
-    }
-
     fn info(&self) -> AttachmentStoreInfo {
         AttachmentStoreInfo {
             engine: "controlled".into(),
             location: None,
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl PreparedAttachmentMutation for ControlledPreparedMutation {
-    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
-        self.events.lock().unwrap().push(format!(
-            "publish_{}:{}:{}",
-            self.operation, self.note_id, self.path
-        ));
-        if self.fail_publish {
-            anyhow::bail!("controlled mutation publish failure");
-        }
-        Ok(())
-    }
-
-    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
-        self.events.lock().unwrap().push(format!(
-            "abort_{}:{}:{}",
-            self.operation, self.note_id, self.path
-        ));
-        if self.fail_abort {
-            anyhow::bail!("controlled mutation abort failure");
-        }
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl PreparedAttachmentSet for ControlledPreparedSet {
-    fn metadata(&self) -> &[NoteAttachment] {
-        &self.metadata
-    }
-
-    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
-        if self.block_publish {
-            self.publish_started.notify_one();
-            self.publish_release.notified().await;
-        }
-        let session = self.backend.session().await?;
-        let state = session
-            .list_all_notes()
-            .await?
-            .into_iter()
-            .find(|note| note.id == self.note_id)
-            .map_or_else(|| "missing".to_string(), |note| note.title);
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("publish:{}:{state}", self.note_id));
-        if self.fail_publish {
-            anyhow::bail!("controlled publish failure");
-        }
-        Ok(())
-    }
-
-    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
-        let marker = if let Some(key) = &self.committed_marker {
-            let session = self.backend.session().await?;
-            session
-                .list_label_keys()
-                .await?
-                .iter()
-                .any(|label| &label.key == key)
-        } else {
-            false
-        };
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("abort:{}:marker={marker}", self.note_id));
-        if self.fail_abort {
-            anyhow::bail!("controlled abort failure");
-        }
-        Ok(())
     }
 }
 

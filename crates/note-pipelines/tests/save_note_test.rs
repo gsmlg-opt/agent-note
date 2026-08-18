@@ -1,8 +1,7 @@
 mod support;
 
 use note_attachments::{
-    AttachmentStore, AttachmentStoreInfo, DeleteObjectOutcome, PreparedAttachmentMutation,
-    PreparedAttachmentSet, PutObjectRequest, StoredObject,
+    AttachmentStore, AttachmentStoreInfo, DeleteObjectOutcome, PutObjectRequest, StoredObject,
 };
 use note_core::{
     AttachmentStorageMetadata, LabelKeyValidationError, LabelValueType, NoteAttachment,
@@ -57,62 +56,12 @@ struct RecordingAttachmentStore {
     reads: Arc<Mutex<Vec<(String, String)>>>,
 }
 
-struct RecordingPreparedSet {
-    note_id: String,
-    metadata: Vec<NoteAttachment>,
-    objects: AttachmentObjects,
-    content: Vec<(String, Vec<u8>)>,
-}
-
-struct RecordingPreparedMutation {
-    note_id: String,
-    path: String,
-    content: Option<Vec<u8>>,
-    objects: AttachmentObjects,
-}
-
 struct PanicAttachmentStore;
 
 #[async_trait::async_trait]
 impl AttachmentStore for PanicAttachmentStore {
-    async fn prepare(
-        &self,
-        _note_id: &str,
-        _attachments: &[NoteAttachment],
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
-        panic!("metadata-only workflows must not prepare attachments")
-    }
-
-    async fn prepare_put(
-        &self,
-        _note_id: &str,
-        _attachment: &NoteAttachment,
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-        panic!("metadata-only workflows must not prepare an attachment put")
-    }
-
-    async fn prepare_delete(
-        &self,
-        _note_id: &str,
-        _path: &str,
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-        panic!("metadata-only workflows must not prepare an attachment delete")
-    }
-
-    async fn read(&self, _note_id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
+    async fn read_legacy(&self, _note_id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
         panic!("metadata-only workflows must not read attachments")
-    }
-
-    async fn hydrate(
-        &self,
-        _note_id: &str,
-        _attachments: &mut [NoteAttachment],
-    ) -> anyhow::Result<()> {
-        panic!("metadata-only workflows must not hydrate attachments")
-    }
-
-    async fn remove_note(&self, _note_id: &str) -> anyhow::Result<()> {
-        panic!("metadata-only workflows must not remove attachments")
     }
 
     fn info(&self) -> AttachmentStoreInfo {
@@ -120,44 +69,6 @@ impl AttachmentStore for PanicAttachmentStore {
             engine: "panic".into(),
             location: None,
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl PreparedAttachmentSet for RecordingPreparedSet {
-    fn metadata(&self) -> &[NoteAttachment] {
-        &self.metadata
-    }
-
-    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
-        let mut objects = self.objects.lock().unwrap();
-        objects.retain(|(note_id, _), _| note_id != &self.note_id);
-        for (path, content) in self.content {
-            objects.insert((self.note_id.clone(), path), content);
-        }
-        Ok(())
-    }
-
-    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl PreparedAttachmentMutation for RecordingPreparedMutation {
-    async fn publish(self: Box<Self>) -> anyhow::Result<()> {
-        let mut objects = self.objects.lock().unwrap();
-        let key = (self.note_id, self.path);
-        if let Some(content) = self.content {
-            objects.insert(key, content);
-        } else {
-            objects.remove(&key);
-        }
-        Ok(())
-    }
-
-    async fn abort(self: Box<Self>) -> anyhow::Result<()> {
-        Ok(())
     }
 }
 
@@ -204,59 +115,7 @@ impl AttachmentStore for RecordingAttachmentStore {
         )
     }
 
-    async fn prepare(
-        &self,
-        note_id: &str,
-        attachments: &[NoteAttachment],
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
-        Ok(Box::new(RecordingPreparedSet {
-            note_id: note_id.to_string(),
-            metadata: attachments
-                .iter()
-                .map(|attachment| NoteAttachment {
-                    id: attachment.id.clone(),
-                    path: attachment.path.clone(),
-                    mime: attachment.mime.clone(),
-                    description: attachment.description.clone(),
-                    content: Vec::new(),
-                    storage: attachment.storage.clone(),
-                })
-                .collect(),
-            objects: self.objects.clone(),
-            content: attachments
-                .iter()
-                .map(|attachment| (attachment.path.clone(), attachment.content.clone()))
-                .collect(),
-        }))
-    }
-
-    async fn prepare_put(
-        &self,
-        note_id: &str,
-        attachment: &NoteAttachment,
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-        Ok(Box::new(RecordingPreparedMutation {
-            note_id: note_id.to_string(),
-            path: attachment.path.clone(),
-            content: Some(attachment.content.clone()),
-            objects: self.objects.clone(),
-        }))
-    }
-
-    async fn prepare_delete(
-        &self,
-        note_id: &str,
-        path: &str,
-    ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-        Ok(Box::new(RecordingPreparedMutation {
-            note_id: note_id.to_string(),
-            path: path.to_string(),
-            content: None,
-            objects: self.objects.clone(),
-        }))
-    }
-
-    async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+    async fn read_legacy(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
         self.reads
             .lock()
             .unwrap()
@@ -267,14 +126,6 @@ impl AttachmentStore for RecordingAttachmentStore {
             .get(&(note_id.to_string(), path.to_string()))
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("missing test attachment"))
-    }
-
-    async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {
-        self.objects
-            .lock()
-            .unwrap()
-            .retain(|(stored_note_id, _), _| stored_note_id != note_id);
-        Ok(())
     }
 
     fn info(&self) -> AttachmentStoreInfo {

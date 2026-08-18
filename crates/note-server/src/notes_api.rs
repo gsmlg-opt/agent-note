@@ -1318,10 +1318,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::{body::Body, Router};
     use http_body_util::BodyExt;
-    use note_attachments::{
-        AttachmentStore, AttachmentStoreInfo, FilesystemAttachmentStore,
-        PreparedAttachmentMutation, PreparedAttachmentSet,
-    };
+    use note_attachments::{AttachmentStore, AttachmentStoreInfo, FilesystemAttachmentStore};
     use note_embedding::StubEmbedder;
     use note_storage::{
         ActiveNoteSource, AttachmentMetadataUpdate, AttachmentOperation,
@@ -1602,37 +1599,42 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AttachmentStore for RecordingReadAttachmentStore {
-        async fn prepare(
+        async fn put_immutable(
             &self,
-            note_id: &str,
-            attachments: &[NoteAttachment],
-        ) -> anyhow::Result<Box<dyn PreparedAttachmentSet>> {
-            self.inner.prepare(note_id, attachments).await
+            request: note_attachments::PutObjectRequest,
+        ) -> anyhow::Result<note_attachments::StoredObject> {
+            self.inner.put_immutable(request).await
         }
 
-        async fn prepare_put(
-            &self,
-            note_id: &str,
-            attachment: &NoteAttachment,
-        ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-            self.inner.prepare_put(note_id, attachment).await
+        async fn read_object(&self, object_key: &str) -> anyhow::Result<Vec<u8>> {
+            self.inner.read_object(object_key).await
         }
 
-        async fn prepare_delete(
+        async fn head_object(
+            &self,
+            object_key: &str,
+        ) -> anyhow::Result<note_attachments::ObjectMetadata> {
+            self.inner.head_object(object_key).await
+        }
+
+        async fn delete_object(
+            &self,
+            object_key: &str,
+        ) -> anyhow::Result<note_attachments::DeleteObjectOutcome> {
+            self.inner.delete_object(object_key).await
+        }
+
+        async fn delete_legacy(
             &self,
             note_id: &str,
             path: &str,
-        ) -> anyhow::Result<Box<dyn PreparedAttachmentMutation>> {
-            self.inner.prepare_delete(note_id, path).await
+        ) -> anyhow::Result<note_attachments::DeleteObjectOutcome> {
+            self.inner.delete_legacy(note_id, path).await
         }
 
-        async fn read(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        async fn read_legacy(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
             self.read_calls.fetch_add(1, Ordering::SeqCst);
-            self.inner.read(note_id, path).await
-        }
-
-        async fn remove_note(&self, note_id: &str) -> anyhow::Result<()> {
-            self.inner.remove_note(note_id).await
+            self.inner.read_legacy(note_id, path).await
         }
 
         fn info(&self) -> AttachmentStoreInfo {

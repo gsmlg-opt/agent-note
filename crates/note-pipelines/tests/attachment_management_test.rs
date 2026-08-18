@@ -70,12 +70,28 @@ async fn seed_note_at(
     attachments: &[NoteAttachment],
     timestamp: i64,
 ) {
-    let prepared = ctx
-        .attachments()
-        .prepare(note_id, attachments)
-        .await
-        .unwrap();
-    let metadata = prepared.metadata().to_vec();
+    let store_info = ctx.attachments().info();
+    if store_info.engine == "filesystem" {
+        let root = std::path::PathBuf::from(store_info.location.unwrap());
+        for attachment in attachments {
+            let path = if let Some(storage) = &attachment.storage {
+                root.join(&storage.object_key)
+            } else {
+                root.join(note_id)
+                    .join(attachment.path.trim_start_matches("./"))
+            };
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &attachment.content).unwrap();
+        }
+    }
+    let metadata = attachments
+        .iter()
+        .cloned()
+        .map(|mut attachment| {
+            attachment.content.clear();
+            attachment
+        })
+        .collect::<Vec<_>>();
     let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
     transaction
         .insert_note(NewNote {
@@ -123,7 +139,6 @@ async fn seed_note_at(
         .await
         .unwrap();
     transaction.commit().await.unwrap();
-    prepared.publish().await.unwrap();
 }
 
 async fn stored_note(backend: &Arc<dyn StorageBackend>, note_id: &str) -> note_core::Note {
