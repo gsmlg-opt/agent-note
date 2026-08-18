@@ -457,22 +457,44 @@ jobs. The System API exposes only `embedding_engine`, `embedding_model`, and
 `embedding_fingerprint` for the embedding backend—never the base URL, API-key
 environment-variable name, or secret.
 
+### Attachment durability
+
+Generated attachment bytes are stored as immutable object generations. Agent Note chooses opaque
+object keys and storage-generation IDs that are unrelated to the user-visible attachment path and
+do not contain raw note or attachment IDs. Each generated attachment persists its `object_key`,
+`storage_generation`, `size_bytes`, and SHA-256 `checksum_sha256` with the normal attachment
+metadata. Records created before these fields existed remain readable through the legacy
+note-ID/path layout; new writes never publish to that mutable layout.
+
+Create, update, attachment-put, and import operations publish and verify every new immutable object
+before opening the database transaction. Only then does the note CAS make those object generations
+authoritative for an update; creates use the same object-first transaction boundary. A pre-commit
+failure deletes newly published objects when possible. If the database commit result is ambiguous,
+Agent Note retains them as safe orphans rather than risk deleting bytes that a successful commit
+may reference.
+
+Replacement, attachment deletion, and permanent note deletion enqueue cleanup intent in the
+durable `attachment_operations` table in the same database transaction as the note mutation. After
+a successful commit, the request path makes one best-effort cleanup pass. Cleanup failure never
+rolls back or changes the result of the committed user mutation; the durable intent remains
+claimable for a later attempt. The recurring cleanup worker, startup reconciliation, orphan doctor,
+and cleanup metrics are intentionally deferred to PR3 and do not exist yet.
+
+Legacy archive import preserves its existing candidate filtering. It decodes and validates each
+attachment before publishing that attachment's generated object, cleans up earlier uploads if a
+later decode or publication fails, and opens the database transaction only after all objects are
+published and verified. It also removes objects for other pre-commit failures and race-skipped
+notes, while retaining them when commit outcome is uncertain. Import never trusts source archives'
+internal storage coordinates. Export hydration supports both legacy attachments and generated
+object metadata.
+
 ### Filesystem attachments
 
-The filesystem attachment adapter stages a complete attachment set before the database
-transaction, publishes it after the database commit, and aborts staged data when the transaction
-fails. Reads load bytes through the same adapter, and permanent deletion removes the note's
-attachment directory after deleting its database record. Its configured root must be exclusively
-owned by this agent-note process: external mutation, symlinks, and multiple writers are unsupported.
-The database and attachment store do not share one transaction. Because the database commit
-precedes publication, a publication error can leave committed metadata referring to unavailable
-bytes or to the previous published bytes. A cleanup error after permanent database deletion can
-leave orphan attachment files or objects. Do not blindly retry: a create or update may already be
-committed, so retrying a create can duplicate it; retrying a permanent delete may return not found
-and cannot rerun attachment cleanup. Inspect the committed database and attachment-store state,
-then manually repair or publish bytes or remove orphan data as appropriate. Errors are returned or
-logged, but there is no built-in retry or reconciliation command, worker, or durable outbox.
-Publication failure after database commit must not be treated as a database rollback.
+The filesystem adapter publishes each generated object with an atomic no-replace operation and
+then verifies its size and checksum. An existing object key is accepted only when it identifies the
+same bytes. Reads and cleanup use the persisted object key; legacy reads and deletes use the old
+note-ID/path layout explicitly. The configured root must be exclusively owned by this agent-note
+process: external mutation, symlinks, and multiple writers are unsupported.
 
 ### S3 attachments
 
@@ -499,19 +521,12 @@ profiles, web identity, container credentials, and instance roles. The adapter a
 SDK attempts—the initial request and at most three retries—for failures the SDK classifies as
 transient.
 
-Final object keys are `<prefix>/<note-id>/<canonical-relative-path>`, or
-`<note-id>/<canonical-relative-path>` when `prefix` is empty. A write first uploads the complete
-attachment set beneath a unique `.staging` prefix. After the database transaction commits, it
-copies every staged object to its final key, removes obsolete final keys, and then removes staging.
-Listing consumes every continuation token, and each delete request contains at most 1,000 keys.
-One attachment read issues one `GetObject`; full note and export hydration read every attachment
-declared by the note metadata.
-
-The database and S3 do not share a transaction. Permanent deletion commits the database removal
-before object cleanup, so a cleanup failure can leave safe orphan objects. Final publication also
-happens after the database commit. If it fails, committed metadata can be temporarily unreadable;
-the safe staging location is retained for manual repair. This release has no durable outbox or
-reconciler, so inspect database and object state before retrying or repairing an operation.
+The configured prefix is prepended to Agent Note's opaque generated object keys. S3 publication is
+a conditional `PutObject`: it never overwrites a different existing generation. Agent Note verifies
+the resulting object's size and SHA-256 checksum with object metadata and reads when required; an
+idempotent retry is accepted only when the existing object has the same identity. A single
+attachment read issues one `GetObject`, and note/export hydration reads every object declared by
+the persisted metadata. Cleanup deletes exact object keys recorded by durable operations.
 
 The System API reports backend-neutral `database_engine`, optional `database_path` and
 `database_size_bytes`, `attachments_engine` and optional `attachments_location`, plus the three

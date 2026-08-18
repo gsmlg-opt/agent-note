@@ -196,21 +196,40 @@ standard AWS region provider chain. Credentials are never stored in TOML. They c
 standard AWS credential chain, including `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional
 `AWS_SESSION_TOKEN`, shared profiles, web identity, container credentials, and instance roles.
 
-Final object keys are `<prefix>/<note-id>/<canonical-relative-path>`, or
-`<note-id>/<canonical-relative-path>` for an empty prefix. Writes upload a complete set beneath a
-unique `.staging` prefix, commit note metadata, copy every expected object to its final key, remove
-obsolete final keys, and remove staging. The AWS SDK permits four total attempts (the initial
-request plus at most three retries) for SDK-classified transient failures. List operations consume
-every continuation token, and delete requests contain at most 1,000 keys. A single attachment read
-issues one `GetObject`; note and export hydration read every object declared by note metadata.
+Generated attachments use immutable object generations. The application creates an opaque
+`storage_generation` and object key for each write; neither is derived from the user-visible path
+or contains a raw note or attachment ID. The note's internal attachment record persists
+`object_key`, `storage_generation`, `size_bytes`, and `checksum_sha256` alongside the stable public
+ID, path, MIME type, and description. A record without storage fields is a legacy attachment and is
+read through the old note-ID/path layout. Generated writes never target that mutable layout.
 
-S3 publication and deletion preserve the same database boundary as the filesystem adapter.
-Permanent deletion commits the database removal before object cleanup, so failure can leave safe
-orphan objects. Publication happens after database commit and failure can leave committed metadata
-temporarily unreadable; the safe staging location is retained for manual repair. There is no
-durable outbox or reconciler in this release. Backend-neutral System information reports only
-engine `s3` and `s3://bucket/prefix`, never endpoint user information, profiles, access keys,
-secret keys, or session tokens.
+All generated objects for a create, update, attachment put, or legacy archive import are published
+and verified before the database transaction begins. The transaction's note mutation, including
+CAS for existing notes, makes the new generations authoritative only after object publication
+succeeds. Pre-commit failures clean up newly published objects when possible. An ambiguous commit
+result retains them because deleting an object referenced by a successful but unobserved commit
+would be data loss. Import preserves its candidate filtering, ignores source storage coordinates,
+and decodes and validates each attachment before publishing that attachment's object. A later
+decode or publication failure cleans up earlier uploads. Every object is published and verified
+before the import transaction, and objects for race-skipped notes are also cleaned up. Export
+hydrates both legacy and generated attachments.
+
+Replacing or deleting an attachment and permanently deleting a note insert cleanup intent into the
+durable `attachment_operations` table in the same transaction as the authoritative note mutation.
+After commit, the request path makes a best-effort claim and cleanup pass. Failure cannot roll back
+or change the committed user operation; the intent remains pending for another claim. This design
+prefers recoverable orphan objects over metadata that references missing bytes. A recurring cleanup
+worker, startup reconciliation, an orphan doctor, and cleanup metrics are PR3 work and are not
+implemented in PR2.
+
+The filesystem adapter uses atomic no-replace publication and verifies the stored size and SHA-256
+checksum. The S3 adapter uses conditional `PutObject`, followed by metadata/read verification as
+needed; a pre-existing key is idempotently accepted only when its size and checksum identify the
+same bytes. The AWS SDK permits four total attempts (the initial request plus at most three retries)
+for SDK-classified transient failures. A single attachment read issues one `GetObject`; note and
+export hydration read every object declared by note metadata. Backend-neutral System information
+reports only engine `s3` and `s3://bucket/prefix`, never endpoint user information, profiles,
+access keys, secret keys, or session tokens.
 
 `note-storage-pg` is the complete external database adapter. Before Agent Note starts, the operator
 must provision pgvector in the selected database:
@@ -227,21 +246,11 @@ schema stores title search data as
 Backend-neutral System information reports the `pg` engine without the database URL or
 credentials.
 
-The current filesystem attachment adapter stages a complete note set before the database
-transaction, publishes after commit, and aborts staging on database failure. Hydration and
-single-object reads go through the adapter; permanent deletion removes attachment data only after
-the database record is deleted. Per-note operations are coordinated within the process. The root
-must be exclusively owned by one agent-note process, with no external mutation or symlinks, and
-filesystem publication cannot be atomically committed with the database transaction.
-
-The database commit precedes attachment publication. A publication error can therefore leave
-committed metadata referring to unavailable or previously published bytes; it cannot roll back the
-database commit. A cleanup error after permanent database deletion can leave orphan files or
-objects. Callers must not blindly retry: create or update may already be committed, and retrying a
-create can duplicate it; a permanent-delete retry may return not found and cannot rerun attachment
-cleanup. Recovery requires inspecting committed database and object state, then manually repairing
-or publishing bytes or removing orphan data. Errors are returned or logged, but there is no
-built-in retry or reconciliation command, worker, or durable outbox.
+The filesystem root must be exclusively owned by one Agent Note process, with no external mutation
+or symlinks. The database and attachment backend still do not share one physical transaction;
+object-first publication plus transactionally durable cleanup intent defines the failure boundary.
+Safe orphans can remain after failed pre-commit cleanup, ambiguous commits, or failed post-commit
+cleanup. They must not be removed merely because the initiating request returned an error.
 
 There is no guaranteed in-place migration from databases created by the retired storage
 implementation. Delete and recreate only disposable test/development databases. Export or back up
@@ -358,14 +367,16 @@ note-level `matched`, `updated`, and `unchanged` counts. `matched` is the number
 notes; `updated` counts a matched note once when at least one assignment changes; `unchanged` is
 `matched - updated`, so a note with both a no-op and a change is updated.
 
-**save_note**: validate non-empty title/content and typed label values → prepare the attachment set
-outside the database transaction → atomically persist the note, auto-created missing label keys,
-attached labels, chunk records, and durable embedding jobs → commit the database transaction →
-publish prepared attachments → return the persisted `Note`. A database failure aborts the prepared
-set. A publication failure is returned after the database commit and may leave committed metadata
-referring to unavailable or previous bytes; it does not roll back that commit. The embedding worker
-later claims each job, performs one dense inference call outside the database transaction, and
-atomically persists the dense body-chunk vector for the current chunk revision.
+**save_note**: validate non-empty title/content and typed label values → create opaque immutable
+attachment generations → publish and verify every generated object → atomically persist the note,
+generated storage metadata, auto-created missing label keys, attached labels, chunk records, and
+durable embedding jobs → commit the database transaction → return the persisted `Note`. A
+pre-commit failure attempts to delete the newly published generation; an ambiguous commit retains
+it as a safe orphan. For replacement, deletion, and permanent deletion, the same note transaction
+also persists cleanup intent for superseded objects, and a post-commit cleanup failure does not
+change the successful mutation result. The embedding worker later claims each job, performs one
+dense inference call outside the database transaction, and atomically persists the dense
+body-chunk vector for the current chunk revision.
 
 **search_notes**: a blank query or zero limit returns without calling storage or embedding
 endpoints. Otherwise, when label selectors are present, parse them → acquire a short filter storage
