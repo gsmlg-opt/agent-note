@@ -67,6 +67,7 @@ pub struct Label {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LabelOperator {
+    ExactEq,
     Eq,
     NotEq,
     Gt,
@@ -81,6 +82,7 @@ pub enum LabelOperator {
 impl LabelOperator {
     pub fn as_str(self) -> &'static str {
         match self {
+            LabelOperator::ExactEq => "==",
             LabelOperator::Eq => "=",
             LabelOperator::NotEq => "!=",
             LabelOperator::Gt => ">",
@@ -101,29 +103,92 @@ pub struct LabelSelector {
     pub operator: LabelOperator,
 }
 
-pub fn parse_label_selectors(input: &str) -> Vec<LabelSelector> {
-    input
-        .split('&')
-        .filter_map(|term| {
-            let term = term.trim();
-            if term.is_empty() {
-                return None;
-            }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelSelectorParseError {
+    MalformedExactSelector,
+}
 
-            match split_selector_term(term) {
-                Some((key, operator, value)) => Some(LabelSelector {
-                    key: key.trim().to_string(),
-                    value: Some(value.trim().to_string()),
-                    operator,
-                }),
-                None => Some(LabelSelector {
-                    key: term.to_string(),
-                    value: None,
-                    operator: LabelOperator::Eq,
-                }),
+impl std::fmt::Display for LabelSelectorParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedExactSelector => formatter.write_str("malformed exact label selector"),
+        }
+    }
+}
+
+impl std::error::Error for LabelSelectorParseError {}
+
+pub fn parse_label_selectors(input: &str) -> Vec<LabelSelector> {
+    try_parse_label_selectors(input).unwrap_or_else(|_| {
+        vec![LabelSelector {
+            key: String::new(),
+            value: Some(String::new()),
+            operator: LabelOperator::ExactEq,
+        }]
+    })
+}
+
+pub fn try_parse_label_selectors(
+    input: &str,
+) -> Result<Vec<LabelSelector>, LabelSelectorParseError> {
+    let mut selectors = Vec::new();
+    for term in input.split('&') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+
+        if let Some(encoded) = term.strip_prefix('~') {
+            let (key, value) = encoded
+                .split_once("==")
+                .ok_or(LabelSelectorParseError::MalformedExactSelector)?;
+            let key = decode_exact_selector_component(key)?;
+            if key.is_empty() {
+                return Err(LabelSelectorParseError::MalformedExactSelector);
             }
-        })
-        .collect()
+            selectors.push(LabelSelector {
+                key,
+                value: Some(decode_exact_selector_component(value)?),
+                operator: LabelOperator::ExactEq,
+            });
+            continue;
+        }
+
+        selectors.push(match split_selector_term(term) {
+            Some((key, operator, value)) => LabelSelector {
+                key: key.trim().to_string(),
+                value: Some(value.trim().to_string()),
+                operator,
+            },
+            None => LabelSelector {
+                key: term.to_string(),
+                value: None,
+                operator: LabelOperator::Eq,
+            },
+        });
+    }
+    Ok(selectors)
+}
+
+fn decode_exact_selector_component(component: &str) -> Result<String, LabelSelectorParseError> {
+    let bytes = component.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(LabelSelectorParseError::MalformedExactSelector);
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    urlencoding::decode(component)
+        .map(|value| value.into_owned())
+        .map_err(|_| LabelSelectorParseError::MalformedExactSelector)
 }
 
 pub fn label_matches_selector(label: &Label, selector: &LabelSelector) -> bool {
@@ -149,6 +214,7 @@ pub fn compare_label_values(
     right: &str,
 ) -> bool {
     match operator {
+        LabelOperator::ExactEq => return left == right,
         LabelOperator::StartsWith => {
             return left.to_lowercase().starts_with(&right.to_lowercase());
         }
@@ -281,6 +347,7 @@ fn parse_time(value: &str) -> Option<chrono::NaiveTime> {
 
 fn compare_ordering(ordering: std::cmp::Ordering, operator: LabelOperator) -> bool {
     match operator {
+        LabelOperator::ExactEq => false,
         LabelOperator::Eq => ordering.is_eq(),
         LabelOperator::NotEq => !ordering.is_eq(),
         LabelOperator::Gt => ordering.is_gt(),
@@ -420,6 +487,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_percent_encoded_exact_selectors_without_trimming_operands() {
+        assert_eq!(LabelOperator::ExactEq.as_str(), "==");
+        for (input, key, value) in [
+            ("~project==a%26b", "project", "a&b"),
+            ("~project==a%3Db", "project", "a=b"),
+            ("~project==%2526", "project", "%26"),
+            ("~project==%2B", "project", "+"),
+            ("~project==%20padded%20", "project", " padded "),
+            ("~project==", "project", ""),
+            ("~%E9%A1%B9%E7%9B%AE==%E7%8C%AB", "项目", "猫"),
+        ] {
+            assert_eq!(
+                parse_label_selectors(input),
+                vec![LabelSelector {
+                    key: key.to_string(),
+                    value: Some(value.to_string()),
+                    operator: LabelOperator::ExactEq,
+                }],
+                "selector: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_exact_selectors_are_rejected_as_a_whole_and_fail_closed() {
+        for input in [
+            "~==secret",
+            "~project",
+            "~project==%ZZ",
+            "status=ready&~==secret",
+        ] {
+            assert_eq!(
+                try_parse_label_selectors(input),
+                Err(LabelSelectorParseError::MalformedExactSelector),
+                "selector: {input}"
+            );
+            let selectors = parse_label_selectors(input);
+            assert_eq!(selectors.len(), 1, "selector: {input}");
+            assert!(selectors[0].key.is_empty(), "selector: {input}");
+            assert_eq!(selectors[0].operator, LabelOperator::ExactEq);
+        }
+    }
+
+    #[test]
     fn parses_bare_key_selector() {
         assert_eq!(
             parse_label_selectors("archived"),
@@ -541,16 +652,20 @@ mod tests {
 
     #[test]
     fn parses_first_operator_when_values_contain_operator_tokens() {
-        for (input, operator, value) in [
-            ("name~=^a!=b$", LabelOperator::Regex, "^a!=b$"),
-            ("name^=a>=b", LabelOperator::StartsWith, "a>=b"),
-            ("name$=a<=b", LabelOperator::EndsWith, "a<=b"),
-            ("name~=a^=b$=c", LabelOperator::Regex, "a^=b$=c"),
+        for (input, key, operator, value) in [
+            ("name~=^a!=b$", "name", LabelOperator::Regex, "^a!=b$"),
+            ("name^=a>=b", "name", LabelOperator::StartsWith, "a>=b"),
+            ("name$=a<=b", "name", LabelOperator::EndsWith, "a<=b"),
+            ("name~=a^=b$=c", "name", LabelOperator::Regex, "a^=b$=c"),
+            ("name~=a==b", "name", LabelOperator::Regex, "a==b"),
+            ("env=foo==bar", "env", LabelOperator::Eq, "foo==bar"),
+            ("env==foo", "env", LabelOperator::Eq, "=foo"),
+            ("~env==foo%3Dbar", "env", LabelOperator::ExactEq, "foo=bar"),
         ] {
             assert_eq!(
                 parse_label_selectors(input),
                 vec![LabelSelector {
-                    key: "name".to_string(),
+                    key: key.to_string(),
                     value: Some(value.to_string()),
                     operator,
                 }]
@@ -650,6 +765,33 @@ mod tests {
             LabelOperator::EndsWith,
             "nöte"
         ));
+    }
+
+    #[test]
+    fn exact_equality_matches_raw_values_before_typed_normalization() {
+        for (value_type, stored, selector, expected) in [
+            (LabelValueType::Text, " padded ", " padded ", true),
+            (LabelValueType::Text, "", "", true),
+            (LabelValueType::Number, "01", "01", true),
+            (LabelValueType::Number, "01", "1", false),
+        ] {
+            assert_eq!(
+                label_matches_selector(
+                    &Label {
+                        key: "project".into(),
+                        value: stored.into(),
+                        description: String::new(),
+                        value_type,
+                    },
+                    &LabelSelector {
+                        key: "project".into(),
+                        value: Some(selector.into()),
+                        operator: LabelOperator::ExactEq,
+                    },
+                ),
+                expected
+            );
+        }
     }
 
     #[test]

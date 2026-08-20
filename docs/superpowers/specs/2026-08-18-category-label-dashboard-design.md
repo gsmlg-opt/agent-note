@@ -8,7 +8,7 @@ For example, configuring `project` produces chips such as `yellow-dog · 12` and
 
 ## Scope
 
-This feature extends persisted system configuration, label-value aggregation in both storage backends, the dashboard API, the System page, and the Home dashboard. It reuses the existing URL-backed Notes filtering contract and does not change label-selector semantics, note mutation behavior, or the existing dashboard label summary and recent-updates panels.
+This feature extends persisted system configuration, label-value aggregation in both storage backends, the dashboard API, the System page, and the Home dashboard. Category chips use a backward-compatible `~<percent-encoded-key>==<percent-encoded-value>` exact-equality term while legacy selector meanings, note mutation behavior, and the existing dashboard label summary and recent-updates panels remain unchanged.
 
 ## System Configuration
 
@@ -57,7 +57,7 @@ The existing dashboard cache includes category groups. Successful system-configu
 
 Home renders one category panel per configured key before the existing general label summary and recent updates. Each panel uses the label description as supporting text when it is present and shows one accessible chip per distinct value.
 
-Each chip displays the value and matching active-note count. Clicking it navigates to Notes at page 1 with the existing default page size and an exact equality filter for `key=value`. URL construction uses the existing Notes filter serializer so spaces and special characters are encoded correctly and the resulting URL is shareable.
+Each chip displays the value and matching active-note count. Clicking it navigates to Notes at page 1 with the existing default page size and an exact equality filter. `key=value` is display shorthand; the shareable URL uses the reserved-prefix `~<percent-encoded-key>==<percent-encoded-value>` wire term so spaces, empty values, and special characters round-trip exactly.
 
 A configured category with no values still renders its panel with `No notes in this category.` When no categories are configured, Home renders no category area and otherwise retains its current layout. Dashboard loading failures retain the existing non-destructive unavailable state.
 

@@ -1,7 +1,9 @@
 use crate::connection::map_sqlx_error;
 use crate::PgSession;
 use note_core::{Label, LabelKey, LabelValueType};
-use note_storage::{LabelRepository, StorageError, StorageErrorKind, StorageResult};
+use note_storage::{
+    LabelRepository, LabelValueCount, StorageError, StorageErrorKind, StorageResult,
+};
 use serde_json::json;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -217,10 +219,39 @@ impl LabelRepository for PgSession {
         .fetch_all(&mut *connection)
         .await
         .map_err(|error| map_sqlx_error("query label note counts", error))?;
-        Ok(rows
-            .into_iter()
-            .map(|(key, count)| (key, count.max(0) as usize))
-            .collect())
+        rows.into_iter()
+            .map(|(key, count)| Ok((key, checked_label_count(count)?)))
+            .collect()
+    }
+
+    async fn label_value_counts(&self, keys: &[String]) -> StorageResult<Vec<LabelValueCount>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut connection = self.connection().await?;
+        let rows = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT lk.key, nl.value, COUNT(n.id)::bigint
+             FROM label_keys lk
+             JOIN note_labels nl ON nl.label_key_id = lk.id
+             JOIN notes n ON n.id = nl.note_id AND n.deleted_at IS NULL
+             WHERE lk.key = ANY($1)
+             GROUP BY lk.key, nl.value
+             ORDER BY lk.key COLLATE \"C\", COUNT(n.id) DESC, nl.value COLLATE \"C\"",
+        )
+        .bind(keys.to_vec())
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query label value counts", error))?;
+        rows.into_iter()
+            .map(|(key, value, count)| {
+                Ok(LabelValueCount {
+                    key,
+                    value,
+                    count: checked_label_count(count)?,
+                })
+            })
+            .collect()
     }
 
     async fn find_note_with_labels(
@@ -264,6 +295,15 @@ impl LabelRepository for PgSession {
         .await
         .map_err(|error| map_sqlx_error("query note by exact labels", error))
     }
+}
+
+fn checked_label_count(count: i64) -> StorageResult<usize> {
+    usize::try_from(count).map_err(|_| {
+        StorageError::new(
+            StorageErrorKind::Operation,
+            "label value count is outside the supported range",
+        )
+    })
 }
 
 fn parse_value_type(value: &str) -> StorageResult<LabelValueType> {

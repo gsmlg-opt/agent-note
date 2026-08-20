@@ -141,12 +141,21 @@ struct SearchResultDto {
 pub fn label_filter_selector(filters: &[LabelFilter]) -> Option<String> {
     let terms = filters
         .iter()
-        .filter(|filter| !filter.key.trim().is_empty())
-        .map(|filter| match filter.value.trim() {
-            "" => filter.key.trim().to_string(),
-            value => {
-                format!("{}{}{}", filter.key.trim(), filter.operator.trim(), value)
+        .filter_map(|filter| {
+            if filter.operator == "==" {
+                return (!filter.key.is_empty()).then(|| {
+                    format!(
+                        "~{}=={}",
+                        urlencoding::encode(&filter.key),
+                        urlencoding::encode(&filter.value)
+                    )
+                });
             }
+
+            (!filter.key.trim().is_empty()).then(|| match filter.value.trim() {
+                "" => filter.key.trim().to_string(),
+                value => format!("{}{}{}", filter.key.trim(), filter.operator.trim(), value),
+            })
         })
         .collect::<Vec<_>>();
     if terms.is_empty() {
@@ -336,6 +345,19 @@ pub struct DashboardLabel {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DashboardCategoryValue {
+    pub value: String,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DashboardCategory {
+    pub key: String,
+    pub description: String,
+    pub values: Vec<DashboardCategoryValue>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct DashboardNote {
     pub id: String,
     pub title: String,
@@ -356,7 +378,17 @@ pub struct DashboardSummary {
     pub label_count: usize,
     pub last_updated_at: Option<i64>,
     pub labels: Vec<DashboardLabel>,
+    pub categories: Vec<DashboardCategory>,
     pub recent_updates: Vec<DashboardNote>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DashboardFetch {
+    Modified {
+        summary: DashboardSummary,
+        etag: Option<String>,
+    },
+    NotModified,
 }
 
 fn notes_list_url(filters: &[LabelFilter], limit: Option<usize>, offset: Option<usize>) -> String {
@@ -424,16 +456,22 @@ pub async fn count_notes_filtered(filters: &[LabelFilter]) -> Result<usize, Stri
     Ok(count.total)
 }
 
-pub async fn dashboard() -> Result<DashboardSummary, String> {
-    let resp = Request::get("/api/dashboard")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    ok_or_body_error(resp)
+pub async fn dashboard(etag: Option<&str>) -> Result<DashboardFetch, String> {
+    let mut request = Request::get("/api/dashboard");
+    if let Some(etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+    let resp = request.send().await.map_err(|e| e.to_string())?;
+    if resp.status() == 304 {
+        return Ok(DashboardFetch::NotModified);
+    }
+    let etag = resp.headers().get("ETag");
+    let summary = ok_or_body_error(resp)
         .await?
         .json()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(DashboardFetch::Modified { summary, etag })
 }
 
 pub async fn list_notes_page(
@@ -816,5 +854,39 @@ mod tests {
         assert_eq!(error.code, "unexpected_response");
         assert!(error.retryable);
         assert!(!error.to_string().contains("proxy secret"));
+    }
+
+    #[test]
+    fn dashboard_summary_deserializes_category_values() {
+        let summary: DashboardSummary = serde_json::from_value(serde_json::json!({
+            "note_count": 7,
+            "embedded_note_count": 5,
+            "embedding_note": { "id": "note-5", "title": "Embedded note" },
+            "label_count": 3,
+            "last_updated_at": 1_723_456_789,
+            "labels": [{
+                "key": "project",
+                "description": "Project",
+                "value_type": "text",
+                "count": 2
+            }],
+            "categories": [{
+                "key": "project",
+                "description": "Project",
+                "values": [{ "value": "yellow-dog", "count": 2 }]
+            }],
+            "recent_updates": [{
+                "id": "note-7",
+                "title": "Latest note",
+                "updated_at": 1_723_456_789
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(summary.categories.len(), 1);
+        assert_eq!(summary.categories[0].key, "project");
+        assert_eq!(summary.categories[0].description, "Project");
+        assert_eq!(summary.categories[0].values[0].value, "yellow-dog");
+        assert_eq!(summary.categories[0].values[0].count, 2);
     }
 }

@@ -628,6 +628,20 @@ async fn rejects_invalid_request_shapes_before_beginning_a_transaction() {
             "label selector is malformed",
         ),
         (
+            "~==secret",
+            vec![("project".into(), "new".into())],
+            vec![],
+            BulkUpdateNoteLabelsValidationError::MalformedSelector,
+            "label selector is malformed",
+        ),
+        (
+            "type=x&~project==%ZZ",
+            vec![("project".into(), "new".into())],
+            vec![],
+            BulkUpdateNoteLabelsValidationError::MalformedSelector,
+            "label selector is malformed",
+        ),
+        (
             "type=x",
             vec![],
             vec![],

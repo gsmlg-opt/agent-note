@@ -66,6 +66,7 @@ impl TursoSession {
     pub(crate) async fn begin_transaction(&mut self, mode: TransactionMode) -> StorageResult<()> {
         let (sql, context) = match mode {
             TransactionMode::Deferred => ("BEGIN DEFERRED", "begin deferred storage transaction"),
+            TransactionMode::Snapshot => ("BEGIN DEFERRED", "begin snapshot storage transaction"),
             TransactionMode::Immediate => {
                 ("BEGIN IMMEDIATE", "begin immediate storage transaction")
             }

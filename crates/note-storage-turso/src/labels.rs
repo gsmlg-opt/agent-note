@@ -1,7 +1,9 @@
 use crate::connection::map_turso_error;
 use crate::TursoSession;
 use note_core::{Label, LabelKey, LabelValueType};
-use note_storage::{LabelRepository, StorageError, StorageErrorKind, StorageResult};
+use note_storage::{
+    LabelRepository, LabelValueCount, StorageError, StorageErrorKind, StorageResult,
+};
 use std::str::FromStr;
 
 #[async_trait::async_trait]
@@ -177,13 +179,66 @@ impl LabelRepository for TursoSession {
             .await
             .map_err(|error| map_turso_error("read label note counts", error))?
         {
-            counts.push((
-                row.get::<String>(0)
-                    .map_err(|error| map_turso_error("decode counted label key", error))?,
-                row.get::<i64>(1)
-                    .map_err(|error| map_turso_error("decode label note count", error))?
-                    .max(0) as usize,
-            ));
+            let key = row
+                .get::<String>(0)
+                .map_err(|error| map_turso_error("decode counted label key", error))?;
+            let count = row
+                .get::<i64>(1)
+                .map_err(|error| map_turso_error("decode label note count", error))?;
+            counts.push((key, checked_label_count(count)?));
+        }
+        Ok(counts)
+    }
+
+    async fn label_value_counts(&self, keys: &[String]) -> StorageResult<Vec<LabelValueCount>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _operation_guard = self.operation_guard().await;
+        let placeholders = (1..=keys.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT lk.key, nl.value, COUNT(n.id)
+             FROM label_keys lk
+             JOIN note_labels nl ON nl.label_key_id = lk.id
+             JOIN notes n ON n.id = nl.note_id AND n.deleted_at IS NULL
+             WHERE lk.key IN ({placeholders})
+             GROUP BY lk.key, nl.value
+             ORDER BY lk.key COLLATE BINARY, COUNT(n.id) DESC, nl.value COLLATE BINARY"
+        );
+        let params = keys
+            .iter()
+            .cloned()
+            .map(turso::Value::from)
+            .collect::<Vec<_>>();
+        let mut rows = self
+            .connection
+            .query(&sql, turso::params_from_iter(params))
+            .await
+            .map_err(|error| map_turso_error("query label value counts", error))?;
+        let mut counts = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read label value counts", error))?
+        {
+            let key = row
+                .get::<String>(0)
+                .map_err(|error| map_turso_error("decode counted label key", error))?;
+            let value = row
+                .get::<String>(1)
+                .map_err(|error| map_turso_error("decode counted label value", error))?;
+            let count = row
+                .get::<i64>(2)
+                .map_err(|error| map_turso_error("decode label value count", error))?;
+            counts.push(LabelValueCount {
+                key,
+                value,
+                count: checked_label_count(count)?,
+            });
         }
         Ok(counts)
     }
@@ -237,6 +292,15 @@ impl LabelRepository for TursoSession {
             })
             .transpose()
     }
+}
+
+fn checked_label_count(count: i64) -> StorageResult<usize> {
+    usize::try_from(count).map_err(|_| {
+        StorageError::new(
+            StorageErrorKind::Operation,
+            "label value count is outside the supported range",
+        )
+    })
 }
 
 async fn label_key_id_for_note_label_unlocked(

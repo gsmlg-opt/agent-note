@@ -29,6 +29,10 @@ impl ToSchema for Binary {}
 #[derive(ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct SystemConfigSchema {
+    /// Ordered, unique, nonblank label keys that must exist in the label catalog.
+    /// Key spelling is exact; leading or trailing whitespace is invalid.
+    #[schema(required = false, default = json!([]))]
+    pub category_labels: Vec<String>,
     #[schema(
         required = false,
         default = json!({"enabled": false, "rules": []})
@@ -1159,6 +1163,7 @@ mod tests {
     #[test]
     fn system_schema_fields_match_runtime_serialization() {
         let runtime_config = note_core::SystemConfig {
+            category_labels: vec!["project".to_string()],
             duplicate_check: note_core::DuplicateCheckConfig {
                 enabled: true,
                 rules: vec![note_core::DuplicateCheckRule {
@@ -1239,6 +1244,10 @@ mod tests {
         }
 
         let schemas = &document["components"]["schemas"];
+        assert_eq!(
+            schemas["SystemConfigSchema"]["properties"]["category_labels"]["default"],
+            serde_json::json!([])
+        );
         assert_eq!(
             schemas["SystemConfigSchema"]["properties"]["duplicate_check"]["default"],
             serde_json::json!({"enabled": false, "rules": []})

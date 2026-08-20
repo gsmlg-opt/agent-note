@@ -1,7 +1,7 @@
 use crate::Context;
 use chrono::Utc;
 use note_core::{
-    parse_label_selectors, validate_label_key, validate_label_value, LabelValueType,
+    try_parse_label_selectors, validate_label_key, validate_label_value, LabelValueType,
     ValidationError,
 };
 use note_storage::TransactionMode;
@@ -69,7 +69,8 @@ pub async fn bulk_update_note_labels(
             BulkUpdateNoteLabelsValidationError::MalformedSelector,
         ));
     }
-    let selectors = parse_label_selectors(selector);
+    let selectors = try_parse_label_selectors(selector)
+        .map_err(|_| anyhow::Error::new(BulkUpdateNoteLabelsValidationError::MalformedSelector))?;
     if selectors.is_empty() {
         return Err(anyhow::Error::new(
             BulkUpdateNoteLabelsValidationError::MalformedSelector,

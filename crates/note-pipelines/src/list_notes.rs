@@ -1,5 +1,5 @@
 use crate::context::Context;
-use note_core::{parse_label_selectors, Note, NoteListItem};
+use note_core::{try_parse_label_selectors, Note, NoteListItem};
 
 pub const DEFAULT_LIST_LIMIT: i64 = 10;
 pub const MAX_LIST_LIMIT: i64 = 1_000;
@@ -24,7 +24,9 @@ pub async fn list_notes(ctx: &Context, params: ListNotesParams) -> anyhow::Resul
     let selectors = params
         .label
         .as_deref()
-        .map(parse_label_selectors)
+        .map(try_parse_label_selectors)
+        .transpose()
+        .map_err(anyhow::Error::new)?
         .unwrap_or_default();
     let mut notes = session
         .list_notes(&selectors, params.limit, params.offset)
@@ -54,7 +56,9 @@ pub async fn list_note_summaries(
     let selectors = params
         .label
         .as_deref()
-        .map(parse_label_selectors)
+        .map(try_parse_label_selectors)
+        .transpose()
+        .map_err(anyhow::Error::new)?
         .unwrap_or_default();
     Ok(session
         .list_note_summaries(&selectors, params.limit, params.offset)
@@ -65,7 +69,9 @@ pub async fn count_notes(ctx: &Context, label: Option<String>) -> anyhow::Result
     let session = ctx.storage().session().await?;
     let selectors = label
         .as_deref()
-        .map(parse_label_selectors)
+        .map(try_parse_label_selectors)
+        .transpose()
+        .map_err(anyhow::Error::new)?
         .unwrap_or_default();
     Ok(session.count_notes(&selectors).await?)
 }

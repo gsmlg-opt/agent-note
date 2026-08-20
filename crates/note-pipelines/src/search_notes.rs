@@ -1,5 +1,5 @@
 use crate::context::Context;
-use note_core::{parse_label_selectors, weighted_rrf_fuse, NoteListItem, SearchResult};
+use note_core::{try_parse_label_selectors, weighted_rrf_fuse, NoteListItem, SearchResult};
 use std::collections::HashSet;
 
 const RRF_K: f32 = 60.0;
@@ -23,14 +23,15 @@ pub async fn search_notes_filtered(
     limit: usize,
     label: Option<String>,
 ) -> anyhow::Result<Vec<SearchResult>> {
+    let selectors = label
+        .as_deref()
+        .map(try_parse_label_selectors)
+        .transpose()
+        .map_err(anyhow::Error::new)?
+        .unwrap_or_default();
     if limit == 0 || query.trim().is_empty() {
         return Ok(Vec::new());
     }
-
-    let selectors = label
-        .as_deref()
-        .map(parse_label_selectors)
-        .unwrap_or_default();
     let allowed_note_ids = if selectors.is_empty() {
         None
     } else {

@@ -1,7 +1,7 @@
 use note_core::{parse_label_selectors, AttachmentStorageMetadata, LabelValueType, NoteAttachment};
 use note_storage::{
-    ActiveNoteSource, AttachmentMetadataUpdate, NewNote, NoteFieldsUpdate, NoteMutationResult,
-    NoteUpdate, StorageBackend, StorageErrorKind,
+    ActiveNoteSource, AttachmentMetadataUpdate, LabelValueCount, NewNote, NoteFieldsUpdate,
+    NoteMutationResult, NoteUpdate, StorageBackend, StorageErrorKind,
 };
 use std::sync::Arc;
 
@@ -819,6 +819,145 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         .any(|(key, count)| { key == "contract-notes-active-only" && *count == 0 }));
     assert_eq!(
         session
+            .label_value_counts(&["contract-notes-status".to_string()])
+            .await
+            .unwrap(),
+        vec![
+            LabelValueCount {
+                key: "contract-notes-status".into(),
+                value: "ready".into(),
+                count: 4,
+            },
+            LabelValueCount {
+                key: "contract-notes-status".into(),
+                value: "blocked".into(),
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(
+        session
+            .label_value_counts(&["contract-notes-priority".to_string()])
+            .await
+            .unwrap(),
+        ["1", "10", "3", "5", "9"]
+            .into_iter()
+            .map(|value| LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: value.into(),
+                count: 1,
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        session
+            .label_value_counts(&[
+                "contract-notes-status".to_string(),
+                "contract-notes-missing".to_string(),
+                "contract-notes-priority".to_string(),
+                "contract-notes-status".to_string(),
+            ])
+            .await
+            .unwrap(),
+        vec![
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "1".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "10".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "3".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "5".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-priority".into(),
+                value: "9".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-status".into(),
+                value: "ready".into(),
+                count: 4,
+            },
+            LabelValueCount {
+                key: "contract-notes-status".into(),
+                value: "blocked".into(),
+                count: 1,
+            },
+        ]
+    );
+    session
+        .insert_label_key_with_type("contract-notes-category", "Category", LabelValueType::Text)
+        .await
+        .unwrap();
+    for (id, value) in [
+        ("contract-notes-category-zebra", "Zebra"),
+        ("contract-notes-category-alpha", "alpha"),
+        ("contract-notes-category-eclair", "Éclair"),
+    ] {
+        session
+            .insert_note(NewNote {
+                id,
+                title: id,
+                content: id,
+                attachments: &[],
+                created_at: 100,
+                updated_at: 100,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        session
+            .attach_label(id, "contract-notes-category", value)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session
+            .label_value_counts(&["contract-notes-category".to_string()])
+            .await
+            .unwrap(),
+        vec![
+            LabelValueCount {
+                key: "contract-notes-category".into(),
+                value: "Zebra".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-category".into(),
+                value: "alpha".into(),
+                count: 1,
+            },
+            LabelValueCount {
+                key: "contract-notes-category".into(),
+                value: "Éclair".into(),
+                count: 1,
+            },
+        ]
+    );
+    for id in [
+        "contract-notes-category-zebra",
+        "contract-notes-category-alpha",
+        "contract-notes-category-eclair",
+    ] {
+        session.soft_delete_note(id, 1, 110).await.unwrap();
+        session.permanently_delete_note(id, 2).await.unwrap();
+    }
+    assert!(session.label_value_counts(&[]).await.unwrap().is_empty());
+    assert_eq!(
+        session
             .get_deleted_note_content_and_revision("contract-notes-active")
             .await
             .unwrap(),
@@ -1252,4 +1391,49 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         raced.title.as_str(),
         "First winner candidate" | "Second winner candidate"
     ));
+
+    session
+        .insert_label_key_with_type(
+            "contract-exact",
+            "Exact selector contract",
+            LabelValueType::Text,
+        )
+        .await
+        .unwrap();
+    for (index, value) in ["a&b", "%26", "+", " padded ", ""].into_iter().enumerate() {
+        let id = format!("contract-exact-{index}");
+        session
+            .insert_note(NewNote {
+                id: &id,
+                title: &id,
+                content: &id,
+                attachments: &[],
+                created_at: 3_000 + index as i64,
+                updated_at: 3_000 + index as i64,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        session
+            .attach_label(&id, "contract-exact", value)
+            .await
+            .unwrap();
+    }
+    for (index, encoded) in ["a%26b", "%2526", "%2B", "%20padded%20", ""]
+        .into_iter()
+        .enumerate()
+    {
+        let selector = parse_label_selectors(&format!("~contract-exact=={encoded}"));
+        assert_eq!(
+            session.matching_note_ids(&selector).await.unwrap(),
+            vec![format!("contract-exact-{index}")],
+            "selector: {encoded}"
+        );
+    }
+    for index in 0..5 {
+        let id = format!("contract-exact-{index}");
+        session.soft_delete_note(&id, 1, 3_100).await.unwrap();
+        session.permanently_delete_note(&id, 2).await.unwrap();
+    }
 }

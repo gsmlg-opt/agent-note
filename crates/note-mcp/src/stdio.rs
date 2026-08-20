@@ -75,7 +75,9 @@ impl From<SaveNoteToolOutput> for SaveNoteResponse {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct BulkUpdateNoteLabelsRequest {
-    /// Label selector used to choose active notes.
+    /// Label selector used to choose active notes. Exact raw equality is `==` with
+    /// `~<percent-encoded-key>==<percent-encoded-value>` so reserved, empty, and
+    /// outer-whitespace operands round-trip exactly.
     pub selector: String,
     /// Label `(key, value)` pairs to set or replace on every matching note.
     #[serde(default)]
@@ -384,9 +386,9 @@ pub struct ListNotesRequest {
     pub offset: Option<u32>,
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
-    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
-    /// the `&` separator is also reserved in operands.
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
+    /// `==` with `~<percent-encoded-key>==<percent-encoded-value>`; the reserved prefix
+    /// preserves legacy selector meanings while reserved characters, empty values, and whitespace round-trip.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -414,9 +416,9 @@ pub struct SemanticSearchRequest {
     pub limit: usize,
     /// Label selector: `&`-separated terms are ANDed; bare-key presence is supported;
     /// operators are `=`, `!=`, `>`, `>=`, `<`, `<=`; case-insensitive operators are
-    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Keys cannot contain
-    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`;
-    /// the `&` separator is also reserved in operands.
+    /// `^=` (starts-with), `$=` (ends-with), and `~=` (regex). Exact raw equality is
+    /// `==` with `~<percent-encoded-key>==<percent-encoded-value>`; the reserved prefix
+    /// preserves legacy selector meanings while reserved characters, empty values, and whitespace round-trip.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -909,6 +911,9 @@ fn to_error_data(error: anyhow::Error) -> ErrorData {
         || error
             .downcast_ref::<note_core::LabelKeyValidationError>()
             .is_some()
+        || error
+            .downcast_ref::<note_core::LabelSelectorParseError>()
+            .is_some()
     {
         return ErrorData::invalid_params(error.to_string(), None);
     }
@@ -1160,6 +1165,7 @@ mod tests {
             fn remove_note_label(note_id: &str, key: &str) -> bool;
             fn labels_for_note(note_id: &str) -> Vec<note_core::Label>;
             fn label_note_counts() -> Vec<(String, usize)>;
+            fn label_value_counts(keys: &[String]) -> Vec<note_storage::LabelValueCount>;
             fn find_note_with_labels(labels: &[(String, String)]) -> Option<String>;
         }
     }
@@ -1685,10 +1691,11 @@ mod tests {
             &search_input["properties"]["label"],
         ] {
             let description = label["description"].as_str().unwrap();
-            for operator in ["^=", "$=", "~="] {
+            for operator in ["==", "^=", "$=", "~="] {
                 assert!(description.contains(operator), "{description}");
             }
             assert!(description.contains("case-insensitive"), "{description}");
+            assert!(description.contains("percent-encoded"), "{description}");
         }
         assert_eq!(required_names(&search_input), vec!["limit", "query"]);
 
@@ -2204,6 +2211,40 @@ mod tests {
     fn label_key_validation_faults_are_invalid_params() {
         let error = anyhow::Error::new(note_core::LabelKeyValidationError::ReservedCharacter('$'));
         assert_eq!(to_error_data(error).code, ErrorCode::INVALID_PARAMS);
+        let error = anyhow::Error::new(note_core::LabelSelectorParseError::MalformedExactSelector);
+        assert_eq!(to_error_data(error).code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn malformed_exact_selectors_are_invalid_params_for_read_tools() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
+
+        let list_error = expect_error(
+            server
+                .list_notes(Parameters(ListNotesRequest {
+                    limit: None,
+                    offset: None,
+                    label: Some("status=ready&~==secret".into()),
+                }))
+                .await,
+        );
+        assert_eq!(list_error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(list_error.message, "malformed exact label selector");
+
+        for (query, limit) in [("anything", 10), ("", 10), ("anything", 0)] {
+            let search_error = expect_error(
+                server
+                    .semantic_search(Parameters(SemanticSearchRequest {
+                        query: query.into(),
+                        limit,
+                        label: Some("~project==%ZZ".into()),
+                    }))
+                    .await,
+            );
+            assert_eq!(search_error.code, ErrorCode::INVALID_PARAMS);
+            assert_eq!(search_error.message, "malformed exact label selector");
+        }
     }
 
     #[test]

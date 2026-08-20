@@ -1,4 +1,4 @@
-use web_sys::HtmlInputElement;
+use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 use yew_duskmoon::Alert;
 
@@ -11,6 +11,7 @@ pub fn system_page() -> Html {
     let config = use_state(|| None::<SystemConfig>);
     let info = use_state(|| None::<SystemInfo>);
     let labels = use_state(Vec::<LabelKey>::new);
+    let labels_error = use_state(|| None::<String>);
     let loading = use_state(|| true);
     let saving = use_state(|| false);
     let error = use_state(|| None::<String>);
@@ -20,6 +21,7 @@ pub fn system_page() -> Html {
         let config = config.clone();
         let info = info.clone();
         let labels = labels.clone();
+        let labels_error = labels_error.clone();
         let loading = loading.clone();
         let error = error.clone();
         use_effect_with((), move |_| {
@@ -32,8 +34,12 @@ pub fn system_page() -> Html {
                     Ok(next) => info.set(Some(next)),
                     Err(message) => error.set(Some(message)),
                 }
-                if let Ok(next) = api::list_labels().await {
-                    labels.set(next);
+                match api::list_labels().await {
+                    Ok(next) => {
+                        labels.set(next);
+                        labels_error.set(None);
+                    }
+                    Err(message) => labels_error.set(Some(message)),
                 }
                 loading.set(false);
             });
@@ -67,6 +73,22 @@ pub fn system_page() -> Html {
                 });
                 config.set(Some(next));
                 saved.set(false);
+            }
+        })
+    };
+
+    let on_add_category_label = {
+        let config = config.clone();
+        let saved = saved.clone();
+        Callback::from(move |event: Event| {
+            let select: HtmlSelectElement = event.target_unchecked_into();
+            let key = select.value();
+            select.set_value("");
+            if let Some(mut next) = (*config).clone() {
+                if add_category_label(&mut next.category_labels, &key) {
+                    config.set(Some(next));
+                    saved.set(false);
+                }
             }
         })
     };
@@ -115,6 +137,71 @@ pub fn system_page() -> Html {
             if *loading {
                 <p class="loading">{ "Loading..." }</p>
             } else if let Some(current) = &*config {
+                <section class="system-section" aria-labelledby="category-labels-title">
+                    <div class="system-section-head">
+                        <div>
+                            <h3 id="category-labels-title">{ "Category labels" }</h3>
+                            <p>{ "Group notes by selected label values on the Home dashboard." }</p>
+                        </div>
+                    </div>
+
+                    <div class="category-label-controls">
+                        if let Some(message) = &*labels_error {
+                            <Alert variant={Some("error".to_string())}>
+                                <span>{ format!("Label catalog unavailable: {message}") }</span>
+                            </Alert>
+                        } else if labels.is_empty() {
+                            <p class="empty compact">{ "No label keys available. Create one on Labels first." }</p>
+                        }
+
+                        <select
+                            class="select category-label-select"
+                            aria-label="Add category label"
+                            disabled={category_label_select_disabled((*labels_error).is_some(), *saving, &*labels, &current.category_labels)}
+                            onchange={on_add_category_label}
+                        >
+                            <option value="" disabled=true>{ "Add category label" }</option>
+                            { for labels.iter()
+                                .filter(|label| !current.category_labels.iter().any(|key| key == &label.key))
+                                .map(|label| html! { <option value={label.key.clone()}>{ label.key.clone() }</option> })
+                            }
+                        </select>
+
+                        <div class="category-label-selection">
+                            if current.category_labels.is_empty() {
+                                <p class="empty compact">{ "No category labels configured." }</p>
+                            } else {
+                                { for current.category_labels.iter().map(|key| {
+                                    let config = config.clone();
+                                    let saved = saved.clone();
+                                    let key = key.clone();
+                                    let key_to_remove = key.clone();
+                                    let on_remove = Callback::from(move |_| {
+                                        if let Some(mut next) = (*config).clone() {
+                                            if remove_category_label(&mut next.category_labels, &key_to_remove) {
+                                                config.set(Some(next));
+                                                saved.set(false);
+                                            }
+                                        }
+                                    });
+                                    html! {
+                                        <button
+                                            type="button"
+                                            class="chip chip-clickable chip-primary category-label-selection-chip"
+                                            aria-label={format!("Remove category label {key}")}
+                                            onclick={on_remove}
+                                            disabled={*saving}
+                                        >
+                                            <span>{ key }</span>
+                                            <span aria-hidden="true">{ "×" }</span>
+                                        </button>
+                                    }
+                                }) }
+                            }
+                        </div>
+                    </div>
+                </section>
+
                 <section class="system-section" aria-labelledby="duplicate-check-title">
                     <div class="system-section-head">
                         <div>
@@ -409,6 +496,34 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn add_category_label(keys: &mut Vec<String>, key: &str) -> bool {
+    if key.is_empty() || keys.iter().any(|existing| existing == key) {
+        return false;
+    }
+
+    keys.push(key.to_string());
+    true
+}
+
+fn remove_category_label(keys: &mut Vec<String>, key: &str) -> bool {
+    let before = keys.len();
+    keys.retain(|existing| existing != key);
+    keys.len() != before
+}
+
+fn category_label_select_disabled(
+    labels_error: bool,
+    saving: bool,
+    labels: &[LabelKey],
+    selected: &[String],
+) -> bool {
+    labels_error
+        || saving
+        || !labels
+            .iter()
+            .any(|label| !selected.iter().any(|key| key == &label.key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +544,63 @@ mod tests {
         };
         assert_eq!(rule_expression(&rule), "[kind=skill + version]");
         assert_eq!(format_bytes(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn category_selection_preserves_order_and_rejects_duplicates() {
+        let mut keys = vec!["project".to_string()];
+        assert!(add_category_label(&mut keys, "team"));
+        assert!(!add_category_label(&mut keys, "project"));
+        assert!(!add_category_label(&mut keys, ""));
+        assert_eq!(keys, vec!["project", "team"]);
+    }
+
+    #[test]
+    fn category_selection_removes_only_requested_key() {
+        let mut keys = vec!["project".to_string(), "team".to_string()];
+        assert!(remove_category_label(&mut keys, "project"));
+        assert_eq!(keys, vec!["team"]);
+        assert!(!remove_category_label(&mut keys, "missing"));
+    }
+
+    #[test]
+    fn category_label_picker_is_disabled_when_catalog_is_unavailable() {
+        let labels = vec![label_key("project")];
+
+        assert!(category_label_select_disabled(false, true, &labels, &[]));
+        assert!(category_label_select_disabled(true, false, &labels, &[]));
+    }
+
+    #[test]
+    fn category_label_picker_is_disabled_when_catalog_is_empty_or_all_selected() {
+        let labels = vec![label_key("project")];
+
+        assert!(category_label_select_disabled(false, false, &[], &[]));
+        assert!(category_label_select_disabled(
+            false,
+            false,
+            &labels,
+            &["project".to_string()]
+        ));
+    }
+
+    #[test]
+    fn category_label_picker_is_enabled_for_an_unselected_catalog_key() {
+        let labels = vec![label_key("project"), label_key("team")];
+
+        assert!(!category_label_select_disabled(
+            false,
+            false,
+            &labels,
+            &["project".to_string()]
+        ));
+    }
+
+    fn label_key(key: &str) -> LabelKey {
+        LabelKey {
+            key: key.to_string(),
+            description: String::new(),
+            value_type: "string".to_string(),
+        }
     }
 }

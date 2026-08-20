@@ -52,6 +52,19 @@ async fn blank_query_returns_no_results_without_embedding() {
 }
 
 #[tokio::test]
+async fn malformed_filters_are_rejected_before_blank_or_zero_limit_shortcuts() {
+    let (ctx, _backend, _dir) = test_context().await;
+    for (query, limit) in [("", 10), ("anything", 0)] {
+        let error = search_notes_filtered(&ctx, query, limit, Some("~==secret".into()))
+            .await
+            .unwrap_err();
+        assert!(error
+            .downcast_ref::<note_core::LabelSelectorParseError>()
+            .is_some());
+    }
+}
+
+#[tokio::test]
 async fn empty_label_collection_returns_without_embedding() {
     let dir = tempfile::tempdir().unwrap();
     let storage: Arc<dyn note_storage::StorageBackend> = Arc::new(

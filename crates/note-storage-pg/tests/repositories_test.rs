@@ -1348,6 +1348,7 @@ async fn embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantic
         SystemConfig::default()
     );
     let config = SystemConfig {
+        category_labels: Vec::new(),
         duplicate_check: DuplicateCheckConfig {
             enabled: true,
             rules: vec![DuplicateCheckRule {

@@ -19,6 +19,7 @@ async fn system_config_defaults_and_persists() {
     );
 
     let config = SystemConfig {
+        category_labels: Vec::new(),
         duplicate_check: DuplicateCheckConfig {
             enabled: true,
             rules: vec![DuplicateCheckRule {

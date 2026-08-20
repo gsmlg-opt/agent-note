@@ -7,6 +7,8 @@ use crate::pages::{
     TrashPage,
 };
 
+pub const DEFAULT_NOTES_PAGE_SIZE: usize = 10;
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct NotesQueryParams {
     pub current: usize,
@@ -112,7 +114,7 @@ pub fn switch(route: Route) -> Html {
 
 #[cfg(test)]
 mod tests {
-    use super::{NotesQueryParams, Route};
+    use super::{NotesQueryParams, Route, DEFAULT_NOTES_PAGE_SIZE};
     use yew_router::Routable;
 
     #[test]
@@ -200,5 +202,11 @@ mod tests {
         };
 
         assert_eq!(query.clone().validated(), Some(query));
+    }
+
+    #[test]
+    fn default_notes_page_size_is_a_supported_existing_page_size() {
+        assert!(matches!(DEFAULT_NOTES_PAGE_SIZE, 10 | 30 | 50 | 100 | 1000));
+        assert_eq!(DEFAULT_NOTES_PAGE_SIZE, 10);
     }
 }
