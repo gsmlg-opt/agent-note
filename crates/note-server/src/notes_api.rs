@@ -1480,6 +1480,10 @@ pub struct SearchQuery {
 pub struct SearchResultDto {
     pub id: String,
     pub title: String,
+    #[schema(schema_with = crate::openapi::label_pairs_schema)]
+    pub labels: Vec<(String, String)>,
+    pub created_at: i64,
+    pub updated_at: i64,
     pub revision: i64,
     pub score: f32, // fused RRF score — label as such in any client UI, not "similarity" (docs/design.md §7)
 }
@@ -1508,6 +1512,14 @@ async fn search_handler(
             .map(|r| SearchResultDto {
                 id: r.note.id,
                 title: r.note.title,
+                labels: r
+                    .note
+                    .labels
+                    .iter()
+                    .map(|label| (label.key.clone(), label.value.clone()))
+                    .collect(),
+                created_at: r.note.created_at,
+                updated_at: r.note.updated_at,
                 revision: r.note.revision,
                 score: r.score,
             })
@@ -2265,6 +2277,19 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("revision")));
+        for field in ["labels", "created_at", "updated_at"] {
+            assert!(
+                schemas["SearchResultDto"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(field)),
+                "SearchResultDto must require {field}"
+            );
+        }
+        assert_eq!(
+            schemas["SearchResultDto"]["properties"]["labels"],
+            schemas["NoteListDto"]["properties"]["labels"]
+        );
         assert_eq!(
             operation_parameter(
                 &document["paths"]["/api/notes/{id}"]["delete"],
@@ -4220,7 +4245,7 @@ mod tests {
         app.clone()
             .oneshot(post(
                 "/api/notes",
-                r#"{"title":"Find","content":"unique text","labels":[]}"#,
+                r#"{"title":"Find","content":"unique text","labels":[["topic","search"]]}"#,
             ))
             .await
             .unwrap();
@@ -4240,14 +4265,17 @@ mod tests {
         // The StubEmbedder is deterministic and the query equals the seeded content, so the seeded
         // note must be found — assert a real hit so the seed step is load-bearing, not decorative.
         let hits = arr.as_array().expect("response is a JSON array");
-        assert!(hits.iter().all(|result| result["revision"]
+        let hit = hits
+            .iter()
+            .find(|result| result["title"] == "Find")
+            .unwrap_or_else(|| panic!("expected the seeded note in results, got {arr}"));
+        assert!(hit["revision"]
             .as_i64()
-            .is_some_and(|revision| revision > 0)));
-        assert!(
-            hits.iter()
-                .any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Find")),
-            "expected the seeded note in results, got {arr}"
-        );
+            .is_some_and(|revision| revision > 0));
+        assert_eq!(hit["labels"], serde_json::json!([["topic", "search"]]));
+        assert!(hit["created_at"].as_i64().is_some());
+        assert!(hit["updated_at"].as_i64().is_some());
+        assert!(hit["score"].as_f64().is_some_and(f64::is_finite));
     }
 
     #[tokio::test]

@@ -33,11 +33,20 @@ pub(crate) struct SystemConfigSchema {
     /// Key spelling is exact; leading or trailing whitespace is invalid.
     #[schema(required = false, default = json!([]))]
     pub category_labels: Vec<String>,
+    #[schema(required = false, default = json!({"minimum_score": 0.01}))]
+    pub search: SearchConfigSchema,
     #[schema(
         required = false,
         default = json!({"enabled": false, "rules": []})
     )]
     pub duplicate_check: DuplicateCheckConfigSchema,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct SearchConfigSchema {
+    #[schema(required = false, default = 0.01, minimum = 0.0)]
+    pub minimum_score: f32,
 }
 
 #[derive(ToSchema)]
@@ -1176,6 +1185,7 @@ mod tests {
             },
         };
         let runtime_config = serde_json::to_value(runtime_config).unwrap();
+        let runtime_search = &runtime_config["search"];
         let runtime_duplicate_check = &runtime_config["duplicate_check"];
         let runtime_rule = &runtime_duplicate_check["rules"][0];
         let runtime_term = &runtime_rule["terms"][0];
@@ -1200,6 +1210,10 @@ mod tests {
             schema_property_keys(&document, "SystemConfigSchema")
         );
         assert_eq!(
+            property_keys(runtime_search),
+            schema_property_keys(&document, "SearchConfigSchema")
+        );
+        assert_eq!(
             property_keys(runtime_duplicate_check),
             schema_property_keys(&document, "DuplicateCheckConfigSchema")
         );
@@ -1218,6 +1232,10 @@ mod tests {
 
         assert_eq!(
             schema_required_keys(&document, "SystemConfigSchema"),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            schema_required_keys(&document, "SearchConfigSchema"),
             BTreeSet::new()
         );
         assert_eq!(
@@ -1250,8 +1268,20 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(
+            schemas["SystemConfigSchema"]["properties"]["search"]["default"],
+            serde_json::json!({"minimum_score": 0.01})
+        );
+        assert_eq!(
             schemas["SystemConfigSchema"]["properties"]["duplicate_check"]["default"],
             serde_json::json!({"enabled": false, "rules": []})
+        );
+        assert_eq!(
+            schemas["SearchConfigSchema"]["properties"]["minimum_score"]["default"],
+            0.01
+        );
+        assert_eq!(
+            schemas["SearchConfigSchema"]["properties"]["minimum_score"]["minimum"],
+            0.0
         );
         assert_eq!(
             schemas["DuplicateCheckConfigSchema"]["properties"]["enabled"]["default"],

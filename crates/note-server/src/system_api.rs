@@ -305,13 +305,14 @@ mod tests {
         let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(config["category_labels"], serde_json::json!([]));
         assert_eq!(config["duplicate_check"]["enabled"], false);
+        assert_eq!(config["search"]["minimum_score"], 0.01);
 
         let response = app
             .clone()
             .oneshot(request(
                 "PUT",
                 "/api/system/config",
-                r#"{"duplicate_check":{"enabled":true,"rules":[{"terms":[{"key":"skill-name"},{"key":"version"}]}]}}"#,
+                r#"{"search":{"minimum_score":0.025},"duplicate_check":{"enabled":true,"rules":[{"terms":[{"key":"skill-name"},{"key":"version"}]}]}}"#,
             ))
             .await
             .unwrap();
@@ -324,6 +325,7 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(config["duplicate_check"]["enabled"], true);
+        assert_eq!(config["search"]["minimum_score"], 0.025);
         assert_eq!(
             config["duplicate_check"]["rules"][0]["terms"]
                 .as_array()
@@ -378,7 +380,8 @@ mod tests {
             config,
             serde_json::json!({
                 "category_labels": [],
-                "duplicate_check": {"enabled": false, "rules": []}
+                "duplicate_check": {"enabled": false, "rules": []},
+                "search": {"minimum_score": 0.01}
             })
         );
     }
