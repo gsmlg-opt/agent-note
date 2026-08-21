@@ -264,7 +264,7 @@ pub fn system_page() -> Html {
                             value={(*minimum_score_draft).clone()}
                             disabled={*saving}
                             aria-invalid={minimum_score_error.is_some().to_string()}
-                            aria-describedby="minimum-score-help minimum-score-error"
+                            aria-describedby={minimum_score_description_ids(minimum_score_error.is_some())}
                             oninput={on_minimum_score}
                         />
                         <p id="minimum-score-help" class="system-score-help">
@@ -615,6 +615,14 @@ struct MinimumScoreTransition {
     error: Option<&'static str>,
 }
 
+fn minimum_score_description_ids(has_error: bool) -> &'static str {
+    if has_error {
+        "minimum-score-help minimum-score-error"
+    } else {
+        "minimum-score-help"
+    }
+}
+
 fn parse_minimum_score(value: &str) -> Result<f32, &'static str> {
     if value.trim().is_empty() {
         return Err("Enter a minimum score.");
@@ -765,9 +773,15 @@ mod tests {
         let source = include_str!("system.rs");
 
         assert_eq!(source.matches(concat!("Save ", "settings")).count(), 1);
-        assert!(source.contains(concat!("aria-", "invalid")));
-        assert!(source.contains(concat!("aria-", "describedby")));
-        assert!(source.contains(concat!("minimum-score-", "error")));
+    }
+
+    #[test]
+    fn minimum_score_description_ids_match_the_rendered_validation_state() {
+        assert_eq!(minimum_score_description_ids(false), "minimum-score-help");
+        assert_eq!(
+            minimum_score_description_ids(true),
+            "minimum-score-help minimum-score-error"
+        );
     }
 
     fn label_key(key: &str) -> LabelKey {
