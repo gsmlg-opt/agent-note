@@ -2,7 +2,7 @@ mod support;
 
 use note_core::{
     CategoryLabelConfigError, DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm,
-    SystemConfig, SystemConfigValidationError,
+    SearchConfig, SystemConfig, SystemConfigValidationError,
 };
 use note_pipelines::{
     category_label_summaries, define_label_key, delete_label_key, get_system_config,
@@ -28,6 +28,7 @@ async fn config_roundtrips_and_system_info_reports_storage() {
                 }],
             }],
         },
+        search: SearchConfig::default(),
     };
 
     update_system_config(&ctx, &config).await.unwrap();
@@ -59,6 +60,7 @@ async fn invalid_config_is_rejected_before_storage() {
             enabled: true,
             rules: vec![DuplicateCheckRule { terms: vec![] }],
         },
+        search: SearchConfig::default(),
     };
 
     let error = update_system_config(&ctx, &config).await.unwrap_err();
@@ -76,6 +78,7 @@ async fn category_keys_must_exist_and_configured_keys_cannot_be_deleted() {
     let (ctx, _backend, _dir) = test_context().await;
     let configured = SystemConfig {
         category_labels: vec!["project".to_string()],
+        search: SearchConfig::default(),
         ..SystemConfig::default()
     };
 
@@ -159,6 +162,7 @@ async fn category_summaries_preserve_config_order_and_include_empty_categories()
                 "empty-category".to_string(),
                 "project".to_string(),
             ],
+            search: SearchConfig::default(),
             ..SystemConfig::default()
         },
     )
@@ -213,6 +217,7 @@ async fn category_summaries_reject_stale_configured_keys() {
     session
         .set_system_config(&SystemConfig {
             category_labels: vec!["missing".to_string()],
+            search: SearchConfig::default(),
             ..SystemConfig::default()
         })
         .await
@@ -235,6 +240,7 @@ async fn category_summaries_reject_duplicate_keys_from_stored_config() {
     session
         .set_system_config(&SystemConfig {
             category_labels: vec!["project".to_string(), "project".to_string()],
+            search: SearchConfig::default(),
             ..SystemConfig::default()
         })
         .await
@@ -250,6 +256,7 @@ async fn category_summaries_reject_duplicate_keys_from_stored_config() {
 
     let valid = SystemConfig {
         category_labels: vec!["project".to_string()],
+        search: SearchConfig::default(),
         ..SystemConfig::default()
     };
     update_system_config(&ctx, &valid).await.unwrap();

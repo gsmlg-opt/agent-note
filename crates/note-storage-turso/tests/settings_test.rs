@@ -1,6 +1,8 @@
 mod support;
 
-use note_core::{DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, SystemConfig};
+use note_core::{
+    DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, SearchConfig, SystemConfig,
+};
 use note_storage::{SettingsRepository, StorageErrorKind};
 use note_storage_turso::TursoStorage;
 use support::{fixture, Fixture};
@@ -35,6 +37,7 @@ async fn system_config_defaults_and_persists() {
                 ],
             }],
         },
+        search: SearchConfig::default(),
     };
     session.set_system_config(&config).await.unwrap();
     drop(session);

@@ -1,4 +1,6 @@
-use note_core::{DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, SystemConfig};
+use note_core::{
+    DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, SearchConfig, SystemConfig,
+};
 use note_storage::StorageBackend;
 use std::sync::Arc;
 
@@ -24,6 +26,9 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
                     },
                 ],
             }],
+        },
+        search: SearchConfig {
+            minimum_score: 0.025,
         },
     };
     session.set_system_config(&config).await.unwrap();

@@ -3,7 +3,7 @@ mod support;
 
 use note_core::{
     parse_label_selectors, AttachmentStorageMetadata, DuplicateCheckConfig, DuplicateCheckRule,
-    DuplicateCheckTerm, LabelValueType, NoteAttachment, SystemConfig,
+    DuplicateCheckTerm, LabelValueType, NoteAttachment, SearchConfig, SystemConfig,
 };
 use note_storage::{
     EmbeddingRepository, LabelRepository, NewNote, NoteChunk, NoteMutationResult, NoteUpdate,
@@ -1364,6 +1364,7 @@ async fn embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantic
                 ],
             }],
         },
+        search: SearchConfig::default(),
     };
     session.set_system_config(&config).await.unwrap();
     assert_eq!(session.get_system_config().await.unwrap(), config);

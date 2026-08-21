@@ -29,7 +29,8 @@ use support::{
 };
 
 use note_core::{
-    DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SystemConfig,
+    DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SearchConfig,
+    SystemConfig,
 };
 
 type AttachmentObjects = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
@@ -652,6 +653,7 @@ async fn enable_duplicate_series_rule(ctx: &Context) {
                     }],
                 }],
             },
+            search: SearchConfig::default(),
         },
     )
     .await
@@ -2218,6 +2220,7 @@ fn duplicate_config(terms: &[(&str, Option<&str>)]) -> SystemConfig {
                     .collect(),
             }],
         },
+        search: SearchConfig::default(),
     }
 }
 

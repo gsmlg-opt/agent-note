@@ -3,13 +3,34 @@ use std::collections::HashSet;
 
 pub const MAX_DUPLICATE_CHECK_RULES: usize = 64;
 pub const MAX_DUPLICATE_CHECK_TERMS: usize = 32;
+pub const DEFAULT_MINIMUM_SEARCH_SCORE: f32 = 0.01;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
     pub category_labels: Vec<String>,
     #[serde(default)]
     pub duplicate_check: DuplicateCheckConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchConfig {
+    #[serde(default = "default_minimum_search_score")]
+    pub minimum_score: f32,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            minimum_score: DEFAULT_MINIMUM_SEARCH_SCORE,
+        }
+    }
+}
+
+fn default_minimum_search_score() -> f32 {
+    DEFAULT_MINIMUM_SEARCH_SCORE
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +55,7 @@ pub struct DuplicateCheckTerm {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SystemConfigValidationError {
+    InvalidSearchMinimumScore,
     EmptyCategoryLabel { index: usize },
     CategoryLabelHasOuterWhitespace { index: usize },
     DuplicateCategoryLabel { key: String },
@@ -48,6 +70,9 @@ pub enum SystemConfigValidationError {
 impl std::fmt::Display for SystemConfigValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidSearchMinimumScore => {
+                write!(f, "search minimum score must be finite and non-negative")
+            }
             Self::EmptyCategoryLabel { index } => {
                 write!(f, "category label {} must have a label key", index + 1)
             }
@@ -119,6 +144,10 @@ impl std::fmt::Display for CategoryLabelConfigError {
 impl std::error::Error for CategoryLabelConfigError {}
 
 pub fn validate_system_config(config: &SystemConfig) -> Result<(), SystemConfigValidationError> {
+    if !config.search.minimum_score.is_finite() || config.search.minimum_score < 0.0 {
+        return Err(SystemConfigValidationError::InvalidSearchMinimumScore);
+    }
+
     let mut category_keys = HashSet::new();
     for (index, key) in config.category_labels.iter().enumerate() {
         let trimmed = key.trim();
@@ -235,9 +264,45 @@ mod tests {
     }
 
     #[test]
+    fn search_minimum_score_defaults_to_point_zero_one() {
+        assert_eq!(SystemConfig::default().search.minimum_score, 0.01);
+    }
+
+    #[test]
+    fn search_minimum_score_deserializes_to_default_when_search_is_omitted() {
+        let config: SystemConfig = serde_json::from_str(r#"{"duplicate_check": {}}"#).unwrap();
+
+        assert_eq!(config.search.minimum_score, 0.01);
+    }
+
+    #[test]
+    fn accepts_finite_non_negative_search_minimum_scores() {
+        for minimum_score in [0.0, 0.01, 1.0, f32::MAX] {
+            let mut config = SystemConfig::default();
+            config.search.minimum_score = minimum_score;
+
+            assert_eq!(validate_system_config(&config), Ok(()));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_search_minimum_scores() {
+        for minimum_score in [-0.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut config = SystemConfig::default();
+            config.search.minimum_score = minimum_score;
+
+            assert_eq!(
+                validate_system_config(&config),
+                Err(SystemConfigValidationError::InvalidSearchMinimumScore)
+            );
+        }
+    }
+
+    #[test]
     fn accepts_ordered_category_labels_without_normalizing_keys() {
         let config = SystemConfig {
             category_labels: vec!["Project.Team".to_string(), "project".to_string()],
+            search: SearchConfig::default(),
             ..SystemConfig::default()
         };
 
@@ -272,6 +337,7 @@ mod tests {
         ] {
             let config = SystemConfig {
                 category_labels: labels,
+                search: SearchConfig::default(),
                 ..SystemConfig::default()
             };
             assert_eq!(validate_system_config(&config), Err(expected));
@@ -313,6 +379,7 @@ mod tests {
                     terms: vec![term("skill-name", None), term("version", None)],
                 }],
             },
+            search: SearchConfig::default(),
         };
 
         assert_eq!(validate_system_config(&config), Ok(()));
@@ -328,6 +395,7 @@ mod tests {
                     terms: vec![term("version", None), term("version", Some("1.0.0"))],
                 }],
             },
+            search: SearchConfig::default(),
         };
 
         assert_eq!(
@@ -349,6 +417,7 @@ mod tests {
                     terms: vec![term(" version ", None)],
                 }],
             },
+            search: SearchConfig::default(),
         };
 
         assert_eq!(

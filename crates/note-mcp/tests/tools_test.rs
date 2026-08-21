@@ -1,6 +1,7 @@
 use note_attachments::FilesystemAttachmentStore;
 use note_core::{
-    DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SystemConfig,
+    DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SearchConfig,
+    SystemConfig,
 };
 use note_embedding::StubEmbedder;
 use note_mcp::{
@@ -482,6 +483,7 @@ async fn save_note_tool_honors_duplicate_check_config() {
                     ],
                 }],
             },
+            search: SearchConfig::default(),
         },
     )
     .await
