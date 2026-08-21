@@ -123,12 +123,32 @@ pub struct LabelFilter {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
     pub category_labels: Vec<String>,
     #[serde(default)]
+    pub search: SearchConfig,
+    #[serde(default)]
     pub duplicate_check: DuplicateCheckConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchConfig {
+    #[serde(default = "default_search_minimum_score")]
+    pub minimum_score: f32,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            minimum_score: default_search_minimum_score(),
+        }
+    }
+}
+
+fn default_search_minimum_score() -> f32 {
+    0.01
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,5 +264,32 @@ mod tests {
 
         assert!(omitted.category_labels.is_empty());
         assert_eq!(configured.category_labels, ["team", "project"]);
+    }
+
+    #[test]
+    fn system_config_defaults_omitted_search_minimum_score() {
+        let config: SystemConfig =
+            serde_json::from_str(r#"{"category_labels":[],"duplicate_check":{}}"#).unwrap();
+
+        assert_eq!(config.search.minimum_score, 0.01);
+    }
+
+    #[test]
+    fn system_config_preserves_configured_search_minimum_score() {
+        let config: SystemConfig = serde_json::from_str(
+            r#"{"category_labels":[],"search":{"minimum_score":0.025},"duplicate_check":{}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.search.minimum_score, 0.025);
+    }
+
+    #[test]
+    fn system_config_defaults_omitted_search_minimum_score_field() {
+        let config: SystemConfig =
+            serde_json::from_str(r#"{"category_labels":[],"search":{},"duplicate_check":{}}"#)
+                .unwrap();
+
+        assert_eq!(config.search.minimum_score, 0.01);
     }
 }

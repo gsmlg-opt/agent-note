@@ -16,6 +16,8 @@ pub fn system_page() -> Html {
     let saving = use_state(|| false);
     let error = use_state(|| None::<String>);
     let saved = use_state(|| false);
+    let minimum_score_draft = use_state(String::new);
+    let minimum_score_error = use_state(|| None::<String>);
 
     {
         let config = config.clone();
@@ -24,10 +26,16 @@ pub fn system_page() -> Html {
         let labels_error = labels_error.clone();
         let loading = loading.clone();
         let error = error.clone();
+        let minimum_score_draft = minimum_score_draft.clone();
+        let minimum_score_error = minimum_score_error.clone();
         use_effect_with((), move |_| {
             wasm_bindgen_futures::spawn_local(async move {
                 match api::get_system_config().await {
-                    Ok(next) => config.set(Some(next)),
+                    Ok(next) => {
+                        minimum_score_draft.set(next.search.minimum_score.to_string());
+                        minimum_score_error.set(None);
+                        config.set(Some(next));
+                    }
                     Err(message) => error.set(Some(message)),
                 }
                 match api::get_system_info().await {
@@ -56,6 +64,29 @@ pub fn system_page() -> Html {
                 next.duplicate_check.enabled = input.checked();
                 config.set(Some(next));
                 saved.set(false);
+            }
+        })
+    };
+
+    let on_minimum_score = {
+        let config = config.clone();
+        let saved = saved.clone();
+        let minimum_score_draft = minimum_score_draft.clone();
+        let minimum_score_error = minimum_score_error.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            let draft = input.value();
+            minimum_score_draft.set(draft.clone());
+            saved.set(false);
+
+            let Some(mut next) = (*config).clone() else {
+                return;
+            };
+            let transition = transition_minimum_score(next.search.minimum_score, draft);
+            minimum_score_error.set(transition.error.map(str::to_string));
+            if transition.error.is_none() {
+                next.search.minimum_score = transition.minimum_score;
+                config.set(Some(next));
             }
         })
     };
@@ -98,10 +129,21 @@ pub fn system_page() -> Html {
         let saving = saving.clone();
         let error = error.clone();
         let saved = saved.clone();
+        let minimum_score_draft = minimum_score_draft.clone();
+        let minimum_score_error = minimum_score_error.clone();
         Callback::from(move |_| {
-            let Some(next) = (*config).clone() else {
+            let minimum_score = match parse_minimum_score(&minimum_score_draft) {
+                Ok(minimum_score) => minimum_score,
+                Err(message) => {
+                    minimum_score_error.set(Some(message.to_string()));
+                    saved.set(false);
+                    return;
+                }
+            };
+            let Some(mut next) = (*config).clone() else {
                 return;
             };
+            next.search.minimum_score = minimum_score;
             saving.set(true);
             error.set(None);
             saved.set(false);
@@ -117,6 +159,8 @@ pub fn system_page() -> Html {
             });
         })
     };
+
+    let minimum_score_invalid = parse_minimum_score(&minimum_score_draft).is_err();
 
     html! {
         <section class="stack system-page">
@@ -202,6 +246,38 @@ pub fn system_page() -> Html {
                     </div>
                 </section>
 
+                <section class="system-section" aria-labelledby="note-search-title">
+                    <div class="system-section-head">
+                        <div>
+                            <h3 id="note-search-title">{ "Note search" }</h3>
+                            <p>{ "Hide results below this fused weighted-RRF score." }</p>
+                        </div>
+                    </div>
+
+                    <label class="field system-score-field">
+                        <span>{ "Minimum score" }</span>
+                        <input
+                            type="number"
+                            class="input"
+                            min="0"
+                            step="0.001"
+                            value={(*minimum_score_draft).clone()}
+                            disabled={*saving}
+                            aria-invalid={minimum_score_error.is_some().to_string()}
+                            aria-describedby="minimum-score-help minimum-score-error"
+                            oninput={on_minimum_score}
+                        />
+                        <p id="minimum-score-help" class="system-score-help">
+                            { "Enter a finite score of zero or greater." }
+                        </p>
+                        if let Some(message) = &*minimum_score_error {
+                            <p id="minimum-score-error" class="system-score-error" role="alert">
+                                { message.clone() }
+                            </p>
+                        }
+                    </label>
+                </section>
+
                 <section class="system-section" aria-labelledby="duplicate-check-title">
                     <div class="system-section-head">
                         <div>
@@ -241,11 +317,19 @@ pub fn system_page() -> Html {
                             { icons::plus() }
                             <span>{ "Add rule" }</span>
                         </button>
-                        <button type="button" class="btn btn-primary" onclick={on_save} disabled={*saving}>
-                            { if *saving { "Saving..." } else { "Save settings" } }
-                        </button>
                     </div>
                 </section>
+
+                <div class="system-section-actions">
+                    <button
+                        type="button"
+                        class="btn btn-primary"
+                        onclick={on_save}
+                        disabled={*saving || minimum_score_invalid}
+                    >
+                        { if *saving { "Saving..." } else { "Save settings" } }
+                    </button>
+                </div>
             }
 
             if let Some(info) = &*info {
@@ -524,6 +608,41 @@ fn category_label_select_disabled(
             .any(|label| !selected.iter().any(|key| key == &label.key))
 }
 
+#[derive(Debug, PartialEq)]
+struct MinimumScoreTransition {
+    draft: String,
+    minimum_score: f32,
+    error: Option<&'static str>,
+}
+
+fn parse_minimum_score(value: &str) -> Result<f32, &'static str> {
+    if value.trim().is_empty() {
+        return Err("Enter a minimum score.");
+    }
+
+    match value.parse::<f32>() {
+        Ok(score) if !score.is_finite() => Err("Minimum score must be a finite number."),
+        Ok(score) if score < 0.0 => Err("Minimum score must be zero or greater."),
+        Ok(score) => Ok(score),
+        Err(_) => Err("Enter a valid minimum score."),
+    }
+}
+
+fn transition_minimum_score(previous_minimum_score: f32, draft: String) -> MinimumScoreTransition {
+    match parse_minimum_score(&draft) {
+        Ok(minimum_score) => MinimumScoreTransition {
+            draft,
+            minimum_score,
+            error: None,
+        },
+        Err(message) => MinimumScoreTransition {
+            draft,
+            minimum_score: previous_minimum_score,
+            error: Some(message),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +713,61 @@ mod tests {
             &labels,
             &["project".to_string()]
         ));
+    }
+
+    #[test]
+    fn minimum_score_draft_accepts_a_valid_finite_non_negative_number() {
+        let transition = transition_minimum_score(0.01, "0.025".to_string());
+
+        assert_eq!(transition.draft, "0.025");
+        assert_eq!(transition.minimum_score, 0.025);
+        assert_eq!(transition.error, None);
+    }
+
+    #[test]
+    fn minimum_score_draft_rejects_empty_input() {
+        let transition = transition_minimum_score(0.01, String::new());
+
+        assert_eq!(transition.error, Some("Enter a minimum score."));
+    }
+
+    #[test]
+    fn minimum_score_draft_rejects_negative_input() {
+        let transition = transition_minimum_score(0.01, "-0.1".to_string());
+
+        assert_eq!(
+            transition.error,
+            Some("Minimum score must be zero or greater.")
+        );
+    }
+
+    #[test]
+    fn minimum_score_draft_rejects_non_finite_input() {
+        let transition = transition_minimum_score(0.01, "NaN".to_string());
+
+        assert_eq!(
+            transition.error,
+            Some("Minimum score must be a finite number.")
+        );
+    }
+
+    #[test]
+    fn invalid_minimum_score_draft_preserves_the_prior_valid_config() {
+        let transition = transition_minimum_score(0.025, "partial".to_string());
+
+        assert_eq!(transition.draft, "partial");
+        assert_eq!(transition.minimum_score, 0.025);
+        assert_eq!(transition.error, Some("Enter a valid minimum score."));
+    }
+
+    #[test]
+    fn system_page_has_one_shared_save_action_and_accessible_score_validation() {
+        let source = include_str!("system.rs");
+
+        assert_eq!(source.matches(concat!("Save ", "settings")).count(), 1);
+        assert!(source.contains(concat!("aria-", "invalid")));
+        assert!(source.contains(concat!("aria-", "describedby")));
+        assert!(source.contains(concat!("minimum-score-", "error")));
     }
 
     fn label_key(key: &str) -> LabelKey {
