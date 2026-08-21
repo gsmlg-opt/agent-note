@@ -1,6 +1,7 @@
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 use yew_duskmoon::{Alert, Button};
+use yew_router::components::LinkProps;
 use yew_router::prelude::*;
 
 use crate::api;
@@ -661,7 +662,7 @@ pub fn notes_page() -> Html {
             if *loading {
                 <p class="loading">{ "Loading…" }</p>
             } else if let Some(hits) = &*results {
-                { search_results_view(hits, &page, &page_size, &notes_query, on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
+                { search_results_view(hits, &page, &page_size, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
             } else {
                 { list_view(&notes, *total_notes, &page, &page_size, &delete_target, &notes_query, on_quick_add_filter, on_page_change, on_page_size_change, on_refresh) }
             }
@@ -914,74 +915,159 @@ fn note_table(
             </div>
         };
     }
+    let on_delete_target = {
+        let delete_target = delete_target.clone();
+        Callback::from(move |target| delete_target.set(Some(target)))
+    };
     html! {
         <div class="table-scroll">
             <table class="table note-table">
-                <thead>
-                    <tr>
-                        <th class="col-title">{ "Title" }</th>
-                        <th>{ "Labels" }</th>
-                        <th class="col-time">{ "Created" }</th>
-                        <th class="col-time">{ "Updated" }</th>
-                        <th class="col-actions">{ "Actions" }</th>
-                    </tr>
-                </thead>
+                { note_table_head(false) }
                 <tbody>
-                    { for notes.iter().map(|note| {
-                        let id = note.id.clone();
-                        let on_remove = {
-                            let delete_target = delete_target.clone();
-                            let id = note.id.clone();
-                            let title = note.title.clone();
-                            let revision = note.revision;
-                            Callback::from(move |_| delete_target.set(Some((id.clone(), title.clone(), revision))))
-                        };
-                        html! {
-                            <tr key={note.id.clone()}>
-                                <td class="col-title">
-                                    <Link<Route, NotesQueryParams>
-                                        to={Route::NoteShow { id: id.clone() }}
-                                        query={Some(notes_query.clone())}
-                                        classes={classes!("note-title-link")}
-                                    >
-                                        { note.title.clone() }
-                                    </Link<Route, NotesQueryParams>>
-                                </td>
-                                <td>
-                                    <div class="applied-labels">
-                                        { for note.labels.iter().map(|(k, v)| {
-                                            label_chip(k, v, on_quick_add_filter.clone())
-                                        }) }
-                                    </div>
-                                </td>
-                                <td class="col-time">{ format_timestamp(note.created_at) }</td>
-                                <td class="col-time">{ format_timestamp(note.updated_at) }</td>
-                                <td class="col-actions">
-                                    <div class="row-actions">
-                                        <Link<Route, NotesQueryParams>
-                                            to={Route::NoteShow { id: id.clone() }}
-                                            query={Some(notes_query.clone())}
-                                            classes={classes!("btn","btn-ghost","btn-icon")}>
-                                            { icons::eye() }<span class="sr-only">{ "View" }</span>
-                                        </Link<Route, NotesQueryParams>>
-                                        <Link<Route, NotesQueryParams>
-                                            to={Route::NoteEdit { id: id.clone() }}
-                                            query={Some(notes_query.clone())}
-                                            classes={classes!("btn","btn-ghost","btn-icon")}>
-                                            { icons::pencil() }<span class="sr-only">{ "Edit" }</span>
-                                        </Link<Route, NotesQueryParams>>
-                                        <button type="button" class="btn btn-ghost btn-icon icon-danger"
-                                            onclick={on_remove}>
-                                            { icons::trash() }<span class="sr-only">{ "Remove" }</span>
-                                        </button>
-                                    </div>
-                                </td>
-                            </tr>
-                        }
-                    }) }
+                    { for notes.iter().map(|note| note_row(
+                        &note.id,
+                        &note.title,
+                        note.revision,
+                        None,
+                        &note.labels,
+                        note.created_at,
+                        note.updated_at,
+                        notes_query,
+                        on_delete_target.clone(),
+                        on_quick_add_filter.clone(),
+                    )) }
                 </tbody>
             </table>
         </div>
+    }
+}
+
+fn note_table_head(show_score: bool) -> Html {
+    html! {
+        <thead>
+            <tr>
+                if show_score {
+                    <th class="col-score">{ "Score" }</th>
+                }
+                <th class="col-title">{ "Title" }</th>
+                <th>{ "Labels" }</th>
+                <th class="col-time">{ "Created" }</th>
+                <th class="col-time">{ "Updated" }</th>
+                <th class="col-actions">{ "Actions" }</th>
+            </tr>
+        </thead>
+    }
+}
+
+struct NoteRowLinks {
+    title: LinkProps<Route, NotesQueryParams>,
+    view: LinkProps<Route, NotesQueryParams>,
+    edit: LinkProps<Route, NotesQueryParams>,
+}
+
+fn note_row_links(id: &str, title: &str, notes_query: &NotesQueryParams) -> NoteRowLinks {
+    NoteRowLinks {
+        title: LinkProps {
+            classes: classes!("note-title-link"),
+            to: Route::NoteShow { id: id.into() },
+            query: Some(notes_query.clone()),
+            state: None,
+            disabled: false,
+            anchor_ref: NodeRef::default(),
+            children: html! { title.to_string() },
+        },
+        view: LinkProps {
+            classes: classes!("btn", "btn-ghost", "btn-icon"),
+            to: Route::NoteShow { id: id.into() },
+            query: Some(notes_query.clone()),
+            state: None,
+            disabled: false,
+            anchor_ref: NodeRef::default(),
+            children: html! {
+                <>{ icons::eye() }<span class="sr-only">{ "View" }</span></>
+            },
+        },
+        edit: LinkProps {
+            classes: classes!("btn", "btn-ghost", "btn-icon"),
+            to: Route::NoteEdit { id: id.into() },
+            query: Some(notes_query.clone()),
+            state: None,
+            disabled: false,
+            anchor_ref: NodeRef::default(),
+            children: html! {
+                <>{ icons::pencil() }<span class="sr-only">{ "Edit" }</span></>
+            },
+        },
+    }
+}
+
+fn emit_delete_target(
+    on_delete_target: &Callback<(String, String, i64)>,
+    id: &str,
+    title: &str,
+    revision: i64,
+) {
+    on_delete_target.emit((id.to_string(), title.to_string(), revision));
+}
+
+fn emit_quick_label(on_quick_add_filter: &Callback<(String, String)>, key: &str, value: &str) {
+    on_quick_add_filter.emit((key.to_string(), value.to_string()));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn note_row(
+    id: &str,
+    title: &str,
+    revision: i64,
+    score: Option<f32>,
+    labels: &[(String, String)],
+    created_at: i64,
+    updated_at: i64,
+    notes_query: &NotesQueryParams,
+    on_delete_target: Callback<(String, String, i64)>,
+    on_quick_add_filter: Callback<(String, String)>,
+) -> Html {
+    let id = id.to_string();
+    let title = title.to_string();
+    let links = note_row_links(&id, &title, notes_query);
+    let NoteRowLinks {
+        title: title_link,
+        view: view_link,
+        edit: edit_link,
+    } = links;
+    let on_remove = {
+        let id = id.clone();
+        let title = title.clone();
+        Callback::from(move |_| emit_delete_target(&on_delete_target, &id, &title, revision))
+    };
+    html! {
+        <tr key={id.clone()}>
+            if let Some(score) = score {
+                <td class="col-score">{ format!("{score:.4}") }</td>
+            }
+            <td class="col-title">
+                <Link<Route, NotesQueryParams> ..title_link />
+            </td>
+            <td>
+                <div class="applied-labels">
+                    { for labels.iter().map(|(key, value)| {
+                        label_chip(key, value, on_quick_add_filter.clone())
+                    }) }
+                </div>
+            </td>
+            <td class="col-time">{ format_timestamp(created_at) }</td>
+            <td class="col-time">{ format_timestamp(updated_at) }</td>
+            <td class="col-actions">
+                <div class="row-actions">
+                    <Link<Route, NotesQueryParams> ..view_link />
+                    <Link<Route, NotesQueryParams> ..edit_link />
+                    <button type="button" class="btn btn-ghost btn-icon icon-danger"
+                        onclick={on_remove}>
+                        { icons::trash() }<span class="sr-only">{ "Remove" }</span>
+                    </button>
+                </div>
+            </td>
+        </tr>
     }
 }
 
@@ -992,7 +1078,7 @@ fn label_chip(key: &str, value: &str, on_quick_add_filter: Callback<(String, Str
         let key = key.to_string();
         let value = value.to_string();
         Callback::from(move |_: MouseEvent| {
-            on_quick_add_filter.emit((key.clone(), value.clone()));
+            emit_quick_label(&on_quick_add_filter, &key, &value);
         })
     };
     // TODO(upstream): duskmoon-dev/yew-duskmoon-ui#10
@@ -1028,7 +1114,9 @@ fn search_results_view(
     hits: &[SearchResultSummary],
     page: &UseStateHandle<usize>,
     page_size: &UseStateHandle<usize>,
+    delete_target: &UseStateHandle<Option<(String, String, i64)>>,
     notes_query: &NotesQueryParams,
+    on_quick_add_filter: Callback<(String, String)>,
     on_page_change: Callback<usize>,
     on_page_size_change: Callback<usize>,
     on_refresh: Callback<MouseEvent>,
@@ -1037,36 +1125,82 @@ fn search_results_view(
         return html! { <p class="empty">{ "No matches. Try different words." }</p> };
     }
     let total = hits.len();
-    let per_page = **page_size;
-    let total_pages = total.div_ceil(per_page);
-    let current = (**page).min(total_pages - 1);
-    let start = current * per_page;
-    let end = (start + per_page).min(total);
+    let search_page = search_result_page(total, **page, **page_size, notes_query);
+    let on_delete_target = {
+        let delete_target = delete_target.clone();
+        Callback::from(move |target| delete_target.set(Some(target)))
+    };
     html! {
         <>
-            <ul class="results">
-                { for hits[start..end].iter().map(|r| html! {
-                    <li class="result" key={r.id.clone()}>
-                        <Link<Route, NotesQueryParams>
-                            to={Route::NoteShow { id: r.id.clone() }}
-                            query={Some(notes_query.clone())}
-                            classes={classes!("result-title-link")}
-                        >
-                            <div class="result-title">{ r.title.clone() }</div>
-                        </Link<Route, NotesQueryParams>>
-                        // RRF rank-fusion score, not a raw similarity/distance (docs/design.md §7).
-                        <div class="result-score">{ format!("fused score: {:.4}", r.score) }</div>
-                    </li>
-                }) }
-            </ul>
-            { pagination_bar(current, total_pages, total, start, end, **page_size, on_page_change, on_page_size_change, on_refresh) }
+            { search_result_table(&hits[search_page.start..search_page.end], &search_page.notes_query, on_delete_target, on_quick_add_filter) }
+            { pagination_bar(search_page.current, search_page.total_pages, total, search_page.start, search_page.end, **page_size, on_page_change, on_page_size_change, on_refresh) }
         </>
+    }
+}
+
+struct SearchResultPage {
+    current: usize,
+    total_pages: usize,
+    start: usize,
+    end: usize,
+    notes_query: NotesQueryParams,
+}
+
+fn search_result_page(
+    total: usize,
+    requested_page: usize,
+    page_size: usize,
+    notes_query: &NotesQueryParams,
+) -> SearchResultPage {
+    let total_pages = total.div_ceil(page_size);
+    let current = requested_page.min(total_pages.saturating_sub(1));
+    let start = current * page_size;
+    let end = (start + page_size).min(total);
+    let mut notes_query = notes_query.clone();
+    notes_query.current = current + 1;
+    SearchResultPage {
+        current,
+        total_pages,
+        start,
+        end,
+        notes_query,
+    }
+}
+
+fn search_result_table(
+    hits: &[SearchResultSummary],
+    notes_query: &NotesQueryParams,
+    on_delete_target: Callback<(String, String, i64)>,
+    on_quick_add_filter: Callback<(String, String)>,
+) -> Html {
+    html! {
+        <div class="table-scroll">
+            <table class="table note-table search-result-table">
+                { note_table_head(true) }
+                <tbody>
+                    { for hits.iter().map(|result| note_row(
+                        &result.id,
+                        &result.title,
+                        result.revision,
+                        Some(result.score),
+                        &result.labels,
+                        result.created_at,
+                        result.updated_at,
+                        notes_query,
+                        on_delete_target.clone(),
+                        on_quick_add_filter.clone(),
+                    )) }
+                </tbody>
+            </table>
+        </div>
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use yew::virtual_dom::VNode;
 
     fn attribute<'a>(node: &'a VNode, name: &str) -> Option<&'a str> {
@@ -1086,6 +1220,46 @@ mod tests {
             VNode::VList(children) => children.iter().collect(),
             child => vec![child],
         }
+    }
+
+    fn visible_text(node: &VNode) -> Vec<String> {
+        match node {
+            VNode::VText(text) => vec![text.text.to_string()],
+            VNode::VTag(_) => element_children(node)
+                .into_iter()
+                .flat_map(visible_text)
+                .collect(),
+            VNode::VList(children) => children.iter().flat_map(visible_text).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn rendered_children(node: &VNode) -> Vec<&VNode> {
+        fn append_rendered<'a>(node: &'a VNode, children: &mut Vec<&'a VNode>) {
+            match node {
+                VNode::VList(list) => {
+                    for child in list.iter() {
+                        append_rendered(child, children);
+                    }
+                }
+                _ => children.push(node),
+            }
+        }
+
+        let mut children = Vec::new();
+        for child in element_children(node) {
+            append_rendered(child, &mut children);
+        }
+        children
+    }
+
+    fn only_child_with_tag<'a>(node: &'a VNode, tag_name: &str) -> &'a VNode {
+        let matches = rendered_children(node)
+            .into_iter()
+            .filter(|child| matches!(child, VNode::VTag(tag) if tag.tag() == tag_name))
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "expected one {tag_name} child");
+        matches[0]
     }
 
     #[test]
@@ -1122,6 +1296,191 @@ mod tests {
         let app_css = include_str!("../../app.css");
 
         assert!(app_css.contains(".note-table {\n    width: 100%;\n    min-width: 60rem;"));
+    }
+
+    #[test]
+    fn search_result_table_renders_score_first_with_normal_note_row_content() {
+        let query = NotesQueryParams {
+            current: 2,
+            page_size: 30,
+            search: Some("match".into()),
+            labels: Some("~project==agent-note".into()),
+        };
+        let table_wrapper = search_result_table(
+            &[SearchResultSummary {
+                id: "note-1".into(),
+                title: "Matched note".into(),
+                revision: 4,
+                score: 0.12345,
+                labels: vec![("project".into(), "agent-note".into())],
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_060,
+            }],
+            &query,
+            Callback::noop(),
+            Callback::noop(),
+        );
+
+        assert_eq!(attribute(&table_wrapper, "class"), Some("table-scroll"));
+        let table = only_child_with_tag(&table_wrapper, "table");
+        assert_eq!(
+            attribute(table, "class"),
+            Some("table note-table search-result-table")
+        );
+        let thead = only_child_with_tag(table, "thead");
+        let header_row = only_child_with_tag(thead, "tr");
+        let headers = rendered_children(header_row)
+            .into_iter()
+            .filter(|child| matches!(child, VNode::VTag(tag) if tag.tag() == "th"))
+            .flat_map(visible_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            headers,
+            ["Score", "Title", "Labels", "Created", "Updated", "Actions"]
+        );
+
+        let tbody = only_child_with_tag(table, "tbody");
+        let row = only_child_with_tag(tbody, "tr");
+        let cells = rendered_children(row)
+            .into_iter()
+            .filter(|child| matches!(child, VNode::VTag(tag) if tag.tag() == "td"))
+            .collect::<Vec<_>>();
+        assert_eq!(cells.len(), 6);
+        assert_eq!(attribute(cells[0], "class"), Some("col-score"));
+        assert_eq!(visible_text(cells[0]), ["0.1235"]);
+        assert_eq!(attribute(cells[1], "class"), Some("col-title"));
+        assert!(matches!(
+            element_children(cells[1]).as_slice(),
+            [VNode::VComp(_)]
+        ));
+        let links = note_row_links("note-1", "Matched note", &query);
+        assert_eq!(
+            links.title.to,
+            Route::NoteShow {
+                id: "note-1".into()
+            }
+        );
+        assert_eq!(links.title.query, Some(query.clone()));
+        assert_eq!(visible_text(&links.title.children), ["Matched note"]);
+        assert_eq!(
+            links.view.to,
+            Route::NoteShow {
+                id: "note-1".into()
+            }
+        );
+        assert_eq!(links.view.query, Some(query.clone()));
+        assert_eq!(
+            links.edit.to,
+            Route::NoteEdit {
+                id: "note-1".into()
+            }
+        );
+        assert_eq!(links.edit.query, Some(query.clone()));
+        assert!(visible_text(cells[2]).contains(&"project: agent-note".to_string()));
+        assert_eq!(visible_text(cells[3]), ["2023-11-14 22:13"]);
+        assert_eq!(visible_text(cells[4]), ["2023-11-14 22:14"]);
+        let actions = only_child_with_tag(cells[5], "div");
+        let action_children = element_children(actions);
+        assert_eq!(action_children.len(), 3);
+        assert!(matches!(action_children[0], VNode::VComp(_)));
+        assert!(matches!(action_children[1], VNode::VComp(_)));
+        assert_eq!(visible_text(action_children[2]), ["Remove"]);
+
+        let app_css = include_str!("../../app.css");
+        assert!(app_css.contains(".search-result-table {\n    min-width: 66rem;"));
+        assert!(app_css.contains(
+            ".col-score {\n    width: 6rem;\n    white-space: nowrap;\n    font-variant-numeric: tabular-nums;"
+        ));
+    }
+
+    #[test]
+    fn search_result_page_clamps_link_context_when_hits_shrink() {
+        let stale_query = NotesQueryParams {
+            current: 5,
+            page_size: 2,
+            search: Some("match".into()),
+            labels: Some("~project==agent-note".into()),
+        };
+
+        let page = search_result_page(3, 4, 2, &stale_query);
+        assert_eq!((page.current, page.start, page.end), (1, 2, 3));
+        assert_eq!(page.notes_query.current, 2);
+        assert_eq!(page.notes_query.page_size, stale_query.page_size);
+        assert_eq!(page.notes_query.search, stale_query.search);
+        assert_eq!(page.notes_query.labels, stale_query.labels);
+
+        let last_match = SearchResultSummary {
+            id: "note-3".into(),
+            title: "Last match".into(),
+            revision: 7,
+            score: 0.25,
+            labels: vec![("project".into(), "agent-note".into())],
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_060,
+        };
+        let hits = vec![last_match; 3];
+        let rendered = search_result_table(
+            &hits[page.start..page.end],
+            &page.notes_query,
+            Callback::noop(),
+            Callback::noop(),
+        );
+        let table = only_child_with_tag(&rendered, "table");
+        let tbody = only_child_with_tag(table, "tbody");
+        let row = only_child_with_tag(tbody, "tr");
+        let title_cell = rendered_children(row)
+            .into_iter()
+            .filter(|child| matches!(child, VNode::VTag(tag) if tag.tag() == "td"))
+            .nth(1)
+            .expect("scored row should have a title cell");
+        assert!(matches!(
+            element_children(title_cell).as_slice(),
+            [VNode::VComp(_)]
+        ));
+
+        let links = note_row_links("note-3", "Last match", &page.notes_query);
+        assert_eq!(links.title.query, Some(page.notes_query.clone()));
+        assert_eq!(links.view.query, Some(page.notes_query.clone()));
+        assert_eq!(links.edit.query, Some(page.notes_query.clone()));
+
+        let in_range = search_result_page(
+            6,
+            1,
+            2,
+            &NotesQueryParams {
+                current: 2,
+                ..stale_query.clone()
+            },
+        );
+        assert_eq!(in_range.notes_query.current, 2);
+        assert_eq!(in_range.notes_query.page_size, stale_query.page_size);
+        assert_eq!(in_range.notes_query.search, stale_query.search);
+        assert_eq!(in_range.notes_query.labels, stale_query.labels);
+    }
+
+    #[test]
+    fn search_result_row_forwards_delete_and_quick_label_payloads() {
+        let removed = Rc::new(RefCell::new(None));
+        let on_delete_target = {
+            let removed = removed.clone();
+            Callback::from(move |target| *removed.borrow_mut() = Some(target))
+        };
+        emit_delete_target(&on_delete_target, "note-1", "Matched note", 4);
+        assert_eq!(
+            *removed.borrow(),
+            Some(("note-1".into(), "Matched note".into(), 4))
+        );
+
+        let clicked_label = Rc::new(RefCell::new(None));
+        let on_quick_add_filter = {
+            let clicked_label = clicked_label.clone();
+            Callback::from(move |label| *clicked_label.borrow_mut() = Some(label))
+        };
+        emit_quick_label(&on_quick_add_filter, "project", "agent-note");
+        assert_eq!(
+            *clicked_label.borrow(),
+            Some(("project".into(), "agent-note".into()))
+        );
     }
 
     #[test]

@@ -52,6 +52,9 @@ pub struct SearchResultSummary {
     pub revision: i64,
     /// Fused RRF rank-fusion score — label it as such in the UI, not "similarity" (docs/design.md §7).
     pub score: f32,
+    pub labels: Vec<(String, String)>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 pub fn stale_retry_blocked(pending: bool, has_conflict: bool) -> bool {

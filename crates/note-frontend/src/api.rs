@@ -136,6 +136,28 @@ struct SearchResultDto {
     title: String,
     revision: i64,
     score: f32,
+    labels: Vec<(String, String)>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl From<SearchResultDto> for SearchResultSummary {
+    fn from(dto: SearchResultDto) -> Self {
+        Self {
+            id: dto.id,
+            title: dto.title,
+            revision: dto.revision,
+            // Guard against a non-finite score from a malformed payload (breaks PartialEq/render).
+            score: if dto.score.is_finite() {
+                dto.score
+            } else {
+                0.0
+            },
+            labels: dto.labels,
+            created_at: dto.created_at,
+            updated_at: dto.updated_at,
+        }
+    }
 }
 
 pub fn label_filter_selector(filters: &[LabelFilter]) -> Option<String> {
@@ -187,16 +209,7 @@ pub async fn search_filtered(
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    Ok(dtos
-        .into_iter()
-        .map(|d| SearchResultSummary {
-            id: d.id,
-            title: d.title,
-            revision: d.revision,
-            // Guard against a non-finite score from a malformed payload (breaks PartialEq/render).
-            score: if d.score.is_finite() { d.score } else { 0.0 },
-        })
-        .collect())
+    Ok(dtos.into_iter().map(SearchResultSummary::from).collect())
 }
 
 pub async fn save_note(
@@ -818,18 +831,53 @@ mod tests {
             "id": "note-1",
             "title": "Match",
             "revision": 4,
-            "score": 0.25
+            "score": 0.25,
+            "labels": [["project", "agent-note"]],
+            "created_at": 1_700_000_000,
+            "updated_at": 1_700_000_060
         }))
         .unwrap();
-        assert_eq!(result.revision, 4);
+        let summary: SearchResultSummary = result.into();
+        assert_eq!(summary.revision, 4);
+        assert_eq!(
+            summary.labels,
+            vec![("project".into(), "agent-note".into())]
+        );
+        assert_eq!(summary.created_at, 1_700_000_000);
+        assert_eq!(summary.updated_at, 1_700_000_060);
         assert!(
             serde_json::from_value::<SearchResultDto>(serde_json::json!({
                 "id": "note-1",
                 "title": "Match",
-                "score": 0.25
+                "score": 0.25,
+                "labels": [["project", "agent-note"]],
+                "created_at": 1_700_000_000,
+                "updated_at": 1_700_000_060
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn search_result_mapping_sanitizes_non_finite_scores_without_losing_metadata() {
+        let result = SearchResultDto {
+            id: "note-1".into(),
+            title: "Match".into(),
+            revision: 4,
+            score: f32::NAN,
+            labels: vec![("project".into(), "agent-note".into())],
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_060,
+        };
+
+        let summary: SearchResultSummary = result.into();
+        assert_eq!(summary.score, 0.0);
+        assert_eq!(
+            summary.labels,
+            vec![("project".into(), "agent-note".into())]
+        );
+        assert_eq!(summary.created_at, 1_700_000_000);
+        assert_eq!(summary.updated_at, 1_700_000_060);
     }
 
     #[test]

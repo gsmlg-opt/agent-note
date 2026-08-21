@@ -579,6 +579,16 @@ a.dashboard-metric-detail:hover {
     overflow: visible;
 }
 
+.search-result-table {
+    min-width: 66rem;
+}
+
+.col-score {
+    width: 6rem;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+
 .note-table th,
 .note-table td {
     text-align: left;
@@ -997,11 +1007,6 @@ a.dashboard-metric-detail:hover {
     margin: 0 0 0.85rem;
     line-height: 1.6;
     white-space: pre-wrap;
-}
-
-.result-title-link {
-    text-decoration: none;
-    color: inherit;
 }
 
 /* Visually-hidden label for icon-only controls (fallback if the design system's is absent). */
@@ -1783,38 +1788,6 @@ a.dashboard-metric-detail:hover {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-}
-
-.results {
-    list-style: none;
-    padding: 0;
-    margin: 0.75rem 0 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-}
-
-.result {
-    padding: 0.6rem 0.8rem;
-    border: 1px solid var(--color-outline-variant, #c7c5d0);
-    border-radius: 0.5rem;
-    background: var(--color-surface-container-low, #f3f0f9);
-}
-
-.result-title {
-    font-weight: 600;
-}
-
-.result-id {
-    font-size: 0.72rem;
-    opacity: 0.6;
-    word-break: break-all;
-}
-
-.result-score {
-    font-size: 0.8rem;
-    color: var(--color-primary, #6750a4);
-    margin-top: 0.15rem;
 }
 
 .loading {
