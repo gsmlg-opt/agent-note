@@ -2115,6 +2115,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn note_mutation_schemas_require_expected_revision() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
+
+        for tool_name in ["update_note", "edit_note"] {
+            let schema = tool_schema(&server, tool_name, false);
+            assert_eq!(
+                schema["properties"]["expected_revision"]["type"], "integer",
+                "{tool_name}: {schema}"
+            );
+            assert!(
+                required_names(&schema).contains(&"expected_revision".to_owned()),
+                "{tool_name}: {schema}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn bulk_update_note_labels_sanitizes_repository_failures() {
         let (_ctx, backend, dir) = test_context().await;
         let failing_backend: Arc<dyn StorageBackend> =
@@ -2266,6 +2284,70 @@ mod tests {
                     "note_id": "note-1",
                     "expected_revision": 5,
                     "current_revision": 6
+                },
+                "retryable": false
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_note_uses_the_read_revision_and_returns_structured_stale_conflicts() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
+        let saved = server
+            .save_note(Parameters(SaveNoteRequest {
+                title: "Editable".into(),
+                content: "first".into(),
+                labels: vec![],
+            }))
+            .await
+            .unwrap()
+            .0;
+        let read = server
+            .read_note_lines(Parameters(ReadNoteLinesRequest {
+                id: saved.id.clone(),
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        let edited = server
+            .edit_note(Parameters(EditNoteRequest {
+                id: saved.id.clone(),
+                expected_revision: read.revision,
+                tag: read.tag.clone(),
+                edits: vec![EditOpSchema::InsertTail {
+                    lines: vec!["second".into()],
+                }],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(edited.revision, read.revision + 1);
+        assert_ne!(edited.tag, read.tag);
+
+        let stale = expect_error(
+            server
+                .edit_note(Parameters(EditNoteRequest {
+                    id: saved.id.clone(),
+                    expected_revision: read.revision,
+                    tag: edited.tag.clone(),
+                    edits: vec![EditOpSchema::InsertTail {
+                        lines: vec!["stale".into()],
+                    }],
+                }))
+                .await,
+        );
+        assert_eq!(stale.code, ErrorCode::INVALID_REQUEST);
+        assert_eq!(
+            stale.data,
+            Some(json!({
+                "code": "stale_revision",
+                "message": "the note changed after it was read",
+                "details": {
+                    "note_id": saved.id,
+                    "expected_revision": read.revision,
+                    "current_revision": edited.revision
                 },
                 "retryable": false
             }))
