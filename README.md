@@ -40,7 +40,7 @@ note-core        pure: Note/Label/LabelKey types, input validation, RRF rank-fus
 note-pipelines   Context + workflows that compose core/storage/embedding:
                    • save_note   — validate → atomically persist note/chunks/jobs/labels → return Note
                    • embedding worker — embed queued body chunks → atomically persist dense vectors only
-                   • search_notes — title FTS + exact dense content → weighted RRF → hydrate top-k
+                   • search_notes — title FTS + exact dense content → weighted RRF → minimum score → hydrate top-k
                    • org — transport-free, revision-safe workspace/document/item commands,
                      append-only audit reads, and recovery-context assembly
    ▲
@@ -92,8 +92,10 @@ exposure to an untrusted network is unsupported.
 functions — no business logic is duplicated per transport (design.md §1–2). **Hybrid retrieval**
 runs Turso full-text ranking over note titles and exact dense-vector ranking over body chunks, then
 fuses the two ranked lists with deterministic weighted Reciprocal Rank Fusion. Title FTS has weight
-`3.0`; dense body retrieval has weight `1.0`. The resulting `score` is a fused rank score, not raw
-BM25 or cosine similarity, so the UI labels the action as retrieval. **Labels** are
+`3.0`; dense body retrieval has weight `1.0`. The persisted global System setting
+`search.minimum_score` defaults to `0.01`; the shared pipeline keeps fused scores greater than or
+equal to that cutoff before hydration and the requested result limit. The resulting `score` is a
+fused weighted-RRF score, so the UI labels the action as retrieval. **Labels** are
 Kubernetes-style: each key is registered once in a catalog with a description, and notes attach
 known keys with a value (at most one value per key); save auto-creates a missing key with an empty
 description.
@@ -569,6 +571,18 @@ filters active notes in SQL, ranks matches with `ts_rank_cd` and a note-ID tie-b
 requested overfetch length directly as its SQL `LIMIT`. Both adapters feed the resulting title and
 content rankings into the same weighted RRF pipeline.
 
+The shared pipeline reads the persisted global System setting `search.minimum_score`, which
+defaults to `0.01` and must be finite and non-negative. After fusion, it retains results inclusively
+(`score >= minimum_score`) before hydrating note summaries and before applying the requested result
+limit. REST, the web frontend, and MCP all use this same cutoff; search requests have no per-request
+override. This setting does not change the retrieval weights, RRF constant, or score normalization.
+The System page provides the editor for this persisted value.
+
+`POST /api/notes/search` and MCP `semantic_search` return the same search-summary fields: `id`,
+`title`, `revision`, `score`, `labels`, `created_at`, and `updated_at`. They do not return `content`,
+`attachments`, or `deleted_at`. The Notes frontend renders these results as a full table with
+`Score | Title | Labels | Created | Updated | Actions`, formatting `Score` to four decimal places.
+
 Exact dense scanning avoids an approximate-index lifecycle and gives deterministic results; the
 accepted trade-off is linear dense-search cost, which is appropriate for the current personal-notes
 corpus. The PostgreSQL adapter keeps the same logical channels using title FTS and exact cosine
@@ -624,8 +638,9 @@ It exposes `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`
 `update_note`, `delete_note`, `list_notes`, `semantic_search`, `put_note_attachment`,
 `get_note_attachment_content`, and `delete_note_attachment`. Explicit label-key catalog management
 is REST/UI-only. `list_notes` returns exactly `id`, `title`, `labels`, `created_at`, `updated_at`,
-and `revision` for each result. `semantic_search` returns `id`, `title`, `labels`, `created_at`,
-`updated_at`, `revision`, and `score`. Neither response includes note content or attachments.
+and `revision` for each result. `semantic_search` returns exactly `id`, `title`, `revision`, `score`,
+`labels`, `created_at`, and `updated_at`, matching the REST search summary. Neither response includes
+note content, attachments, or `deleted_at`.
 
 `get_note` and `update_note` return note content plus attachment metadata (`id`, `path`, `mime`, and
 `description`) without attachment bytes, plus the authoritative note `revision`. `read_note_lines`

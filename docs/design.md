@@ -339,8 +339,12 @@ retrieval retains native FTS ranking. The Turso distinction should be reevaluate
 upgrades.
 
 Both rankings feed weighted RRF. Final allowed-ID membership is checked defensively before the
-top-k notes are hydrated, and returned scores are fused RRF scores rather than raw BM25 or cosine
-scores.
+notes are hydrated. The pipeline then applies the persisted global System
+`search.minimum_score`, which defaults to `0.01` and accepts only finite, non-negative values.
+Filtering is inclusive (`score >= minimum_score`) and occurs after fusion but before hydration and
+the requested top-k limit. REST, the web frontend, and MCP therefore share one cutoff, with no
+per-request override. The setting changes neither the retriever weights nor the RRF constant or
+normalization. Returned scores are fused weighted-RRF scores.
 
 Exact scanning avoids approximate-index build and maintenance, produces deterministic results, and
 fits the expected personal-notes corpus. Its accepted trade-off is linear dense-search cost. If
@@ -398,8 +402,9 @@ Embed the query once → acquire a fresh retrieval session for retrieval and hyd
 title and exact dense candidate selection before their limits → apply bounded
 `clamp(requested_limit × 32, 128, 4096)` overfetch, capped by the allowed collection size when
 filtered → combine both rankings with weighted RRF (pure function, no I/O) → defensively check
-allowed-ID membership and hydrate the top-k → return `Vec<SearchResult>`, each containing a
-`NoteListItem` summary and fused weighted-RRF score rather than raw BM25 or cosine.
+allowed-ID membership → inclusively discard fused scores below the persisted global
+`search.minimum_score` (default `0.01`) → hydrate surviving notes until the requested limit →
+return `Vec<SearchResult>`, each containing a `NoteListItem` summary and fused weighted-RRF score.
 
 Context/environment: one struct holds a shared `StorageBackend`, embedder, and `AttachmentStore`.
 The application composition root constructs it once and passes it explicitly — no global or
@@ -427,7 +432,10 @@ mounted local draft is preserved, and an explicit action refetches the latest re
 user deliberately reapplies that draft. Delete and Trash confirmation state is retained on
 conflict, with reload required before another attempt.
 
-The Notes page retrieval bar says “Retrieve by title or content” and renders fused-score results.
+The System page edits the persisted global `search.minimum_score` and accepts only finite,
+non-negative values. The Notes page retrieval bar says “Retrieve by title or content” and renders
+search results as a full `Score | Title | Labels | Created | Updated | Actions` table. Score cells
+show the fused weighted-RRF score to four decimal places.
 Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than custom equivalents
 — `Tag` renders each attached label as `key=value`, with the key's description as a tooltip/hint.
 
@@ -470,6 +478,11 @@ Trash restore carries one expected revision per note. Both transports map ordina
 to the common structured envelope (`code`, `message`, `details`, `retryable`), with
 `stale_revision` details containing `note_id`, `expected_revision`, and `current_revision`. Clients
 must refetch and merge or deliberately reapply rather than automatically retrying stale data.
+
+REST `POST /api/notes/search` and MCP `semantic_search` expose the same search-summary fields:
+`id`, `title`, `revision`, `score`, `labels`, `created_at`, and `updated_at`. Neither transport
+includes `content`, `attachments`, or `deleted_at` in search results. Both call the shared pipeline,
+so the persisted `search.minimum_score` applies globally to both response sets.
 
 ### 8.1 Org REST/OpenAPI Interface
 
