@@ -50,6 +50,7 @@ pub async fn search_notes_filtered(
     let dense = ctx.embedder.embed(query).await?;
     // Use one session for retrieval and note metadata collection.
     let session = ctx.storage().session().await?;
+    let minimum_score = session.get_system_config().await?.search.minimum_score;
     let retrieval_limit = limit
         .saturating_mul(RETRIEVAL_OVERFETCH_FACTOR)
         .clamp(MIN_RETRIEVAL_CANDIDATES, MAX_RETRIEVAL_CANDIDATES);
@@ -76,6 +77,9 @@ pub async fn search_notes_filtered(
 
     let mut notes = vec![];
     for (note_id, score) in fused {
+        if score < minimum_score {
+            break;
+        }
         if allowed_note_ids_set
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(note_id.as_str()))

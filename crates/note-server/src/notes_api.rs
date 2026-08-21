@@ -2962,6 +2962,7 @@ mod tests {
             &ctx,
             &note_core::SystemConfig {
                 category_labels: Vec::new(),
+                search: note_core::SearchConfig::default(),
                 duplicate_check: note_core::DuplicateCheckConfig {
                     enabled: true,
                     rules: vec![note_core::DuplicateCheckRule {
@@ -4247,6 +4248,52 @@ mod tests {
                 .any(|r| r.get("title").and_then(|v| v.as_str()) == Some("Find")),
             "expected the seeded note in results, got {arr}"
         );
+    }
+
+    #[tokio::test]
+    async fn search_uses_saved_minimum_score() {
+        let (app, ctx, storage, _dir) = test_app_with_backend().await;
+        app.clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Threshold marker","content":"unrelated body","labels":[]}"#,
+            ))
+            .await
+            .unwrap();
+        note_pipelines::drain_embedding_jobs(&ctx, 10)
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/search",
+                r#"{"query":"Threshold marker","limit":5}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let results: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let score = results[0]["score"].as_f64().unwrap() as f32;
+        {
+            let session = storage.session().await.unwrap();
+            let mut config = session.get_system_config().await.unwrap();
+            config.search.minimum_score = f32::from_bits(score.to_bits() + 1);
+            session.set_system_config(&config).await.unwrap();
+        }
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/search",
+                r#"{"query":"Threshold marker","limit":5}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let results: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(results, serde_json::json!([]));
     }
 
     #[tokio::test]

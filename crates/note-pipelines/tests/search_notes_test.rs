@@ -280,6 +280,53 @@ async fn title_only_match_is_retrieved_without_body_embeddings() {
 }
 
 #[tokio::test]
+async fn search_applies_the_saved_minimum_score_inclusively() {
+    let (ctx, backend, _dir) = test_context().await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            title: "Quasar threshold handbook".into(),
+            content: "Unrelated body text".into(),
+            attachments: vec![],
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    {
+        let session = backend.session().await.unwrap();
+        let mut config = session.get_system_config().await.unwrap();
+        config.search.minimum_score = 0.0;
+        session.set_system_config(&config).await.unwrap();
+    }
+
+    let baseline = search_notes(&ctx, "Quasar threshold", 10).await.unwrap();
+    let score = baseline
+        .iter()
+        .find(|result| result.note.id == note.id)
+        .unwrap()
+        .score;
+    {
+        let session = backend.session().await.unwrap();
+        let mut config = session.get_system_config().await.unwrap();
+        config.search.minimum_score = score;
+        session.set_system_config(&config).await.unwrap();
+    }
+
+    let inclusive = search_notes(&ctx, "Quasar threshold", 10).await.unwrap();
+    assert_eq!(inclusive[0].note.id, note.id);
+    {
+        let session = backend.session().await.unwrap();
+        let mut config = session.get_system_config().await.unwrap();
+        config.search.minimum_score = f32::from_bits(score.to_bits() + 1);
+        session.set_system_config(&config).await.unwrap();
+    }
+
+    let excluded = search_notes(&ctx, "Quasar threshold", 10).await.unwrap();
+    assert!(excluded.is_empty());
+}
+
+#[tokio::test]
 async fn rank_one_title_match_outranks_rank_one_content_match() {
     let (ctx, _backend, _dir) = test_context().await;
     let title_match = save_note(

@@ -1164,6 +1164,7 @@ mod tests {
     fn system_schema_fields_match_runtime_serialization() {
         let runtime_config = note_core::SystemConfig {
             category_labels: vec!["project".to_string()],
+            search: note_core::SearchConfig::default(),
             duplicate_check: note_core::DuplicateCheckConfig {
                 enabled: true,
                 rules: vec![note_core::DuplicateCheckRule {

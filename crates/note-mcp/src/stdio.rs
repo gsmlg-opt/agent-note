@@ -2265,6 +2265,57 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn semantic_search_uses_saved_minimum_score() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend.clone());
+        let saved = server
+            .save_note(Parameters(SaveNoteRequest {
+                title: "Threshold marker".into(),
+                content: "unrelated body".into(),
+                labels: vec![],
+            }))
+            .await
+            .unwrap()
+            .0;
+        note_pipelines::drain_embedding_jobs(&server.ctx, 10)
+            .await
+            .unwrap();
+
+        let baseline = server
+            .semantic_search(Parameters(SemanticSearchRequest {
+                query: "Threshold marker".into(),
+                limit: 5,
+                label: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        let score = baseline
+            .results
+            .iter()
+            .find(|result| result.id == saved.id)
+            .unwrap()
+            .score;
+        {
+            let session = backend.session().await.unwrap();
+            let mut config = session.get_system_config().await.unwrap();
+            config.search.minimum_score = f32::from_bits(score.to_bits() + 1);
+            session.set_system_config(&config).await.unwrap();
+        }
+
+        let response = server
+            .semantic_search(Parameters(SemanticSearchRequest {
+                query: "Threshold marker".into(),
+                limit: 5,
+                label: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(response.results.is_empty());
+    }
+
     #[test]
     fn note_conflicts_preserve_the_shared_structured_error_fields() {
         let mapped = to_error_data(anyhow::Error::new(
