@@ -1,6 +1,7 @@
 use crate::context::Context;
 use note_core::{
-    validate_label_key, CategoryLabelConfigError, LabelKey, LabelKeyValidationError, LabelValueType,
+    parse_category_label_expression, validate_label_key, CategoryLabelConfigError, LabelKey,
+    LabelKeyValidationError, LabelValueType,
 };
 use note_storage::TransactionMode;
 use std::str::FromStr;
@@ -63,7 +64,7 @@ pub async fn delete_label_key(ctx: &Context, key: &str) -> anyhow::Result<()> {
         if config
             .category_labels
             .iter()
-            .any(|configured_key| configured_key == key)
+            .any(|entry| parse_category_label_expression(entry).key == key)
         {
             return Err(anyhow::Error::new(
                 CategoryLabelConfigError::ConfiguredKeyCannotBeDeleted {
