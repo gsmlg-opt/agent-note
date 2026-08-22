@@ -1317,10 +1317,40 @@ a.dashboard-metric-detail:hover {
     gap: 0.75rem;
 }
 
-.category-label-select {
-    width: min(24rem, 100%);
+.category-label-editor {
+    display: grid;
+    grid-template-columns: minmax(10rem, 1.4fr) minmax(9rem, 1fr) minmax(12rem, 1.4fr) auto;
+    align-items: end;
+    gap: 0.75rem;
+}
+
+.category-label-editor .field {
+    min-width: 0;
+}
+
+.category-label-editor-value {
+    min-width: 0;
+}
+
+.category-label-editor .input,
+.category-label-editor .select {
+    width: 100%;
     min-width: 0;
     box-sizing: border-box;
+}
+
+.category-label-editor .btn {
+    white-space: nowrap;
+}
+
+.category-label-error {
+    margin: 0;
+    color: var(--color-error, #ba1a1a);
+    font-size: 0.8rem;
+}
+
+.category-label-select {
+    min-width: 0;
 }
 
 .category-label-selection {
@@ -1409,6 +1439,17 @@ a.dashboard-metric-detail:hover {
     .system-info > div {
         grid-template-columns: 1fr;
         gap: 0.25rem;
+    }
+}
+
+@media (max-width: 48rem) {
+    .category-label-editor {
+        grid-template-columns: minmax(0, 1fr);
+        align-items: stretch;
+    }
+
+    .category-label-editor .btn {
+        justify-self: start;
     }
 }
 

@@ -270,6 +270,20 @@ mod tests {
     }
 
     #[test]
+    fn system_config_round_trips_exact_category_label_expressions_without_normalizing_values() {
+        let config: SystemConfig = serde_json::from_str(
+            r#"{"category_labels":["project=yellow-dog","project="],"duplicate_check":{}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.category_labels, ["project=yellow-dog", "project="]);
+        assert_eq!(
+            serde_json::to_string(&config).unwrap(),
+            r#"{"category_labels":["project=yellow-dog","project="],"search":{"minimum_score":0.01},"duplicate_check":{"enabled":false,"rules":[]}}"#
+        );
+    }
+
+    #[test]
     fn system_config_defaults_omitted_search_minimum_score() {
         let config: SystemConfig =
             serde_json::from_str(r#"{"category_labels":[],"duplicate_check":{}}"#).unwrap();
