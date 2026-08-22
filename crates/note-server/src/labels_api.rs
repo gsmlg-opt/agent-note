@@ -571,7 +571,7 @@ mod tests {
             .clone()
             .oneshot(put(
                 "/api/system/config",
-                r#"{"category_labels":["project"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+                r#"{"category_labels":["project=yellow-dog"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
             ))
             .await
             .unwrap();

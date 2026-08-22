@@ -357,17 +357,14 @@ mod tests {
             .oneshot(request(
                 "PUT",
                 "/api/system/config",
-                r#"{"category_labels":["missing"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+                r#"{"category_labels":["missing=value"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(
-            body.contains("unknown category label key: missing"),
-            "{body}"
-        );
+        assert_eq!(body, "unknown category label key: missing");
 
         let response = app
             .oneshot(request("GET", "/api/system/config", ""))
@@ -397,7 +394,7 @@ mod tests {
             .oneshot(request(
                 "PUT",
                 "/api/system/config",
-                r#"{"category_labels":["status","project"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+                r#"{"category_labels":["status=ready","project=yellow-dog","project=sigma"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
             ))
             .await
             .unwrap();
@@ -412,7 +409,53 @@ mod tests {
         let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             config["category_labels"],
-            serde_json::json!(["status", "project"])
+            serde_json::json!(["status=ready", "project=yellow-dog", "project=sigma"])
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_category_label_modes_return_bad_request_without_changing_config() {
+        let (app, ctx, _dir) = test_app().await;
+        define_label_key(&ctx, "project", "Project").await.unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "PUT",
+                "/api/system/config",
+                r#"{"category_labels":["project=yellow-dog"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                "PUT",
+                "/api/system/config",
+                r#"{"category_labels":["project","project=yellow-dog"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(
+            body,
+            "category label project cannot configure all values and exact values together"
+        );
+
+        let response = app
+            .oneshot(request("GET", "/api/system/config", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            config["category_labels"],
+            serde_json::json!(["project=yellow-dog"])
         );
     }
 

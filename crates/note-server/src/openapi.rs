@@ -29,8 +29,7 @@ impl ToSchema for Binary {}
 #[derive(ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct SystemConfigSchema {
-    /// Ordered, unique, nonblank label keys that must exist in the label catalog.
-    /// Key spelling is exact; leading or trailing whitespace is invalid.
+    /// Ordered category expressions. `key` includes all values; `key=value` includes exactly that value. The first `=` separates key and value. Keys must exist in the label catalog and have no leading or trailing whitespace; values are preserved byte-for-byte.
     #[schema(required = false, default = json!([]))]
     pub category_labels: Vec<String>,
     #[schema(required = false, default = json!({"minimum_score": 0.01}))]
@@ -1266,6 +1265,10 @@ mod tests {
         assert_eq!(
             schemas["SystemConfigSchema"]["properties"]["category_labels"]["default"],
             serde_json::json!([])
+        );
+        assert_eq!(
+            schemas["SystemConfigSchema"]["properties"]["category_labels"]["description"],
+            "Ordered category expressions. `key` includes all values; `key=value` includes exactly that value. The first `=` separates key and value. Keys must exist in the label catalog and have no leading or trailing whitespace; values are preserved byte-for-byte."
         );
         assert_eq!(
             schemas["SystemConfigSchema"]["properties"]["search"]["default"],

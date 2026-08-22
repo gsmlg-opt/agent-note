@@ -3451,6 +3451,16 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes",
+                r#"{"title":"Second category note","content":"C","labels":[["project","sigma"]]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
         let response = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -3467,6 +3477,32 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
+        let response = app.clone().oneshot(get("/api/dashboard")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let dashboard: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            dashboard["categories"],
+            serde_json::json!([{
+                "key": "project",
+                "description": "",
+                "values": [
+                    {"value": "sigma", "count": 1},
+                    {"value": "yellow-dog", "count": 1}
+                ]
+            }])
+        );
+
+        let response = app
+            .clone()
+            .oneshot(put(
+                "/api/system/config",
+                r#"{"category_labels":["project=missing","project=yellow-dog"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
         let response = app.oneshot(get("/api/dashboard")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -3476,7 +3512,10 @@ mod tests {
             serde_json::json!([{
                 "key": "project",
                 "description": "",
-                "values": [{"value": "yellow-dog", "count": 1}]
+                "values": [
+                    {"value": "missing", "count": 0},
+                    {"value": "yellow-dog", "count": 1}
+                ]
             }])
         );
         invalidate_dashboard_cache();
