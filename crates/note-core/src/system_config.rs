@@ -15,6 +15,25 @@ pub struct SystemConfig {
     pub search: SearchConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CategoryLabelExpression<'a> {
+    pub key: &'a str,
+    pub value: Option<&'a str>,
+}
+
+pub fn parse_category_label_expression(expression: &str) -> CategoryLabelExpression<'_> {
+    match expression.split_once('=') {
+        Some((key, value)) => CategoryLabelExpression {
+            key,
+            value: Some(value),
+        },
+        None => CategoryLabelExpression {
+            key: expression,
+            value: None,
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchConfig {
     #[serde(default = "default_minimum_search_score")]
@@ -58,7 +77,8 @@ pub enum SystemConfigValidationError {
     InvalidSearchMinimumScore,
     EmptyCategoryLabel { index: usize },
     CategoryLabelHasOuterWhitespace { index: usize },
-    DuplicateCategoryLabel { key: String },
+    DuplicateCategoryLabelEntry { entry: String },
+    MixedCategoryLabelModes { key: String },
     TooManyRules { count: usize },
     EmptyRule { rule: usize },
     TooManyTerms { rule: usize, count: usize },
@@ -81,9 +101,13 @@ impl std::fmt::Display for SystemConfigValidationError {
                 "category label {} key must not have leading or trailing whitespace",
                 index + 1
             ),
-            Self::DuplicateCategoryLabel { key } => {
-                write!(f, "category label key {key} is configured more than once")
+            Self::DuplicateCategoryLabelEntry { entry } => {
+                write!(f, "category label {entry} is configured more than once")
             }
+            Self::MixedCategoryLabelModes { key } => write!(
+                f,
+                "category label {key} cannot configure all values and exact values together"
+            ),
             Self::TooManyRules { count } => write!(
                 f,
                 "duplicate check supports at most {MAX_DUPLICATE_CHECK_RULES} rules, got {count}"
@@ -148,17 +172,45 @@ pub fn validate_system_config(config: &SystemConfig) -> Result<(), SystemConfigV
         return Err(SystemConfigValidationError::InvalidSearchMinimumScore);
     }
 
-    let mut category_keys = HashSet::new();
-    for (index, key) in config.category_labels.iter().enumerate() {
-        let trimmed = key.trim();
+    let mut bare_category_keys = HashSet::new();
+    let mut exact_category_keys = HashSet::new();
+    let mut exact_category_entries = HashSet::new();
+    for (index, entry) in config.category_labels.iter().enumerate() {
+        let expression = parse_category_label_expression(entry);
+        let trimmed = expression.key.trim();
         if trimmed.is_empty() {
             return Err(SystemConfigValidationError::EmptyCategoryLabel { index });
         }
-        if trimmed != key {
+        if trimmed != expression.key {
             return Err(SystemConfigValidationError::CategoryLabelHasOuterWhitespace { index });
         }
-        if !category_keys.insert(key.as_str()) {
-            return Err(SystemConfigValidationError::DuplicateCategoryLabel { key: key.clone() });
+
+        match expression.value {
+            Some(value) => {
+                if bare_category_keys.contains(expression.key) {
+                    return Err(SystemConfigValidationError::MixedCategoryLabelModes {
+                        key: expression.key.to_string(),
+                    });
+                }
+                exact_category_keys.insert(expression.key);
+                if !exact_category_entries.insert((expression.key, value)) {
+                    return Err(SystemConfigValidationError::DuplicateCategoryLabelEntry {
+                        entry: entry.clone(),
+                    });
+                }
+            }
+            None => {
+                if exact_category_keys.contains(expression.key) {
+                    return Err(SystemConfigValidationError::MixedCategoryLabelModes {
+                        key: expression.key.to_string(),
+                    });
+                }
+                if !bare_category_keys.insert(expression.key) {
+                    return Err(SystemConfigValidationError::DuplicateCategoryLabelEntry {
+                        entry: entry.clone(),
+                    });
+                }
+            }
         }
     }
 
@@ -330,8 +382,8 @@ mod tests {
             ),
             (
                 vec!["project".to_string(), "project".to_string()],
-                SystemConfigValidationError::DuplicateCategoryLabel {
-                    key: "project".to_string(),
+                SystemConfigValidationError::DuplicateCategoryLabelEntry {
+                    entry: "project".to_string(),
                 },
             ),
         ] {
@@ -342,6 +394,143 @@ mod tests {
             };
             assert_eq!(validate_system_config(&config), Err(expected));
         }
+    }
+
+    #[test]
+    fn parses_bare_category_label_expression() {
+        assert_eq!(
+            parse_category_label_expression("project"),
+            CategoryLabelExpression {
+                key: "project",
+                value: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_category_label_expression_at_first_equals_and_preserves_value() {
+        for (expression, expected_value) in [
+            ("project=a=b", "a=b"),
+            ("project=", ""),
+            ("project= padded & % + 值 ", " padded & % + 值 "),
+        ] {
+            assert_eq!(
+                parse_category_label_expression(expression),
+                CategoryLabelExpression {
+                    key: "project",
+                    value: Some(expected_value),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_multiple_distinct_exact_category_label_values() {
+        let config = SystemConfig {
+            category_labels: vec![
+                "project=yellow-dog".to_string(),
+                "team".to_string(),
+                "project=sigma".to_string(),
+            ],
+            search: SearchConfig::default(),
+            ..SystemConfig::default()
+        };
+
+        assert_eq!(validate_system_config(&config), Ok(()));
+    }
+
+    #[test]
+    fn rejects_duplicate_exact_category_label_entries() {
+        let config = SystemConfig {
+            category_labels: vec!["project=sigma".to_string(), "project=sigma".to_string()],
+            search: SearchConfig::default(),
+            ..SystemConfig::default()
+        };
+
+        assert_eq!(
+            validate_system_config(&config),
+            Err(SystemConfigValidationError::DuplicateCategoryLabelEntry {
+                entry: "project=sigma".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_bare_and_exact_category_label_modes() {
+        for category_labels in [
+            vec!["project".to_string(), "project=sigma".to_string()],
+            vec!["project=sigma".to_string(), "project".to_string()],
+        ] {
+            let config = SystemConfig {
+                category_labels,
+                search: SearchConfig::default(),
+                ..SystemConfig::default()
+            };
+
+            assert_eq!(
+                validate_system_config(&config),
+                Err(SystemConfigValidationError::MixedCategoryLabelModes {
+                    key: "project".to_string(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn validates_category_label_key_only_and_preserves_outer_value_whitespace() {
+        let config = SystemConfig {
+            category_labels: vec!["project= padded ".to_string()],
+            search: SearchConfig::default(),
+            ..SystemConfig::default()
+        };
+
+        assert_eq!(validate_system_config(&config), Ok(()));
+    }
+
+    #[test]
+    fn rejects_outer_whitespace_in_category_label_key() {
+        let config = SystemConfig {
+            category_labels: vec![" project=sigma".to_string()],
+            search: SearchConfig::default(),
+            ..SystemConfig::default()
+        };
+
+        assert_eq!(
+            validate_system_config(&config),
+            Err(SystemConfigValidationError::CategoryLabelHasOuterWhitespace { index: 0 })
+        );
+    }
+
+    #[test]
+    fn rejects_empty_category_label_key_with_exact_value() {
+        let config = SystemConfig {
+            category_labels: vec!["=sigma".to_string()],
+            search: SearchConfig::default(),
+            ..SystemConfig::default()
+        };
+
+        assert_eq!(
+            validate_system_config(&config),
+            Err(SystemConfigValidationError::EmptyCategoryLabel { index: 0 })
+        );
+    }
+
+    #[test]
+    fn category_label_validation_errors_have_actionable_messages() {
+        assert_eq!(
+            SystemConfigValidationError::DuplicateCategoryLabelEntry {
+                entry: "project=sigma".to_string(),
+            }
+            .to_string(),
+            "category label project=sigma is configured more than once"
+        );
+        assert_eq!(
+            SystemConfigValidationError::MixedCategoryLabelModes {
+                key: "project".to_string(),
+            }
+            .to_string(),
+            "category label project cannot configure all values and exact values together"
+        );
     }
 
     #[test]
