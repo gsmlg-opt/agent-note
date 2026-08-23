@@ -74,10 +74,10 @@ async fn invalid_config_is_rejected_before_storage() {
 }
 
 #[tokio::test]
-async fn category_keys_must_exist_and_configured_keys_cannot_be_deleted() {
+async fn exact_category_keys_must_exist_and_configured_keys_cannot_be_deleted() {
     let (ctx, _backend, _dir) = test_context().await;
     let configured = SystemConfig {
-        category_labels: vec!["project".to_string()],
+        category_labels: vec!["project=yellow-dog".to_string()],
         search: SearchConfig::default(),
         ..SystemConfig::default()
     };
@@ -204,6 +204,89 @@ async fn category_summaries_preserve_config_order_and_include_empty_categories()
 }
 
 #[tokio::test]
+async fn category_summaries_group_pinned_values_in_expression_order() {
+    let (ctx, backend, _dir) = test_context().await;
+    define_label_key(&ctx, "project", "Project").await.unwrap();
+    define_label_key(&ctx, "team", "Owning team").await.unwrap();
+
+    let session = backend.session().await.unwrap();
+    for (index, id, labels) in [
+        (
+            1,
+            "pinned-a",
+            vec![("project", "yellow-dog"), ("team", "platform")],
+        ),
+        (2, "pinned-b", vec![("project", "yellow-dog")]),
+        (3, "pinned-c", vec![("project", "sigma")]),
+    ] {
+        session
+            .insert_note(NewNote {
+                id,
+                title: id,
+                content: id,
+                attachments: &[],
+                created_at: index,
+                updated_at: index,
+                note_revision: 1,
+                deleted_at: None,
+            })
+            .await
+            .unwrap();
+        for (key, value) in labels {
+            session.attach_label(id, key, value).await.unwrap();
+        }
+    }
+
+    update_system_config(
+        &ctx,
+        &SystemConfig {
+            category_labels: vec![
+                "project=sigma".to_string(),
+                "team".to_string(),
+                "project=missing".to_string(),
+                "project=yellow-dog".to_string(),
+            ],
+            search: SearchConfig::default(),
+            ..SystemConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        category_label_summaries(&ctx).await.unwrap(),
+        vec![
+            CategoryLabelSummary {
+                key: "project".to_string(),
+                description: "Project".to_string(),
+                values: vec![
+                    CategoryLabelValueSummary {
+                        value: "sigma".to_string(),
+                        count: 1,
+                    },
+                    CategoryLabelValueSummary {
+                        value: "missing".to_string(),
+                        count: 0,
+                    },
+                    CategoryLabelValueSummary {
+                        value: "yellow-dog".to_string(),
+                        count: 2,
+                    },
+                ],
+            },
+            CategoryLabelSummary {
+                key: "team".to_string(),
+                description: "Owning team".to_string(),
+                values: vec![CategoryLabelValueSummary {
+                    value: "platform".to_string(),
+                    count: 1,
+                }],
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn no_configured_categories_returns_an_empty_summary() {
     let (ctx, _backend, _dir) = test_context().await;
 
@@ -249,8 +332,8 @@ async fn category_summaries_reject_duplicate_keys_from_stored_config() {
     let error = category_label_summaries(&ctx).await.unwrap_err();
     assert_eq!(
         error.downcast_ref::<SystemConfigValidationError>(),
-        Some(&SystemConfigValidationError::DuplicateCategoryLabel {
-            key: "project".to_string(),
+        Some(&SystemConfigValidationError::DuplicateCategoryLabelEntry {
+            entry: "project".to_string(),
         })
     );
 

@@ -1,5 +1,7 @@
 use crate::Context;
-use note_core::{validate_system_config, CategoryLabelConfigError, SystemConfig};
+use note_core::{
+    parse_category_label_expression, validate_system_config, CategoryLabelConfigError, SystemConfig,
+};
 use note_storage::TransactionMode;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +17,46 @@ pub struct CategoryLabelSummary {
     pub key: String,
     pub description: String,
     pub values: Vec<CategoryLabelValueSummary>,
+}
+
+#[derive(Debug)]
+enum CategorySelection {
+    All,
+    Exact(Vec<String>),
+}
+
+#[derive(Debug)]
+struct CategoryRequest {
+    key: String,
+    selection: CategorySelection,
+}
+
+fn category_requests(category_labels: &[String]) -> Vec<CategoryRequest> {
+    let mut requests: Vec<CategoryRequest> = Vec::new();
+    let mut request_indices: HashMap<String, usize> = HashMap::new();
+
+    for entry in category_labels {
+        let expression = parse_category_label_expression(entry);
+        match request_indices.get(expression.key).copied() {
+            Some(index) => match (&mut requests[index].selection, expression.value) {
+                (CategorySelection::Exact(values), Some(value)) => values.push(value.to_string()),
+                _ => unreachable!("category label configuration was validated"),
+            },
+            None => {
+                let selection = match expression.value {
+                    Some(value) => CategorySelection::Exact(vec![value.to_string()]),
+                    None => CategorySelection::All,
+                };
+                request_indices.insert(expression.key.to_string(), requests.len());
+                requests.push(CategoryRequest {
+                    key: expression.key.to_string(),
+                    selection,
+                });
+            }
+        }
+    }
+
+    requests
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -36,6 +78,7 @@ pub async fn get_system_config(ctx: &Context) -> anyhow::Result<SystemConfig> {
 
 pub async fn update_system_config(ctx: &Context, config: &SystemConfig) -> anyhow::Result<()> {
     validate_system_config(config).map_err(anyhow::Error::new)?;
+    let requests = category_requests(&config.category_labels);
     let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
     let result = async {
         let catalog: HashSet<String> = transaction
@@ -44,10 +87,10 @@ pub async fn update_system_config(ctx: &Context, config: &SystemConfig) -> anyho
             .into_iter()
             .map(|label_key| label_key.key)
             .collect();
-        for key in &config.category_labels {
-            if !catalog.contains(key) {
+        for request in &requests {
+            if !catalog.contains(&request.key) {
                 return Err(anyhow::Error::new(CategoryLabelConfigError::UnknownKey {
-                    key: key.clone(),
+                    key: request.key.clone(),
                 }));
             }
         }
@@ -66,6 +109,7 @@ pub async fn category_label_summaries(ctx: &Context) -> anyhow::Result<Vec<Categ
         if config.category_labels.is_empty() {
             return Ok(Vec::new());
         }
+        let requests = category_requests(&config.category_labels);
 
         let mut descriptions: HashMap<String, String> = transaction
             .list_label_keys()
@@ -73,17 +117,22 @@ pub async fn category_label_summaries(ctx: &Context) -> anyhow::Result<Vec<Categ
             .into_iter()
             .map(|label_key| (label_key.key, label_key.description))
             .collect();
-        for key in &config.category_labels {
-            if !descriptions.contains_key(key) {
+        for request in &requests {
+            if !descriptions.contains_key(&request.key) {
                 return Err(anyhow::Error::new(CategoryLabelConfigError::UnknownKey {
-                    key: key.clone(),
+                    key: request.key.clone(),
                 }));
             }
         }
 
         let mut values_by_key: HashMap<String, Vec<CategoryLabelValueSummary>> = HashMap::new();
         for count in transaction
-            .label_value_counts(&config.category_labels)
+            .label_value_counts(
+                &requests
+                    .iter()
+                    .map(|request| request.key.clone())
+                    .collect::<Vec<_>>(),
+            )
             .await?
         {
             values_by_key
@@ -95,13 +144,37 @@ pub async fn category_label_summaries(ctx: &Context) -> anyhow::Result<Vec<Categ
                 });
         }
 
-        Ok(config
-            .category_labels
+        Ok(requests
             .into_iter()
-            .map(|key| CategoryLabelSummary {
-                description: descriptions.remove(&key).expect("category key validated"),
-                values: values_by_key.remove(&key).unwrap_or_default(),
-                key,
+            .map(|request| {
+                let values = match request.selection {
+                    CategorySelection::All => {
+                        values_by_key.remove(&request.key).unwrap_or_default()
+                    }
+                    CategorySelection::Exact(configured_values) => {
+                        let counts: HashMap<String, usize> = values_by_key
+                            .remove(&request.key)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|summary| (summary.value, summary.count))
+                            .collect();
+                        configured_values
+                            .into_iter()
+                            .map(|value| CategoryLabelValueSummary {
+                                count: counts.get(&value).copied().unwrap_or(0),
+                                value,
+                            })
+                            .collect()
+                    }
+                };
+
+                CategoryLabelSummary {
+                    description: descriptions
+                        .remove(&request.key)
+                        .expect("category key validated"),
+                    values,
+                    key: request.key,
+                }
             })
             .collect())
     }

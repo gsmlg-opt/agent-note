@@ -1,3 +1,4 @@
+use note_core::parse_category_label_expression;
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 use yew_duskmoon::Alert;
@@ -5,6 +6,28 @@ use yew_duskmoon::Alert;
 use crate::api;
 use crate::components::icons;
 use crate::state::{DuplicateCheckRule, DuplicateCheckTerm, LabelKey, SystemConfig, SystemInfo};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CategoryLabelMode {
+    All,
+    Exact,
+}
+
+impl CategoryLabelMode {
+    fn value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Exact => "exact",
+        }
+    }
+
+    fn from_value(value: &str) -> Self {
+        match value {
+            "exact" => Self::Exact,
+            _ => Self::All,
+        }
+    }
+}
 
 #[function_component(SystemPage)]
 pub fn system_page() -> Html {
@@ -18,6 +41,10 @@ pub fn system_page() -> Html {
     let saved = use_state(|| false);
     let minimum_score_draft = use_state(String::new);
     let minimum_score_error = use_state(|| None::<String>);
+    let category_key_draft = use_state(String::new);
+    let category_mode_draft = use_state(|| CategoryLabelMode::All);
+    let category_value_draft = use_state(String::new);
+    let category_draft_error = use_state(|| None::<String>);
 
     {
         let config = config.clone();
@@ -108,17 +135,52 @@ pub fn system_page() -> Html {
         })
     };
 
+    let on_category_key = {
+        let category_key_draft = category_key_draft.clone();
+        Callback::from(move |event: Event| {
+            let select: HtmlSelectElement = event.target_unchecked_into();
+            category_key_draft.set(select.value());
+        })
+    };
+
+    let on_category_mode = {
+        let category_mode_draft = category_mode_draft.clone();
+        Callback::from(move |event: Event| {
+            let select: HtmlSelectElement = event.target_unchecked_into();
+            category_mode_draft.set(CategoryLabelMode::from_value(&select.value()));
+        })
+    };
+
+    let on_category_value = {
+        let category_value_draft = category_value_draft.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            category_value_draft.set(input.value());
+        })
+    };
+
     let on_add_category_label = {
         let config = config.clone();
         let saved = saved.clone();
-        Callback::from(move |event: Event| {
-            let select: HtmlSelectElement = event.target_unchecked_into();
-            let key = select.value();
-            select.set_value("");
+        let category_key_draft = category_key_draft.clone();
+        let category_mode_draft = category_mode_draft.clone();
+        let category_value_draft = category_value_draft.clone();
+        let category_draft_error = category_draft_error.clone();
+        Callback::from(move |_| {
             if let Some(mut next) = (*config).clone() {
-                if add_category_label(&mut next.category_labels, &key) {
-                    config.set(Some(next));
-                    saved.set(false);
+                match add_category_label(
+                    &mut next.category_labels,
+                    &category_key_draft,
+                    *category_mode_draft,
+                    &category_value_draft,
+                ) {
+                    Ok(()) => {
+                        config.set(Some(next));
+                        category_value_draft.set(String::new());
+                        category_draft_error.set(None);
+                        saved.set(false);
+                    }
+                    Err(message) => category_draft_error.set(Some(message.to_string())),
                 }
             }
         })
@@ -198,18 +260,64 @@ pub fn system_page() -> Html {
                             <p class="empty compact">{ "No label keys available. Create one on Labels first." }</p>
                         }
 
-                        <select
-                            class="select category-label-select"
-                            aria-label="Add category label"
-                            disabled={category_label_select_disabled((*labels_error).is_some(), *saving, &*labels, &current.category_labels)}
-                            onchange={on_add_category_label}
-                        >
-                            <option value="" disabled=true>{ "Add category label" }</option>
-                            { for labels.iter()
-                                .filter(|label| !current.category_labels.iter().any(|key| key == &label.key))
-                                .map(|label| html! { <option value={label.key.clone()}>{ label.key.clone() }</option> })
-                            }
-                        </select>
+                        <div class="category-label-editor">
+                            <label class="field">
+                                <span>{ "Label name" }</span>
+                                <select
+                                    class="select category-label-select"
+                                    value={(*category_key_draft).clone()}
+                                    disabled={category_label_select_disabled((*labels_error).is_some(), *saving, &*labels, &current.category_labels, *category_mode_draft)}
+                                    onchange={on_category_key}
+                                >
+                                    <option value="">{ "Choose a label" }</option>
+                                    { for labels.iter()
+                                        .filter(|label| category_label_key_available(&label.key, *category_mode_draft, &current.category_labels))
+                                        .map(|label| html! { <option value={label.key.clone()}>{ label.key.clone() }</option> })
+                                    }
+                                </select>
+                            </label>
+
+                            <label class="field">
+                                <span>{ "Values" }</span>
+                                <select
+                                    class="select"
+                                    value={category_mode_draft.value()}
+                                    disabled={category_label_controls_disabled((*labels_error).is_some(), *saving, &*labels)}
+                                    onchange={on_category_mode}
+                                >
+                                    <option value="all">{ "All values" }</option>
+                                    <option value="exact">{ "Exact value" }</option>
+                                </select>
+                            </label>
+
+                            <div class="category-label-editor-value">
+                                if *category_mode_draft == CategoryLabelMode::Exact {
+                                    <label class="field">
+                                        <span>{ "Exact value" }</span>
+                                        <input
+                                            type="text"
+                                            class="input"
+                                            value={(*category_value_draft).clone()}
+                                            disabled={category_label_controls_disabled((*labels_error).is_some(), *saving, &*labels)}
+                                            oninput={on_category_value}
+                                        />
+                                    </label>
+                                }
+                            </div>
+
+                            <button
+                                type="button"
+                                class="btn btn-outline"
+                                disabled={category_label_add_disabled((*labels_error).is_some(), *saving, &*labels, &current.category_labels, &category_key_draft, *category_mode_draft)}
+                                onclick={on_add_category_label}
+                            >
+                                { "Add category" }
+                            </button>
+                        </div>
+
+                        if let Some(message) = &*category_draft_error {
+                            <p class="category-label-error" role="alert">{ message.clone() }</p>
+                        }
 
                         <div class="category-label-selection">
                             if current.category_labels.is_empty() {
@@ -580,19 +688,82 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn add_category_label(keys: &mut Vec<String>, key: &str) -> bool {
-    if key.is_empty() || keys.iter().any(|existing| existing == key) {
-        return false;
+fn add_category_label(
+    entries: &mut Vec<String>,
+    key: &str,
+    mode: CategoryLabelMode,
+    value: &str,
+) -> Result<(), &'static str> {
+    if key.is_empty() {
+        return Err("Choose a label name.");
     }
 
-    keys.push(key.to_string());
+    match mode {
+        CategoryLabelMode::All => {
+            if entries.iter().any(|entry| {
+                let expression = parse_category_label_expression(entry);
+                expression.key == key && expression.value.is_none()
+            }) {
+                return Err("That all-values category is already configured.");
+            }
+
+            let first_exact_index = entries.iter().position(|entry| {
+                let expression = parse_category_label_expression(entry);
+                expression.key == key && expression.value.is_some()
+            });
+            match first_exact_index {
+                Some(index) => {
+                    entries.retain(|entry| {
+                        let expression = parse_category_label_expression(entry);
+                        expression.key != key || expression.value.is_none()
+                    });
+                    entries.insert(index, key.to_string());
+                }
+                None => entries.push(key.to_string()),
+            }
+        }
+        CategoryLabelMode::Exact => {
+            if entries.iter().any(|entry| {
+                let expression = parse_category_label_expression(entry);
+                expression.key == key && expression.value.is_none()
+            }) {
+                return Err("Remove the all-values category before adding exact values.");
+            }
+
+            let expression = format!("{key}={value}");
+            if entries.iter().any(|entry| entry == &expression) {
+                return Err("That exact category value is already configured.");
+            }
+            entries.push(expression);
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_category_label(entries: &mut Vec<String>, expression: &str) -> bool {
+    let Some(index) = entries.iter().position(|entry| entry == expression) else {
+        return false;
+    };
+    entries.remove(index);
     true
 }
 
-fn remove_category_label(keys: &mut Vec<String>, key: &str) -> bool {
-    let before = keys.len();
-    keys.retain(|existing| existing != key);
-    keys.len() != before
+fn category_label_controls_disabled(labels_error: bool, saving: bool, labels: &[LabelKey]) -> bool {
+    labels_error || saving || labels.is_empty()
+}
+
+fn category_label_key_available(key: &str, mode: CategoryLabelMode, selected: &[String]) -> bool {
+    match mode {
+        CategoryLabelMode::All => !selected.iter().any(|entry| {
+            let expression = parse_category_label_expression(entry);
+            expression.key == key && expression.value.is_none()
+        }),
+        CategoryLabelMode::Exact => !selected.iter().any(|entry| {
+            let expression = parse_category_label_expression(entry);
+            expression.key == key && expression.value.is_none()
+        }),
+    }
 }
 
 fn category_label_select_disabled(
@@ -600,12 +771,26 @@ fn category_label_select_disabled(
     saving: bool,
     labels: &[LabelKey],
     selected: &[String],
+    mode: CategoryLabelMode,
 ) -> bool {
-    labels_error
-        || saving
+    category_label_controls_disabled(labels_error, saving, labels)
         || !labels
             .iter()
-            .any(|label| !selected.iter().any(|key| key == &label.key))
+            .any(|label| category_label_key_available(&label.key, mode, selected))
+}
+
+fn category_label_add_disabled(
+    labels_error: bool,
+    saving: bool,
+    labels: &[LabelKey],
+    selected: &[String],
+    key: &str,
+    mode: CategoryLabelMode,
+) -> bool {
+    category_label_controls_disabled(labels_error, saving, labels)
+        || key.is_empty()
+        || !labels.iter().any(|label| label.key == key)
+        || !category_label_key_available(key, mode, selected)
 }
 
 #[derive(Debug, PartialEq)]
@@ -674,19 +859,75 @@ mod tests {
     }
 
     #[test]
-    fn category_selection_preserves_order_and_rejects_duplicates() {
-        let mut keys = vec!["project".to_string()];
-        assert!(add_category_label(&mut keys, "team"));
-        assert!(!add_category_label(&mut keys, "project"));
-        assert!(!add_category_label(&mut keys, ""));
-        assert_eq!(keys, vec!["project", "team"]);
+    fn category_selection_adds_and_replaces_entries_by_parsed_key() {
+        let mut keys = vec![
+            "team".to_string(),
+            "project=yellow-dog".to_string(),
+            "kind=skill".to_string(),
+        ];
+
+        assert_eq!(
+            add_category_label(&mut keys, "project", CategoryLabelMode::All, ""),
+            Ok(())
+        );
+        assert_eq!(keys, ["team", "project", "kind=skill"]);
     }
 
     #[test]
-    fn category_selection_removes_only_requested_key() {
-        let mut keys = vec!["project".to_string(), "team".to_string()];
-        assert!(remove_category_label(&mut keys, "project"));
-        assert_eq!(keys, vec!["team"]);
+    fn category_selection_preserves_exact_values_and_rejects_conflicting_modes() {
+        let mut keys = vec!["team".to_string()];
+        let value = "  yellow=dog&%+你好 ";
+
+        assert_eq!(
+            add_category_label(&mut keys, "project", CategoryLabelMode::Exact, value),
+            Ok(())
+        );
+        assert_eq!(keys, vec!["team".to_string(), format!("project={value}")]);
+        assert_eq!(
+            add_category_label(&mut keys, "project", CategoryLabelMode::Exact, value),
+            Err("That exact category value is already configured.")
+        );
+        assert_eq!(
+            add_category_label(&mut keys, "team", CategoryLabelMode::Exact, "any"),
+            Err("Remove the all-values category before adding exact values.")
+        );
+        assert_eq!(
+            add_category_label(&mut keys, "kind", CategoryLabelMode::Exact, ""),
+            Ok(())
+        );
+        assert_eq!(keys.last(), Some(&"kind=".to_string()));
+    }
+
+    #[test]
+    fn category_selection_reports_missing_and_duplicate_all_values_keys() {
+        let mut keys = Vec::new();
+
+        assert_eq!(
+            add_category_label(&mut keys, "", CategoryLabelMode::All, ""),
+            Err("Choose a label name.")
+        );
+        assert_eq!(
+            add_category_label(&mut keys, "project", CategoryLabelMode::All, ""),
+            Ok(())
+        );
+        assert_eq!(keys, ["project"]);
+        assert_eq!(
+            add_category_label(&mut keys, "project", CategoryLabelMode::All, ""),
+            Err("That all-values category is already configured.")
+        );
+    }
+
+    #[test]
+    fn category_selection_removes_only_requested_full_expression() {
+        let mut keys = vec![
+            "project=yellow-dog".to_string(),
+            "project=".to_string(),
+            "team".to_string(),
+        ];
+        assert!(!remove_category_label(&mut keys, "project"));
+        assert_eq!(keys, ["project=yellow-dog", "project=", "team"]);
+        assert!(remove_category_label(&mut keys, "project="));
+        assert_eq!(keys, ["project=yellow-dog", "team"]);
         assert!(!remove_category_label(&mut keys, "missing"));
     }
 
@@ -694,32 +935,59 @@ mod tests {
     fn category_label_picker_is_disabled_when_catalog_is_unavailable() {
         let labels = vec![label_key("project")];
 
-        assert!(category_label_select_disabled(false, true, &labels, &[]));
-        assert!(category_label_select_disabled(true, false, &labels, &[]));
-    }
-
-    #[test]
-    fn category_label_picker_is_disabled_when_catalog_is_empty_or_all_selected() {
-        let labels = vec![label_key("project")];
-
-        assert!(category_label_select_disabled(false, false, &[], &[]));
         assert!(category_label_select_disabled(
             false,
+            true,
+            &labels,
+            &[],
+            CategoryLabelMode::All,
+        ));
+        assert!(category_label_select_disabled(
+            true,
             false,
             &labels,
-            &["project".to_string()]
+            &[],
+            CategoryLabelMode::All,
         ));
     }
 
     #[test]
-    fn category_label_picker_is_enabled_for_an_unselected_catalog_key() {
-        let labels = vec![label_key("project"), label_key("team")];
+    fn category_label_picker_is_disabled_when_catalog_is_empty_or_selected_mode_is_unavailable() {
+        let labels = vec![label_key("project")];
+
+        assert!(category_label_select_disabled(
+            false,
+            false,
+            &[],
+            &[],
+            CategoryLabelMode::All,
+        ));
+        assert!(category_label_select_disabled(
+            false,
+            false,
+            &labels,
+            &["project".to_string()],
+            CategoryLabelMode::Exact,
+        ));
+    }
+
+    #[test]
+    fn category_label_picker_uses_parsed_keys_for_mode_availability() {
+        let labels = vec![label_key("project")];
 
         assert!(!category_label_select_disabled(
             false,
             false,
             &labels,
-            &["project".to_string()]
+            &["project=yellow-dog".to_string()],
+            CategoryLabelMode::All,
+        ));
+        assert!(category_label_select_disabled(
+            false,
+            false,
+            &labels,
+            &["project".to_string()],
+            CategoryLabelMode::Exact,
         ));
     }
 
@@ -773,6 +1041,12 @@ mod tests {
         let source = include_str!("system.rs");
 
         assert_eq!(source.matches(concat!("Save ", "settings")).count(), 1);
+        assert_eq!(source.matches(concat!("Add ", "category")).count(), 1);
+        assert!(source.contains("Label name"));
+        assert!(source.contains("Values"));
+        assert!(source.contains("Exact value"));
+        assert!(source.contains("category_draft_error"));
+        assert!(source.contains("class=\"category-label-error\" role=\"alert\""));
     }
 
     #[test]
