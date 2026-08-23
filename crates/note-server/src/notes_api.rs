@@ -387,39 +387,100 @@ enum BatchLabelActionRequest {
     },
 }
 
-impl utoipa::PartialSchema for BatchLabelActionRequest {
-    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
-        use utoipa::openapi::schema::{
-            AdditionalProperties, Discriminator, ObjectBuilder, OneOfBuilder, Type,
-        };
+struct BatchLabelActionAddRequest;
+struct BatchLabelActionUpdateRequest;
+struct BatchLabelActionRemoveRequest;
 
-        fn variant(
-            kind: &str,
-            fields: &[&str],
-        ) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
-            let mut schema = ObjectBuilder::new()
-                .schema_type(Type::Object)
-                .additional_properties(Some(AdditionalProperties::FreeForm(false)))
-                .property(
-                    "type",
-                    ObjectBuilder::new()
-                        .schema_type(Type::String)
-                        .enum_values(Some([kind])),
-                )
-                .required("type");
-            for field in fields {
-                schema = schema
-                    .property(*field, ObjectBuilder::new().schema_type(Type::String))
-                    .required(*field);
+fn batch_label_action_variant_schema(
+    kind: &str,
+    fields: &[&str],
+) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+    use utoipa::openapi::schema::{AdditionalProperties, ObjectBuilder, Type};
+
+    let mut schema = ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .additional_properties(Some(AdditionalProperties::FreeForm(false)))
+        .property(
+            "type",
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .enum_values(Some([kind])),
+        )
+        .required("type");
+    for field in fields {
+        schema = schema
+            .property(*field, ObjectBuilder::new().schema_type(Type::String))
+            .required(*field);
+    }
+    schema.into()
+}
+
+macro_rules! batch_label_action_schema {
+    ($type:ident, $name:literal, $kind:literal, [$($field:literal),* $(,)?]) => {
+        impl utoipa::PartialSchema for $type {
+            fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+                batch_label_action_variant_schema($kind, &[$($field),*])
             }
-            schema.into()
         }
 
+        impl utoipa::ToSchema for $type {
+            fn name() -> std::borrow::Cow<'static, str> {
+                std::borrow::Cow::Borrowed($name)
+            }
+        }
+    };
+}
+
+batch_label_action_schema!(
+    BatchLabelActionAddRequest,
+    "BatchLabelActionAddRequest",
+    "add",
+    ["key", "value"]
+);
+batch_label_action_schema!(
+    BatchLabelActionUpdateRequest,
+    "BatchLabelActionUpdateRequest",
+    "update",
+    ["from_key", "key", "value"]
+);
+batch_label_action_schema!(
+    BatchLabelActionRemoveRequest,
+    "BatchLabelActionRemoveRequest",
+    "remove",
+    ["key"]
+);
+
+impl utoipa::PartialSchema for BatchLabelActionRequest {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::{
+            schema::{Discriminator, OneOfBuilder},
+            Ref,
+        };
+
         OneOfBuilder::new()
-            .item(variant("add", &["key", "value"]))
-            .item(variant("update", &["from_key", "key", "value"]))
-            .item(variant("remove", &["key"]))
-            .discriminator(Some(Discriminator::new("type")))
+            .item(Ref::from_schema_name(
+                <BatchLabelActionAddRequest as utoipa::ToSchema>::name(),
+            ))
+            .item(Ref::from_schema_name(
+                <BatchLabelActionUpdateRequest as utoipa::ToSchema>::name(),
+            ))
+            .item(Ref::from_schema_name(
+                <BatchLabelActionRemoveRequest as utoipa::ToSchema>::name(),
+            ))
+            .discriminator(Some(Discriminator::with_mapping(
+                "type",
+                [
+                    ("add", "#/components/schemas/BatchLabelActionAddRequest"),
+                    (
+                        "update",
+                        "#/components/schemas/BatchLabelActionUpdateRequest",
+                    ),
+                    (
+                        "remove",
+                        "#/components/schemas/BatchLabelActionRemoveRequest",
+                    ),
+                ],
+            )))
             .into()
     }
 }
@@ -427,6 +488,30 @@ impl utoipa::PartialSchema for BatchLabelActionRequest {
 impl utoipa::ToSchema for BatchLabelActionRequest {
     fn name() -> std::borrow::Cow<'static, str> {
         std::borrow::Cow::Borrowed("BatchLabelActionRequest")
+    }
+
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        for (name, schema) in [
+            (
+                <BatchLabelActionAddRequest as utoipa::ToSchema>::name().into_owned(),
+                <BatchLabelActionAddRequest as utoipa::PartialSchema>::schema(),
+            ),
+            (
+                <BatchLabelActionUpdateRequest as utoipa::ToSchema>::name().into_owned(),
+                <BatchLabelActionUpdateRequest as utoipa::PartialSchema>::schema(),
+            ),
+            (
+                <BatchLabelActionRemoveRequest as utoipa::ToSchema>::name().into_owned(),
+                <BatchLabelActionRemoveRequest as utoipa::PartialSchema>::schema(),
+            ),
+        ] {
+            schemas.push((name, schema));
+        }
     }
 }
 
@@ -2257,16 +2342,26 @@ mod tests {
             .expect("tagged action alternatives");
         assert_eq!(action["discriminator"]["propertyName"], "type");
         assert_eq!(alternatives.len(), 3);
-        for (kind, fields) in [
-            ("add", vec!["key", "value"]),
-            ("update", vec!["from_key", "key", "value"]),
-            ("remove", vec!["key"]),
+        for (kind, schema_name, fields) in [
+            ("add", "BatchLabelActionAddRequest", vec!["key", "value"]),
+            (
+                "update",
+                "BatchLabelActionUpdateRequest",
+                vec!["from_key", "key", "value"],
+            ),
+            ("remove", "BatchLabelActionRemoveRequest", vec!["key"]),
         ] {
-            let variant = alternatives
+            let schema_ref = format!("#/components/schemas/{schema_name}");
+            assert!(alternatives
                 .iter()
-                .find(|variant| variant["properties"]["type"]["enum"] == serde_json::json!([kind]))
-                .unwrap_or_else(|| panic!("missing {kind} action schema"));
+                .any(|variant| variant["$ref"] == schema_ref));
+            assert_eq!(action["discriminator"]["mapping"][kind], schema_ref);
+            let variant = &schemas[schema_name];
             assert_eq!(variant["additionalProperties"], false);
+            assert_eq!(
+                variant["properties"]["type"]["enum"],
+                serde_json::json!([kind])
+            );
             for field in fields {
                 assert!(variant["required"]
                     .as_array()
@@ -3045,26 +3140,46 @@ mod tests {
         .await;
         let invalidations_before = BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst);
 
-        for body in [
-            format!(
-                r#"{{"notes":[{{"id":"{id}","expected_revision":1}}],"action":{{"type":"add","key":"project","value":"other"}}}}"#
-            ),
-            r#"{"notes":[],"action":{"type":"remove","key":"project"}}"#.into(),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(post("/api/notes/batch-labels", &body))
-                .await
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/batch-labels",
+                &format!(
+                    r#"{{"notes":[{{"id":"{id}","expected_revision":1}}],"action":{{"type":"add","key":"project","value":"other"}}}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &response.into_body().collect().await.unwrap().to_bytes()
+            )
+            .unwrap(),
+            serde_json::json!({"requested": 1, "updated": 0, "unchanged": 1})
+        );
+        assert_eq!(
+            BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
+            invalidations_before
+        );
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/batch-labels",
+                r#"{"notes":[],"action":{"type":"remove","key":"project"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
-            assert!(matches!(
-                response.status(),
-                StatusCode::OK | StatusCode::BAD_REQUEST
-            ));
-            assert_eq!(
-                BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
-                invalidations_before
-            );
-        }
+        assert_eq!(error["code"], "invalid_input");
+        assert_eq!(
+            BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
+            invalidations_before
+        );
 
         let response = app
             .oneshot(post(
