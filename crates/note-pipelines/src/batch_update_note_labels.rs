@@ -3,12 +3,23 @@ use crate::{
     Context,
 };
 use note_core::{validate_label_key, validate_label_value, LabelValueType, ValidationError};
-use note_storage::TransactionMode;
+use note_storage::{StorageTransaction, TransactionMode};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchLabelAction {
-    Add { key: String, value: String },
+    Add {
+        key: String,
+        value: String,
+    },
+    Update {
+        from_key: String,
+        key: String,
+        value: String,
+    },
+    Remove {
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,8 +40,16 @@ pub async fn batch_update_note_labels(
     input: BatchUpdateNoteLabelsInput,
 ) -> anyhow::Result<BatchUpdateNoteLabelsResult> {
     let targets = validate_batch_note_targets(input.notes)?;
-    let BatchLabelAction::Add { key, value } = input.action;
-    validate_label_key(&key).map_err(anyhow::Error::new)?;
+    let action = input.action;
+    match &action {
+        BatchLabelAction::Add { key, .. } | BatchLabelAction::Remove { key } => {
+            validate_label_key(key).map_err(anyhow::Error::new)?;
+        }
+        BatchLabelAction::Update { from_key, key, .. } => {
+            validate_label_key(from_key).map_err(anyhow::Error::new)?;
+            validate_label_key(key).map_err(anyhow::Error::new)?;
+        }
+    }
 
     let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
     let requested = targets.len();
@@ -39,12 +58,15 @@ pub async fn batch_update_note_labels(
 
         let mut eligible_ids = Vec::new();
         for target in &targets {
-            let has_key = transaction
-                .labels_for_note(&target.id)
-                .await?
-                .iter()
-                .any(|label| label.key == key);
-            if !has_key {
+            let labels = transaction.labels_for_note(&target.id).await?;
+            let eligible = match &action {
+                BatchLabelAction::Add { key, .. } => !labels.iter().any(|label| label.key == *key),
+                BatchLabelAction::Update { from_key, .. } => {
+                    labels.iter().any(|label| label.key == *from_key)
+                }
+                BatchLabelAction::Remove { key } => labels.iter().any(|label| label.key == *key),
+            };
+            if eligible {
                 eligible_ids.push(target.id.as_str());
             }
         }
@@ -56,39 +78,45 @@ pub async fn batch_update_note_labels(
             });
         }
 
-        let existing_keys: HashMap<String, LabelValueType> = transaction
-            .list_label_keys()
-            .await?
-            .into_iter()
-            .map(|label_key| (label_key.key, label_key.value_type))
-            .collect();
-        if !existing_keys.contains_key(&key) {
-            transaction.insert_label_key_if_missing(&key, "").await?;
-        }
-        let final_types: HashMap<String, LabelValueType> = transaction
-            .list_label_keys()
-            .await?
-            .into_iter()
-            .map(|label_key| (label_key.key, label_key.value_type))
-            .collect();
-        let value_type = final_types
-            .get(&key)
-            .copied()
-            .unwrap_or(LabelValueType::Text);
-        if !validate_label_value(value_type, &value) {
-            return Err(anyhow::Error::new(ValidationError::InvalidLabelValue {
-                key,
-                value,
-                value_type,
-            }));
-        }
-
         let now = chrono::Utc::now().timestamp();
         let mut updated = 0;
-        for note_id in eligible_ids {
-            if transaction.set_note_label(note_id, &key, &value).await? {
-                transaction.advance_note_updated_at(note_id, now).await?;
-                updated += 1;
+        match &action {
+            BatchLabelAction::Add { key, value } => {
+                validate_destination_label(transaction.as_ref(), key, value).await?;
+                for note_id in eligible_ids {
+                    if transaction.set_note_label(note_id, key, value).await? {
+                        transaction.advance_note_updated_at(note_id, now).await?;
+                        updated += 1;
+                    }
+                }
+            }
+            BatchLabelAction::Update {
+                from_key,
+                key,
+                value,
+            } => {
+                validate_destination_label(transaction.as_ref(), key, value).await?;
+                for note_id in eligible_ids {
+                    let changed = if from_key == key {
+                        transaction.set_note_label(note_id, key, value).await?
+                    } else {
+                        transaction.remove_note_label(note_id, from_key).await?;
+                        transaction.set_note_label(note_id, key, value).await?;
+                        true
+                    };
+                    if changed {
+                        transaction.advance_note_updated_at(note_id, now).await?;
+                        updated += 1;
+                    }
+                }
+            }
+            BatchLabelAction::Remove { key } => {
+                for note_id in eligible_ids {
+                    if transaction.remove_note_label(note_id, key).await? {
+                        transaction.advance_note_updated_at(note_id, now).await?;
+                        updated += 1;
+                    }
+                }
             }
         }
         Ok(BatchUpdateNoteLabelsResult {
@@ -110,4 +138,38 @@ pub async fn batch_update_note_labels(
         ctx.notify_note_mutated();
     }
     Ok(result)
+}
+
+async fn validate_destination_label(
+    transaction: &dyn StorageTransaction,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let existing_keys: HashMap<String, LabelValueType> = transaction
+        .list_label_keys()
+        .await?
+        .into_iter()
+        .map(|label_key| (label_key.key, label_key.value_type))
+        .collect();
+    if !existing_keys.contains_key(key) {
+        transaction.insert_label_key_if_missing(key, "").await?;
+    }
+    let final_types: HashMap<String, LabelValueType> = transaction
+        .list_label_keys()
+        .await?
+        .into_iter()
+        .map(|label_key| (label_key.key, label_key.value_type))
+        .collect();
+    let value_type = final_types
+        .get(key)
+        .copied()
+        .unwrap_or(LabelValueType::Text);
+    if !validate_label_value(value_type, value) {
+        return Err(anyhow::Error::new(ValidationError::InvalidLabelValue {
+            key: key.into(),
+            value: value.into(),
+            value_type,
+        }));
+    }
+    Ok(())
 }
