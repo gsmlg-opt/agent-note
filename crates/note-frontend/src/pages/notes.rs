@@ -113,6 +113,10 @@ fn selection_reconciliation_visible_ids(
     (!loading).then(|| visible_ids.clone())
 }
 
+fn notes_load_is_current(started_generation: u64, current_generation: u64) -> bool {
+    started_generation == current_generation
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) struct NotesUrlState {
     current: usize,
@@ -340,6 +344,7 @@ pub fn notes_page() -> Html {
     let filter_operator = use_state(|| "=".to_string());
     let filter_value = use_state(String::new);
     let refresh_tick = use_state(|| 0usize);
+    let load_generation = use_mut_ref(|| 0_u64);
     let navigator = use_navigator();
     let location = use_location();
     let query_string = location
@@ -435,7 +440,13 @@ pub fn notes_page() -> Html {
         let loading = loading.clone();
         let error = error.clone();
         let stale_revision_gate = stale_revision_gate.clone();
+        let load_generation = load_generation.clone();
         use_effect_with((url_state.clone(), *refresh_tick), move |(state, _)| {
+            let started_generation = {
+                let mut generation = load_generation.borrow_mut();
+                *generation = generation.saturating_add(1);
+                *generation
+            };
             let state = state.clone();
             let refresh_epoch = stale_revision_gate.refresh_epoch();
             notes.set(Vec::new());
@@ -448,13 +459,16 @@ pub fn notes_page() -> Html {
             loading.set(true);
             error.set(None);
             if state.invalid_labels {
-                loading.set(false);
-                error.set(Some("Invalid label filter in URL.".to_string()));
-                stale_revision_gate.dispatch(StaleRevisionGateAction::RefreshFinished {
-                    started_epoch: refresh_epoch,
-                    succeeded: false,
-                });
+                if notes_load_is_current(started_generation, *load_generation.borrow()) {
+                    loading.set(false);
+                    error.set(Some("Invalid label filter in URL.".to_string()));
+                    stale_revision_gate.dispatch(StaleRevisionGateAction::RefreshFinished {
+                        started_epoch: refresh_epoch,
+                        succeeded: false,
+                    });
+                }
             } else {
+                let load_generation = load_generation.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let search = state.search.trim().to_string();
                     if search.is_empty() {
@@ -464,23 +478,33 @@ pub fn notes_page() -> Html {
                             .saturating_mul(state.page_size);
                         match api::list_notes_page(&state.labels, state.page_size, offset).await {
                             Ok(page) => {
-                                notes.set(page.notes);
-                                total_notes.set(page.total);
-                                stale_revision_gate.dispatch(
-                                    StaleRevisionGateAction::RefreshFinished {
-                                        started_epoch: refresh_epoch,
-                                        succeeded: true,
-                                    },
-                                );
+                                if notes_load_is_current(
+                                    started_generation,
+                                    *load_generation.borrow(),
+                                ) {
+                                    notes.set(page.notes);
+                                    total_notes.set(page.total);
+                                    stale_revision_gate.dispatch(
+                                        StaleRevisionGateAction::RefreshFinished {
+                                            started_epoch: refresh_epoch,
+                                            succeeded: true,
+                                        },
+                                    );
+                                }
                             }
                             Err(e) => {
-                                stale_revision_gate.dispatch(
-                                    StaleRevisionGateAction::RefreshFinished {
-                                        started_epoch: refresh_epoch,
-                                        succeeded: false,
-                                    },
-                                );
-                                error.set(Some(e));
+                                if notes_load_is_current(
+                                    started_generation,
+                                    *load_generation.borrow(),
+                                ) {
+                                    stale_revision_gate.dispatch(
+                                        StaleRevisionGateAction::RefreshFinished {
+                                            started_epoch: refresh_epoch,
+                                            succeeded: false,
+                                        },
+                                    );
+                                    error.set(Some(e));
+                                }
                             }
                         }
                     } else {
@@ -491,26 +515,38 @@ pub fn notes_page() -> Html {
                             .max(state.page_size);
                         match api::search_filtered(&search, limit, &state.labels).await {
                             Ok(r) => {
-                                results.set(Some(r));
-                                stale_revision_gate.dispatch(
-                                    StaleRevisionGateAction::RefreshFinished {
-                                        started_epoch: refresh_epoch,
-                                        succeeded: true,
-                                    },
-                                );
+                                if notes_load_is_current(
+                                    started_generation,
+                                    *load_generation.borrow(),
+                                ) {
+                                    results.set(Some(r));
+                                    stale_revision_gate.dispatch(
+                                        StaleRevisionGateAction::RefreshFinished {
+                                            started_epoch: refresh_epoch,
+                                            succeeded: true,
+                                        },
+                                    );
+                                }
                             }
                             Err(e) => {
-                                stale_revision_gate.dispatch(
-                                    StaleRevisionGateAction::RefreshFinished {
-                                        started_epoch: refresh_epoch,
-                                        succeeded: false,
-                                    },
-                                );
-                                error.set(Some(e));
+                                if notes_load_is_current(
+                                    started_generation,
+                                    *load_generation.borrow(),
+                                ) {
+                                    stale_revision_gate.dispatch(
+                                        StaleRevisionGateAction::RefreshFinished {
+                                            started_epoch: refresh_epoch,
+                                            succeeded: false,
+                                        },
+                                    );
+                                    error.set(Some(e));
+                                }
                             }
                         }
                     }
-                    loading.set(false);
+                    if notes_load_is_current(started_generation, *load_generation.borrow()) {
+                        loading.set(false);
+                    }
                 });
             }
             || ()
@@ -1542,6 +1578,15 @@ mod tests {
         let selected = selected.reduce(SelectionAction::RetainVisible(reconciled));
 
         assert_eq!(**selected, HashSet::from(["first".to_string()]));
+    }
+
+    #[test]
+    fn notes_load_generation_rejects_an_older_completion_after_a_newer_start() {
+        let older_generation = 4;
+        let latest_generation = 5;
+
+        assert!(!notes_load_is_current(older_generation, latest_generation));
+        assert!(notes_load_is_current(latest_generation, latest_generation));
     }
 
     #[test]
