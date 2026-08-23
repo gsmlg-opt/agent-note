@@ -11,13 +11,14 @@ use axum::{
 };
 use note_core::{Note, NoteAttachment, NoteListItem};
 use note_pipelines::{
-    bulk_update_note_labels, category_label_summaries, count_notes, delete_note,
-    embedding_dashboard_status, get_note_attachment, get_note_markdown, get_note_metadata,
-    label_note_counts, list_deleted_note_summaries, list_label_keys, list_note_summaries,
-    normalized_list_limit, normalized_list_offset, permanently_delete_note, restore_notes,
-    save_note, search_notes_filtered, update_note, BulkUpdateNoteLabelsInput,
-    BulkUpdateNoteLabelsValidationError, Context, ListNotesParams, NoteMutationNotifier,
-    RestoreNoteInput, SaveNoteInput,
+    batch_update_note_labels, bulk_update_note_labels, category_label_summaries, count_notes,
+    delete_note, embedding_dashboard_status, get_note_attachment, get_note_markdown,
+    get_note_metadata, label_note_counts, list_deleted_note_summaries, list_label_keys,
+    list_note_summaries, normalized_list_limit, normalized_list_offset, permanently_delete_note,
+    restore_notes, save_note, search_notes_filtered, update_note, BatchLabelAction,
+    BatchNoteTarget, BatchNoteTargetsValidationError, BatchUpdateNoteLabelsInput,
+    BulkUpdateNoteLabelsInput, BulkUpdateNoteLabelsValidationError, Context, ListNotesParams,
+    NoteMutationNotifier, RestoreNoteInput, SaveNoteInput,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -123,7 +124,10 @@ impl NoteMutationApiError {
         if let Some(error) = error.downcast_ref::<note_pipelines::NoteMutationError>() {
             return Self::from(error.clone());
         }
-        if error.downcast_ref::<note_core::ValidationError>().is_some()
+        if error
+            .downcast_ref::<BatchNoteTargetsValidationError>()
+            .is_some()
+            || error.downcast_ref::<note_core::ValidationError>().is_some()
             || error
                 .downcast_ref::<note_core::LabelKeyValidationError>()
                 .is_some()
@@ -183,7 +187,10 @@ where
 }
 
 fn note_json_rejection(rejection: JsonRejection) -> NoteMutationApiError {
-    if rejection.body_text().contains("expected_revision") {
+    if rejection
+        .body_text()
+        .contains("missing field `expected_revision`")
+    {
         NoteMutationApiError::expected_revision_required()
     } else {
         NoteMutationApiError::invalid_input("Invalid JSON request body")
@@ -354,6 +361,115 @@ struct BulkUpdateNoteLabelsResponse {
     matched: usize,
     updated: usize,
     unchanged: usize,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct BatchNoteTargetRequest {
+    id: String,
+    expected_revision: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum BatchLabelActionRequest {
+    Add {
+        key: String,
+        value: String,
+    },
+    Update {
+        from_key: String,
+        key: String,
+        value: String,
+    },
+    Remove {
+        key: String,
+    },
+}
+
+impl utoipa::PartialSchema for BatchLabelActionRequest {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{
+            AdditionalProperties, Discriminator, ObjectBuilder, OneOfBuilder, Type,
+        };
+
+        fn variant(
+            kind: &str,
+            fields: &[&str],
+        ) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+            let mut schema = ObjectBuilder::new()
+                .schema_type(Type::Object)
+                .additional_properties(Some(AdditionalProperties::FreeForm(false)))
+                .property(
+                    "type",
+                    ObjectBuilder::new()
+                        .schema_type(Type::String)
+                        .enum_values(Some([kind])),
+                )
+                .required("type");
+            for field in fields {
+                schema = schema
+                    .property(*field, ObjectBuilder::new().schema_type(Type::String))
+                    .required(*field);
+            }
+            schema.into()
+        }
+
+        OneOfBuilder::new()
+            .item(variant("add", &["key", "value"]))
+            .item(variant("update", &["from_key", "key", "value"]))
+            .item(variant("remove", &["key"]))
+            .discriminator(Some(Discriminator::new("type")))
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for BatchLabelActionRequest {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("BatchLabelActionRequest")
+    }
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct BatchUpdateNoteLabelsRequest {
+    #[schema(min_items = 1, max_items = 1000)]
+    notes: Vec<BatchNoteTargetRequest>,
+    action: BatchLabelActionRequest,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct BatchUpdateNoteLabelsResponse {
+    requested: usize,
+    updated: usize,
+    unchanged: usize,
+}
+
+impl From<BatchNoteTargetRequest> for BatchNoteTarget {
+    fn from(request: BatchNoteTargetRequest) -> Self {
+        Self {
+            id: request.id,
+            expected_revision: request.expected_revision,
+        }
+    }
+}
+
+impl From<BatchLabelActionRequest> for BatchLabelAction {
+    fn from(request: BatchLabelActionRequest) -> Self {
+        match request {
+            BatchLabelActionRequest::Add { key, value } => Self::Add { key, value },
+            BatchLabelActionRequest::Update {
+                from_key,
+                key,
+                value,
+            } => Self::Update {
+                from_key,
+                key,
+                value,
+            },
+            BatchLabelActionRequest::Remove { key } => Self::Remove { key },
+        }
+    }
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -979,6 +1095,40 @@ async fn bulk_update_note_labels_handler(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/notes/batch-labels",
+    tag = "notes",
+    request_body = BatchUpdateNoteLabelsRequest,
+    responses(
+        (status = 200, description = "Selected-note label update result", body = BatchUpdateNoteLabelsResponse),
+        (status = 400, description = "Invalid selected-note label update", body = NoteMutationApiError),
+        (status = 404, description = "Note not found", body = NoteMutationApiError),
+        (status = 409, description = "Stale note revision", body = NoteMutationApiError),
+        (status = 500, description = "Server error", body = NoteMutationApiError)
+    )
+)]
+async fn batch_update_note_labels_handler(
+    State(ctx): State<Arc<Context>>,
+    NoteJson(req): NoteJson<BatchUpdateNoteLabelsRequest>,
+) -> Result<Json<BatchUpdateNoteLabelsResponse>, NoteMutationApiError> {
+    let result = batch_update_note_labels(
+        &ctx,
+        BatchUpdateNoteLabelsInput {
+            notes: req.notes.into_iter().map(BatchNoteTarget::from).collect(),
+            action: req.action.into(),
+        },
+    )
+    .await
+    .map_err(NoteMutationApiError::from_anyhow)?;
+
+    Ok(Json(BatchUpdateNoteLabelsResponse {
+        requested: result.requested,
+        updated: result.updated,
+        unchanged: result.unchanged,
+    }))
+}
+
 fn map_bulk_update_note_labels_error(error: anyhow::Error) -> (axum::http::StatusCode, String) {
     let caller_message = error
         .downcast_ref::<BulkUpdateNoteLabelsValidationError>()
@@ -1574,6 +1724,7 @@ where
     OpenApiRouter::with_openapi(AttachmentOpenApi::openapi())
         .routes(routes!(save_note_handler, list_notes_handler))
         .routes(routes!(bulk_update_note_labels_handler))
+        .routes(routes!(batch_update_note_labels_handler))
         .routes(routes!(count_notes_handler))
         .routes(routes!(list_deleted_notes_handler))
         .routes(routes!(restore_notes_handler))
@@ -1951,6 +2102,7 @@ mod tests {
         for (path, methods) in [
             ("/api/notes", &["get", "post"][..]),
             ("/api/notes/bulk-labels", &["post"][..]),
+            ("/api/notes/batch-labels", &["post"][..]),
             ("/api/notes/count", &["get"][..]),
             ("/api/notes/{id}", &["get", "put", "delete"][..]),
             ("/api/notes/{id}/raw", &["get"][..]),
@@ -2069,6 +2221,79 @@ mod tests {
             assert_eq!(
                 operation["responses"][status]["content"]["text/plain"]["schema"]["type"],
                 "string"
+            );
+        }
+    }
+
+    #[test]
+    fn openapi_documents_batch_label_contract() {
+        let document = note_openapi_document();
+        let schemas = &document["components"]["schemas"];
+        let request = &schemas["BatchUpdateNoteLabelsRequest"];
+        let target = &schemas["BatchNoteTargetRequest"];
+        let action = &schemas["BatchLabelActionRequest"];
+        let response = &schemas["BatchUpdateNoteLabelsResponse"];
+
+        assert_eq!(request["additionalProperties"], false);
+        assert_eq!(request["required"], serde_json::json!(["notes", "action"]));
+        assert_eq!(request["properties"]["notes"]["minItems"], 1);
+        assert_eq!(request["properties"]["notes"]["maxItems"], 1000);
+        assert_eq!(
+            request["properties"]["notes"]["items"]["$ref"],
+            "#/components/schemas/BatchNoteTargetRequest"
+        );
+        assert_eq!(
+            request["properties"]["action"]["$ref"],
+            "#/components/schemas/BatchLabelActionRequest"
+        );
+        assert_eq!(target["additionalProperties"], false);
+        assert_eq!(
+            target["required"],
+            serde_json::json!(["id", "expected_revision"])
+        );
+
+        let alternatives = action["oneOf"]
+            .as_array()
+            .expect("tagged action alternatives");
+        assert_eq!(action["discriminator"]["propertyName"], "type");
+        assert_eq!(alternatives.len(), 3);
+        for (kind, fields) in [
+            ("add", vec!["key", "value"]),
+            ("update", vec!["from_key", "key", "value"]),
+            ("remove", vec!["key"]),
+        ] {
+            let variant = alternatives
+                .iter()
+                .find(|variant| variant["properties"]["type"]["enum"] == serde_json::json!([kind]))
+                .unwrap_or_else(|| panic!("missing {kind} action schema"));
+            assert_eq!(variant["additionalProperties"], false);
+            for field in fields {
+                assert!(variant["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(field)));
+                assert_eq!(variant["properties"][field]["type"], "string");
+            }
+        }
+        assert_eq!(
+            response["required"],
+            serde_json::json!(["requested", "updated", "unchanged"])
+        );
+
+        let operation = &document["paths"]["/api/notes/batch-labels"]["post"];
+        assert_eq!(operation["tags"], serde_json::json!(["notes"]));
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BatchUpdateNoteLabelsRequest"
+        );
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BatchUpdateNoteLabelsResponse"
+        );
+        for status in ["400", "404", "409", "500"] {
+            assert_eq!(
+                operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/NoteMutationApiError"
             );
         }
     }
@@ -2483,6 +2708,378 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn batch_label_adds_selected_notes_only() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, _dir) = test_app().await;
+        let first_id = save_note_id(
+            app.clone(),
+            r#"{"title":"First","content":"Body","labels":[["project","existing"]]}"#,
+        )
+        .await;
+        let second_id = save_note_id(
+            app.clone(),
+            r#"{"title":"Second","content":"Body","labels":[]}"#,
+        )
+        .await;
+        let third_id = save_note_id(
+            app.clone(),
+            r#"{"title":"Third","content":"Body","labels":[]}"#,
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/batch-labels",
+                &format!(
+                    r#"{{"notes":[{{"id":"{first_id}","expected_revision":1}},{{"id":"{second_id}","expected_revision":1}}],"action":{{"type":"add","key":"project","value":"selected"}}}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::json!({"requested": 2, "updated": 1, "unchanged": 1})
+        );
+        assert!(get_note_json(app.clone(), &first_id).await["labels"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(["project", "existing"])));
+        assert!(get_note_json(app.clone(), &second_id).await["labels"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(["project", "selected"])));
+        assert!(get_note_json(app, &third_id).await["labels"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_label_update_renames_collisions_and_remove_reports_exact_counts() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, _dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Rename","content":"Body","labels":[["project","old"],["team","keep"]]}"#,
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/batch-labels",
+                &format!(
+                    r#"{{"notes":[{{"id":"{id}","expected_revision":1}}],"action":{{"type":"update","from_key":"project","key":"team","value":"new"}}}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &response.into_body().collect().await.unwrap().to_bytes()
+            )
+            .unwrap(),
+            serde_json::json!({"requested": 1, "updated": 1, "unchanged": 0})
+        );
+        let note = get_note_json(app.clone(), &id).await;
+        assert_eq!(note["labels"], serde_json::json!([["team", "new"]]));
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/api/notes/batch-labels",
+                &format!(
+                    r#"{{"notes":[{{"id":"{id}","expected_revision":1}}],"action":{{"type":"remove","key":"team"}}}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &response.into_body().collect().await.unwrap().to_bytes()
+            )
+            .unwrap(),
+            serde_json::json!({"requested": 1, "updated": 1, "unchanged": 0})
+        );
+        assert!(get_note_json(app, &id).await["labels"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_label_rejects_invalid_targets_without_mutating_any_note() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, _dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Target","content":"Body","labels":[["project","original"]]}"#,
+        )
+        .await;
+        let too_many_notes = (0..1001)
+            .map(|index| serde_json::json!({"id": format!("missing-{index}"), "expected_revision": 1}))
+            .collect::<Vec<_>>();
+        let requests = vec![
+            serde_json::json!({"notes": [], "action": {"type": "remove", "key": "project"}}),
+            serde_json::json!({"notes": [{"id": id, "expected_revision": 1}, {"id": id, "expected_revision": 1}], "action": {"type": "remove", "key": "project"}}),
+            serde_json::json!({"notes": [{"id": "  ", "expected_revision": 1}], "action": {"type": "remove", "key": "project"}}),
+            serde_json::json!({"notes": too_many_notes, "action": {"type": "remove", "key": "project"}}),
+        ];
+
+        for request in requests {
+            let response = app
+                .clone()
+                .oneshot(post("/api/notes/batch-labels", &request.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["code"], "invalid_input");
+            assert_eq!(body["details"], serde_json::json!({}));
+        }
+
+        assert_eq!(
+            get_note_json(app, &id).await["labels"],
+            serde_json::json!([["project", "original"]])
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_label_preflight_errors_leave_valid_siblings_unchanged() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, _dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Sibling","content":"Body","labels":[]}"#,
+        )
+        .await;
+        let sibling_id = save_note_id(
+            app.clone(),
+            r#"{"title":"Other sibling","content":"Body","labels":[]}"#,
+        )
+        .await;
+
+        for (notes, expected_status, expected_code) in [
+            (
+                serde_json::json!([
+                    {"id": id, "expected_revision": 1},
+                    {"id": "missing", "expected_revision": 1}
+                ]),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                serde_json::json!([
+                    {"id": sibling_id, "expected_revision": 1},
+                    {"id": id, "expected_revision": 2}
+                ]),
+                StatusCode::CONFLICT,
+                "stale_revision",
+            ),
+        ] {
+            let request = serde_json::json!({
+                "notes": notes,
+                "action": {"type": "add", "key": "project", "value": "selected"}
+            });
+            let response = app
+                .clone()
+                .oneshot(post("/api/notes/batch-labels", &request.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["code"], expected_code);
+            if expected_code == "not_found" {
+                assert_eq!(body["details"]["note_id"], "missing");
+            } else {
+                assert_eq!(body["details"]["note_id"], id);
+                assert_eq!(body["details"]["expected_revision"], 2);
+                assert_eq!(body["details"]["current_revision"], 1);
+            }
+            assert!(get_note_json(app.clone(), &id).await["labels"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert!(get_note_json(app.clone(), &sibling_id).await["labels"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_label_rejects_invalid_typed_destinations_without_partial_changes() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, ctx, _dir) = test_app().await;
+        note_pipelines::define_label_key_with_type(
+            &ctx,
+            "priority",
+            "Priority score",
+            note_core::LabelValueType::Number,
+        )
+        .await
+        .unwrap();
+        let first_id = save_note_id(
+            app.clone(),
+            r#"{"title":"First","content":"Body","labels":[]}"#,
+        )
+        .await;
+        let second_id = save_note_id(
+            app.clone(),
+            r#"{"title":"Second","content":"Body","labels":[]}"#,
+        )
+        .await;
+        let request = serde_json::json!({
+            "notes": [
+                {"id": first_id, "expected_revision": 1},
+                {"id": second_id, "expected_revision": 1}
+            ],
+            "action": {"type": "add", "key": "priority", "value": "urgent"}
+        });
+        let response = app
+            .clone()
+            .oneshot(post("/api/notes/batch-labels", &request.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["code"], "invalid_input");
+        for id in [first_id, second_id] {
+            assert!(get_note_json(app.clone(), &id).await["labels"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_label_rejects_invalid_json_shapes_with_safe_structured_errors() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, _dir) = test_app().await;
+        for (body, code) in [
+            (
+                r#"{"notes":[{"id":"note","expected_revision":1}],"action":{"type":"add","key":"project","value":"x"},"unknown":true}"#,
+                "invalid_input",
+            ),
+            (
+                r#"{"notes":[{"id":"note","expected_revision":1,"unknown":true}],"action":{"type":"remove","key":"project"}}"#,
+                "invalid_input",
+            ),
+            (
+                r#"{"notes":[{"id":"note","expected_revision":1}],"action":{"type":"remove","key":"project","value":"x"}}"#,
+                "invalid_input",
+            ),
+            (
+                r#"{"notes":[{"id":"note"}],"action":{"type":"remove","key":"project"}}"#,
+                "expected_revision_required",
+            ),
+            (r#"{"notes": "#, "invalid_input"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post("/api/notes/batch-labels", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let error: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(error["code"], code, "{body}");
+            assert_eq!(error["details"], serde_json::json!({}));
+            assert!(!error.to_string().contains("unknown field"));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_label_sanitizes_storage_failures() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
+        let app = test_app_from_backend(
+            Arc::new(FailingBeginStorageBackend { inner: backend }),
+            dir.path().join("attachments"),
+        );
+        let response = app
+            .oneshot(post(
+                "/api/notes/batch-labels",
+                r#"{"notes":[{"id":"note","expected_revision":1}],"action":{"type":"remove","key":"project"}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["code"], "storage_failure");
+        assert_eq!(body["message"], "note storage operation failed");
+        assert_eq!(body["details"], serde_json::json!({}));
+        assert!(!body
+            .to_string()
+            .contains("private repository failure detail"));
+    }
+
+    #[tokio::test]
+    async fn batch_label_invalidates_dashboard_only_when_a_note_changes() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let (app, _ctx, _dir) = test_app().await;
+        let id = save_note_id(
+            app.clone(),
+            r#"{"title":"Cache","content":"Body","labels":[["project","existing"]]}"#,
+        )
+        .await;
+        let invalidations_before = BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst);
+
+        for body in [
+            format!(
+                r#"{{"notes":[{{"id":"{id}","expected_revision":1}}],"action":{{"type":"add","key":"project","value":"other"}}}}"#
+            ),
+            r#"{"notes":[],"action":{"type":"remove","key":"project"}}"#.into(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post("/api/notes/batch-labels", &body))
+                .await
+                .unwrap();
+            assert!(matches!(
+                response.status(),
+                StatusCode::OK | StatusCode::BAD_REQUEST
+            ));
+            assert_eq!(
+                BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
+                invalidations_before
+            );
+        }
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/batch-labels",
+                &format!(
+                    r#"{{"notes":[{{"id":"{id}","expected_revision":1}}],"action":{{"type":"update","from_key":"project","key":"project","value":"changed"}}}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
+            invalidations_before + 1
+        );
     }
 
     #[tokio::test]
