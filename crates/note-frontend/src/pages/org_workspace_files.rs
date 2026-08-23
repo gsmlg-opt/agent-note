@@ -285,6 +285,13 @@ fn raw_query(state: &DocumentListState) -> Raw<String> {
     Raw(state.canonical_query())
 }
 
+fn page_size_options(current: u16) -> Vec<(u16, bool)> {
+    DOCUMENT_ALLOWED_LIMITS
+        .iter()
+        .map(|limit| (*limit, *limit == current))
+        .collect()
+}
+
 fn files_href(workspace_id: &str, state: &DocumentListState) -> String {
     format!(
         "/org/{}/files?{}",
@@ -985,6 +992,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         status_filter_transition(&query_state, &pagination_history, DocumentStatus::Active);
     let (archived_filter, _) =
         status_filter_transition(&query_state, &pagination_history, DocumentStatus::Archived);
+    let page_size_options = page_size_options(query_state.limit);
 
     html! {
         <section class="stack org-files-page" aria-labelledby="org-files-title" data-testid="org-workspace-files-page">
@@ -1018,7 +1026,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
                 <label class="org-page-size">
                     <span>{ "Rows" }</span>
                     <select id="org-files-page-size" name="limit" class="input" onchange={on_limit} aria-label="Files per page" value={query_state.limit.to_string()}>
-                        { for DOCUMENT_ALLOWED_LIMITS.iter().map(|limit| html! { <option value={limit.to_string()}>{ limit }</option> }) }
+                        { for page_size_options.iter().map(|(limit, selected)| html! { <option value={limit.to_string()} selected={*selected}>{ limit }</option> }) }
                     </select>
                 </label>
             </div>
@@ -1770,6 +1778,28 @@ mod tests {
         ));
         assert!(source.contains("<input id=\"org-files-path\""));
         assert!(source.contains("<input id=\"org-files-archive-confirmation\""));
+    }
+
+    #[test]
+    fn every_allowed_page_size_marks_only_the_current_limit_selected() {
+        for current in DOCUMENT_ALLOWED_LIMITS {
+            let options = page_size_options(current);
+            assert_eq!(options.len(), DOCUMENT_ALLOWED_LIMITS.len());
+            assert_eq!(
+                options
+                    .iter()
+                    .filter_map(|(limit, selected)| selected.then_some(*limit))
+                    .collect::<Vec<_>>(),
+                vec![current]
+            );
+        }
+
+        let source = include_str!("org_workspace_files.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(source.contains("let page_size_options = page_size_options(query_state.limit);"));
+        assert!(source.contains("selected={*selected}"));
     }
 
     #[test]
