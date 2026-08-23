@@ -163,9 +163,12 @@ assert_network_boundary() {
                 | not)
         ] | length == 0
     ' <<<"$network" >/dev/null || fail "browser issued an Org request outside approved workspace/document lifecycle traffic"
+    # Read-only queue/agenda/item GETs remain allowed. The first allowlist above rejects every
+    # unapproved non-GET route; this second check makes the source/workflow mutation boundary
+    # explicit without rejecting the legitimate reads exercised by this gate.
     jq -e '[(.networkRequests // [])[]
+        | select(.method != "GET")
         | select(.method == "PUT" or .method == "DELETE"
-            or (.url | test("/api/org/(items|queue|agenda)(/|\\?|$)"))
             or (.url | test("/(claim|review|progress|result|transition|dependencies|note-links|import)(/|\\?|$)")))]
         | length == 0' <<<"$network" >/dev/null ||
         fail "browser issued source or workflow mutation traffic"
