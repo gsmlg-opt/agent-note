@@ -413,6 +413,16 @@ fn batch_label_workflow_open_callback(
     })
 }
 
+fn batch_delete_workflow_open_callback(
+    clear_label_success: Callback<()>,
+    open_delete: Callback<()>,
+) -> Callback<()> {
+    Callback::from(move |_: ()| {
+        clear_label_success.emit(());
+        open_delete.emit(());
+    })
+}
+
 fn batch_delete_open_callback(
     selected_count: usize,
     batch_mutating: bool,
@@ -1364,11 +1374,17 @@ pub fn notes_page() -> Html {
     };
 
     let on_open_batch_delete = {
+        let batch_label_ui = batch_label_ui.clone();
         let batch_delete_ui = batch_delete_ui.clone();
-        Callback::from(move |_: ()| {
-            batch_delete_ui.dispatch(BatchDeleteUiAction::ClearSuccess);
-            batch_delete_ui.dispatch(BatchDeleteUiAction::Open);
-        })
+        batch_delete_workflow_open_callback(
+            Callback::from(move |_: ()| {
+                batch_label_ui.dispatch(BatchLabelUiAction::ClearSuccess);
+            }),
+            Callback::from(move |_: ()| {
+                batch_delete_ui.dispatch(BatchDeleteUiAction::ClearSuccess);
+                batch_delete_ui.dispatch(BatchDeleteUiAction::Open);
+            }),
+        )
     };
 
     let on_query_input = {
@@ -2772,6 +2788,41 @@ mod tests {
             .emit(BatchLabelMode::Add);
 
         assert_eq!(*events.borrow(), ["clear delete success", "Add label"]);
+    }
+
+    #[test]
+    fn batch_delete_workflow_start_clears_label_success_and_prior_delete_success() {
+        let label_ui = Rc::new(RefCell::new(
+            Rc::new(BatchLabelUiState::default())
+                .reduce(BatchLabelUiAction::Success("Label success".into())),
+        ));
+        let delete_ui = Rc::new(RefCell::new(
+            Rc::new(BatchDeleteUiState::default())
+                .reduce(BatchDeleteUiAction::Success("Delete success".into())),
+        ));
+
+        let clear_label_success = {
+            let label_ui = label_ui.clone();
+            Callback::from(move |_: ()| {
+                let current = label_ui.borrow().clone();
+                *label_ui.borrow_mut() = current.reduce(BatchLabelUiAction::ClearSuccess);
+            })
+        };
+        let open_delete = {
+            let delete_ui = delete_ui.clone();
+            Callback::from(move |_: ()| {
+                let current = delete_ui.borrow().clone();
+                *delete_ui.borrow_mut() = current.reduce(BatchDeleteUiAction::ClearSuccess);
+                let current = delete_ui.borrow().clone();
+                *delete_ui.borrow_mut() = current.reduce(BatchDeleteUiAction::Open);
+            })
+        };
+
+        batch_delete_workflow_open_callback(clear_label_success, open_delete).emit(());
+
+        assert_eq!(label_ui.borrow().success, None);
+        assert!(delete_ui.borrow().open);
+        assert_eq!(delete_ui.borrow().success, None);
     }
 
     #[test]
