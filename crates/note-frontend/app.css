@@ -1514,6 +1514,10 @@ a.dashboard-metric-detail:hover {
     resize: vertical;
 }
 
+.note-content-input .markdown-input-field {
+    field-sizing: content;
+}
+
 .markdown-input-field::placeholder {
     color: var(--color-on-surface-variant, #46464f);
 }
