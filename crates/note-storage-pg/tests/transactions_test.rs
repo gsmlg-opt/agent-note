@@ -377,6 +377,76 @@ async fn matching_note_ids_for_update_locks_selected_notes_until_commit() {
 }
 
 #[tokio::test]
+async fn active_note_revisions_for_update_locks_selected_notes_until_commit() {
+    let Some((database, storage)) =
+        storage("active_note_revisions_for_update_locks_selected_notes_until_commit").await
+    else {
+        return;
+    };
+    let session = StorageBackend::session(storage.as_ref()).await.unwrap();
+    session
+        .insert_note(NewNote {
+            id: "exact-row-lock",
+            title: "Exact row lock",
+            content: "content",
+            attachments: &[],
+            created_at: 1,
+            updated_at: 1,
+            note_revision: 1,
+            deleted_at: None,
+        })
+        .await
+        .unwrap();
+    drop(session);
+
+    let first = StorageBackend::begin(storage.as_ref(), TransactionMode::Immediate)
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .active_note_revisions_for_update(&["exact-row-lock".to_owned()])
+            .await
+            .unwrap(),
+        vec![("exact-row-lock".to_owned(), 1)]
+    );
+
+    let second_storage = Arc::clone(&storage);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let mut handle = tokio::spawn(async move {
+        let second = StorageBackend::begin(second_storage.as_ref(), TransactionMode::Deferred)
+            .await
+            .unwrap();
+        ready_tx
+            .send(())
+            .expect("exact-row-lock update readiness receiver was dropped");
+        let affected = second
+            .advance_note_updated_at("exact-row-lock", 10)
+            .await
+            .unwrap();
+        second.commit().await.unwrap();
+        affected
+    });
+    ready_rx
+        .await
+        .expect("exact-row-lock update task ended before reaching the update");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut handle)
+            .await
+            .is_err(),
+        "concurrent note timestamp update was not blocked by the exact row lock"
+    );
+
+    first.commit().await.unwrap();
+    let affected = tokio::time::timeout(Duration::from_secs(2), &mut handle)
+        .await
+        .expect("concurrent note timestamp update did not finish after commit")
+        .expect("concurrent note timestamp task failed");
+    assert_eq!(affected, 1);
+
+    database.cleanup(Some(&storage)).await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_multi_repository_write_rolls_back_all_postgresql_tables() {
     let Some((database, storage)) =
         storage("failed_multi_repository_write_rolls_back_all_postgresql_tables").await

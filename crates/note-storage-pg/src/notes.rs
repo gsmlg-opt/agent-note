@@ -711,6 +711,27 @@ impl NotesRepository for PgSession {
         self.matching_note_ids_impl(selectors, true).await
     }
 
+    async fn active_note_revisions_for_update(
+        &self,
+        ids: &[String],
+    ) -> StorageResult<Vec<(String, i64)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT id, note_revision
+             FROM notes
+             WHERE id = ANY($1) AND deleted_at IS NULL
+             ORDER BY id
+             FOR UPDATE",
+        )
+        .bind(ids)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("lock active note revisions", error))
+    }
+
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>> {
         let mut connection = self.connection().await?;
         let rows = sqlx::query_as::<_, (String, String, i64)>(

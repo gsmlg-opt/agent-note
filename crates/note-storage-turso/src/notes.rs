@@ -1116,6 +1116,55 @@ impl NotesRepository for TursoSession {
         self.matching_note_ids_unlocked(selectors).await
     }
 
+    async fn active_note_revisions_for_update(
+        &self,
+        ids: &[String],
+    ) -> StorageResult<Vec<(String, i64)>> {
+        if self.transaction_mode != Some(note_storage::TransactionMode::Immediate) {
+            return Err(StorageError::new(
+                StorageErrorKind::Transaction,
+                "locking active note revisions requires an immediate transaction",
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json = serde_json::to_string(ids).map_err(|error| {
+            StorageError::with_source(
+                StorageErrorKind::Operation,
+                "serialize active note revision ids",
+                error,
+            )
+        })?;
+        let _operation_guard = self.operation_guard().await;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT id, note_revision
+                 FROM notes
+                 WHERE deleted_at IS NULL
+                   AND id IN (SELECT value FROM json_each(?1))
+                 ORDER BY id",
+                turso::params![ids_json],
+            )
+            .await
+            .map_err(|error| map_turso_error("query active note revisions", error))?;
+        let mut revisions = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read active note revisions", error))?
+        {
+            revisions.push((
+                row.get::<String>(0)
+                    .map_err(|error| map_turso_error("decode active note revision id", error))?,
+                row.get::<i64>(1)
+                    .map_err(|error| map_turso_error("decode active note revision", error))?,
+            ));
+        }
+        Ok(revisions)
+    }
+
     async fn list_active_note_sources(&self) -> StorageResult<Vec<ActiveNoteSource>> {
         let _operation_guard = self.operation_guard().await;
         let mut rows = self
