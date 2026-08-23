@@ -11,11 +11,12 @@ use crate::{
         model::{
             OperationalCounts, OperationalPage, OperationalView, Page, Workspace, WorkspaceSummary,
         },
+        mutation::MutationSubmission,
         url::{
             PriorityFilter, WorkspaceFilters, WorkspaceListState, WorkspaceQueryState,
             ALLOWED_LIMITS,
         },
-        workspace_management::{ArchiveWorkspaceBody, WorkspaceSubmission},
+        workspace_management::ArchiveWorkspaceBody,
     },
     routes::Route,
 };
@@ -650,7 +651,7 @@ pub fn org_workspace_page(props: &OrgWorkspacePageProps) -> Html {
                 return;
             }
             let body = ArchiveWorkspaceBody::new(
-                WorkspaceSubmission::new().operation_id,
+                MutationSubmission::new().operation_id,
                 workspace.revision,
             );
             pending_archive.set(Some(body.clone()));

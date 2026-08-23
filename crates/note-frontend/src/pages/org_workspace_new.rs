@@ -5,10 +5,8 @@ use crate::{
     components::{org_workspace_form::WorkspaceFormMode, OrgWorkspaceForm},
     org::{
         api::{self as org_api, OrgApiError},
-        workspace_management::{
-            new_workspace_id, CreateWorkspaceBody, WorkspaceDraft, WorkspaceSubmission,
-            WorkspaceValidationError,
-        },
+        mutation::{new_id, MutationSubmission},
+        workspace_management::{CreateWorkspaceBody, WorkspaceDraft, WorkspaceValidationError},
     },
     routes::Route,
 };
@@ -73,8 +71,8 @@ pub fn org_workspace_new_page() -> Html {
             }
             validation_errors.set(Vec::new());
             let body = CreateWorkspaceBody::from_draft(
-                new_workspace_id(),
-                WorkspaceSubmission::new().operation_id,
+                new_id(),
+                MutationSubmission::new().operation_id,
                 &draft,
             );
             pending.set(Some(body.clone()));

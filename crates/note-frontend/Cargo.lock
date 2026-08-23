@@ -84,6 +84,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -629,6 +630,7 @@ dependencies = [
  "gloo-timers",
  "js-sys",
  "note-core",
+ "note-org",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "serde",
@@ -641,6 +643,17 @@ dependencies = [
  "yew",
  "yew-duskmoon",
  "yew-router",
+]
+
+[[package]]
+name = "note-org"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "serde",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -1164,6 +1177,7 @@ checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

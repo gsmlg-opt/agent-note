@@ -32,3 +32,4 @@ chrono-tz = "0.10"
 yew-duskmoon = "0.8.1"
 yew-router = "0.20.0"
 note-core = { path = "../note-core" }
+note-org = { path = "../note-org" }
