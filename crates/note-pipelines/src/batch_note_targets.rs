@@ -11,14 +11,14 @@ pub struct BatchNoteTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BatchNoteTargetValidationError {
+pub enum BatchNoteTargetsValidationError {
     Empty,
     BlankId,
     DuplicateId(String),
     TooMany { maximum: usize },
 }
 
-impl std::fmt::Display for BatchNoteTargetValidationError {
+impl std::fmt::Display for BatchNoteTargetsValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Empty => formatter.write_str("at least one note target is required"),
@@ -31,16 +31,16 @@ impl std::fmt::Display for BatchNoteTargetValidationError {
     }
 }
 
-impl std::error::Error for BatchNoteTargetValidationError {}
+impl std::error::Error for BatchNoteTargetsValidationError {}
 
 pub(crate) fn validate_batch_note_targets(
     mut targets: Vec<BatchNoteTarget>,
 ) -> anyhow::Result<Vec<BatchNoteTarget>> {
     if targets.is_empty() {
-        return Err(BatchNoteTargetValidationError::Empty.into());
+        return Err(BatchNoteTargetsValidationError::Empty.into());
     }
     if targets.len() > MAX_BATCH_NOTE_TARGETS {
-        return Err(BatchNoteTargetValidationError::TooMany {
+        return Err(BatchNoteTargetsValidationError::TooMany {
             maximum: MAX_BATCH_NOTE_TARGETS,
         }
         .into());
@@ -49,12 +49,12 @@ pub(crate) fn validate_batch_note_targets(
     targets.sort_by(|left, right| left.id.cmp(&right.id));
     for target in &targets {
         if target.id.trim().is_empty() {
-            return Err(BatchNoteTargetValidationError::BlankId.into());
+            return Err(BatchNoteTargetsValidationError::BlankId.into());
         }
     }
     for pair in targets.windows(2) {
         if pair[0].id == pair[1].id {
-            return Err(BatchNoteTargetValidationError::DuplicateId(pair[0].id.clone()).into());
+            return Err(BatchNoteTargetsValidationError::DuplicateId(pair[0].id.clone()).into());
         }
     }
     Ok(targets)

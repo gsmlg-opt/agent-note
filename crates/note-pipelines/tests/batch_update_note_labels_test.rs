@@ -4,7 +4,7 @@ use note_attachments::FilesystemAttachmentStore;
 use note_core::{LabelKeyValidationError, LabelValueType};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
-    batch_update_note_labels, BatchLabelAction, BatchNoteTarget, BatchNoteTargetValidationError,
+    batch_update_note_labels, BatchLabelAction, BatchNoteTarget, BatchNoteTargetsValidationError,
     BatchUpdateNoteLabelsInput, BatchUpdateNoteLabelsResult, Context, NoteMutationError,
     NoteMutationNotifier,
 };
@@ -86,20 +86,20 @@ async fn rejects_invalid_target_lists_before_starting_a_transaction() {
     let (ctx, _traced) = traced_context(backend, events.clone(), &dir);
 
     for (notes, expected) in [
-        (vec![], BatchNoteTargetValidationError::Empty),
+        (vec![], BatchNoteTargetsValidationError::Empty),
         (
             vec![target("same", 1), target("same", 2)],
-            BatchNoteTargetValidationError::DuplicateId("same".into()),
+            BatchNoteTargetsValidationError::DuplicateId("same".into()),
         ),
         (
             vec![target("   ", 1)],
-            BatchNoteTargetValidationError::BlankId,
+            BatchNoteTargetsValidationError::BlankId,
         ),
         (
             (0..1_001)
                 .map(|index| target(&format!("note-{index}"), 1))
                 .collect(),
-            BatchNoteTargetValidationError::TooMany { maximum: 1_000 },
+            BatchNoteTargetsValidationError::TooMany { maximum: 1_000 },
         ),
     ] {
         let error = batch_update_note_labels(
