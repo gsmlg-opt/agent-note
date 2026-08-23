@@ -19,7 +19,7 @@ use note_storage::{
     OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceUpdate, StorageBackend,
 };
 use note_storage_turso::TursoStorage;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr as _;
 use std::sync::Arc;
 use support::{
@@ -107,6 +107,7 @@ async fn offline_workspace_snapshot_accepts_note_links_without_touching_note_sto
                 "READY",
                 &format!("[[agent-note:design:{missing_note}][Missing note]]\n"),
             ),
+            archived_at: None,
         }],
         document_revisions: BTreeMap::from([(document_id, 1)]),
         lease_proofs: BTreeMap::new(),
@@ -1506,11 +1507,13 @@ async fn multi_document_import_requires_complete_revisions_and_moves_ids_atomica
                     document_id: source_document,
                     path: "source.org".into(),
                     source: source(moved_item, "READY", "Moved body.\r\n"),
+                    archived_at: None,
                 },
                 DocumentImport {
                     document_id: target_document,
                     path: "target.org".into(),
                     source: "Target prelude.\r\n".into(),
+                    archived_at: None,
                 },
             ],
             expected_revisions: BTreeMap::new(),
@@ -1526,11 +1529,13 @@ async fn multi_document_import_requires_complete_revisions_and_moves_ids_atomica
                 document_id: source_document,
                 path: "source.org".into(),
                 source: "Source now empty.\r\n".into(),
+                archived_at: None,
             },
             DocumentImport {
                 document_id: target_document,
                 path: "target.org".into(),
                 source: source(moved_item, "READY", "Moved body.\r\n"),
+                archived_at: None,
             },
         ],
         expected_revisions: BTreeMap::from([(source_document, 1)]),
@@ -3058,11 +3063,13 @@ async fn workspace_snapshot_create_is_atomic_and_document_export_resolves_owners
                 document_id: valid_document,
                 path: "valid.org".into(),
                 source: source(item, "READY", "Exact bytes.\r\n"),
+                archived_at: None,
             },
             DocumentImport {
                 document_id: invalid_document,
                 path: "invalid.org".into(),
                 source: source(item, "READY", "Duplicate identity.\r\n"),
+                archived_at: None,
             },
         ],
         document_revisions: BTreeMap::from([(valid_document, 4), (invalid_document, 1)]),
@@ -3163,6 +3170,364 @@ async fn workspace_snapshot_create_is_atomic_and_document_export_resolves_owners
 }
 
 #[tokio::test]
+async fn workspace_snapshot_round_trips_active_and_archived_document_lifecycle() {
+    let (source_context, source_backend, _source_dir) = empty_context(NOW).await;
+    let source_workspace = workspace_id("10000000-0000-4000-8000-0000000000c1");
+    create_test_workspace(&source_context, source_workspace, "lifecycle-source", "UTC").await;
+    let active_document = document_id("20000000-0000-4000-8000-0000000000c1");
+    let archived_document = document_id("20000000-0000-4000-8000-0000000000c2");
+    let active_item = work_item_id("30000000-0000-4000-8000-0000000000c1");
+    let archived_item = work_item_id("30000000-0000-4000-8000-0000000000c2");
+    for (operation, document_id, path, source) in [
+        (
+            "seed-active-snapshot-document",
+            active_document,
+            "active.org",
+            source(active_item, "READY", "Active source.\r\n"),
+        ),
+        (
+            "seed-archived-snapshot-document",
+            archived_document,
+            "archive/history.org",
+            source(archived_item, "READY", "Archived source.\r\n"),
+        ),
+    ] {
+        put_document(
+            &source_context,
+            &envelope(source_workspace, operation),
+            &PutDocumentRequest {
+                document_id,
+                path: path.into(),
+                source,
+                expected_revision: None,
+                lease_proofs: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    archive_document(
+        &source_context,
+        &envelope(source_workspace, "archive-snapshot-document"),
+        &DocumentRevisionRequest {
+            document_id: archived_document,
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let export = export_workspace(&source_context, source_workspace)
+        .await
+        .unwrap();
+    let source_projection = source_backend
+        .session()
+        .await
+        .unwrap()
+        .list_org_workspace_projection(source_workspace)
+        .await
+        .unwrap();
+    let target_workspace = workspace_id("10000000-0000-4000-8000-0000000000c2");
+    let (target_context, target_backend, _target_dir) = empty_context(NOW + 10).await;
+    let request = ImportWorkspaceSnapshotRequest {
+        mode: WorkspaceImportMode::Create,
+        workspace: WorkspaceSnapshotMetadata {
+            slug: "lifecycle-target".into(),
+            display_name: export.workspace.display_name,
+            description: export.workspace.description,
+            timezone: export.workspace.timezone,
+            policy_schema_version: export.workspace.policy_schema_version,
+            policy: export.workspace.policy,
+            revision: export.workspace.revision,
+            archived_at: export.workspace.archived_at,
+        },
+        documents: export
+            .documents
+            .iter()
+            .map(|document| DocumentImport {
+                document_id: document.id,
+                path: document.path.clone(),
+                source: document.source.clone(),
+                archived_at: document.archived_at,
+            })
+            .collect(),
+        document_revisions: export
+            .documents
+            .iter()
+            .map(|document| (document.id, document.revision))
+            .collect(),
+        lease_proofs: BTreeMap::new(),
+    };
+    import_workspace_snapshot(
+        &target_context,
+        &envelope(target_workspace, "restore-lifecycle-snapshot"),
+        &request,
+    )
+    .await
+    .unwrap();
+
+    let target_session = target_backend.session().await.unwrap();
+    let restored = target_session
+        .list_org_documents(target_workspace)
+        .await
+        .unwrap();
+    assert_eq!(restored.len(), 2);
+    for expected in &export.documents {
+        let actual = restored
+            .iter()
+            .find(|document| document.id == expected.id)
+            .unwrap();
+        assert_eq!(actual.path, expected.path);
+        assert_eq!(actual.source, expected.source);
+        assert_eq!(actual.content_hash, expected.content_hash);
+        assert_eq!(actual.revision, expected.revision);
+        assert_eq!(actual.archived_at, expected.archived_at);
+    }
+    let restored_projection = target_session
+        .list_org_workspace_projection(target_workspace)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored_projection
+            .iter()
+            .map(|item| item.id)
+            .collect::<BTreeSet<_>>(),
+        source_projection
+            .iter()
+            .map(|item| item.id)
+            .collect::<BTreeSet<_>>()
+    );
+    drop(target_session);
+    let active = list_documents(
+        &target_context,
+        target_workspace,
+        &OrgDocumentReadQuery {
+            status: DocumentStatus::Active,
+            cursor: None,
+            limit: Some(50),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(active.items.len(), 1);
+    assert_eq!(active.items[0].id, active_document);
+}
+
+#[tokio::test]
+async fn workspace_snapshot_update_applies_document_lifecycle_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn StorageBackend> = Arc::new(
+        TursoStorage::open(dir.path().join("snapshot-lifecycle-update.db"))
+            .await
+            .unwrap(),
+    );
+    let context = OrgContext::new(
+        inner.clone(),
+        Arc::new(note_pipelines::org::FixedOrgClock::new(NOW)),
+    );
+    let workspace = workspace_id("10000000-0000-4000-8000-0000000000d1");
+    let document = document_id("20000000-0000-4000-8000-0000000000d1");
+    let item = work_item_id("30000000-0000-4000-8000-0000000000d1");
+    create_test_workspace(&context, workspace, "snapshot-lifecycle-update", "UTC").await;
+    let original = source(item, "READY", "Lifecycle source.\r\n");
+    put_document(
+        &context,
+        &envelope(workspace, "seed-snapshot-lifecycle-update"),
+        &PutDocumentRequest {
+            document_id: document,
+            path: "lifecycle.org".into(),
+            source: original.clone(),
+            expected_revision: None,
+            lease_proofs: BTreeMap::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let workspace_record = inner
+        .session()
+        .await
+        .unwrap()
+        .get_org_workspace(workspace)
+        .await
+        .unwrap()
+        .unwrap();
+    let update =
+        |workspace_revision, document_revision, archived_at| ImportWorkspaceSnapshotRequest {
+            mode: WorkspaceImportMode::Update,
+            workspace: WorkspaceSnapshotMetadata {
+                slug: workspace_record.slug.clone(),
+                display_name: workspace_record.display_name.clone(),
+                description: workspace_record.description.clone(),
+                timezone: workspace_record.timezone.clone(),
+                policy_schema_version: workspace_record.policy_schema_version,
+                policy: workspace_record.policy.clone(),
+                revision: workspace_revision,
+                archived_at: None,
+            },
+            documents: vec![DocumentImport {
+                document_id: document,
+                path: "lifecycle.org".into(),
+                source: original.clone(),
+                archived_at,
+            }],
+            document_revisions: BTreeMap::from([(document, document_revision)]),
+            lease_proofs: BTreeMap::new(),
+        };
+
+    let before = workspace_snapshot(inner.as_ref(), workspace).await;
+    let fault_context =
+        context
+            .clone()
+            .with_workflow_test_hook(Arc::new(FailAtWorkflowPhaseOccurrence::new(
+                OrgWorkflowPhase::SourceEdit,
+                1,
+            )));
+    let failed = import_workspace_snapshot(
+        &fault_context,
+        &envelope(workspace, "snapshot-archive-rollback"),
+        &update(1, 1, Some(NOW)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failed.code, OrgErrorCode::StorageFailure, "{failed:?}");
+    assert_eq!(workspace_snapshot(inner.as_ref(), workspace).await, before);
+    assert!(inner
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(workspace, "snapshot-archive-rollback")
+        .await
+        .unwrap()
+        .is_none());
+
+    let archived = import_workspace_snapshot(
+        &context,
+        &envelope(workspace, "snapshot-archive-success"),
+        &update(1, 1, Some(NOW)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(archived.document_revisions[&document.to_string()], 3);
+    let archived_record = inner
+        .session()
+        .await
+        .unwrap()
+        .get_org_document(document)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(archived_record.source, original);
+    assert_eq!(archived_record.archived_at, Some(NOW));
+    let archive_event = workspace_snapshot(inner.as_ref(), workspace)
+        .await
+        .events
+        .into_iter()
+        .find(|event| event.event_type == OrgEventType::DocumentArchive)
+        .unwrap();
+    assert_eq!(archive_event.metadata["previous_revision"], 1);
+    assert_eq!(archive_event.metadata["resulting_revision"], 3);
+    assert!(!archive_event.metadata.to_string().contains("source"));
+    assert!(!archive_event.metadata.to_string().contains("hash"));
+    assert!(!archive_event.metadata.to_string().contains("lease"));
+
+    let restored = import_workspace_snapshot(
+        &context,
+        &envelope(workspace, "snapshot-restore-success"),
+        &update(2, 3, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.document_revisions[&document.to_string()], 5);
+    let restored_record = inner
+        .session()
+        .await
+        .unwrap()
+        .get_org_document(document)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored_record.id, document);
+    assert_eq!(restored_record.source, original);
+    assert_eq!(restored_record.archived_at, None);
+    assert!(workspace_snapshot(inner.as_ref(), workspace)
+        .await
+        .events
+        .iter()
+        .any(|event| event.event_type == OrgEventType::DocumentRestore));
+}
+
+#[tokio::test]
+async fn snapshot_and_ordinary_import_validate_document_archive_state() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let invalid_workspace = workspace_id("10000000-0000-4000-8000-0000000000e1");
+    let invalid_document = document_id("20000000-0000-4000-8000-0000000000e1");
+    let invalid_item = work_item_id("30000000-0000-4000-8000-0000000000e1");
+    let invalid_snapshot = |revision, archived_at| ImportWorkspaceSnapshotRequest {
+        mode: WorkspaceImportMode::Create,
+        workspace: WorkspaceSnapshotMetadata {
+            slug: "invalid-document-lifecycle".into(),
+            display_name: "Invalid document lifecycle".into(),
+            description: String::new(),
+            timezone: "UTC".into(),
+            policy_schema_version: 1,
+            policy: WorkspacePolicy::engineering_default(),
+            revision: 1,
+            archived_at: None,
+        },
+        documents: vec![DocumentImport {
+            document_id: invalid_document,
+            path: "invalid.org".into(),
+            source: source(invalid_item, "READY", "Invalid lifecycle.\r\n"),
+            archived_at,
+        }],
+        document_revisions: BTreeMap::from([(invalid_document, revision)]),
+        lease_proofs: BTreeMap::new(),
+    };
+    for (operation, request) in [
+        ("archived-revision-one", invalid_snapshot(1, Some(NOW))),
+        ("archived-timestamp-zero", invalid_snapshot(2, Some(0))),
+    ] {
+        let error =
+            import_workspace_snapshot(&context, &envelope(invalid_workspace, operation), &request)
+                .await
+                .unwrap_err();
+        assert_eq!(error.code, OrgErrorCode::InvalidInput);
+        assert!(backend
+            .session()
+            .await
+            .unwrap()
+            .get_org_workspace(invalid_workspace)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    let workspace = workspace_id("10000000-0000-4000-8000-0000000000e2");
+    create_test_workspace(&context, workspace, "ordinary-archive-state", "UTC").await;
+    let error = import_documents(
+        &context,
+        &envelope(workspace, "ordinary-import-archive-state"),
+        &ImportDocumentsRequest {
+            documents: vec![DocumentImport {
+                document_id: document_id("20000000-0000-4000-8000-0000000000e2"),
+                path: "ordinary.org".into(),
+                source: source(
+                    work_item_id("30000000-0000-4000-8000-0000000000e2"),
+                    "READY",
+                    "Ordinary import.\r\n",
+                ),
+                archived_at: Some(NOW),
+            }],
+            expected_revisions: BTreeMap::new(),
+            lease_proofs: BTreeMap::new(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, OrgErrorCode::InvalidInput);
+}
+
+#[tokio::test]
 async fn workspace_snapshot_update_checks_workspace_and_every_document_revision_atomically() {
     let (context, backend, _dir) = empty_context(NOW).await;
     let workspace = workspace_id("10000000-0000-4000-8000-0000000000b1");
@@ -3187,11 +3552,13 @@ async fn workspace_snapshot_update_checks_workspace_and_every_document_revision_
                 document_id: first,
                 path: "first.org".into(),
                 source: source(first_item, "READY", "First.\r\n"),
+                archived_at: None,
             },
             DocumentImport {
                 document_id: second,
                 path: "second.org".into(),
                 source: source(second_item, "READY", "Second.\r\n"),
+                archived_at: None,
             },
         ],
         document_revisions: BTreeMap::from([(first, 1), (second, 1)]),
@@ -3268,6 +3635,7 @@ async fn workspace_snapshot_command_kinds_replay_once_and_reject_divergent_paylo
                 document_id: document,
                 path: "idempotent.org".into(),
                 source: source(item, "READY", "Original.\r\n"),
+                archived_at: None,
             }],
             document_revisions: BTreeMap::from([(document, 1)]),
             lease_proofs: BTreeMap::new(),

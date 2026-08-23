@@ -585,6 +585,7 @@ impl ImportWorkspaceInput {
                     document_id: parse_id(document.document_id, "document_id")?,
                     path: document.path,
                     source: document.source,
+                    archived_at: None,
                 })
             })
             .collect::<Result<Vec<_>, OrgError>>()?;
@@ -2786,6 +2787,19 @@ mod tests {
                 .metadata["phase"],
             "build"
         );
+    }
+
+    #[test]
+    fn ordinary_document_import_rejects_and_omits_archived_state() {
+        assert!(serde_json::from_value::<DocumentImportInput>(json!({
+            "document_id": "20000000-0000-4000-8000-000000000001",
+            "path": "main.org",
+            "source": "",
+            "archived_at": 1
+        }))
+        .is_err());
+        let schema = serde_json::to_value(schemars::schema_for!(DocumentImportInput)).unwrap();
+        assert!(schema["properties"].get("archived_at").is_none());
     }
 
     #[test]

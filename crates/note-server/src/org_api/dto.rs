@@ -1356,6 +1356,7 @@ impl ImportWorkspaceBody {
                     document_id: parse_id(document.document_id, "document_id")?,
                     path: document.path,
                     source: document.source,
+                    archived_at: None,
                 })
             })
             .collect::<Result<Vec<_>, OrgError>>()?;
@@ -1525,5 +1526,18 @@ mod tests {
 
         assert_eq!(error.code, note_pipelines::org::OrgErrorCode::InvalidInput);
         assert_eq!(error.message, "document_id keys must be unique UUIDs");
+    }
+
+    #[test]
+    fn ordinary_document_import_rejects_archived_state() {
+        assert!(
+            serde_json::from_value::<DocumentImportBody>(serde_json::json!({
+                "document_id": "20000000-0000-4000-8000-000000000001",
+                "path": "main.org",
+                "source": "",
+                "archived_at": 1
+            }))
+            .is_err()
+        );
     }
 }

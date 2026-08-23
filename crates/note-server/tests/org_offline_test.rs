@@ -6,9 +6,9 @@ use axum::{
 use note_attachments::FilesystemAttachmentStore;
 use note_embedding::StubEmbedder;
 use note_pipelines::org::{
-    archive_workspace, claim_item, create_workspace, put_document, ArchiveWorkspaceRequest,
-    CommandEnvelope, CreateWorkspaceRequest, FixedOrgClock, OrgClaimKind, OrgContext,
-    PutDocumentRequest, StartClaimRequest,
+    archive_document, archive_workspace, claim_item, create_workspace, put_document,
+    ArchiveWorkspaceRequest, CommandEnvelope, CreateWorkspaceRequest, DocumentRevisionRequest,
+    FixedOrgClock, OrgClaimKind, OrgContext, PutDocumentRequest, StartClaimRequest,
 };
 use note_pipelines::Context;
 use note_server::org_offline::{
@@ -94,6 +94,144 @@ async fn seed_workspace(context: &OrgContext) -> (String, String) {
         .unwrap();
     }
     (first, second)
+}
+
+#[tokio::test]
+async fn workspace_manifest_round_trips_document_archive_state_and_accepts_legacy_omission() {
+    let dir = tempfile::tempdir().unwrap();
+    let (source_context, _source_storage) = test_context(&dir.path().join("source.db")).await;
+    let (first, second) = seed_workspace(&source_context).await;
+    archive_document(
+        &source_context,
+        &envelope("archive-offline-document"),
+        &DocumentRevisionRequest {
+            document_id: SECOND_DOCUMENT_ID.parse().unwrap(),
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let snapshot = dir.path().join("lifecycle-snapshot");
+    let exported = execute_command(
+        &source_context,
+        OrgOfflineCommand::ExportWorkspace {
+            workspace_id: WORKSPACE_ID.parse().unwrap(),
+            output: snapshot.clone(),
+        },
+    )
+    .await;
+    assert!(exported.ok, "{exported:?}");
+    let manifest = read_manifest(&snapshot);
+    let active = manifest
+        .documents
+        .iter()
+        .find(|document| document.id.to_string() == DOCUMENT_ID)
+        .unwrap();
+    let archived = manifest
+        .documents
+        .iter()
+        .find(|document| document.id.to_string() == SECOND_DOCUMENT_ID)
+        .unwrap();
+    assert_eq!(active.archived_at, None);
+    assert_eq!(archived.archived_at, Some(NOW));
+    assert_eq!(archived.revision, 2);
+
+    let (target_context, target_storage) = test_context(&dir.path().join("target.db")).await;
+    let imported = execute_command(
+        &target_context,
+        OrgOfflineCommand::ImportWorkspace {
+            input: snapshot.clone(),
+            mode: ImportMode::Create,
+            actor_id: "offline-restore".into(),
+            operation_id: "restore-document-lifecycle".into(),
+        },
+    )
+    .await;
+    assert!(imported.ok, "{imported:?}");
+    let session = target_storage.session().await.unwrap();
+    let active_record = session
+        .get_org_document(DOCUMENT_ID.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let archived_record = session
+        .get_org_document(SECOND_DOCUMENT_ID.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_record.source, first);
+    assert_eq!(active_record.archived_at, None);
+    assert_eq!(archived_record.source, second);
+    assert_eq!(archived_record.archived_at, Some(NOW));
+    assert_eq!(archived_record.revision, 2);
+    drop(session);
+
+    let legacy = dir.path().join("legacy-snapshot");
+    copy_snapshot(&snapshot, &legacy);
+    let mut legacy_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(legacy.join("manifest.json")).unwrap()).unwrap();
+    for document in legacy_manifest["documents"].as_array_mut().unwrap() {
+        document.as_object_mut().unwrap().remove("archived_at");
+    }
+    std::fs::write(
+        legacy.join("manifest.json"),
+        serde_json::to_vec_pretty(&legacy_manifest).unwrap(),
+    )
+    .unwrap();
+    let (legacy_context, legacy_storage) = test_context(&dir.path().join("legacy.db")).await;
+    let legacy_import = execute_command(
+        &legacy_context,
+        OrgOfflineCommand::ImportWorkspace {
+            input: legacy,
+            mode: ImportMode::Create,
+            actor_id: "legacy-restore".into(),
+            operation_id: "restore-legacy-manifest".into(),
+        },
+    )
+    .await;
+    assert!(legacy_import.ok, "{legacy_import:?}");
+    assert_eq!(
+        legacy_storage
+            .session()
+            .await
+            .unwrap()
+            .get_org_document(SECOND_DOCUMENT_ID.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at,
+        None
+    );
+
+    let invalid = dir.path().join("invalid-lifecycle-snapshot");
+    copy_snapshot(&snapshot, &invalid);
+    let mut invalid_manifest = read_manifest(&invalid);
+    invalid_manifest.documents[0].archived_at = Some(0);
+    write_manifest(&invalid, &invalid_manifest);
+    let (invalid_context, invalid_storage) = test_context(&dir.path().join("invalid.db")).await;
+    let invalid_report = execute_command(
+        &invalid_context,
+        OrgOfflineCommand::ImportWorkspace {
+            input: invalid,
+            mode: ImportMode::Create,
+            actor_id: "invalid-restore".into(),
+            operation_id: "reject-invalid-document-timestamp".into(),
+        },
+    )
+    .await;
+    assert!(!invalid_report.ok);
+    assert_eq!(invalid_report.error.as_ref().unwrap().code, "invalid_input");
+    let rendered = serde_json::to_string(&invalid_report).unwrap();
+    assert!(!rendered.contains("source"));
+    assert!(!rendered.contains("fencing_token"));
+    assert!(invalid_storage
+        .session()
+        .await
+        .unwrap()
+        .get_org_workspace(WORKSPACE_ID.parse().unwrap())
+        .await
+        .unwrap()
+        .is_none());
 }
 
 fn read_manifest(path: &Path) -> WorkspaceManifest {

@@ -12,9 +12,10 @@ use note_org::{
 };
 use note_storage::{
     ConditionalUpdate, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocument,
-    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
-    OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof,
-    OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceUpdate, StorageTransaction,
+    OrgDocumentLifecycleUpdate, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult,
+    OrgDocumentUpdate, OrgEventType, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseKind,
+    OrgLeaseOwnershipMove, OrgLeaseProof, OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceUpdate,
+    StorageTransaction,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -45,6 +46,8 @@ pub struct DocumentImport {
     pub document_id: DocumentId,
     pub path: String,
     pub source: String,
+    #[serde(default)]
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +129,7 @@ async fn put_document_with_mode(
             document_id: request.document_id,
             path: request.path.clone(),
             source: request.source.clone(),
+            archived_at: None,
         }],
         expected_revisions,
         lease_proofs: request.lease_proofs.clone(),
@@ -200,7 +204,7 @@ async fn import_workspace_snapshot_with_mode(
         },
         lease_proofs: request.lease_proofs.clone(),
     };
-    validate_import_shape_inner(&documents, true)?;
+    validate_import_shape_inner(&documents, true, true)?;
     let document_ids = request
         .documents
         .iter()
@@ -232,6 +236,18 @@ async fn import_workspace_snapshot_with_mode(
     if request.workspace.archived_at.is_some() && request.workspace.revision < 2 {
         return Err(OrgError::invalid_input(
             "Archived snapshot workspace revision must be at least two",
+        ));
+    }
+    if request.documents.iter().any(|document| {
+        document
+            .archived_at
+            .is_some_and(|archived_at| archived_at < 1)
+            || (request.mode == WorkspaceImportMode::Create
+                && document.archived_at.is_some()
+                && request.document_revisions[&document.document_id] < 2)
+    }) {
+        return Err(OrgError::invalid_input(
+            "Archived snapshot documents require a positive timestamp and revision of at least two",
         ));
     }
     if request.mode == WorkspaceImportMode::Create
@@ -350,6 +366,7 @@ async fn execute_import(
                         event_ids: Vec::new(),
                         created_target_revisions: None,
                         import_mode,
+                        allow_archived_state: false,
                     },
                 )
                 .await
@@ -492,6 +509,7 @@ async fn apply_workspace_snapshot(
             created_target_revisions: (request.mode == WorkspaceImportMode::Create)
                 .then_some(&request.document_revisions),
             import_mode,
+            allow_archived_state: true,
         },
     )
     .await?;
@@ -636,6 +654,7 @@ struct ApplyDocumentImportOptions<'a> {
     event_ids: Vec<String>,
     created_target_revisions: Option<&'a BTreeMap<DocumentId, i64>>,
     import_mode: DocumentImportMode,
+    allow_archived_state: bool,
 }
 
 async fn apply_document_import(
@@ -654,11 +673,15 @@ async fn apply_document_import(
         request,
         now,
         options.import_mode,
+        options.allow_archived_state,
     )
     .await?;
     let mut event_ids = options.event_ids;
     context.after_workflow_phase(OrgWorkflowPhase::Proof)?;
     validate_prepared_revisions(&prepared, &request.expected_revisions)?;
+    if options.allow_archived_state {
+        validate_snapshot_archive_lease_preflight(transaction, &prepared, now).await?;
+    }
     apply_prepared_ownership_changes(
         transaction,
         context,
@@ -672,7 +695,7 @@ async fn apply_document_import(
     let mut revisions = BTreeMap::new();
     for document in &prepared.documents {
         let revision = if let Some(existing) = &document.existing {
-            super::resolve_cas(
+            let source_updated = super::resolve_cas(
                 transaction
                     .compare_and_swap_org_document(OrgDocumentUpdate {
                         id: document.input.document_id,
@@ -685,8 +708,26 @@ async fn apply_document_import(
                     .await
                     .map_err(OrgError::storage)?,
                 "document",
-            )?
-            .revision
+            )?;
+            if existing.archived_at != document.input.archived_at {
+                super::resolve_cas(
+                    transaction
+                        .compare_and_swap_org_document_lifecycle(OrgDocumentLifecycleUpdate {
+                            id: document.input.document_id,
+                            expected_revision: source_updated.revision,
+                            expected_archived_at: existing.archived_at,
+                            path: &document.input.path,
+                            archived_at: document.input.archived_at,
+                            updated_at: now,
+                        })
+                        .await
+                        .map_err(OrgError::storage)?,
+                    "document",
+                )?
+                .revision
+            } else {
+                source_updated.revision
+            }
         } else {
             transaction
                 .insert_org_document(NewOrgDocument {
@@ -705,7 +746,12 @@ async fn apply_document_import(
                 .and_then(|revisions| revisions.get(&document.input.document_id))
                 .copied()
                 .unwrap_or(1);
-            while revision < target_revision {
+            let source_target_revision = if document.input.archived_at.is_some() {
+                target_revision - 1
+            } else {
+                target_revision
+            };
+            while revision < source_target_revision {
                 revision = super::resolve_cas(
                     transaction
                         .compare_and_swap_org_document(OrgDocumentUpdate {
@@ -714,6 +760,23 @@ async fn apply_document_import(
                             path: &document.input.path,
                             source: &document.input.source,
                             content_hash: &content_hash(&document.input.source),
+                            updated_at: now,
+                        })
+                        .await
+                        .map_err(OrgError::storage)?,
+                    "document",
+                )?
+                .revision;
+            }
+            if let Some(archived_at) = document.input.archived_at {
+                revision = super::resolve_cas(
+                    transaction
+                        .compare_and_swap_org_document_lifecycle(OrgDocumentLifecycleUpdate {
+                            id: document.input.document_id,
+                            expected_revision: revision,
+                            expected_archived_at: None,
+                            path: &document.input.path,
+                            archived_at: Some(archived_at),
                             updated_at: now,
                         })
                         .await
@@ -755,12 +818,41 @@ async fn apply_document_import(
         context.after_workflow_phase(OrgWorkflowPhase::Events)?;
     }
     for document in &prepared.documents {
+        let previous_archived_at = document
+            .existing
+            .as_ref()
+            .and_then(|existing| existing.archived_at);
+        let previous_revision = document.existing.as_ref().map(|existing| existing.revision);
+        let lifecycle_changed =
+            document.existing.is_some() && previous_archived_at != document.input.archived_at;
         let metadata = json!({
             "document_id": document.input.document_id,
             "path": document.input.path,
             "revision": revisions[&document.input.document_id.to_string()],
+            "archived_at": document.input.archived_at,
+            "previous_archived_at": previous_archived_at,
+            "resulting_archived_at": document.input.archived_at,
+            "previous_revision": previous_revision,
+            "resulting_revision": revisions[&document.input.document_id.to_string()],
             "created": document.existing.is_none(),
         });
+        let (event_type, summary) = if lifecycle_changed {
+            if document.input.archived_at.is_some() {
+                (
+                    OrgEventType::DocumentArchive,
+                    "Archived Org document from snapshot",
+                )
+            } else {
+                (
+                    OrgEventType::DocumentRestore,
+                    "Restored Org document from snapshot",
+                )
+            }
+        } else if document.existing.is_some() {
+            (OrgEventType::DocumentImport, "Imported Org document")
+        } else {
+            (OrgEventType::Creation, "Imported Org document")
+        };
         let event = transaction
             .append_org_event(NewOrgEvent {
                 id: &uuid::Uuid::new_v4().to_string(),
@@ -769,13 +861,9 @@ async fn apply_document_import(
                 subject_id: &document.input.document_id.to_string(),
                 actor_id: &envelope.actor_id,
                 attempt_id: None,
-                event_type: if document.existing.is_some() {
-                    OrgEventType::DocumentImport
-                } else {
-                    OrgEventType::Creation
-                },
+                event_type,
                 occurred_at: now,
-                summary: "Imported Org document",
+                summary,
                 metadata: &metadata,
                 previous_state: None,
                 resulting_state: None,
@@ -1203,6 +1291,7 @@ async fn prepare_import(
     request: &ImportDocumentsRequest,
     now: i64,
     import_mode: DocumentImportMode,
+    allow_archived_state: bool,
 ) -> Result<PreparedImport, OrgError> {
     let old_workspace_projection = transaction
         .list_org_workspace_projection(workspace.id)
@@ -1234,7 +1323,7 @@ async fn prepare_import(
                         false,
                     ));
                 }
-                if existing.archived_at.is_some() {
+                if existing.archived_at.is_some() && !allow_archived_state {
                     return Err(OrgError::new(
                         OrgErrorCode::ArchivedDocument,
                         "Archived Org documents are read-only",
@@ -1411,6 +1500,34 @@ async fn prepare_import(
         active_leases: guard.active,
         expired_leases: guard.expired,
     })
+}
+
+async fn validate_snapshot_archive_lease_preflight(
+    transaction: &dyn StorageTransaction,
+    prepared: &PreparedImport,
+    now: i64,
+) -> Result<(), OrgError> {
+    for document in &prepared.documents {
+        let Some(existing) = &document.existing else {
+            continue;
+        };
+        if existing.archived_at.is_some() || document.input.archived_at.is_none() {
+            continue;
+        }
+        let blocking = super::blocking_document_lease_ids(transaction, existing.id, now).await?;
+        if !blocking.is_empty() {
+            return Err(OrgError::new(
+                OrgErrorCode::ActiveLease,
+                "Org document has active work-item leases",
+                json!({
+                    "document_id": existing.id,
+                    "work_item_ids": blocking,
+                }),
+                false,
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn apply_prepared_ownership_changes(
@@ -2004,12 +2121,13 @@ async fn require_workspace(
 }
 
 fn validate_import_shape(request: &ImportDocumentsRequest) -> Result<(), OrgError> {
-    validate_import_shape_inner(request, false)
+    validate_import_shape_inner(request, false, false)
 }
 
 fn validate_import_shape_inner(
     request: &ImportDocumentsRequest,
     allow_empty: bool,
+    allow_archived_state: bool,
 ) -> Result<(), OrgError> {
     if request.documents.is_empty() && !allow_empty {
         return Err(OrgError::invalid_input(
@@ -2019,6 +2137,11 @@ fn validate_import_shape_inner(
     let mut ids = BTreeSet::new();
     let mut paths = BTreeSet::new();
     for document in &request.documents {
+        if !allow_archived_state && document.archived_at.is_some() {
+            return Err(OrgError::invalid_input(
+                "Ordinary Org document imports cannot set archived state",
+            ));
+        }
         validate_document_path(&document.path).map_err(|_| {
             OrgError::new(
                 OrgErrorCode::InvalidInput,

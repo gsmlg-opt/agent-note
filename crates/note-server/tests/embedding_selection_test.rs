@@ -136,6 +136,7 @@ fn write_org_snapshot(dir: &Path) -> std::path::PathBuf {
             id: DOCUMENT_ID.parse().unwrap(),
             path: "main.org".into(),
             revision: 1,
+            archived_at: None,
             content_hash: snapshot_hash(source),
             file: format!("documents/{DOCUMENT_ID}.org"),
         }],

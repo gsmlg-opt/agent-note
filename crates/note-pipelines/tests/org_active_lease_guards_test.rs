@@ -246,6 +246,143 @@ async fn document_archive_rejects_active_execution_and_review_leases_without_exp
 }
 
 #[tokio::test]
+async fn snapshot_archive_rejects_active_execution_and_review_leases_atomically() {
+    for (kind, fixture) in [
+        (OrgClaimKind::Execution, claimed_item().await),
+        (OrgClaimKind::Review, claimed_review_item().await),
+    ] {
+        let (context, backend, _dir, workspace_id, claim) = fixture;
+        let before = public_payload_snapshot(&backend, workspace_id).await;
+        let workspace = backend
+            .session()
+            .await
+            .unwrap()
+            .get_org_workspace(workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let operation_id = format!("snapshot-archive-with-active-{kind:?}");
+        let error = import_workspace_snapshot(
+            &context,
+            &envelope(workspace_id, "operator", &operation_id),
+            &ImportWorkspaceSnapshotRequest {
+                mode: WorkspaceImportMode::Update,
+                workspace: WorkspaceSnapshotMetadata {
+                    slug: workspace.slug,
+                    display_name: workspace.display_name,
+                    description: workspace.description,
+                    timezone: workspace.timezone,
+                    policy_schema_version: workspace.policy_schema_version,
+                    policy: workspace.policy,
+                    revision: workspace.revision,
+                    archived_at: workspace.archived_at,
+                },
+                documents: vec![DocumentImport {
+                    document_id: before.document.id,
+                    path: before.document.path.clone(),
+                    source: before.document.source.clone(),
+                    archived_at: Some(NOW),
+                }],
+                document_revisions: BTreeMap::from([(
+                    before.document.id,
+                    before.document.revision,
+                )]),
+                lease_proofs: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, OrgErrorCode::ActiveLease, "{kind:?}");
+        assert_eq!(
+            error.details,
+            serde_json::json!({
+                "document_id": document_id(),
+                "work_item_ids": [item_id()],
+            })
+        );
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains(&claim.lease_id));
+        assert!(!encoded.contains(&claim.fencing_token));
+        assert!(!encoded.contains("fencing_token"));
+        assert_eq!(
+            public_payload_snapshot(&backend, workspace_id).await,
+            before
+        );
+        assert!(backend
+            .session()
+            .await
+            .unwrap()
+            .get_org_operation(workspace_id, &operation_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn stale_snapshot_archive_revision_precedes_active_lease_details() {
+    let (context, backend, _dir, workspace_id, claim) = claimed_item().await;
+    let before = public_payload_snapshot(&backend, workspace_id).await;
+    let workspace = backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_workspace(workspace_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let operation_id = "stale-snapshot-archive-with-active-lease";
+    let error = import_workspace_snapshot(
+        &context,
+        &envelope(workspace_id, "operator", operation_id),
+        &ImportWorkspaceSnapshotRequest {
+            mode: WorkspaceImportMode::Update,
+            workspace: WorkspaceSnapshotMetadata {
+                slug: workspace.slug,
+                display_name: workspace.display_name,
+                description: workspace.description,
+                timezone: workspace.timezone,
+                policy_schema_version: workspace.policy_schema_version,
+                policy: workspace.policy,
+                revision: workspace.revision,
+                archived_at: workspace.archived_at,
+            },
+            documents: vec![DocumentImport {
+                document_id: before.document.id,
+                path: before.document.path.clone(),
+                source: before.document.source.clone(),
+                archived_at: Some(NOW),
+            }],
+            document_revisions: BTreeMap::from([(
+                before.document.id,
+                before.document.revision - 1,
+            )]),
+            lease_proofs: BTreeMap::new(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, OrgErrorCode::StaleRevision);
+    assert_eq!(error.details["current_revision"], before.document.revision);
+    assert!(error.details.get("work_item_ids").is_none());
+    let encoded = serde_json::to_string(&error).unwrap();
+    assert!(!encoded.contains(&claim.lease_id));
+    assert!(!encoded.contains(&claim.fencing_token));
+    assert_eq!(
+        public_payload_snapshot(&backend, workspace_id).await,
+        before
+    );
+    assert!(backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_operation(workspace_id, operation_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn archived_documents_are_guarded_by_import_claim_item_and_move_loaders() {
     let (context, backend, _dir, _path, workspace_id) = support::org_test_context(NOW).await;
     put_document(
@@ -323,6 +460,7 @@ async fn archived_documents_are_guarded_by_import_claim_item_and_move_loaders() 
                 document_id: document_id(),
                 path: archived.path.clone(),
                 source: archived.source.clone(),
+                archived_at: None,
             }],
             expected_revisions: BTreeMap::from([(document_id(), archived.revision)]),
             lease_proofs: BTreeMap::new(),
@@ -1035,6 +1173,7 @@ async fn archive_rejects_active_ownership_but_bookkeeps_expiry_before_archiving(
                     document_id: document_id(),
                     path: stored_document.path.clone(),
                     source: stored_document.source.clone(),
+                    archived_at: None,
                 }],
                 expected_revisions: BTreeMap::from([(document_id(), stored_document.revision,)]),
                 lease_proofs: BTreeMap::new(),
@@ -1916,6 +2055,7 @@ async fn raw_put_and_import_reject_fencing_material_before_fingerprint_or_writes
                     "{}\r\nOpaque digest {digest}.\r\n",
                     current.source.replace("Guarded", "Import renamed")
                 ),
+                archived_at: None,
             }],
             expected_revisions: BTreeMap::from([(document_id(), 2)]),
             lease_proofs: BTreeMap::from([(item_id(), proof)]),
@@ -1972,6 +2112,7 @@ async fn workspace_snapshot_rejects_fencing_material_before_fingerprint_or_write
             document_id: before.document.id,
             path: before.document.path.clone(),
             source: before.document.source.clone(),
+            archived_at: None,
         }],
         document_revisions: BTreeMap::from([(before.document.id, before.document.revision)]),
         lease_proofs: BTreeMap::from([(item_id(), proof)]),
@@ -2181,11 +2322,13 @@ async fn raw_multi_document_move_requires_proof_and_preserves_attempt_on_item_mo
                 document_id: document_id(),
                 path: current.path.clone(),
                 source: "#+TITLE: Source\r\n".into(),
+                archived_at: None,
             },
             DocumentImport {
                 document_id: second_document_id(),
                 path: "raw-move-target.org".into(),
                 source: current.source.clone(),
+                archived_at: None,
             },
         ],
         expected_revisions: BTreeMap::from([(document_id(), 2), (second_document_id(), 1)]),

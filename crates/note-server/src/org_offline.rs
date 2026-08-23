@@ -102,6 +102,8 @@ pub struct ManifestDocument {
     pub id: DocumentId,
     pub path: String,
     pub revision: i64,
+    #[serde(default)]
+    pub archived_at: Option<i64>,
     pub content_hash: String,
     pub file: String,
 }
@@ -490,6 +492,7 @@ async fn export_workspace_command(
             id: document.id,
             path: document.path.clone(),
             revision: document.revision,
+            archived_at: document.archived_at,
             content_hash: document.content_hash.clone(),
             file: format!("documents/{}.org", document.id),
         })
@@ -752,6 +755,7 @@ fn read_workspace_snapshot(input: &Path) -> Result<ReadSnapshot, String> {
             document_id: entry.id,
             path: entry.path.clone(),
             source,
+            archived_at: entry.archived_at,
         });
     }
     Ok(ReadSnapshot {
@@ -780,8 +784,16 @@ fn validate_manifest(manifest: &WorkspaceManifest) -> Result<(), String> {
     let mut paths = BTreeSet::new();
     let mut files = BTreeSet::new();
     for document in &manifest.documents {
-        if document.revision < 1 {
-            return Err("Org document revision must be positive".into());
+        if document.revision < 1
+            || document
+                .archived_at
+                .is_some_and(|archived_at| archived_at < 1)
+            || (document.archived_at.is_some() && document.revision < 2)
+        {
+            return Err(
+                "Org document revisions and archived timestamps must be positive and coherent"
+                    .into(),
+            );
         }
         validate_document_path(&document.path).map_err(|error| error.to_string())?;
         let expected_file = format!("documents/{}.org", document.id);
