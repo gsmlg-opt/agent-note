@@ -403,6 +403,16 @@ fn batch_label_open_callback(
     })
 }
 
+fn batch_label_workflow_open_callback(
+    clear_delete_success: Callback<()>,
+    open_label: Callback<BatchLabelMode>,
+) -> Callback<BatchLabelMode> {
+    Callback::from(move |mode| {
+        clear_delete_success.emit(());
+        open_label.emit(mode);
+    })
+}
+
 fn batch_delete_open_callback(
     selected_count: usize,
     batch_mutating: bool,
@@ -688,6 +698,36 @@ pub(crate) struct NotesUrlState {
     search: String,
     pub(crate) labels: Vec<LabelFilter>,
     pub(crate) invalid_labels: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum AuthoritativeLoadCompletion {
+    Replace(NotesUrlState),
+    Publish,
+}
+
+fn authoritative_current_page(requested_current: usize, page_size: usize, total: usize) -> usize {
+    if total == 0 {
+        return 1;
+    }
+
+    let page_size = page_size.max(1);
+    let total_pages = total / page_size + usize::from(total % page_size != 0);
+    requested_current.max(1).min(total_pages)
+}
+
+fn authoritative_load_completion(
+    state: &NotesUrlState,
+    total: usize,
+) -> AuthoritativeLoadCompletion {
+    let current = authoritative_current_page(state.current, state.page_size, total);
+    if current == state.current {
+        AuthoritativeLoadCompletion::Publish
+    } else {
+        let mut next = state.clone();
+        next.current = current;
+        AuthoritativeLoadCompletion::Replace(next)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1167,6 +1207,7 @@ pub fn notes_page() -> Html {
         let error = error.clone();
         let stale_revision_gate = stale_revision_gate.clone();
         let load_generation = load_generation.clone();
+        let replace_notes_url = replace_notes_url.clone();
         use_effect_with((url_state.clone(), *refresh_tick), move |(state, _)| {
             let started_generation = {
                 let mut generation = load_generation.borrow_mut();
@@ -1195,6 +1236,7 @@ pub fn notes_page() -> Html {
                 }
             } else {
                 let load_generation = load_generation.clone();
+                let replace_notes_url = replace_notes_url.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let search = state.search.trim().to_string();
                     if search.is_empty() {
@@ -1208,6 +1250,12 @@ pub fn notes_page() -> Html {
                                     started_generation,
                                     *load_generation.borrow(),
                                 ) {
+                                    if let AuthoritativeLoadCompletion::Replace(state) =
+                                        authoritative_load_completion(&state, page.total)
+                                    {
+                                        replace_notes_url.emit(state);
+                                        return;
+                                    }
                                     notes.set(page.notes);
                                     total_notes.set(page.total);
                                     stale_revision_gate.dispatch(
@@ -1245,6 +1293,12 @@ pub fn notes_page() -> Html {
                                     started_generation,
                                     *load_generation.borrow(),
                                 ) {
+                                    if let AuthoritativeLoadCompletion::Replace(state) =
+                                        authoritative_load_completion(&state, r.len())
+                                    {
+                                        replace_notes_url.emit(state);
+                                        return;
+                                    }
                                     results.set(Some(r));
                                     stale_revision_gate.dispatch(
                                         StaleRevisionGateAction::RefreshFinished {
@@ -1298,9 +1352,15 @@ pub fn notes_page() -> Html {
 
     let on_open_batch_label = {
         let batch_label_ui = batch_label_ui.clone();
-        Callback::from(move |mode: BatchLabelMode| {
-            batch_label_ui.dispatch(BatchLabelUiAction::Open(mode));
-        })
+        let batch_delete_ui = batch_delete_ui.clone();
+        batch_label_workflow_open_callback(
+            Callback::from(move |_: ()| {
+                batch_delete_ui.dispatch(BatchDeleteUiAction::ClearSuccess);
+            }),
+            Callback::from(move |mode: BatchLabelMode| {
+                batch_label_ui.dispatch(BatchLabelUiAction::Open(mode));
+            }),
+        )
     };
 
     let on_open_batch_delete = {
@@ -2664,6 +2724,54 @@ mod tests {
 
         assert!(!notes_load_is_current(older_generation, latest_generation));
         assert!(notes_load_is_current(latest_generation, latest_generation));
+    }
+
+    #[test]
+    fn authoritative_current_page_clamps_empty_and_out_of_range_results() {
+        assert_eq!(authoritative_current_page(3, 10, 20), 2);
+        assert_eq!(authoritative_current_page(3, 10, 0), 1);
+        assert_eq!(authoritative_current_page(2, 10, 20), 2);
+    }
+
+    #[test]
+    fn authoritative_load_completion_replaces_before_publish_when_results_shrink() {
+        let state = NotesUrlState {
+            current: 3,
+            page_size: 10,
+            search: "needle".into(),
+            labels: Vec::new(),
+            invalid_labels: false,
+        };
+
+        assert_eq!(
+            authoritative_load_completion(&state, 20),
+            AuthoritativeLoadCompletion::Replace(NotesUrlState {
+                current: 2,
+                ..state.clone()
+            })
+        );
+        assert_eq!(
+            authoritative_load_completion(&state, 30),
+            AuthoritativeLoadCompletion::Publish
+        );
+    }
+
+    #[test]
+    fn batch_label_workflow_start_clears_delete_success_before_opening_label_dialog() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let clear_delete_success = {
+            let events = events.clone();
+            Callback::from(move |_: ()| events.borrow_mut().push("clear delete success"))
+        };
+        let open_label = {
+            let events = events.clone();
+            Callback::from(move |mode| events.borrow_mut().push(batch_label_title(mode)))
+        };
+
+        batch_label_workflow_open_callback(clear_delete_success, open_label)
+            .emit(BatchLabelMode::Add);
+
+        assert_eq!(*events.borrow(), ["clear delete success", "Add label"]);
     }
 
     #[test]
