@@ -1242,6 +1242,15 @@ mod tests {
     }
 
     #[test]
+    fn mobile_workspace_header_actions_stay_inside_their_parent_width() {
+        let css = include_str!("../../app.css");
+        let mobile = css.split("@media (max-width: 620px)").last().unwrap();
+        assert!(mobile.contains(
+            ".org-workspace-head-actions .btn {\n        box-sizing: border-box;\n        width: 100%;\n        max-width: 100%;\n    }"
+        ));
+    }
+
+    #[test]
     fn source_has_generation_guard_and_no_polling_or_mutation_transport() {
         let source = include_str!("org_workspace.rs")
             .split("#[cfg(test)]")

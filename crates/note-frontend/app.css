@@ -2984,6 +2984,12 @@ a.dashboard-metric-detail:hover {
         width: 100%;
     }
 
+    .org-workspace-head-actions .btn {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+    }
+
     .org-files-head-actions,
     .org-files-filter-bar {
         align-items: stretch;
