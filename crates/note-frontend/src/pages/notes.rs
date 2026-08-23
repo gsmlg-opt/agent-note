@@ -691,17 +691,27 @@ pub(crate) struct NotesUrlState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum BatchDeleteSuccessDecision {
-    Reload,
+enum BatchDeleteCompletionDecision {
+    Ignore,
+    ReloadCurrent,
     Replace(NotesUrlState),
 }
 
-fn batch_delete_success_decision(
+fn batch_delete_completion_decision(
+    component_alive: bool,
+    submitted_generation: u64,
+    current_generation: u64,
     url_state: &NotesUrlState,
     rendered_current_page: usize,
     total_before: usize,
     deleted: usize,
-) -> BatchDeleteSuccessDecision {
+) -> BatchDeleteCompletionDecision {
+    if !component_alive {
+        return BatchDeleteCompletionDecision::Ignore;
+    }
+    if submitted_generation != current_generation {
+        return BatchDeleteCompletionDecision::ReloadCurrent;
+    }
     let target_page = page_after_batch_delete(
         rendered_current_page,
         url_state.page_size,
@@ -709,11 +719,11 @@ fn batch_delete_success_decision(
         total_before,
     );
     if target_page == rendered_current_page {
-        BatchDeleteSuccessDecision::Reload
+        BatchDeleteCompletionDecision::ReloadCurrent
     } else {
         let mut next = url_state.clone();
         next.current = target_page.saturating_add(1);
-        BatchDeleteSuccessDecision::Replace(next)
+        BatchDeleteCompletionDecision::Replace(next)
     }
 }
 
@@ -954,6 +964,14 @@ pub fn notes_page() -> Html {
     let filter_value = use_state(String::new);
     let refresh_tick = use_state(|| 0usize);
     let load_generation = use_mut_ref(|| 0_u64);
+    let component_alive = use_mut_ref(|| true);
+    {
+        let component_alive = component_alive.clone();
+        use_effect_with((), move |_| {
+            *component_alive.borrow_mut() = true;
+            move || *component_alive.borrow_mut() = false
+        });
+    }
     let navigator = use_navigator();
     let location = use_location();
     let query_string = location
@@ -1423,6 +1441,7 @@ pub fn notes_page() -> Html {
                 let stale_revision_gate = stale_revision_gate.clone();
                 let reload = reload.clone();
                 let batch_in_flight = batch_in_flight.clone();
+                let component_alive = component_alive.clone();
                 Callback::from(move |event: SubmitEvent| {
                     event.prevent_default();
                     if !batch_label_submit_allowed(
@@ -1452,8 +1471,14 @@ pub fn notes_page() -> Html {
                     let batch_label_ui = batch_label_ui.clone();
                     let stale_revision_gate = stale_revision_gate.clone();
                     let reload = reload.clone();
+                    let component_alive = component_alive.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        match api::batch_update_note_labels(&targets, &action).await {
+                        let result = api::batch_update_note_labels(&targets, &action).await;
+                        *batch_in_flight.borrow_mut() = false;
+                        if !*component_alive.borrow() {
+                            return;
+                        }
+                        match result {
                             Ok(result) => {
                                 selected.dispatch(SelectionAction::Clear);
                                 batch_label_ui.dispatch(BatchLabelUiAction::Success(
@@ -1476,7 +1501,6 @@ pub fn notes_page() -> Html {
                                 ));
                             }
                         }
-                        *batch_in_flight.borrow_mut() = false;
                     });
                 })
             };
@@ -1552,6 +1576,9 @@ pub fn notes_page() -> Html {
             let reload = reload.clone();
             let replace_notes_url = replace_notes_url.clone();
             let url_state = url_state.clone();
+            let batch_in_flight = batch_in_flight.clone();
+            let load_generation = load_generation.clone();
+            let component_alive = component_alive.clone();
             Callback::from(move |event: SubmitEvent| {
                 event.prevent_default();
                 if !batch_delete_submit_allowed(
@@ -1566,6 +1593,7 @@ pub fn notes_page() -> Html {
                     return;
                 }
 
+                let submitted_generation = *load_generation.borrow();
                 *batch_in_flight.borrow_mut() = true;
                 batch_delete_ui.dispatch(BatchDeleteUiAction::SubmitStarted);
                 let selected = selected.clone();
@@ -1576,22 +1604,34 @@ pub fn notes_page() -> Html {
                 let replace_notes_url = replace_notes_url.clone();
                 let batch_in_flight = batch_in_flight.clone();
                 let url_state = url_state.clone();
+                let load_generation = load_generation.clone();
+                let component_alive = component_alive.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match api::batch_delete_notes(&targets).await {
+                    let result = api::batch_delete_notes(&targets).await;
+                    *batch_in_flight.borrow_mut() = false;
+                    if !*component_alive.borrow() {
+                        return;
+                    }
+                    match result {
                         Ok(result) => {
+                            let decision = batch_delete_completion_decision(
+                                true,
+                                submitted_generation,
+                                *load_generation.borrow(),
+                                &url_state,
+                                rendered_current_page,
+                                total_before,
+                                result.deleted,
+                            );
                             selected.dispatch(SelectionAction::Clear);
                             batch_label_ui.dispatch(BatchLabelUiAction::ClearSuccess);
                             batch_delete_ui.dispatch(BatchDeleteUiAction::Success(
                                 batch_delete_result_message(result.deleted),
                             ));
-                            match batch_delete_success_decision(
-                                &url_state,
-                                rendered_current_page,
-                                total_before,
-                                result.deleted,
-                            ) {
-                                BatchDeleteSuccessDecision::Reload => reload.emit(()),
-                                BatchDeleteSuccessDecision::Replace(state) => {
+                            match decision {
+                                BatchDeleteCompletionDecision::Ignore => {}
+                                BatchDeleteCompletionDecision::ReloadCurrent => reload.emit(()),
+                                BatchDeleteCompletionDecision::Replace(state) => {
                                     replace_notes_url.emit(state)
                                 }
                             }
@@ -1604,7 +1644,6 @@ pub fn notes_page() -> Html {
                             "Could not delete selected notes. Please try again.".to_string(),
                         )),
                     }
-                    *batch_in_flight.borrow_mut() = false;
                 });
             })
         };
@@ -2832,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_delete_success_refreshes_or_replaces_with_existing_url_fields() {
+    fn batch_delete_completion_ignores_unmounted_and_stale_url_generations() {
         let state = NotesUrlState {
             current: 3,
             page_size: 10,
@@ -2845,15 +2884,23 @@ mod tests {
             invalid_labels: false,
         };
         assert_eq!(
-            batch_delete_success_decision(&state, 2, 21, 1),
-            BatchDeleteSuccessDecision::Replace(NotesUrlState {
+            batch_delete_completion_decision(true, 8, 8, &state, 2, 21, 1),
+            BatchDeleteCompletionDecision::Replace(NotesUrlState {
                 current: 2,
                 ..state.clone()
             })
         );
         assert_eq!(
-            batch_delete_success_decision(&state, 1, 30, 1),
-            BatchDeleteSuccessDecision::Reload
+            batch_delete_completion_decision(true, 8, 8, &state, 1, 30, 1),
+            BatchDeleteCompletionDecision::ReloadCurrent
+        );
+        assert_eq!(
+            batch_delete_completion_decision(true, 8, 9, &state, 2, 21, 1),
+            BatchDeleteCompletionDecision::ReloadCurrent
+        );
+        assert_eq!(
+            batch_delete_completion_decision(false, 8, 8, &state, 2, 21, 1),
+            BatchDeleteCompletionDecision::Ignore
         );
     }
 
