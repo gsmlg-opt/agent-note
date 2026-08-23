@@ -43,6 +43,51 @@ impl Default for DocumentListState {
 }
 
 impl DocumentListState {
+    pub fn parse(query: &str) -> Self {
+        let mut status = None;
+        let mut cursor = None;
+        let mut limit = None;
+        for pair in query
+            .trim_start_matches('?')
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+        {
+            let Some((key, value)) = pair.split_once('=') else {
+                return Self::default();
+            };
+            let (Ok(key), Ok(value)) = (urlencoding::decode(key), urlencoding::decode(value))
+            else {
+                return Self::default();
+            };
+            match key.as_ref() {
+                "status" => {
+                    status = match value.as_ref() {
+                        "active" => Some(DocumentStatus::Active),
+                        "archived" => Some(DocumentStatus::Archived),
+                        _ => return Self::default(),
+                    };
+                }
+                "cursor" if !value.is_empty() => cursor = Some(value.into_owned()),
+                "cursor" => {}
+                "limit" => {
+                    let Ok(value) = value.parse::<u16>() else {
+                        return Self::default();
+                    };
+                    if !DOCUMENT_ALLOWED_LIMITS.contains(&value) {
+                        return Self::default();
+                    }
+                    limit = Some(value);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            status: status.unwrap_or(DocumentStatus::Active),
+            cursor,
+            limit: limit.unwrap_or(DOCUMENT_DEFAULT_LIMIT),
+        }
+    }
+
     pub fn canonical_query(&self) -> String {
         let mut pairs = vec![("status", self.status.as_str().to_owned())];
         if let Some(cursor) = self.cursor.as_ref().filter(|cursor| !cursor.is_empty()) {
@@ -200,6 +245,26 @@ mod tests {
         state.set_limit(42);
         assert_eq!(state.limit, 50);
         assert_eq!(state.cursor, None);
+    }
+
+    #[test]
+    fn document_list_query_parsing_normalizes_invalid_values_to_canonical_defaults() {
+        assert_eq!(
+            DocumentListState::parse("status=archived&cursor=opaque%2F%2B%3D%20cursor&limit=25"),
+            DocumentListState {
+                status: DocumentStatus::Archived,
+                cursor: Some("opaque/+= cursor".into()),
+                limit: 25,
+            }
+        );
+        assert_eq!(
+            DocumentListState::parse("status=all&cursor=&limit=42"),
+            DocumentListState::default()
+        );
+        assert_eq!(
+            DocumentListState::parse("garbage=%ZZ").canonical_query(),
+            "status=active&limit=50"
+        );
     }
 
     #[test]

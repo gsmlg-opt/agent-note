@@ -817,6 +817,12 @@ fn workspace_header(
             </div>
             <div class="org-workspace-head-actions">
                 if let Some(payload) = payload {
+                    <Link<Route>
+                        to={Route::OrgWorkspaceFiles { workspace_id: payload.workspace.id.clone() }}
+                        classes={classes!("btn", "btn-outline")}
+                    >
+                        <span data-testid="org-workspace-files">{ "Files" }</span>
+                    </Link<Route>>
                     if payload.workspace.archived_at.is_none() {
                         <Link<Route>
                             to={Route::OrgWorkspaceSettings { workspace_id: payload.workspace.id.clone() }}
@@ -1219,6 +1225,20 @@ mod tests {
         for forbidden in ["delete_workspace", "Restore workspace", "Hard delete"] {
             assert!(!source.contains(forbidden), "forbidden source: {forbidden}");
         }
+    }
+
+    #[test]
+    fn files_link_is_outside_the_active_only_workspace_actions() {
+        let source = include_str!("org_workspace.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let files = source.find("Route::OrgWorkspaceFiles").unwrap();
+        let active_gate = source
+            .find("if payload.workspace.archived_at.is_none()")
+            .unwrap();
+        assert!(files < active_gate);
+        assert!(source.contains("data-testid=\"org-workspace-files\""));
     }
 
     #[test]
