@@ -122,21 +122,24 @@ impl NoteMutationApiError {
     }
 
     fn from_anyhow(error: anyhow::Error) -> Self {
-        if let Some(error) = error.downcast_ref::<note_pipelines::NoteMutationError>() {
+        if let Some(error) = top_level_error::<note_pipelines::NoteMutationError>(&error) {
             return Self::from(error.clone());
         }
-        if error
-            .downcast_ref::<BatchNoteTargetsValidationError>()
-            .is_some()
-            || error.downcast_ref::<note_core::ValidationError>().is_some()
-            || error
-                .downcast_ref::<note_core::LabelKeyValidationError>()
-                .is_some()
+        if top_level_error::<BatchNoteTargetsValidationError>(&error).is_some()
+            || top_level_error::<note_core::ValidationError>(&error).is_some()
+            || top_level_error::<note_core::LabelKeyValidationError>(&error).is_some()
         {
             return Self::invalid_input(error.to_string());
         }
         Self::storage_failure()
     }
+}
+
+fn top_level_error<T>(error: &anyhow::Error) -> Option<&T>
+where
+    T: std::error::Error + Send + Sync + 'static,
+{
+    error.chain().next().and_then(|error| error.downcast_ref())
 }
 
 impl From<note_pipelines::NoteMutationError> for NoteMutationApiError {
@@ -3225,6 +3228,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_label_sanitizes_typed_validation_when_rollback_fails() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
+        let setup_app =
+            test_app_from_backend(backend.clone(), dir.path().join("setup-attachments"));
+        let setup_ctx = Arc::new(Context::new(
+            backend.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("setup-context-attachments"),
+            )),
+        ));
+        note_pipelines::define_label_key_with_type(
+            &setup_ctx,
+            "priority",
+            "Priority score",
+            note_core::LabelValueType::Number,
+        )
+        .await
+        .unwrap();
+        let id = save_note_id(
+            setup_app,
+            r#"{"title":"Typed rollback","content":"Body","labels":[]}"#,
+        )
+        .await;
+        let app = test_app_from_backend(
+            Arc::new(RollbackFailingStorageBackend { inner: backend }),
+            dir.path().join("failing-attachments"),
+        );
+
+        let response = app
+            .oneshot(post(
+                "/api/notes/batch-labels",
+                &serde_json::json!({
+                    "notes": [{"id": id, "expected_revision": 1}],
+                    "action": {"type": "add", "key": "priority", "value": "urgent"}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let error: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({
+                "code": "storage_failure",
+                "message": "note storage operation failed",
+                "details": {},
+                "retryable": true
+            })
+        );
+        let error = error.to_string();
+        assert!(!error.contains("ROLLBACK-SECRET-42"));
+        assert!(!error.contains("urgent"));
+        assert!(!error.contains("private"));
+    }
+
+    #[tokio::test]
     async fn batch_label_invalidates_dashboard_only_when_a_note_changes() {
         let _bulk_guard = BULK_TEST_LOCK.lock().await;
         let (app, _ctx, _dir) = test_app().await;
@@ -3542,6 +3609,56 @@ mod tests {
             BULK_DASHBOARD_CACHE_INVALIDATIONS.load(Ordering::SeqCst),
             invalidations_before
         );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_sanitizes_preflight_errors_when_rollback_fails() {
+        let _bulk_guard = BULK_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(TursoStorage::open(dir.path().join("t.db")).await.unwrap());
+        let setup_app =
+            test_app_from_backend(backend.clone(), dir.path().join("setup-attachments"));
+        let id = save_note_id(
+            setup_app,
+            r#"{"title":"Rollback target","content":"Body","labels":[]}"#,
+        )
+        .await;
+        let app = test_app_from_backend(
+            Arc::new(RollbackFailingStorageBackend { inner: backend }),
+            dir.path().join("failing-attachments"),
+        );
+
+        for notes in [
+            serde_json::json!([{"id": "missing", "expected_revision": 1}]),
+            serde_json::json!([{"id": id, "expected_revision": 2}]),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post(
+                    "/api/notes/batch-delete",
+                    &serde_json::json!({"notes": notes}).to_string(),
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let error: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                error,
+                serde_json::json!({
+                    "code": "storage_failure",
+                    "message": "note storage operation failed",
+                    "details": {},
+                    "retryable": true
+                })
+            );
+            let error = error.to_string();
+            assert!(!error.contains("ROLLBACK-SECRET-42"));
+            assert!(!error.contains("private"));
+        }
     }
 
     #[tokio::test]

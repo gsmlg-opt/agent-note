@@ -125,6 +125,21 @@ async fn catalog_contains(backend: &Arc<dyn StorageBackend>, key: &str) -> bool 
         .any(|label_key| label_key.key == key)
 }
 
+async fn catalog_types(backend: &Arc<dyn StorageBackend>) -> Vec<(String, LabelValueType)> {
+    let mut catalog = backend
+        .session()
+        .await
+        .unwrap()
+        .list_label_keys()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|label_key| (label_key.key, label_key.value_type))
+        .collect::<Vec<_>>();
+    catalog.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    catalog
+}
+
 fn test_embedding() -> Vec<f32> {
     let mut embedding = vec![0.0; 1_024];
     embedding[0] = 1.0;
@@ -828,7 +843,7 @@ async fn eligible_invalid_typed_destination_rolls_back_every_target() {
 }
 
 #[tokio::test]
-async fn ineligible_invalid_typed_destination_is_a_pure_noop_without_validation() {
+async fn ineligible_invalid_typed_destinations_are_rejected_without_mutation() {
     let (base_ctx, backend, dir) = test_context().await;
     seed_note(&backend, "ineligible", None).await;
     let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
@@ -837,25 +852,51 @@ async fn ineligible_invalid_typed_destination_is_a_pure_noop_without_validation(
         .await
         .unwrap();
     transaction.commit().await.unwrap();
-    let events = event_log();
-    let (ctx, _traced) = traced_context(backend, events.clone(), &dir);
+    attach_label(&backend, "ineligible", "number", "1").await;
 
-    let result = batch_update_note_labels(
-        &ctx,
-        BatchUpdateNoteLabelsInput {
-            notes: vec![target("ineligible", NOTE_REVISION)],
-            action: BatchLabelAction::Update {
-                from_key: "source".into(),
+    for action in [
+        BatchLabelAction::Update {
+            from_key: "source".into(),
+            key: "number".into(),
+            value: "not-a-number".into(),
+        },
+        BatchLabelAction::Add {
+            key: "number".into(),
+            value: "not-a-number".into(),
+        },
+    ] {
+        let labels_before = labels_for(&backend, "ineligible").await;
+        let timestamp_before = note_updated_at(&backend, "ineligible").await;
+        let catalog_before = catalog_types(&backend).await;
+        let events = event_log();
+        let (ctx, _traced) = traced_context(backend.clone(), events.clone(), &dir);
+
+        let error = batch_update_note_labels(
+            &ctx,
+            BatchUpdateNoteLabelsInput {
+                notes: vec![target("ineligible", NOTE_REVISION)],
+                action,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<note_core::ValidationError>(),
+            Some(&note_core::ValidationError::InvalidLabelValue {
                 key: "number".into(),
                 value: "not-a-number".into(),
-            },
-        },
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(result.updated, 0);
-    assert_eq!(*events.lock().unwrap(), vec!["begin", "rollback"]);
+                value_type: LabelValueType::Number,
+            })
+        );
+        assert_eq!(labels_for(&backend, "ineligible").await, labels_before);
+        assert_eq!(
+            note_updated_at(&backend, "ineligible").await,
+            timestamp_before
+        );
+        assert_eq!(catalog_types(&backend).await, catalog_before);
+        assert_eq!(*events.lock().unwrap(), vec!["begin", "rollback"]);
+    }
     drop(base_ctx);
 }
 
