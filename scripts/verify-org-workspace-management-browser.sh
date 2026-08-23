@@ -111,18 +111,23 @@ assert_console_clean() {
 
 assert_network_boundary() {
     local network="$1"
+    # Preserve workspace create/update/archive while admitting only the approved document
+    # create/rename/archive/restore lifecycle exception; raw source and workflow stay forbidden.
     jq -e --arg base "$base" '
         [(.networkRequests // [])[]
             | select(.url | contains("/api/org"))
             | select(((.method == "GET")
                 or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
                 or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
-                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$"))))
+                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$")))
+                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/documents$")))
+                or (.method == "PATCH" and (.url | test("/api/org/documents/[^/?]+/path$")))
+                or (.method == "POST" and (.url | test("/api/org/documents/[^/?]+/(archive|restore)$"))))
                 | not)
         ] | length == 0
     ' <<<"$network" >/dev/null || {
         printf '%s\n' "$network" >&2
-        fail "browser issued an Org request outside workspace create/update/archive"
+        fail "browser issued an Org request outside approved workspace/document lifecycle traffic"
     }
     jq -e '[(.networkRequests // [])[] | select(.url | contains("/mcp"))] | length == 0' \
         <<<"$network" >/dev/null || fail "browser contacted /mcp"

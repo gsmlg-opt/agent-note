@@ -150,8 +150,25 @@ assert_network_boundary() {
     local network="$1"
     jq -e '[(.networkRequests // [])[] | select(.url | contains("/mcp"))] | length == 0' \
         <<<"$network" >/dev/null || fail "browser contacted /mcp"
-    jq -e '[(.networkRequests // [])[] | select(.url | contains("/api/org")) | select(.method != "GET")] | length == 0' \
-        <<<"$network" >/dev/null || fail "browser issued a non-GET /api/org request"
+    jq -e --arg base "$base" '
+        [(.networkRequests // [])[]
+            | select(.url | contains("/api/org"))
+            | select(((.method == "GET")
+                or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
+                or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
+                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$")))
+                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/documents$")))
+                or (.method == "PATCH" and (.url | test("/api/org/documents/[^/?]+/path$")))
+                or (.method == "POST" and (.url | test("/api/org/documents/[^/?]+/(archive|restore)$"))))
+                | not)
+        ] | length == 0
+    ' <<<"$network" >/dev/null || fail "browser issued an Org request outside approved workspace/document lifecycle traffic"
+    jq -e '[(.networkRequests // [])[]
+        | select(.method == "PUT" or .method == "DELETE"
+            or (.url | test("/api/org/(items|queue|agenda)(/|\\?|$)"))
+            or (.url | test("/(claim|review|progress|result|transition|dependencies|note-links|import)(/|\\?|$)")))]
+        | length == 0' <<<"$network" >/dev/null ||
+        fail "browser issued source or workflow mutation traffic"
 }
 
 assert_console_clean() {
