@@ -4,10 +4,10 @@ use crate::{
     NewAttachmentOperation, NewNote, NewOrgAttempt, NewOrgDocument, NewOrgEvent, NewOrgLease,
     NewOrgWorkspace, NoteChunk, NoteFieldsUpdate, NoteMutationResult, NoteUpdate,
     OrgArtifactReference, OrgAttempt, OrgAttemptNoteReference, OrgAttemptUpdate, OrgDocument,
-    OrgDocumentUpdate, OrgEvent, OrgLease, OrgLeaseEndReason, OrgLeaseKind, OrgOperationalQuery,
-    OrgOperationalRow, OrgProjectedWorkItem, OrgWorkspace, OrgWorkspaceOperationalSummary,
-    OrgWorkspaceUpdate, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
-    UpsertNoteChunk,
+    OrgDocumentLifecycleUpdate, OrgDocumentUpdate, OrgEvent, OrgLease, OrgLeaseEndReason,
+    OrgLeaseKind, OrgOperationalQuery, OrgOperationalRow, OrgProjectedWorkItem, OrgWorkspace,
+    OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, StorageError, StorageErrorKind,
+    StorageResult, StoredOrgOperation, UpsertNoteChunk,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -613,6 +613,17 @@ pub trait OrgRepository: Send + Sync {
     async fn compare_and_swap_org_document(
         &self,
         update: OrgDocumentUpdate<'_>,
+    ) -> StorageResult<CompareAndSwap<OrgDocument>> {
+        let _ = update;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "Org persistence is not implemented by this storage session",
+        ))
+    }
+
+    async fn compare_and_swap_org_document_lifecycle(
+        &self,
+        update: OrgDocumentLifecycleUpdate<'_>,
     ) -> StorageResult<CompareAndSwap<OrgDocument>> {
         let _ = update;
         Err(StorageError::new(

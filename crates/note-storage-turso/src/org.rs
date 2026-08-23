@@ -6,13 +6,13 @@ use note_storage::{
     ConditionalUpdate, ExpiredOrgLeaseClosure, NewOrgAttempt, NewOrgAttemptAllocation,
     NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace, OrgArtifactReference, OrgAttempt,
     OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument,
-    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
-    OrgEventType, OrgLease, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind,
-    OrgLeaseOwnershipMove, OrgLeaseProof, OrgOperationalCounts, OrgOperationalQuery,
-    OrgOperationalRow, OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker, OrgRepository,
-    OrgReviewLeaseMarker, OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate,
-    SanitizedOrgLease, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
-    StoredOrgTimestamp,
+    OrgDocumentLifecycleUpdate, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult,
+    OrgDocumentUpdate, OrgEvent, OrgEventType, OrgLease, OrgLeaseClosure, OrgLeaseEndReason,
+    OrgLeaseHeartbeat, OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof, OrgOperationalCounts,
+    OrgOperationalQuery, OrgOperationalRow, OrgOperationalView, OrgProjectedWorkItem,
+    OrgReadyMarker, OrgRepository, OrgReviewLeaseMarker, OrgWorkspace,
+    OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, SanitizedOrgLease, StorageError,
+    StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr as _;
@@ -271,6 +271,49 @@ impl OrgRepository for TursoSession {
             .next()
             .await
             .map_err(|error| map_turso_error("read updated Org document", error))?
+        {
+            return decode_document(&row).map(CompareAndSwap::Applied);
+        }
+        drop(rows);
+
+        current_document_revision(self, update.id)
+            .await
+            .map(|revision| match revision {
+                Some(current_revision) => CompareAndSwap::Conflict { current_revision },
+                None => CompareAndSwap::NotFound,
+            })
+    }
+
+    async fn compare_and_swap_org_document_lifecycle(
+        &self,
+        update: OrgDocumentLifecycleUpdate<'_>,
+    ) -> StorageResult<CompareAndSwap<OrgDocument>> {
+        let _operation_guard = self.operation_guard().await;
+        let sql = format!(
+            "UPDATE org_documents
+             SET path=?2, archived_at=?3, updated_at=?4, revision=revision+1
+             WHERE id=?1 AND revision=?5 AND archived_at IS ?6
+             RETURNING {DOCUMENT_COLUMNS}"
+        );
+        let mut rows = self
+            .connection
+            .query(
+                &sql,
+                turso::params![
+                    update.id.to_string(),
+                    update.path,
+                    update.archived_at,
+                    update.updated_at,
+                    update.expected_revision,
+                    update.expected_archived_at
+                ],
+            )
+            .await
+            .map_err(|error| map_turso_error("compare-and-swap Org document lifecycle", error))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read updated Org document lifecycle", error))?
         {
             return decode_document(&row).map(CompareAndSwap::Applied);
         }
@@ -1082,10 +1125,16 @@ impl OrgRepository for TursoSession {
                      WHERE candidate.work_item_id=attempt.work_item_id
                  )
              ), active_counts AS (
-                 SELECT workspace_id, COUNT(*) AS active_count
-                 FROM org_leases
-                 WHERE ended_at IS NULL AND expires_at>{now}
-                 GROUP BY workspace_id
+                 SELECT counted_lease.workspace_id, COUNT(*) AS active_count
+                 FROM org_leases counted_lease
+                 JOIN org_work_items counted_item
+                   ON counted_item.id=counted_lease.work_item_id
+                 JOIN org_documents counted_document
+                   ON counted_document.id=counted_item.document_id
+                 WHERE counted_lease.ended_at IS NULL
+                   AND counted_document.archived_at IS NULL
+                   AND counted_lease.expires_at>{now}
+                 GROUP BY counted_lease.workspace_id
              ), completion_events AS (
                  SELECT subject_id, MAX(occurred_at) AS completion_at
                  FROM org_events
@@ -1102,6 +1151,7 @@ impl OrgRepository for TursoSession {
                     lease.expires_at, lease.ended_at, lease.end_reason, lease.expiry_event_id,
                     completion_events.completion_at, {OPERATIONAL_RELATION_COLUMNS}
              FROM org_work_items item
+             JOIN org_documents document ON document.id=item.document_id
              JOIN org_workspaces workspace ON workspace.id=item.workspace_id
              LEFT JOIN attempt_stats ON attempt_stats.work_item_id=item.id
              LEFT JOIN current_attempt ON current_attempt.work_item_id=item.id
@@ -1109,6 +1159,7 @@ impl OrgRepository for TursoSession {
              LEFT JOIN active_counts ON active_counts.workspace_id=item.workspace_id
              LEFT JOIN completion_events ON completion_events.subject_id=item.id
              WHERE item.workspace_id IN ({workspace_placeholders})
+               AND document.archived_at IS NULL
                AND {}",
             turso_view_predicate(query.view, &now)
         );
@@ -1172,10 +1223,16 @@ impl OrgRepository for TursoSession {
                      WHERE candidate.work_item_id=attempt.work_item_id
                  )
              ), active_counts AS (
-                 SELECT workspace_id, COUNT(*) AS active_count
-                 FROM org_leases
-                 WHERE ended_at IS NULL AND expires_at>?1
-                 GROUP BY workspace_id
+                 SELECT counted_lease.workspace_id, COUNT(*) AS active_count
+                 FROM org_leases counted_lease
+                 JOIN org_work_items counted_item
+                   ON counted_item.id=counted_lease.work_item_id
+                 JOIN org_documents counted_document
+                   ON counted_document.id=counted_item.document_id
+                 WHERE counted_lease.ended_at IS NULL
+                   AND counted_document.archived_at IS NULL
+                   AND counted_lease.expires_at>?1
+                 GROUP BY counted_lease.workspace_id
              ), candidates AS MATERIALIZED (
                  SELECT item.id, item.state, item.scheduled_utc, item.deadline_utc,
                         item.assignee, workspace.policy, workspace.archived_at,
@@ -1187,12 +1244,13 @@ impl OrgRepository for TursoSession {
                         lease.expires_at AS lease_expires_at
                  FROM org_workspaces workspace
                  JOIN org_work_items item ON item.workspace_id=workspace.id
+                 JOIN org_documents document ON document.id=item.document_id
                  LEFT JOIN attempt_stats ON attempt_stats.work_item_id=item.id
                  LEFT JOIN current_attempt ON current_attempt.work_item_id=item.id
                  LEFT JOIN org_leases lease
                         ON lease.work_item_id=item.id AND lease.ended_at IS NULL
                  LEFT JOIN active_counts ON active_counts.workspace_id=workspace.id
-                 WHERE workspace.id=?2
+                 WHERE workspace.id=?2 AND document.archived_at IS NULL
              ), view_counts AS (
                  {view_counts}
              )

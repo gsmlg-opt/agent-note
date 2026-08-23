@@ -263,6 +263,15 @@ pub struct OrgDocumentUpdate<'a> {
     pub updated_at: i64,
 }
 
+pub struct OrgDocumentLifecycleUpdate<'a> {
+    pub id: note_org::DocumentId,
+    pub expected_revision: i64,
+    pub expected_archived_at: Option<i64>,
+    pub path: &'a str,
+    pub archived_at: Option<i64>,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredOrgTimestamp {
     pub raw: String,
