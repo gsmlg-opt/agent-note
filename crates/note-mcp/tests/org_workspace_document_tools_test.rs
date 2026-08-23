@@ -12,7 +12,7 @@ use note_pipelines::{
 use note_storage::StorageBackend;
 use note_storage_turso::TursoStorage;
 use rmcp::{
-    model::{CallToolRequestParams, ErrorData},
+    model::{CallToolRequestParams, ErrorCode, ErrorData},
     service::ServiceError,
     ServiceExt,
 };
@@ -519,7 +519,7 @@ async fn document_put_reads_export_conflicts_and_replay_preserve_canonical_sourc
         .await
         .unwrap();
     assert_eq!(archived_export["documents"][0]["revision"], 1);
-    let hidden = mcp
+    let active_documents = mcp
         .call(
             "org_list_documents",
             json!({
@@ -530,8 +530,9 @@ async fn document_put_reads_export_conflicts_and_replay_preserve_canonical_sourc
         )
         .await
         .unwrap();
-    assert!(hidden["items"].as_array().unwrap().is_empty());
-    let visible = mcp
+    assert_eq!(active_documents["items"][0]["id"], DOCUMENT_ID);
+    assert_eq!(active_documents["items"][0]["archived_at"], Value::Null);
+    let all_documents = mcp
         .call(
             "org_list_documents",
             json!({
@@ -542,7 +543,7 @@ async fn document_put_reads_export_conflicts_and_replay_preserve_canonical_sourc
         )
         .await
         .unwrap();
-    assert_eq!(visible["items"][0]["id"], DOCUMENT_ID);
+    assert_eq!(all_documents, active_documents);
 
     assert_eq!(
         mcp.call("org_put_document", put.clone()).await.unwrap(),
@@ -559,6 +560,416 @@ async fn document_put_reads_export_conflicts_and_replay_preserve_canonical_sourc
         .data
         .unwrap();
     assert_eq!(rejected["code"], "archived_workspace");
+}
+
+#[tokio::test]
+async fn document_lifecycle_tools_cover_replay_status_reads_and_structured_failures() {
+    let mcp = TestServer::new().await;
+    mcp.call(
+        "org_create_workspace",
+        create_workspace_input(WORKSPACE_ID, "create-workspace"),
+    )
+    .await
+    .unwrap();
+
+    let rejected_import = mcp
+        .call(
+            "org_import_workspace",
+            json!({
+                "schema_version": 1,
+                "workspace_id": WORKSPACE_ID,
+                "actor_id": "agent-one",
+                "operation_id": "ordinary-import-cannot-set-archive-state",
+                "documents": [{
+                    "document_id": DOCUMENT_ID,
+                    "path": "import.org",
+                    "source": "",
+                    "archived_at": NOW
+                }],
+                "expected_revisions": {},
+                "lease_proofs": {}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(rejected_import.code, ErrorCode::INVALID_PARAMS);
+
+    let create = json!({
+        "schema_version": 1,
+        "workspace_id": WORKSPACE_ID,
+        "actor_id": "agent-one",
+        "operation_id": "create-empty-document",
+        "document_id": DOCUMENT_ID,
+        "path": "tasks/main.org"
+    });
+    let unknown_field = mcp
+        .call(
+            "org_create_document",
+            json!({
+                "schema_version": 1,
+                "workspace_id": WORKSPACE_ID,
+                "actor_id": "agent-one",
+                "operation_id": "unknown-field",
+                "document_id": DOCUMENT_ID,
+                "path": "tasks/main.org",
+                "source": "not part of lifecycle create"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unknown_field.code, ErrorCode::INVALID_PARAMS);
+
+    let created = mcp
+        .call("org_create_document", create.clone())
+        .await
+        .unwrap();
+    assert_eq!(created["workspace_id"], WORKSPACE_ID);
+    assert_eq!(created["operation_id"], "create-empty-document");
+    assert_eq!(created["document_revisions"][DOCUMENT_ID], 1);
+    assert_eq!(created["event_ids"].as_array().unwrap().len(), 1);
+    assert_eq!(created["data"]["document_id"], DOCUMENT_ID);
+    assert_eq!(created["data"]["path"], "tasks/main.org");
+    assert_eq!(created["data"]["archived_at"], Value::Null);
+    assert_eq!(
+        mcp.call("org_create_document", create).await.unwrap(),
+        created
+    );
+    let source = mcp
+        .call(
+            "org_get_document",
+            json!({"workspace_id": WORKSPACE_ID, "document_id": DOCUMENT_ID}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(source["source"], "");
+    assert_eq!(source["archived_at"], Value::Null);
+
+    mcp.call(
+        "org_create_document",
+        json!({
+            "schema_version": 1,
+            "workspace_id": WORKSPACE_ID,
+            "actor_id": "agent-one",
+            "operation_id": "create-second-document",
+            "document_id": SECOND_DOCUMENT_ID,
+            "path": "tasks/second.org"
+        }),
+    )
+    .await
+    .unwrap();
+
+    let renamed = mcp
+        .call(
+            "org_rename_document",
+            json!({
+                "schema_version": 1,
+                "workspace_id": WORKSPACE_ID,
+                "actor_id": "agent-one",
+                "operation_id": "rename-document",
+                "document_id": DOCUMENT_ID,
+                "new_path": "tasks/renamed.org",
+                "expected_revision": 1
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed["document_revisions"][DOCUMENT_ID], 2);
+    assert_eq!(renamed["data"]["path"], "tasks/renamed.org");
+    assert_eq!(renamed["data"]["archived_at"], Value::Null);
+
+    let stale = mcp
+        .call(
+            "org_rename_document",
+            json!({
+                "schema_version": 1,
+                "workspace_id": WORKSPACE_ID,
+                "actor_id": "agent-one",
+                "operation_id": "stale-rename",
+                "document_id": DOCUMENT_ID,
+                "new_path": "tasks/stale.org",
+                "expected_revision": 1
+            }),
+        )
+        .await
+        .unwrap_err()
+        .data
+        .unwrap();
+    assert_eq!(stale["code"], "stale_revision");
+    assert_eq!(stale["details"]["current_revision"], 2);
+    assert!(stale.to_string().find("fencing_token").is_none());
+
+    let conflict = mcp
+        .call(
+            "org_rename_document",
+            json!({
+                "schema_version": 1,
+                "workspace_id": WORKSPACE_ID,
+                "actor_id": "agent-one",
+                "operation_id": "conflicting-rename",
+                "document_id": DOCUMENT_ID,
+                "new_path": "tasks/second.org",
+                "expected_revision": 2
+            }),
+        )
+        .await
+        .unwrap_err()
+        .data
+        .unwrap();
+    assert_eq!(conflict["code"], "document_path_conflict");
+    assert_eq!(conflict["details"]["path"], "tasks/second.org");
+    assert!(conflict.to_string().find("fencing_token").is_none());
+
+    let archived = mcp
+        .call(
+            "org_archive_document",
+            json!({
+                "schema_version": 1,
+                "workspace_id": WORKSPACE_ID,
+                "actor_id": "agent-one",
+                "operation_id": "archive-document",
+                "document_id": DOCUMENT_ID,
+                "expected_revision": 2
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived["document_revisions"][DOCUMENT_ID], 3);
+    assert_eq!(archived["data"]["archived_at"], NOW);
+
+    let active = mcp
+        .call("org_list_documents", json!({"workspace_id": WORKSPACE_ID}))
+        .await
+        .unwrap();
+    assert_eq!(active["items"].as_array().unwrap().len(), 1);
+    assert_eq!(active["items"][0]["id"], SECOND_DOCUMENT_ID);
+    assert_eq!(active["items"][0]["archived_at"], Value::Null);
+    let legacy_all = mcp
+        .call(
+            "org_list_documents",
+            json!({"workspace_id": WORKSPACE_ID, "include_archived": true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy_all["items"].as_array().unwrap().len(), 2);
+    let legacy_active = mcp
+        .call(
+            "org_list_documents",
+            json!({"workspace_id": WORKSPACE_ID, "include_archived": false}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy_active, active);
+    let archived_only = mcp
+        .call(
+            "org_list_documents",
+            json!({"workspace_id": WORKSPACE_ID, "status": "archived"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_only["items"].as_array().unwrap().len(), 1);
+    assert_eq!(archived_only["items"][0]["id"], DOCUMENT_ID);
+    assert_eq!(archived_only["items"][0]["archived_at"], NOW);
+    let explicit_all = mcp
+        .call(
+            "org_list_documents",
+            json!({"workspace_id": WORKSPACE_ID, "status": "all"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(explicit_all, legacy_all);
+    let explicit_active = mcp
+        .call(
+            "org_list_documents",
+            json!({"workspace_id": WORKSPACE_ID, "status": "active"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(explicit_active, active);
+    let null_filters = mcp
+        .call(
+            "org_list_documents",
+            json!({
+                "workspace_id": WORKSPACE_ID,
+                "status": null,
+                "include_archived": null
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(null_filters, active);
+    let archived_with_null_legacy = mcp
+        .call(
+            "org_list_documents",
+            json!({
+                "workspace_id": WORKSPACE_ID,
+                "status": "archived",
+                "include_archived": null
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_with_null_legacy, archived_only);
+    let all_with_null_status = mcp
+        .call(
+            "org_list_documents",
+            json!({
+                "workspace_id": WORKSPACE_ID,
+                "status": null,
+                "include_archived": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(all_with_null_status, legacy_all);
+    let first_page = mcp
+        .call(
+            "org_list_documents",
+            json!({"workspace_id": WORKSPACE_ID, "status": "all", "limit": 1}),
+        )
+        .await
+        .unwrap();
+    let second_page = mcp
+        .call(
+            "org_list_documents",
+            json!({
+                "workspace_id": WORKSPACE_ID,
+                "status": "all",
+                "limit": 1,
+                "cursor": first_page["next_cursor"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_ne!(first_page["items"][0]["id"], second_page["items"][0]["id"]);
+    let mismatched_cursor = mcp
+        .call(
+            "org_list_documents",
+            json!({
+                "workspace_id": WORKSPACE_ID,
+                "status": "active",
+                "limit": 1,
+                "cursor": first_page["next_cursor"]
+            }),
+        )
+        .await
+        .unwrap_err()
+        .data
+        .unwrap();
+    assert_eq!(mismatched_cursor["code"], "invalid_input");
+    let incompatible_filters = mcp
+        .call(
+            "org_list_documents",
+            json!({
+                "workspace_id": WORKSPACE_ID,
+                "status": "active",
+                "include_archived": false
+            }),
+        )
+        .await
+        .unwrap_err()
+        .data
+        .unwrap();
+    assert_eq!(incompatible_filters["code"], "invalid_input");
+
+    let archived_source = mcp
+        .call(
+            "org_get_document",
+            json!({"workspace_id": WORKSPACE_ID, "document_id": DOCUMENT_ID}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_source["archived_at"], NOW);
+    let archived_mutation = mcp
+        .call(
+            "org_put_document",
+            json!({
+                "schema_version": 1,
+                "workspace_id": WORKSPACE_ID,
+                "actor_id": "agent-one",
+                "operation_id": "mutate-archived-document",
+                "document_id": DOCUMENT_ID,
+                "path": "tasks/renamed.org",
+                "source": "",
+                "expected_revision": 3,
+                "lease_proofs": {}
+            }),
+        )
+        .await
+        .unwrap_err()
+        .data
+        .unwrap();
+    assert_eq!(archived_mutation["code"], "archived_document");
+    assert_eq!(archived_mutation["details"]["document_id"], DOCUMENT_ID);
+    assert!(archived_mutation
+        .to_string()
+        .find("fencing_token")
+        .is_none());
+
+    let restore = json!({
+        "schema_version": 1,
+        "workspace_id": WORKSPACE_ID,
+        "actor_id": "agent-one",
+        "operation_id": "restore-document",
+        "document_id": DOCUMENT_ID,
+        "expected_revision": 3
+    });
+    let restored = mcp
+        .call("org_restore_document", restore.clone())
+        .await
+        .unwrap();
+    assert_eq!(restored["document_revisions"][DOCUMENT_ID], 4);
+    assert_eq!(restored["data"]["path"], "tasks/renamed.org");
+    assert_eq!(restored["data"]["archived_at"], Value::Null);
+    assert_eq!(
+        mcp.call("org_restore_document", restore).await.unwrap(),
+        restored
+    );
+
+    mcp.call(
+        "org_put_document",
+        json!({
+            "schema_version": 1,
+            "workspace_id": WORKSPACE_ID,
+            "actor_id": "agent-one",
+            "operation_id": "seed-active-item",
+            "document_id": DOCUMENT_ID,
+            "path": "tasks/renamed.org",
+            "source": raw_source("Lease blocks archive"),
+            "expected_revision": 4,
+            "lease_proofs": {}
+        }),
+    )
+    .await
+    .unwrap();
+    let claim = claim_execution(
+        &mcp,
+        WORKSPACE_ID,
+        DOCUMENT_ID,
+        ITEM_ID,
+        5,
+        "claim-before-archive",
+    )
+    .await;
+    let active_lease = mcp
+        .call(
+            "org_archive_document",
+            json!({
+                "schema_version": 1,
+                "workspace_id": WORKSPACE_ID,
+                "actor_id": "agent-one",
+                "operation_id": "archive-with-active-lease",
+                "document_id": DOCUMENT_ID,
+                "expected_revision": claim.context.document.revision
+            }),
+        )
+        .await
+        .unwrap_err()
+        .data
+        .unwrap();
+    assert_eq!(active_lease["code"], "active_lease");
+    assert_eq!(active_lease["details"]["document_id"], DOCUMENT_ID);
+    assert_eq!(active_lease["details"]["work_item_ids"][0], ITEM_ID);
+    assert!(active_lease.to_string().find("fencing_token").is_none());
 }
 
 #[tokio::test]

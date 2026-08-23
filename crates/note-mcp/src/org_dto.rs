@@ -70,6 +70,101 @@ pub(crate) struct WorkspaceListInput {
     pub include_archived: bool,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DocumentStatusInput {
+    Active,
+    Archived,
+    All,
+}
+
+impl From<DocumentStatusInput> for note_pipelines::org::DocumentStatus {
+    fn from(value: DocumentStatusInput) -> Self {
+        match value {
+            DocumentStatusInput::Active => Self::Active,
+            DocumentStatusInput::Archived => Self::Archived,
+            DocumentStatusInput::All => Self::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DocumentListInput {
+    pub workspace_id: String,
+    pub cursor: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: u16,
+    pub status: Option<DocumentStatusInput>,
+    pub include_archived: Option<bool>,
+}
+
+impl JsonSchema for DocumentListInput {
+    fn schema_name() -> Cow<'static, str> {
+        "DocumentListInput".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string"},
+                "cursor": {"type": ["string", "null"]},
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 200
+                },
+                "status": {
+                    "type": ["string", "null"],
+                    "enum": ["active", "archived", "all", null]
+                },
+                "include_archived": {"type": ["boolean", "null"]}
+            },
+            "required": ["workspace_id"],
+            "additionalProperties": false,
+            "not": {
+                "properties": {
+                    "status": {"not": {"type": "null"}},
+                    "include_archived": {"not": {"type": "null"}}
+                },
+                "required": ["status", "include_archived"]
+            }
+        })
+    }
+}
+
+impl DocumentListInput {
+    pub(crate) fn into_pipeline<T>(
+        self,
+    ) -> Result<(T, note_pipelines::org::OrgDocumentReadQuery), OrgError>
+    where
+        T: std::str::FromStr,
+    {
+        if self.status.is_some() && self.include_archived.is_some() {
+            return Err(OrgError::invalid_input(
+                "Org document status and include_archived cannot be used together",
+            ));
+        }
+        let status = self.status.map(Into::into).unwrap_or_else(|| {
+            if self.include_archived.unwrap_or(false) {
+                note_pipelines::org::DocumentStatus::All
+            } else {
+                note_pipelines::org::DocumentStatus::Active
+            }
+        });
+        Ok((
+            parse_id(self.workspace_id, "workspace_id")?,
+            note_pipelines::org::OrgDocumentReadQuery {
+                cursor: self.cursor,
+                limit: Some(usize::from(self.limit)),
+                status,
+            },
+        ))
+    }
+}
+
 impl WorkspaceListInput {
     pub(crate) fn into_pipeline<T>(self) -> Result<(T, OrgReadQuery), OrgError>
     where
@@ -515,6 +610,107 @@ impl PutDocumentInput {
                 source: self.source,
                 expected_revision: self.expected_revision,
                 lease_proofs,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct CreateDocumentInput {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub operation_id: String,
+    pub document_id: String,
+    pub path: String,
+}
+
+impl CreateDocumentInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::CreateDocumentRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::CreateDocumentRequest {
+                document_id: parse_id(self.document_id, "document_id")?,
+                path: self.path,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct RenameDocumentInput {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub operation_id: String,
+    pub document_id: String,
+    pub new_path: String,
+    pub expected_revision: i64,
+}
+
+impl RenameDocumentInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::RenameDocumentRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::RenameDocumentRequest {
+                document_id: parse_id(self.document_id, "document_id")?,
+                new_path: self.new_path,
+                expected_revision: self.expected_revision,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct DocumentRevisionInput {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub operation_id: String,
+    pub document_id: String,
+    pub expected_revision: i64,
+}
+
+impl DocumentRevisionInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<
+        (
+            CommandEnvelope,
+            note_pipelines::org::DocumentRevisionRequest,
+        ),
+        OrgError,
+    > {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::DocumentRevisionRequest {
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_revision: self.expected_revision,
             },
         ))
     }
@@ -1562,6 +1758,7 @@ pub(crate) struct DocumentOutput {
     pub id: String,
     pub path: String,
     pub revision: i64,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1573,6 +1770,7 @@ pub(crate) struct DocumentSourceOutput {
     pub source: String,
     pub content_hash: String,
     pub revision: i64,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1841,6 +2039,15 @@ pub(crate) struct WorkspaceArchiveData {
 #[schemars(deny_unknown_fields)]
 pub(crate) struct DocumentCountData {
     pub document_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct DocumentLifecycleDataOutput {
+    pub document_id: String,
+    pub path: String,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -2146,6 +2353,7 @@ impl From<OrgDocumentView> for DocumentOutput {
             id: value.id.to_string(),
             path: value.path,
             revision: value.revision,
+            archived_at: value.archived_at,
         }
     }
 }
@@ -2159,6 +2367,7 @@ impl From<OrgDocumentSourceView> for DocumentSourceOutput {
             source: value.source,
             content_hash: value.content_hash,
             revision: value.revision,
+            archived_at: value.archived_at,
         }
     }
 }
@@ -2195,6 +2404,12 @@ where
         document_revisions: value.document_revisions,
         data,
     })
+}
+
+pub(crate) fn document_lifecycle_command_output(
+    value: OrgCommandResult,
+) -> Result<CommandOutput<DocumentLifecycleDataOutput>, OrgError> {
+    command_output(value)
 }
 
 #[derive(Deserialize)]
