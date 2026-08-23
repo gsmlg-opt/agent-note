@@ -26,7 +26,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-const ORG_ROUTES: [(&str, &str, &str); 36] = [
+const ORG_ROUTES: [(&str, &str, &str); 40] = [
     ("get", "/api/org/workspaces", "org_list_workspaces"),
     ("post", "/api/org/workspaces", "org_create_workspace"),
     (
@@ -58,6 +58,26 @@ const ORG_ROUTES: [(&str, &str, &str); 36] = [
         "put",
         "/api/org/documents/{document_id}",
         "org_put_document",
+    ),
+    (
+        "post",
+        "/api/org/workspaces/{workspace_id}/documents",
+        "org_create_document",
+    ),
+    (
+        "patch",
+        "/api/org/documents/{document_id}/path",
+        "org_rename_document",
+    ),
+    (
+        "post",
+        "/api/org/documents/{document_id}/archive",
+        "org_archive_document",
+    ),
+    (
+        "post",
+        "/api/org/documents/{document_id}/restore",
+        "org_restore_document",
     ),
     (
         "post",
@@ -205,6 +225,10 @@ fn expected_success_schema(operation_id: &str) -> &'static str {
         "org_list_documents" => "OrgDocumentPageResult",
         "org_get_document" => "OrgDocumentSourceResult",
         "org_put_document" | "org_import_workspace" => "OrgDocumentCountCommandResult",
+        "org_create_document"
+        | "org_rename_document"
+        | "org_archive_document"
+        | "org_restore_document" => "OrgDocumentLifecycleCommandResult",
         "org_move_document" => "OrgMoveDocumentCommandResult",
         "org_move_item" => "OrgMoveItemCommandResult",
         "org_export_workspace" => "OrgWorkspaceExportResult",
@@ -610,6 +634,9 @@ fn every_org_operation_documents_success_structured_errors_and_input_constraints
         ("org_update_workspace", "expected_revision"),
         ("org_archive_workspace", "expected_revision"),
         ("org_put_document", "expected_revision"),
+        ("org_rename_document", "expected_revision"),
+        ("org_archive_document", "expected_revision"),
+        ("org_restore_document", "expected_revision"),
         ("org_move_document", "expected_document_revision"),
         ("org_move_document", "expected_source_workspace_revision"),
         ("org_move_document", "expected_target_workspace_revision"),
@@ -843,6 +870,167 @@ fn common_org_schemas_document_mutations_pagination_errors_and_no_auth() {
     assert!(document["components"].get("securitySchemes").is_none());
 }
 
+#[test]
+fn document_lifecycle_openapi_has_closed_bodies_filters_and_archived_fields() {
+    let document = document();
+    let schemas = document["components"]["schemas"]
+        .as_object()
+        .expect("OpenAPI schemas");
+
+    fn collect_contract(
+        schema: &serde_json::Value,
+        schemas: &serde_json::Map<String, serde_json::Value>,
+        properties: &mut BTreeSet<String>,
+        required: &mut BTreeSet<String>,
+        closed: &mut bool,
+        visited: &mut BTreeSet<String>,
+    ) {
+        if let Some(reference) = schema["$ref"].as_str() {
+            let name = reference
+                .strip_prefix("#/components/schemas/")
+                .expect("component schema reference");
+            if visited.insert(name.to_owned()) {
+                collect_contract(
+                    &schemas[name],
+                    schemas,
+                    properties,
+                    required,
+                    closed,
+                    visited,
+                );
+            }
+        }
+        if let Some(fields) = schema["properties"].as_object() {
+            properties.extend(fields.keys().cloned());
+        }
+        if let Some(fields) = schema["required"].as_array() {
+            required.extend(
+                fields
+                    .iter()
+                    .map(|field| field.as_str().unwrap().to_owned()),
+            );
+        }
+        *closed |= schema["additionalProperties"] == false;
+        for keyword in ["allOf", "oneOf"] {
+            if let Some(parts) = schema[keyword].as_array() {
+                for part in parts {
+                    collect_contract(part, schemas, properties, required, closed, visited);
+                }
+            }
+        }
+    }
+
+    for (schema_name, expected) in [
+        (
+            "CreateDocumentBody",
+            [
+                "actor_id",
+                "document_id",
+                "operation_id",
+                "path",
+                "schema_version",
+            ]
+            .as_slice(),
+        ),
+        (
+            "RenameDocumentBody",
+            [
+                "actor_id",
+                "expected_revision",
+                "new_path",
+                "operation_id",
+                "schema_version",
+                "workspace_id",
+            ]
+            .as_slice(),
+        ),
+        (
+            "DocumentRevisionBody",
+            [
+                "actor_id",
+                "expected_revision",
+                "operation_id",
+                "schema_version",
+                "workspace_id",
+            ]
+            .as_slice(),
+        ),
+    ] {
+        let schema = &schemas[schema_name];
+        let mut properties = BTreeSet::new();
+        let mut required = BTreeSet::new();
+        let mut closed = false;
+        collect_contract(
+            schema,
+            schemas,
+            &mut properties,
+            &mut required,
+            &mut closed,
+            &mut BTreeSet::new(),
+        );
+        assert_eq!(
+            properties,
+            expected.iter().map(|field| (*field).to_owned()).collect()
+        );
+        assert!(closed, "{schema_name} must reject unknown fields");
+        assert_eq!(
+            required,
+            expected.iter().map(|field| (*field).to_owned()).collect()
+        );
+        for forbidden in ["source", "lease", "lease_proofs", "fencing_token"] {
+            assert!(!properties.contains(forbidden), "{schema_name}.{forbidden}");
+        }
+    }
+
+    let list = &document["paths"]["/api/org/workspaces/{workspace_id}/documents"]["get"];
+    let parameters = list["parameters"].as_array().unwrap();
+    let status = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "status")
+        .expect("document status parameter");
+    assert_eq!(
+        status["schema"]["enum"],
+        serde_json::json!(["active", "archived", "all"])
+    );
+    assert!(status["description"]
+        .as_str()
+        .unwrap()
+        .contains("include_archived"));
+    assert_eq!(status["required"], false);
+    assert_eq!(status["schema"]["type"], "string");
+    let legacy = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "include_archived")
+        .expect("legacy include_archived parameter");
+    assert!(legacy["description"].as_str().unwrap().contains("status"));
+    assert_eq!(legacy["required"], false);
+    assert_eq!(legacy["schema"]["type"], "boolean");
+
+    for schema_name in ["OrgDocumentResult", "OrgDocumentSourceResult"] {
+        assert!(schemas[schema_name]["properties"]
+            .get("archived_at")
+            .is_some());
+        assert!(schema_accepts_null(
+            &schemas[schema_name]["properties"]["archived_at"]
+        ));
+        assert!(schemas[schema_name]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("archived_at")));
+    }
+    assert!(schema_accepts_null(
+        &schemas["OrgDocumentLifecycleData"]["properties"]["archived_at"]
+    ));
+    assert_eq!(
+        schemas["OrgDocumentLifecycleCommandResult"]["properties"]["data"]["$ref"],
+        "#/components/schemas/OrgDocumentLifecycleData"
+    );
+    assert!(schemas["DocumentImportBody"]["properties"]
+        .get("archived_at")
+        .is_none());
+    assert!(document["paths"].get("/mcp").is_none());
+}
+
 #[tokio::test]
 async fn org_routes_extract_the_shared_org_context_from_app_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -895,6 +1083,12 @@ async fn structured_error_mapping_is_stable_and_storage_details_are_safe() {
         (OrgErrorCode::NotFound, StatusCode::NOT_FOUND, false),
         (OrgErrorCode::NoteUnavailable, StatusCode::NOT_FOUND, false),
         (OrgErrorCode::ArchivedWorkspace, StatusCode::CONFLICT, false),
+        (OrgErrorCode::ArchivedDocument, StatusCode::CONFLICT, false),
+        (
+            OrgErrorCode::DocumentPathConflict,
+            StatusCode::CONFLICT,
+            false,
+        ),
         (OrgErrorCode::StaleRevision, StatusCode::CONFLICT, false),
         (
             OrgErrorCode::IdempotencyConflict,

@@ -6,12 +6,15 @@ use note_pipelines::org::{
 };
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use crate::{app_state::AppState, org_api::error::OrgApiError};
+use crate::{
+    app_state::AppState, openapi::OrgDocumentLifecycleCommandResult, org_api::error::OrgApiError,
+};
 
 use super::{
     dto::{
-        DocumentPath, DocumentReadQuery, ImportWorkspaceBody, ItemPath, MoveDocumentBody,
-        MoveItemBody, OrgPageQuery, PutDocumentBody, WorkspacePath,
+        CreateDocumentBody, DocumentListQuery, DocumentPath, DocumentReadQuery,
+        DocumentRevisionBody, ImportWorkspaceBody, ItemPath, MoveDocumentBody, MoveItemBody,
+        PutDocumentBody, RenameDocumentBody, WorkspacePath,
     },
     error::{OrgJson, OrgPath, OrgQuery},
 };
@@ -23,7 +26,7 @@ use super::{
     tag = "org",
     params(
         ("workspace_id" = String, Path, description = "Workspace UUID"),
-        OrgPageQuery
+        DocumentListQuery
     ),
     responses(
         (status = 200, description = "Workspace documents", body = serde_json::Value),
@@ -37,9 +40,37 @@ use super::{
 async fn list_documents(
     State(context): State<Arc<OrgContext>>,
     OrgPath(path): OrgPath<WorkspacePath>,
-    OrgQuery(query): OrgQuery<OrgPageQuery>,
+    OrgQuery(query): OrgQuery<DocumentListQuery>,
 ) -> Result<Json<OrgReadPage<OrgDocumentView>>, OrgApiError> {
-    note_pipelines::org::list_documents(&context, path.parse()?, &query.into())
+    note_pipelines::org::list_documents(&context, path.parse()?, &query.into_pipeline()?)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/org/workspaces/{workspace_id}/documents",
+    operation_id = "org_create_document",
+    tag = "org",
+    params(("workspace_id" = String, Path, description = "Workspace UUID")),
+    request_body = CreateDocumentBody,
+    responses(
+        (status = 200, description = "Empty document created", body = OrgDocumentLifecycleCommandResult),
+        (status = 400, description = "Invalid input", body = OrgApiError),
+        (status = 404, description = "Resource not found", body = OrgApiError),
+        (status = 409, description = "Org state conflict", body = OrgApiError),
+        (status = 429, description = "Workspace concurrency limit reached", body = OrgApiError),
+        (status = 500, description = "Storage failure", body = OrgApiError)
+    )
+)]
+async fn create_document(
+    State(context): State<Arc<OrgContext>>,
+    OrgPath(path): OrgPath<WorkspacePath>,
+    OrgJson(body): OrgJson<CreateDocumentBody>,
+) -> Result<Json<note_pipelines::org::OrgCommandResult>, OrgApiError> {
+    let (command, request) = body.into_pipeline(path.parse()?)?;
+    note_pipelines::org::create_document(&context, &command, &request)
         .await
         .map(Json)
         .map_err(Into::into)
@@ -97,6 +128,90 @@ async fn put_document(
 ) -> Result<Json<note_pipelines::org::OrgCommandResult>, OrgApiError> {
     let (command, request) = body.into_pipeline(path.parse()?)?;
     note_pipelines::org::put_document(&context, &command, &request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/org/documents/{document_id}/path",
+    operation_id = "org_rename_document",
+    tag = "org",
+    params(("document_id" = String, Path, description = "Document UUID")),
+    request_body = RenameDocumentBody,
+    responses(
+        (status = 200, description = "Document renamed", body = OrgDocumentLifecycleCommandResult),
+        (status = 400, description = "Invalid input", body = OrgApiError),
+        (status = 404, description = "Resource not found", body = OrgApiError),
+        (status = 409, description = "Org state conflict", body = OrgApiError),
+        (status = 429, description = "Workspace concurrency limit reached", body = OrgApiError),
+        (status = 500, description = "Storage failure", body = OrgApiError)
+    )
+)]
+async fn rename_document(
+    State(context): State<Arc<OrgContext>>,
+    OrgPath(path): OrgPath<DocumentPath>,
+    OrgJson(body): OrgJson<RenameDocumentBody>,
+) -> Result<Json<note_pipelines::org::OrgCommandResult>, OrgApiError> {
+    let (command, request) = body.into_pipeline(path.parse()?)?;
+    note_pipelines::org::rename_document(&context, &command, &request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/org/documents/{document_id}/archive",
+    operation_id = "org_archive_document",
+    tag = "org",
+    params(("document_id" = String, Path, description = "Document UUID")),
+    request_body = DocumentRevisionBody,
+    responses(
+        (status = 200, description = "Document archived", body = OrgDocumentLifecycleCommandResult),
+        (status = 400, description = "Invalid input", body = OrgApiError),
+        (status = 404, description = "Resource not found", body = OrgApiError),
+        (status = 409, description = "Org state conflict", body = OrgApiError),
+        (status = 429, description = "Workspace concurrency limit reached", body = OrgApiError),
+        (status = 500, description = "Storage failure", body = OrgApiError)
+    )
+)]
+async fn archive_document(
+    State(context): State<Arc<OrgContext>>,
+    OrgPath(path): OrgPath<DocumentPath>,
+    OrgJson(body): OrgJson<DocumentRevisionBody>,
+) -> Result<Json<note_pipelines::org::OrgCommandResult>, OrgApiError> {
+    let (command, request) = body.into_pipeline(path.parse()?)?;
+    note_pipelines::org::archive_document(&context, &command, &request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/org/documents/{document_id}/restore",
+    operation_id = "org_restore_document",
+    tag = "org",
+    params(("document_id" = String, Path, description = "Document UUID")),
+    request_body = DocumentRevisionBody,
+    responses(
+        (status = 200, description = "Document restored", body = OrgDocumentLifecycleCommandResult),
+        (status = 400, description = "Invalid input", body = OrgApiError),
+        (status = 404, description = "Resource not found", body = OrgApiError),
+        (status = 409, description = "Org state conflict", body = OrgApiError),
+        (status = 429, description = "Workspace concurrency limit reached", body = OrgApiError),
+        (status = 500, description = "Storage failure", body = OrgApiError)
+    )
+)]
+async fn restore_document(
+    State(context): State<Arc<OrgContext>>,
+    OrgPath(path): OrgPath<DocumentPath>,
+    OrgJson(body): OrgJson<DocumentRevisionBody>,
+) -> Result<Json<note_pipelines::org::OrgCommandResult>, OrgApiError> {
+    let (command, request) = body.into_pipeline(path.parse()?)?;
+    note_pipelines::org::restore_document(&context, &command, &request)
         .await
         .map(Json)
         .map_err(Into::into)
@@ -213,8 +328,11 @@ async fn export_workspace(
 
 pub(super) fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(list_documents))
+        .routes(routes!(list_documents, create_document))
         .routes(routes!(get_document, put_document))
+        .routes(routes!(rename_document))
+        .routes(routes!(archive_document))
+        .routes(routes!(restore_document))
         .routes(routes!(move_document))
         .routes(routes!(move_item))
         .routes(routes!(import_workspace))

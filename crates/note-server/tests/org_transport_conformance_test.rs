@@ -28,6 +28,8 @@ const NOW: i64 = 1_900_000_000;
 const WORKSPACE: &str = "10000000-0000-4000-8000-000000000061";
 const DOCUMENT: &str = "20000000-0000-4000-8000-000000000061";
 const IMPORT_DOCUMENT: &str = "20000000-0000-4000-8000-000000000062";
+const LIFECYCLE_DOCUMENT: &str = "20000000-0000-4000-8000-000000000063";
+const LIFECYCLE_DOCUMENT_B: &str = "20000000-0000-4000-8000-000000000064";
 const ITEM_A: &str = "30000000-0000-4000-8000-000000000061";
 const ITEM_B: &str = "30000000-0000-4000-8000-000000000062";
 const ITEM_C: &str = "30000000-0000-4000-8000-000000000063";
@@ -531,8 +533,147 @@ async fn live_mcp_org_names_equal_generated_rest_operation_ids() {
                 .filter_map(|method| item[method]["operationId"].as_str().map(str::to_owned))
         })
         .collect::<BTreeSet<_>>();
-    assert_eq!(mcp_names.len(), 36);
+    assert_eq!(mcp_names.len(), 40);
     assert_eq!(mcp_names, rest_names);
+}
+
+#[tokio::test]
+async fn document_lifecycle_successes_and_errors_match_across_transports() {
+    let mut pair = Pair::new().await;
+    let workspace = merge(
+        command("seed", "lifecycle-workspace"),
+        json!({
+            "slug": "lifecycle-conformance",
+            "display_name": "Lifecycle Conformance",
+            "description": "REST and MCP lifecycle parity",
+            "timezone": "UTC",
+            "policy_schema_version": 1,
+            "policy": policy()
+        }),
+    );
+    pair.call_success(
+        "org_create_workspace",
+        workspace.clone(),
+        Method::POST,
+        "/api/org/workspaces",
+        Some(workspace),
+    )
+    .await;
+
+    for (document_id, path) in [
+        (LIFECYCLE_DOCUMENT, "lifecycle/first.org"),
+        (LIFECYCLE_DOCUMENT_B, "lifecycle/second.org"),
+    ] {
+        let create = merge(
+            command("seed", &format!("create-{document_id}")),
+            json!({"document_id": document_id, "path": path}),
+        );
+        let result = pair
+            .call_success(
+                "org_create_document",
+                create.clone(),
+                Method::POST,
+                &format!("/api/org/workspaces/{WORKSPACE}/documents"),
+                Some(without(create, &["workspace_id"])),
+            )
+            .await;
+        assert_eq!(result["document_revisions"][document_id], 1);
+        assert_eq!(result["data"]["document_id"], document_id);
+        assert_eq!(result["data"]["archived_at"], Value::Null);
+    }
+
+    let rename = merge(
+        command("seed", "rename-lifecycle"),
+        json!({
+            "document_id": LIFECYCLE_DOCUMENT,
+            "new_path": "lifecycle/renamed.org",
+            "expected_revision": 1
+        }),
+    );
+    let renamed = pair
+        .call_success(
+            "org_rename_document",
+            rename.clone(),
+            Method::PATCH,
+            &format!("/api/org/documents/{LIFECYCLE_DOCUMENT}/path"),
+            Some(without(rename, &["document_id"])),
+        )
+        .await;
+    assert_eq!(renamed["document_revisions"][LIFECYCLE_DOCUMENT], 2);
+    assert_eq!(renamed["data"]["path"], "lifecycle/renamed.org");
+
+    let conflict = merge(
+        command("seed", "rename-conflict"),
+        json!({
+            "document_id": LIFECYCLE_DOCUMENT_B,
+            "new_path": "lifecycle/renamed.org",
+            "expected_revision": 1
+        }),
+    );
+    pair.call_error(
+        "document_path_conflict",
+        "org_rename_document",
+        conflict.clone(),
+        Method::PATCH,
+        &format!("/api/org/documents/{LIFECYCLE_DOCUMENT_B}/path"),
+        Some(without(conflict, &["document_id"])),
+    )
+    .await;
+
+    let stale = merge(
+        command("seed", "archive-stale"),
+        json!({
+            "document_id": LIFECYCLE_DOCUMENT,
+            "expected_revision": 99
+        }),
+    );
+    pair.call_error(
+        "stale_revision",
+        "org_archive_document",
+        stale.clone(),
+        Method::POST,
+        &format!("/api/org/documents/{LIFECYCLE_DOCUMENT}/archive"),
+        Some(without(stale, &["document_id"])),
+    )
+    .await;
+
+    let archive = merge(
+        command("seed", "archive-lifecycle"),
+        json!({
+            "document_id": LIFECYCLE_DOCUMENT,
+            "expected_revision": 2
+        }),
+    );
+    let archived = pair
+        .call_success(
+            "org_archive_document",
+            archive.clone(),
+            Method::POST,
+            &format!("/api/org/documents/{LIFECYCLE_DOCUMENT}/archive"),
+            Some(without(archive, &["document_id"])),
+        )
+        .await;
+    assert_eq!(archived["document_revisions"][LIFECYCLE_DOCUMENT], 3);
+    assert_eq!(archived["data"]["archived_at"], NOW);
+
+    let restore = merge(
+        command("seed", "restore-lifecycle"),
+        json!({
+            "document_id": LIFECYCLE_DOCUMENT,
+            "expected_revision": 3
+        }),
+    );
+    let restored = pair
+        .call_success(
+            "org_restore_document",
+            restore.clone(),
+            Method::POST,
+            &format!("/api/org/documents/{LIFECYCLE_DOCUMENT}/restore"),
+            Some(without(restore, &["document_id"])),
+        )
+        .await;
+    assert_eq!(restored["document_revisions"][LIFECYCLE_DOCUMENT], 4);
+    assert_eq!(restored["data"]["archived_at"], Value::Null);
 }
 
 #[tokio::test]
