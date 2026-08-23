@@ -1,3 +1,5 @@
+use std::{collections::HashSet, ops::Deref, rc::Rc};
+
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 use yew_duskmoon::{Alert, Button};
@@ -21,6 +23,88 @@ const LABEL_FILTER_PARSER_OPERATORS: [&str; 9] =
     [">=", "<=", "!=", "^=", "$=", "~=", "=", ">", "<"];
 const LABEL_FILTER_DISPLAY_OPERATORS: [&str; 10] =
     ["==", "=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="];
+
+#[derive(Clone, Default, PartialEq)]
+struct SelectionState(HashSet<String>);
+
+impl Deref for SelectionState {
+    type Target = HashSet<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+enum SelectionAction {
+    Replace(HashSet<String>),
+    RetainVisible(HashSet<String>),
+    Toggle { id: String, selected: bool },
+    Clear,
+}
+
+impl Reducible for SelectionState {
+    type Action = SelectionAction;
+
+    fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
+        let mut next = self.0.clone();
+        match action {
+            SelectionAction::Replace(replacement) => next = replacement,
+            SelectionAction::RetainVisible(visible) => next.retain(|id| visible.contains(id)),
+            SelectionAction::Toggle { id, selected } => {
+                if selected {
+                    next.insert(id);
+                } else {
+                    next.remove(&id);
+                }
+            }
+            SelectionAction::Clear => next.clear(),
+        }
+        Self(next).into()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NoteSelectionTarget {
+    id: String,
+    revision: i64,
+}
+
+impl NoteSelectionTarget {
+    fn new(id: impl Into<String>, revision: i64) -> Self {
+        Self {
+            id: id.into(),
+            revision,
+        }
+    }
+}
+
+fn note_selection_targets(notes: &[NoteSummary]) -> Vec<NoteSelectionTarget> {
+    notes
+        .iter()
+        .map(|note| NoteSelectionTarget::new(note.id.clone(), note.revision))
+        .collect()
+}
+
+fn search_result_selection_targets(hits: &[SearchResultSummary]) -> Vec<NoteSelectionTarget> {
+    hits.iter()
+        .map(|hit| NoteSelectionTarget::new(hit.id.clone(), hit.revision))
+        .collect()
+}
+
+fn selected_note_targets(
+    visible: &[NoteSelectionTarget],
+    selected: &HashSet<String>,
+) -> Vec<api::BatchNoteTarget> {
+    visible
+        .iter()
+        .filter(|target| selected.contains(&target.id))
+        .map(|target| api::BatchNoteTarget::new(target.id.clone(), target.revision))
+        .collect()
+}
+
+fn select_all_is_indeterminate(selected_visible_count: usize, visible_count: usize) -> bool {
+    selected_visible_count > 0 && selected_visible_count < visible_count
+}
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct NotesUrlState {
@@ -239,6 +323,7 @@ pub fn notes_page() -> Html {
     let error = use_state(|| None::<String>);
     // The note pending deletion (id, title) — drives the confirm modal.
     let delete_target = use_state(|| None::<(String, String, i64)>);
+    let selected = use_reducer(SelectionState::default);
     let stale_revision_gate = use_reducer(StaleRevisionGate::default);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
@@ -256,6 +341,65 @@ pub fn notes_page() -> Html {
         .unwrap_or_default();
     let url_state = parse_notes_query(&query_string);
     let notes_query = notes_query_params(&url_state);
+    let visible_targets = if let Some(hits) = &*results {
+        let search_page = search_result_page(hits.len(), *page, *page_size, &notes_query);
+        search_result_selection_targets(&hits[search_page.start..search_page.end])
+    } else {
+        note_selection_targets(&notes)
+    };
+    let visible_ids = visible_targets
+        .iter()
+        .map(|target| target.id.clone())
+        .collect::<HashSet<_>>();
+    let selected_visible_count = selected_note_targets(&visible_targets, &selected).len();
+    let select_all_ref = use_node_ref();
+
+    {
+        let selected = selected.clone();
+        use_effect_with(visible_ids.clone(), move |visible_ids| {
+            selected.dispatch(SelectionAction::RetainVisible(visible_ids.clone()));
+            || ()
+        });
+    }
+
+    {
+        let select_all_ref = select_all_ref.clone();
+        use_effect_with(
+            (selected_visible_count, visible_ids.len()),
+            move |(selected_visible_count, visible_count)| {
+                if let Some(input) = select_all_ref.cast::<HtmlInputElement>() {
+                    input.set_indeterminate(select_all_is_indeterminate(
+                        *selected_visible_count,
+                        *visible_count,
+                    ));
+                }
+                || ()
+            },
+        );
+    }
+
+    let on_select_all = {
+        let selected = selected.clone();
+        let visible_ids = visible_ids.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if input.checked() {
+                selected.dispatch(SelectionAction::Replace(visible_ids.clone()));
+            } else {
+                selected.dispatch(SelectionAction::Clear);
+            }
+        })
+    };
+
+    let on_selection_change = {
+        let selected = selected.clone();
+        Callback::from(move |(id, selected_now): (String, bool)| {
+            selected.dispatch(SelectionAction::Toggle {
+                id,
+                selected: selected_now,
+            });
+        })
+    };
 
     let replace_notes_url = {
         let navigator = navigator.clone();
@@ -662,9 +806,9 @@ pub fn notes_page() -> Html {
             if *loading {
                 <p class="loading">{ "Loading…" }</p>
             } else if let Some(hits) = &*results {
-                { search_results_view(hits, &page, &page_size, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
+                { search_results_view(hits, &page, &page_size, &selected, &select_all_ref, on_select_all.clone(), on_selection_change.clone(), false, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
             } else {
-                { list_view(&notes, *total_notes, &page, &page_size, &delete_target, &notes_query, on_quick_add_filter, on_page_change, on_page_size_change, on_refresh) }
+                { list_view(&notes, *total_notes, &page, &page_size, &selected, &select_all_ref, on_select_all, on_selection_change, false, &delete_target, &notes_query, on_quick_add_filter, on_page_change, on_page_size_change, on_refresh) }
             }
 
             { delete_modal }
@@ -800,6 +944,11 @@ fn list_view(
     total: usize,
     page: &UseStateHandle<usize>,
     page_size: &UseStateHandle<usize>,
+    selected: &UseReducerHandle<SelectionState>,
+    select_all_ref: &NodeRef,
+    on_select_all: Callback<Event>,
+    on_selection_change: Callback<(String, bool)>,
+    selection_disabled: bool,
     delete_target: &UseStateHandle<Option<(String, String, i64)>>,
     notes_query: &NotesQueryParams,
     on_quick_add_filter: Callback<(String, String)>,
@@ -807,8 +956,22 @@ fn list_view(
     on_page_size_change: Callback<usize>,
     on_refresh: Callback<MouseEvent>,
 ) -> Html {
+    let on_delete_target = {
+        let delete_target = delete_target.clone();
+        Callback::from(move |target| delete_target.set(Some(target)))
+    };
     if total == 0 {
-        return note_table(notes, delete_target, notes_query, on_quick_add_filter);
+        return note_table(
+            notes,
+            &**selected,
+            select_all_ref,
+            on_select_all,
+            on_selection_change,
+            selection_disabled,
+            notes_query,
+            on_delete_target,
+            on_quick_add_filter,
+        );
     }
     let per_page = **page_size;
     let total_pages = total.div_ceil(per_page);
@@ -818,7 +981,7 @@ fn list_view(
 
     html! {
         <>
-            { note_table(notes, delete_target, notes_query, on_quick_add_filter) }
+            { note_table(notes, &**selected, select_all_ref, on_select_all, on_selection_change, selection_disabled, notes_query, on_delete_target, on_quick_add_filter) }
             { pagination_bar(current, total_pages, total, start, end, **page_size, on_page_change, on_page_size_change, on_refresh) }
         </>
     }
@@ -901,8 +1064,13 @@ fn pagination_bar(
 
 fn note_table(
     notes: &[NoteSummary],
-    delete_target: &UseStateHandle<Option<(String, String, i64)>>,
+    selected: &HashSet<String>,
+    select_all_ref: &NodeRef,
+    on_select_all: Callback<Event>,
+    on_selection_change: Callback<(String, bool)>,
+    selection_disabled: bool,
     notes_query: &NotesQueryParams,
+    on_delete_target: Callback<(String, String, i64)>,
     on_quick_add_filter: Callback<(String, String)>,
 ) -> Html {
     if notes.is_empty() {
@@ -915,14 +1083,11 @@ fn note_table(
             </div>
         };
     }
-    let on_delete_target = {
-        let delete_target = delete_target.clone();
-        Callback::from(move |target| delete_target.set(Some(target)))
-    };
+    let all_selected = !notes.is_empty() && notes.iter().all(|note| selected.contains(&note.id));
     html! {
         <div class="table-scroll">
             <table class="table note-table">
-                { note_table_head(false) }
+                { note_table_head(false, all_selected, select_all_ref, on_select_all, selection_disabled) }
                 <tbody>
                     { for notes.iter().map(|note| note_row(
                         &note.id,
@@ -932,6 +1097,9 @@ fn note_table(
                         &note.labels,
                         note.created_at,
                         note.updated_at,
+                        selected.contains(&note.id),
+                        on_selection_change.clone(),
+                        selection_disabled,
                         notes_query,
                         on_delete_target.clone(),
                         on_quick_add_filter.clone(),
@@ -942,10 +1110,27 @@ fn note_table(
     }
 }
 
-fn note_table_head(show_score: bool) -> Html {
+fn note_table_head(
+    show_score: bool,
+    all_selected: bool,
+    select_all_ref: &NodeRef,
+    on_select_all: Callback<Event>,
+    selection_disabled: bool,
+) -> Html {
     html! {
         <thead>
             <tr>
+                <th class="col-select">
+                    <input
+                        ref={select_all_ref.clone()}
+                        type="checkbox"
+                        class="checkbox checkbox-primary"
+                        checked={all_selected}
+                        disabled={selection_disabled}
+                        onchange={on_select_all}
+                        aria-label="Select all visible notes"
+                    />
+                </th>
                 if show_score {
                     <th class="col-score">{ "Score" }</th>
                 }
@@ -1023,6 +1208,9 @@ fn note_row(
     labels: &[(String, String)],
     created_at: i64,
     updated_at: i64,
+    selected: bool,
+    on_selection_change: Callback<(String, bool)>,
+    selection_disabled: bool,
     notes_query: &NotesQueryParams,
     on_delete_target: Callback<(String, String, i64)>,
     on_quick_add_filter: Callback<(String, String)>,
@@ -1040,8 +1228,25 @@ fn note_row(
         let title = title.clone();
         Callback::from(move |_| emit_delete_target(&on_delete_target, &id, &title, revision))
     };
+    let on_select = {
+        let id = id.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            on_selection_change.emit((id.clone(), input.checked()));
+        })
+    };
     html! {
         <tr key={id.clone()}>
+            <td class="col-select">
+                <input
+                    type="checkbox"
+                    class="checkbox checkbox-primary"
+                    checked={selected}
+                    disabled={selection_disabled}
+                    onchange={on_select}
+                    aria-label={format!("Select {title}")}
+                />
+            </td>
             if let Some(score) = score {
                 <td class="col-score">{ format!("{score:.4}") }</td>
             }
@@ -1114,6 +1319,11 @@ fn search_results_view(
     hits: &[SearchResultSummary],
     page: &UseStateHandle<usize>,
     page_size: &UseStateHandle<usize>,
+    selected: &UseReducerHandle<SelectionState>,
+    select_all_ref: &NodeRef,
+    on_select_all: Callback<Event>,
+    on_selection_change: Callback<(String, bool)>,
+    selection_disabled: bool,
     delete_target: &UseStateHandle<Option<(String, String, i64)>>,
     notes_query: &NotesQueryParams,
     on_quick_add_filter: Callback<(String, String)>,
@@ -1132,7 +1342,7 @@ fn search_results_view(
     };
     html! {
         <>
-            { search_result_table(&hits[search_page.start..search_page.end], &search_page.notes_query, on_delete_target, on_quick_add_filter) }
+            { search_result_table(&hits[search_page.start..search_page.end], &**selected, select_all_ref, on_select_all, on_selection_change, selection_disabled, &search_page.notes_query, on_delete_target, on_quick_add_filter) }
             { pagination_bar(search_page.current, search_page.total_pages, total, search_page.start, search_page.end, **page_size, on_page_change, on_page_size_change, on_refresh) }
         </>
     }
@@ -1169,14 +1379,20 @@ fn search_result_page(
 
 fn search_result_table(
     hits: &[SearchResultSummary],
+    selected: &HashSet<String>,
+    select_all_ref: &NodeRef,
+    on_select_all: Callback<Event>,
+    on_selection_change: Callback<(String, bool)>,
+    selection_disabled: bool,
     notes_query: &NotesQueryParams,
     on_delete_target: Callback<(String, String, i64)>,
     on_quick_add_filter: Callback<(String, String)>,
 ) -> Html {
+    let all_selected = !hits.is_empty() && hits.iter().all(|hit| selected.contains(&hit.id));
     html! {
         <div class="table-scroll">
             <table class="table note-table search-result-table">
-                { note_table_head(true) }
+                { note_table_head(true, all_selected, select_all_ref, on_select_all, selection_disabled) }
                 <tbody>
                     { for hits.iter().map(|result| note_row(
                         &result.id,
@@ -1186,6 +1402,9 @@ fn search_result_table(
                         &result.labels,
                         result.created_at,
                         result.updated_at,
+                        selected.contains(&result.id),
+                        on_selection_change.clone(),
+                        selection_disabled,
                         notes_query,
                         on_delete_target.clone(),
                         on_quick_add_filter.clone(),
@@ -1200,6 +1419,7 @@ fn search_result_table(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::HashSet;
     use std::rc::Rc;
     use yew::virtual_dom::VNode;
 
@@ -1263,6 +1483,184 @@ mod tests {
     }
 
     #[test]
+    fn selection_reducer_replaces_toggles_clears_and_retains_visible_ids() {
+        let state =
+            Rc::new(SelectionState::default()).reduce(SelectionAction::Replace(HashSet::from([
+                "first".to_string(),
+                "hidden".to_string(),
+            ])));
+        let state = state.reduce(SelectionAction::Toggle {
+            id: "second".to_string(),
+            selected: true,
+        });
+        let state = state.reduce(SelectionAction::RetainVisible(HashSet::from([
+            "first".to_string(),
+            "second".to_string(),
+        ])));
+
+        assert_eq!(
+            **state,
+            HashSet::from(["first".to_string(), "second".to_string()])
+        );
+
+        let state = state.reduce(SelectionAction::Clear);
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn selected_note_targets_follow_visible_order_and_revisions() {
+        let visible = vec![
+            NoteSelectionTarget::new("third", 3),
+            NoteSelectionTarget::new("second", 2),
+            NoteSelectionTarget::new("first", 1),
+        ];
+        let selected = HashSet::from([
+            "first".to_string(),
+            "third".to_string(),
+            "hidden".to_string(),
+        ]);
+
+        assert_eq!(
+            selected_note_targets(&visible, &selected),
+            vec![
+                api::BatchNoteTarget::new("third", 3),
+                api::BatchNoteTarget::new("first", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_target_helpers_map_normal_notes_and_only_the_current_search_page() {
+        let notes = vec![NoteSummary {
+            id: "normal".into(),
+            title: "Normal".into(),
+            content: String::new(),
+            attachments: vec![],
+            labels: vec![],
+            created_at: 0,
+            updated_at: 0,
+            revision: 8,
+        }];
+        assert_eq!(
+            note_selection_targets(&notes),
+            vec![NoteSelectionTarget::new("normal", 8)]
+        );
+
+        let hits = (1..=5)
+            .map(|index| SearchResultSummary {
+                id: format!("hit-{index}"),
+                title: format!("Hit {index}"),
+                revision: index,
+                score: index as f32,
+                labels: vec![],
+                created_at: 0,
+                updated_at: 0,
+            })
+            .collect::<Vec<_>>();
+        let page = search_result_page(
+            5,
+            1,
+            2,
+            &NotesQueryParams {
+                current: 2,
+                page_size: 2,
+                search: Some("hit".into()),
+                labels: None,
+            },
+        );
+
+        assert_eq!(
+            search_result_selection_targets(&hits[page.start..page.end]),
+            vec![
+                NoteSelectionTarget::new("hit-3", 3),
+                NoteSelectionTarget::new("hit-4", 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_all_indeterminate_only_for_a_partial_visible_selection() {
+        assert!(!select_all_is_indeterminate(0, 3));
+        assert!(select_all_is_indeterminate(1, 3));
+        assert!(!select_all_is_indeterminate(3, 3));
+        assert!(!select_all_is_indeterminate(1, 0));
+    }
+
+    #[test]
+    fn normal_note_table_renders_select_column_before_existing_note_columns() {
+        let query = NotesQueryParams {
+            current: 1,
+            page_size: 10,
+            search: None,
+            labels: None,
+        };
+        let notes = vec![NoteSummary {
+            id: "note-1".into(),
+            title: "Normal note".into(),
+            content: String::new(),
+            attachments: vec![],
+            labels: vec![("project".into(), "agent-note".into())],
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_060,
+            revision: 4,
+        }];
+        let table_wrapper = note_table(
+            &notes,
+            &HashSet::from(["note-1".to_string()]),
+            &NodeRef::default(),
+            Callback::noop(),
+            Callback::noop(),
+            false,
+            &query,
+            Callback::noop(),
+            Callback::noop(),
+        );
+        let table = only_child_with_tag(&table_wrapper, "table");
+        let header_row = only_child_with_tag(only_child_with_tag(table, "thead"), "tr");
+        let headers = rendered_children(header_row)
+            .into_iter()
+            .filter(|child| matches!(child, VNode::VTag(tag) if tag.tag() == "th"))
+            .collect::<Vec<_>>();
+        assert_eq!(headers.len(), 6);
+        assert_eq!(attribute(headers[0], "class"), Some("col-select"));
+        let select_all = only_child_with_tag(headers[0], "input");
+        assert_eq!(
+            attribute(select_all, "aria-label"),
+            Some("Select all visible notes")
+        );
+        assert!(format!("{select_all:?}").contains("checked: Some(true)"));
+        assert_eq!(
+            headers[1..]
+                .iter()
+                .flat_map(|header| visible_text(header))
+                .collect::<Vec<_>>(),
+            ["Title", "Labels", "Created", "Updated", "Actions"]
+        );
+
+        let row = only_child_with_tag(only_child_with_tag(table, "tbody"), "tr");
+        let cells = rendered_children(row)
+            .into_iter()
+            .filter(|child| matches!(child, VNode::VTag(tag) if tag.tag() == "td"))
+            .collect::<Vec<_>>();
+        assert_eq!(cells.len(), 6);
+        assert_eq!(attribute(cells[0], "class"), Some("col-select"));
+        let select_row = only_child_with_tag(cells[0], "input");
+        assert_eq!(
+            attribute(select_row, "class"),
+            Some("checkbox checkbox-primary")
+        );
+        assert_eq!(
+            attribute(select_row, "aria-label"),
+            Some("Select Normal note")
+        );
+        assert!(format!("{select_row:?}").contains("checked: Some(true)"));
+        assert_eq!(attribute(cells[1], "class"), Some("col-title"));
+        let actions = only_child_with_tag(cells[5], "div");
+        assert_eq!(element_children(actions).len(), 3);
+        assert_eq!(visible_text(element_children(actions)[2]), ["Remove"]);
+    }
+
+    #[test]
     fn label_chip_uses_tooltip_container_without_popover_positioning() {
         let chip = label_chip("operation", "home/dgx-spark", Callback::noop());
         let classes = attribute(&chip, "class").expect("label wrapper should have classes");
@@ -1299,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn search_result_table_renders_score_first_with_normal_note_row_content() {
+    fn search_result_table_renders_select_then_score_with_normal_note_row_content() {
         let query = NotesQueryParams {
             current: 2,
             page_size: 30,
@@ -1316,6 +1714,11 @@ mod tests {
                 created_at: 1_700_000_000,
                 updated_at: 1_700_000_060,
             }],
+            &HashSet::from(["note-1".to_string()]),
+            &NodeRef::default(),
+            Callback::noop(),
+            Callback::noop(),
+            false,
             &query,
             Callback::noop(),
             Callback::noop(),
@@ -1332,12 +1735,22 @@ mod tests {
         let headers = rendered_children(header_row)
             .into_iter()
             .filter(|child| matches!(child, VNode::VTag(tag) if tag.tag() == "th"))
-            .flat_map(visible_text)
             .collect::<Vec<_>>();
+        assert_eq!(headers.len(), 7);
         assert_eq!(
-            headers,
+            headers[1..]
+                .iter()
+                .flat_map(|header| visible_text(header))
+                .collect::<Vec<_>>(),
             ["Score", "Title", "Labels", "Created", "Updated", "Actions"]
         );
+        assert_eq!(attribute(headers[0], "class"), Some("col-select"));
+        let select_all = only_child_with_tag(headers[0], "input");
+        assert_eq!(
+            attribute(select_all, "aria-label"),
+            Some("Select all visible notes")
+        );
+        assert!(format!("{select_all:?}").contains("checked: Some(true)"));
 
         let tbody = only_child_with_tag(table, "tbody");
         let row = only_child_with_tag(tbody, "tr");
@@ -1345,12 +1758,23 @@ mod tests {
             .into_iter()
             .filter(|child| matches!(child, VNode::VTag(tag) if tag.tag() == "td"))
             .collect::<Vec<_>>();
-        assert_eq!(cells.len(), 6);
-        assert_eq!(attribute(cells[0], "class"), Some("col-score"));
-        assert_eq!(visible_text(cells[0]), ["0.1235"]);
-        assert_eq!(attribute(cells[1], "class"), Some("col-title"));
+        assert_eq!(cells.len(), 7);
+        assert_eq!(attribute(cells[0], "class"), Some("col-select"));
+        let select_row = only_child_with_tag(cells[0], "input");
+        assert_eq!(
+            attribute(select_row, "class"),
+            Some("checkbox checkbox-primary")
+        );
+        assert_eq!(
+            attribute(select_row, "aria-label"),
+            Some("Select Matched note")
+        );
+        assert!(format!("{select_row:?}").contains("checked: Some(true)"));
+        assert_eq!(attribute(cells[1], "class"), Some("col-score"));
+        assert_eq!(visible_text(cells[1]), ["0.1235"]);
+        assert_eq!(attribute(cells[2], "class"), Some("col-title"));
         assert!(matches!(
-            element_children(cells[1]).as_slice(),
+            element_children(cells[2]).as_slice(),
             [VNode::VComp(_)]
         ));
         let links = note_row_links("note-1", "Matched note", &query);
@@ -1376,10 +1800,10 @@ mod tests {
             }
         );
         assert_eq!(links.edit.query, Some(query.clone()));
-        assert!(visible_text(cells[2]).contains(&"project: agent-note".to_string()));
-        assert_eq!(visible_text(cells[3]), ["2023-11-14 22:13"]);
-        assert_eq!(visible_text(cells[4]), ["2023-11-14 22:14"]);
-        let actions = only_child_with_tag(cells[5], "div");
+        assert!(visible_text(cells[3]).contains(&"project: agent-note".to_string()));
+        assert_eq!(visible_text(cells[4]), ["2023-11-14 22:13"]);
+        assert_eq!(visible_text(cells[5]), ["2023-11-14 22:14"]);
+        let actions = only_child_with_tag(cells[6], "div");
         let action_children = element_children(actions);
         assert_eq!(action_children.len(), 3);
         assert!(matches!(action_children[0], VNode::VComp(_)));
@@ -1421,6 +1845,11 @@ mod tests {
         let hits = vec![last_match; 3];
         let rendered = search_result_table(
             &hits[page.start..page.end],
+            &HashSet::new(),
+            &NodeRef::default(),
+            Callback::noop(),
+            Callback::noop(),
+            false,
             &page.notes_query,
             Callback::noop(),
             Callback::noop(),
@@ -1431,7 +1860,7 @@ mod tests {
         let title_cell = rendered_children(row)
             .into_iter()
             .filter(|child| matches!(child, VNode::VTag(tag) if tag.tag() == "td"))
-            .nth(1)
+            .nth(2)
             .expect("scored row should have a title cell");
         assert!(matches!(
             element_children(title_cell).as_slice(),
