@@ -106,6 +106,13 @@ fn select_all_is_indeterminate(selected_visible_count: usize, visible_count: usi
     selected_visible_count > 0 && selected_visible_count < visible_count
 }
 
+fn selection_reconciliation_visible_ids(
+    loading: bool,
+    visible_ids: &HashSet<String>,
+) -> Option<HashSet<String>> {
+    (!loading).then(|| visible_ids.clone())
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) struct NotesUrlState {
     current: usize,
@@ -356,10 +363,17 @@ pub fn notes_page() -> Html {
 
     {
         let selected = selected.clone();
-        use_effect_with(visible_ids.clone(), move |visible_ids| {
-            selected.dispatch(SelectionAction::RetainVisible(visible_ids.clone()));
-            || ()
-        });
+        use_effect_with(
+            (*loading, visible_ids.clone()),
+            move |(loading, visible_ids)| {
+                if let Some(visible_ids) =
+                    selection_reconciliation_visible_ids(*loading, visible_ids)
+                {
+                    selected.dispatch(SelectionAction::RetainVisible(visible_ids));
+                }
+                || ()
+            },
+        );
     }
 
     {
@@ -1505,6 +1519,29 @@ mod tests {
 
         let state = state.reduce(SelectionAction::Clear);
         assert!(state.is_empty());
+    }
+
+    #[test]
+    fn selection_reconciliation_waits_for_completed_refresh_rows() {
+        let visible = HashSet::from(["first".to_string(), "second".to_string()]);
+        assert_eq!(
+            selection_reconciliation_visible_ids(true, &HashSet::new()),
+            None
+        );
+        assert_eq!(
+            selection_reconciliation_visible_ids(false, &HashSet::new()),
+            Some(HashSet::new())
+        );
+
+        let selected = Rc::new(SelectionState(HashSet::from([
+            "first".to_string(),
+            "hidden".to_string(),
+        ])));
+        let reconciled = selection_reconciliation_visible_ids(false, &visible)
+            .expect("completed refresh should reconcile visible rows");
+        let selected = selected.reduce(SelectionAction::RetainVisible(reconciled));
+
+        assert_eq!(**selected, HashSet::from(["first".to_string()]));
     }
 
     #[test]
