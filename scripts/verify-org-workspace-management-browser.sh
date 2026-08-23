@@ -132,14 +132,20 @@ assert_network_boundary() {
     jq -e --arg base "$base" '
         [(.networkRequests // [])[]
             | select(.url | contains("/api/org"))
-            | select(((.method == "GET")
-                or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
-                or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
-                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$")))
-                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/documents$")))
-                or (.method == "PATCH" and (.url | test("/api/org/documents/[^/?]+/path$")))
-                or (.method == "POST" and (.url | test("/api/org/documents/[^/?]+/(archive|restore)$"))))
-                | not)
+            | select(((
+                (.url == ($base + "/api/org")
+                    or (.url | startswith($base + "/api/org/"))
+                    or (.url | startswith($base + "/api/org?")))
+                and (
+                    .method == "GET"
+                    or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
+                    or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
+                    or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$")))
+                    or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/documents$")))
+                    or (.method == "PATCH" and (.url | test("/api/org/documents/[^/?]+/path$")))
+                    or (.method == "POST" and (.url | test("/api/org/documents/[^/?]+/(archive|restore)$")))
+                )
+            )) | not)
         ] | length == 0
     ' <<<"$network" >/dev/null || {
         printf '%s\n' "$network" >&2
