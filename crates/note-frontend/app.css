@@ -560,6 +560,7 @@ a.dashboard-metric-detail:hover {
     max-width: 100%;
     min-width: 0;
     box-sizing: border-box;
+    contain: layout;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     border: 1px solid var(--color-outline-variant, #c7c5d0);

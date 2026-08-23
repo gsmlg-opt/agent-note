@@ -3500,6 +3500,19 @@ mod tests {
     }
 
     #[test]
+    fn note_table_scroll_contains_layout_while_preserving_horizontal_overflow() {
+        let app_css = include_str!("../../app.css");
+        let table_scroll_rule = app_css
+            .split_once(".table-scroll {")
+            .and_then(|(_, remainder)| remainder.split_once('}'))
+            .map(|(rule, _)| rule)
+            .expect("table-scroll CSS rule should exist");
+
+        assert!(table_scroll_rule.contains("overflow-x: auto;"));
+        assert!(table_scroll_rule.contains("contain: layout;"));
+    }
+
+    #[test]
     fn note_table_reserves_space_for_label_actions() {
         let app_css = include_str!("../../app.css");
 
