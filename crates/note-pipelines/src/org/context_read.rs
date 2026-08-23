@@ -1,7 +1,7 @@
 use super::{
-    audit::map_event, OperationalView, OrgArtifactView, OrgAttemptBudgetView, OrgAttemptNoteView,
-    OrgAttemptView, OrgContext, OrgDependencyView, OrgDocumentView, OrgError, OrgErrorCode,
-    OrgHistorySegment, OrgItemContext, OrgItemView, OrgLeaseView, OrgNoteLinkView,
+    audit::map_event, DocumentStatus, OperationalView, OrgArtifactView, OrgAttemptBudgetView,
+    OrgAttemptNoteView, OrgAttemptView, OrgContext, OrgDependencyView, OrgDocumentView, OrgError,
+    OrgErrorCode, OrgHistorySegment, OrgItemContext, OrgItemView, OrgLeaseView, OrgNoteLinkView,
     OrgOperationalContextView, OrgOriginView, OrgReadyStatus, OrgRecoveryStatusView,
     OrgTimestampView, OrgWorkspaceView,
 };
@@ -18,37 +18,38 @@ use note_storage::{
 pub async fn list_documents(
     context: &OrgContext,
     workspace_id: WorkspaceId,
-    query: &super::OrgReadQuery,
+    query: &super::OrgDocumentReadQuery,
 ) -> Result<super::OrgReadPage<super::OrgDocumentView>, OrgError> {
     let session = context
         .storage()
         .session()
         .await
         .map_err(OrgError::storage)?;
-    let workspace = session
+    session
         .get_org_workspace(workspace_id)
         .await
         .map_err(OrgError::storage)?
         .ok_or_else(|| not_found("workspace"))?;
-    if workspace.archived_at.is_some() && !query.include_archived {
-        return Ok(super::OrgReadPage {
-            items: Vec::new(),
-            next_cursor: None,
-        });
-    }
     let documents = session
         .list_org_documents(workspace_id)
         .await
         .map_err(OrgError::storage)?
         .into_iter()
+        .filter(|document| match query.status {
+            DocumentStatus::Active => document.archived_at.is_none(),
+            DocumentStatus::Archived => document.archived_at.is_some(),
+            DocumentStatus::All => true,
+        })
         .map(map_document)
         .collect();
-    super::paginate_read(
+    super::paginate_read_with_discriminator(
         documents,
-        query,
+        query.cursor.as_deref(),
+        query.limit,
         context.cursor_signer(),
         "documents",
         Some(&workspace_id.to_string()),
+        &serde_json::json!({"status": query.status}),
         |document| document.id.to_string(),
     )
 }
@@ -344,6 +345,7 @@ pub(crate) async fn get_item_context_in_transaction(
             id: document.id,
             path: document.path,
             revision: document.revision,
+            archived_at: document.archived_at,
         },
         item: map_item(item),
         parent,
@@ -651,6 +653,7 @@ fn map_document(document: OrgDocument) -> OrgDocumentView {
         id: document.id,
         path: document.path,
         revision: document.revision,
+        archived_at: document.archived_at,
     }
 }
 
@@ -662,6 +665,7 @@ fn map_document_source(document: OrgDocument) -> super::OrgDocumentSourceView {
         source: document.source,
         content_hash: document.content_hash,
         revision: document.revision,
+        archived_at: document.archived_at,
     }
 }
 

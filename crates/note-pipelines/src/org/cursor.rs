@@ -163,6 +163,19 @@ pub(crate) fn read_fingerprint(
     format!("{:x}", Sha256::digest(serde_json::to_vec(&value).unwrap()))
 }
 
+pub(crate) fn read_fingerprint_with_discriminator(
+    family: &str,
+    scope: Option<&str>,
+    discriminator: &serde_json::Value,
+) -> String {
+    let value = serde_json::json!({
+        "family": family,
+        "scope": scope,
+        "filter": discriminator,
+    });
+    format!("{:x}", Sha256::digest(serde_json::to_vec(&value).unwrap()))
+}
+
 pub(crate) fn encode_read_cursor(
     signer: &dyn OrgCursorSigner,
     fingerprint: &str,
@@ -232,4 +245,21 @@ fn open_cursor(
 
 fn invalid_read_cursor() -> OrgError {
     OrgError::invalid_input("Org read cursor is invalid or does not match the query")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_fingerprint;
+
+    #[test]
+    fn generic_read_fingerprint_preserves_legacy_archive_filter_shape() {
+        assert_eq!(
+            read_fingerprint("workspaces", None, false),
+            "7d51e8d420b8814b9cf881b85bb1bae26e42d80b9ce93b1c7611274b8f94bbd4"
+        );
+        assert_eq!(
+            read_fingerprint("workspaces", None, true),
+            "9431f8766004fc55da303b733e0ba86f9c84d6580dba1a90fe9f4a8fdf22b48f"
+        );
+    }
 }

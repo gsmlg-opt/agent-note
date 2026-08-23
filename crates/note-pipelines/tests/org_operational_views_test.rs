@@ -3,10 +3,11 @@ mod support;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy};
 use note_pipelines::org::{
-    export_workspace, get_document, get_item, get_item_context, get_workspace,
+    archive_document, export_workspace, get_document, get_item, get_item_context, get_workspace,
     get_workspace_summary, list_documents, list_note_work_items, list_workspaces, query_agenda,
-    query_queue, FixedOrgClock, FixedOrgCursorSigner, OperationalQuery, OperationalView,
-    OrgContext, OrgErrorCode, OrgReadQuery, OrgReadyStatus, DEFAULT_OPERATIONAL_LIMIT,
+    query_queue, restore_document, CommandEnvelope, DocumentRevisionRequest, DocumentStatus,
+    FixedOrgClock, FixedOrgCursorSigner, OperationalQuery, OperationalView, OrgContext,
+    OrgDocumentReadQuery, OrgErrorCode, OrgReadQuery, OrgReadyStatus, DEFAULT_OPERATIONAL_LIMIT,
     MAX_OPERATIONAL_LIMIT,
 };
 use note_storage::{
@@ -206,6 +207,128 @@ async fn page_for(
     } else {
         query_queue(context, &query).await.unwrap()
     }
+}
+
+fn command(workspace_id: WorkspaceId, operation_id: &str) -> CommandEnvelope {
+    CommandEnvelope {
+        schema_version: 1,
+        workspace_id,
+        actor_id: "agent-one".into(),
+        operation_id: operation_id.into(),
+    }
+}
+
+#[tokio::test]
+async fn archived_document_work_disappears_operationally_but_still_blocks_dependencies() {
+    let (context, backend, _dir, _db_path, workspace_id) = org_test_context(NOW).await;
+    let archived_item_ids = seed_operational_rows(&backend, workspace_id).await;
+    let archived_document = document_id(1);
+    let dependent_document = document_id(5);
+    let dependent_id = item_id(5_000);
+    let session = backend.session().await.unwrap();
+    session
+        .insert_org_document(NewOrgDocument {
+            id: dependent_document,
+            workspace_id,
+            path: "dependent.org",
+            source: "",
+            content_hash: "dependent",
+            now: 1,
+        })
+        .await
+        .unwrap();
+    let mut dependent = row(workspace_id, dependent_document, dependent_id, "READY");
+    dependent.dependencies = vec![archived_item_ids[1]];
+    session
+        .replace_org_document_projection(dependent_document, &[dependent])
+        .await
+        .unwrap();
+    drop(session);
+
+    let mut before_views = std::collections::BTreeMap::new();
+    for view in OperationalView::ALL {
+        before_views.insert(
+            view as u8,
+            page_for(&context, workspace_id, view)
+                .await
+                .items
+                .into_iter()
+                .map(|row| row.item.id)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let before_summary = get_workspace_summary(&context, workspace_id).await.unwrap();
+    assert!(get_item_context(&context, workspace_id, dependent_id)
+        .await
+        .unwrap()
+        .operational
+        .blockers
+        .contains(&"dependencies_incomplete".to_string()));
+
+    archive_document(
+        &context,
+        &command(workspace_id, "archive-operational-document"),
+        &DocumentRevisionRequest {
+            document_id: archived_document,
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    for view in OperationalView::ALL {
+        let page = page_for(&context, workspace_id, view).await;
+        assert!(page
+            .items
+            .iter()
+            .all(|row| row.item.document_id != archived_document));
+        assert!(page.items.iter().all(|row| row.item.id != dependent_id));
+    }
+    let archived_summary = get_workspace_summary(&context, workspace_id).await.unwrap();
+    for view in OperationalView::ALL {
+        assert_eq!(count(&archived_summary.counts, view), 0, "view {view:?}");
+    }
+    let dependent_context = get_item_context(&context, workspace_id, dependent_id)
+        .await
+        .unwrap();
+    assert_eq!(dependent_context.dependencies.len(), 1);
+    assert_eq!(
+        dependent_context.dependencies[0].item.id,
+        archived_item_ids[1]
+    );
+    assert!(!dependent_context.dependencies[0].satisfied);
+    assert!(dependent_context
+        .operational
+        .blockers
+        .contains(&"dependencies_incomplete".to_string()));
+
+    restore_document(
+        &context,
+        &command(workspace_id, "restore-operational-document"),
+        &DocumentRevisionRequest {
+            document_id: archived_document,
+            expected_revision: 2,
+        },
+    )
+    .await
+    .unwrap();
+
+    for view in OperationalView::ALL {
+        let restored_ids = page_for(&context, workspace_id, view)
+            .await
+            .items
+            .into_iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(restored_ids, before_views[&(view as u8)], "view {view:?}");
+    }
+    assert_eq!(
+        get_workspace_summary(&context, workspace_id)
+            .await
+            .unwrap()
+            .counts,
+        before_summary.counts
+    );
 }
 
 #[tokio::test]
@@ -928,6 +1051,7 @@ async fn transport_read_facades_return_canonical_data_with_opaque_paging() {
     let (context, backend, _dir, _db_path, workspace_id) = org_test_context(NOW).await;
     let ids = seed_operational_rows(&backend, workspace_id).await;
     let query = OrgReadQuery::default();
+    let document_query = OrgDocumentReadQuery::default();
 
     assert_eq!(
         get_workspace(&context, workspace_id).await.unwrap().id,
@@ -937,7 +1061,7 @@ async fn transport_read_facades_return_canonical_data_with_opaque_paging() {
         list_workspaces(&context, &query).await.unwrap().items.len(),
         1
     );
-    let documents = list_documents(&context, workspace_id, &query)
+    let documents = list_documents(&context, workspace_id, &document_query)
         .await
         .unwrap();
     assert_eq!(documents.items.len(), 1);
@@ -963,9 +1087,10 @@ async fn transport_read_facades_return_canonical_data_with_opaque_paging() {
     assert_eq!(linked.items.len(), 1);
     assert_eq!(linked.items[0].id, ids[0]);
 
-    let mismatched = OrgReadQuery {
+    let mismatched = OrgDocumentReadQuery {
         cursor: Some("not-a-cursor".into()),
-        ..OrgReadQuery::default()
+        status: DocumentStatus::Active,
+        ..OrgDocumentReadQuery::default()
     };
     assert_eq!(
         list_documents(&context, workspace_id, &mismatched)

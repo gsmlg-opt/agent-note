@@ -2,13 +2,15 @@ mod support;
 
 use note_org::{ClaimPolicy, DocumentId, WorkItemId, WorkspaceId, WorkspacePolicy};
 use note_pipelines::org::{
-    archive_document, claim_item, create_document, create_workspace, export_document_by_id,
-    import_documents, import_offline_document, import_offline_workspace_snapshot,
-    import_workspace_snapshot, move_document, put_document, release_claim, rename_document,
-    restore_document, schedule_item, update_workspace, CommandEnvelope, CreateDocumentRequest,
-    CreateWorkspaceRequest, DocumentImport, DocumentLifecycleData, DocumentRevisionRequest,
-    ImportDocumentsRequest, ImportWorkspaceSnapshotRequest, LeaseProofInput, MoveDocumentRequest,
-    OrgClaimKind, OrgContext, OrgErrorCode, OrgFieldPatch, OrgWorkflowPhase, PutDocumentRequest,
+    archive_document, archive_workspace, claim_item, create_document, create_workspace,
+    export_document_by_id, export_workspace, get_document, import_documents,
+    import_offline_document, import_offline_workspace_snapshot, import_workspace_snapshot,
+    list_documents, move_document, put_document, release_claim, rename_document, restore_document,
+    schedule_item, update_workspace, ArchiveWorkspaceRequest, CommandEnvelope,
+    CreateDocumentRequest, CreateWorkspaceRequest, DocumentImport, DocumentLifecycleData,
+    DocumentRevisionRequest, DocumentStatus, ImportDocumentsRequest,
+    ImportWorkspaceSnapshotRequest, LeaseProofInput, MoveDocumentRequest, OrgClaimKind, OrgContext,
+    OrgDocumentReadQuery, OrgErrorCode, OrgFieldPatch, OrgWorkflowPhase, PutDocumentRequest,
     ReleaseClaimRequest, RenameDocumentRequest, ScheduleItemRequest, StartClaimRequest,
     UpdateWorkspaceRequest, WorkspaceImportMode, WorkspaceSnapshotMetadata,
 };
@@ -226,6 +228,209 @@ async fn create_test_workspace(
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn document_reads_filter_status_before_paging_and_bind_cursors_to_status() {
+    let (context, _backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-000000000205");
+    create_test_workspace(&context, workspace, "status-read-workspace", "UTC").await;
+    let documents = [
+        document_id("20000000-0000-4000-8000-000000000211"),
+        document_id("20000000-0000-4000-8000-000000000212"),
+        document_id("20000000-0000-4000-8000-000000000213"),
+        document_id("20000000-0000-4000-8000-000000000214"),
+    ];
+    for (index, document) in documents.iter().enumerate() {
+        create_document(
+            &context,
+            &envelope(workspace, &format!("create-status-document-{index}")),
+            &CreateDocumentRequest {
+                document_id: *document,
+                path: format!("status/{index}.org"),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    for (index, document) in [documents[1], documents[3]].into_iter().enumerate() {
+        archive_document(
+            &context,
+            &envelope(workspace, &format!("archive-status-document-{index}")),
+            &DocumentRevisionRequest {
+                document_id: document,
+                expected_revision: 1,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut archived_query = OrgDocumentReadQuery {
+        cursor: None,
+        limit: Some(1),
+        status: DocumentStatus::Archived,
+    };
+    let first_archived = list_documents(&context, workspace, &archived_query)
+        .await
+        .unwrap();
+    assert_eq!(first_archived.items.len(), 1);
+    assert_eq!(first_archived.items[0].id, documents[1]);
+    assert_eq!(first_archived.items[0].path, "status/1.org");
+    assert_eq!(first_archived.items[0].revision, 2);
+    assert_eq!(first_archived.items[0].archived_at, Some(NOW));
+    assert!(first_archived.next_cursor.is_some());
+    archived_query.cursor = first_archived.next_cursor.clone();
+    let second_archived = list_documents(&context, workspace, &archived_query)
+        .await
+        .unwrap();
+    assert_eq!(second_archived.items.len(), 1);
+    assert_eq!(second_archived.items[0].id, documents[3]);
+    assert_eq!(second_archived.items[0].archived_at, Some(NOW));
+    assert!(second_archived.next_cursor.is_none());
+
+    let mut active_query = OrgDocumentReadQuery {
+        cursor: None,
+        limit: Some(1),
+        status: DocumentStatus::Active,
+    };
+    let first_active = list_documents(&context, workspace, &active_query)
+        .await
+        .unwrap();
+    assert_eq!(first_active.items[0].id, documents[0]);
+    assert_eq!(first_active.items[0].archived_at, None);
+    let active_cursor = first_active.next_cursor.clone().unwrap();
+    active_query.cursor = Some(active_cursor.clone());
+    assert_eq!(
+        list_documents(&context, workspace, &active_query)
+            .await
+            .unwrap()
+            .items[0]
+            .id,
+        documents[2]
+    );
+
+    for status in [DocumentStatus::Archived, DocumentStatus::All] {
+        let error = list_documents(
+            &context,
+            workspace,
+            &OrgDocumentReadQuery {
+                cursor: Some(active_cursor.clone()),
+                limit: Some(1),
+                status,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, OrgErrorCode::InvalidInput);
+    }
+
+    let all = list_documents(
+        &context,
+        workspace,
+        &OrgDocumentReadQuery {
+            cursor: None,
+            limit: None,
+            status: DocumentStatus::All,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        all.items
+            .iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>(),
+        documents
+    );
+}
+
+#[tokio::test]
+async fn archived_workspace_keeps_status_aware_document_reads_and_exports_inclusive() {
+    let (context, _backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-000000000206");
+    let active_document = document_id("20000000-0000-4000-8000-000000000215");
+    let archived_document = document_id("20000000-0000-4000-8000-000000000216");
+    create_test_workspace(&context, workspace, "archived-workspace-reads", "UTC").await;
+    for (operation, document, path) in [
+        (
+            "create-active-read-document",
+            active_document,
+            "read/active.org",
+        ),
+        (
+            "create-archived-read-document",
+            archived_document,
+            "read/archived.org",
+        ),
+    ] {
+        create_document(
+            &context,
+            &envelope(workspace, operation),
+            &CreateDocumentRequest {
+                document_id: document,
+                path: path.into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    archive_document(
+        &context,
+        &envelope(workspace, "archive-read-document"),
+        &DocumentRevisionRequest {
+            document_id: archived_document,
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+    archive_workspace(
+        &context,
+        &envelope(workspace, "archive-read-workspace"),
+        &ArchiveWorkspaceRequest {
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let default_page = list_documents(&context, workspace, &OrgDocumentReadQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(default_page.items.len(), 1);
+    assert_eq!(default_page.items[0].id, active_document);
+    assert_eq!(default_page.items[0].archived_at, None);
+
+    let archived_page = list_documents(
+        &context,
+        workspace,
+        &OrgDocumentReadQuery {
+            status: DocumentStatus::Archived,
+            ..OrgDocumentReadQuery::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(archived_page.items.len(), 1);
+    assert_eq!(archived_page.items[0].id, archived_document);
+    assert_eq!(archived_page.items[0].archived_at, Some(NOW));
+
+    let direct = get_document(&context, workspace, archived_document)
+        .await
+        .unwrap();
+    assert_eq!(direct.archived_at, Some(NOW));
+    let export = export_workspace(&context, workspace).await.unwrap();
+    assert_eq!(export.documents.len(), 2);
+    assert_eq!(
+        export
+            .documents
+            .iter()
+            .find(|document| document.id == archived_document)
+            .unwrap()
+            .archived_at,
+        Some(NOW)
+    );
 }
 
 #[tokio::test]
