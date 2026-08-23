@@ -582,6 +582,108 @@ pub async fn delete_note(id: &str, expected_revision: i64) -> Result<(), NoteMut
     ok_or_mutation_error(resp).await.map(|_| ())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BatchNoteTarget {
+    id: String,
+    expected_revision: i64,
+}
+
+impl BatchNoteTarget {
+    pub fn new(id: impl Into<String>, expected_revision: i64) -> Self {
+        Self {
+            id: id.into(),
+            expected_revision,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BatchLabelAction {
+    Add {
+        key: String,
+        value: String,
+    },
+    Update {
+        from_key: String,
+        key: String,
+        value: String,
+    },
+    Remove {
+        key: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BatchLabelResult {
+    pub requested: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BatchDeleteResult {
+    pub requested: usize,
+    pub deleted: usize,
+}
+
+#[derive(Serialize)]
+struct BatchLabelRequest<'a> {
+    notes: &'a [BatchNoteTarget],
+    action: &'a BatchLabelAction,
+}
+
+#[derive(Serialize)]
+struct BatchDeleteRequest<'a> {
+    notes: &'a [BatchNoteTarget],
+}
+
+fn batch_label_body(targets: &[BatchNoteTarget], action: &BatchLabelAction) -> Value {
+    serde_json::to_value(BatchLabelRequest {
+        notes: targets,
+        action,
+    })
+    .expect("serialize selected-note request")
+}
+
+fn batch_delete_body(targets: &[BatchNoteTarget]) -> Value {
+    serde_json::to_value(BatchDeleteRequest { notes: targets })
+        .expect("serialize selected-note request")
+}
+
+pub async fn batch_update_note_labels(
+    targets: &[BatchNoteTarget],
+    action: &BatchLabelAction,
+) -> Result<BatchLabelResult, NoteMutationApiError> {
+    let resp = Request::post("/api/notes/batch-labels")
+        .json(&batch_label_body(targets, action))
+        .map_err(|_| NoteMutationApiError::transport())?
+        .send()
+        .await
+        .map_err(|_| NoteMutationApiError::transport())?;
+    ok_or_mutation_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|_| NoteMutationApiError::unexpected(200))
+}
+
+pub async fn batch_delete_notes(
+    targets: &[BatchNoteTarget],
+) -> Result<BatchDeleteResult, NoteMutationApiError> {
+    let resp = Request::post("/api/notes/batch-delete")
+        .json(&batch_delete_body(targets))
+        .map_err(|_| NoteMutationApiError::transport())?
+        .send()
+        .await
+        .map_err(|_| NoteMutationApiError::transport())?;
+    ok_or_mutation_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|_| NoteMutationApiError::unexpected(200))
+}
+
 #[derive(Deserialize)]
 struct TrashNoteDto {
     id: String,
@@ -823,6 +925,124 @@ mod tests {
         assert_eq!(error.details["current_revision"], 6);
         assert_eq!(error.status, Some(409));
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn batch_label_body_preserves_visible_target_order_and_revisions() {
+        let targets = vec![
+            BatchNoteTarget::new("visible-second", 12),
+            BatchNoteTarget::new("visible-first", 4),
+        ];
+
+        assert_eq!(
+            batch_label_body(
+                &targets,
+                &BatchLabelAction::Add {
+                    key: "project".into(),
+                    value: "agent-note".into(),
+                },
+            ),
+            serde_json::json!({
+                "notes": [
+                    {"id": "visible-second", "expected_revision": 12},
+                    {"id": "visible-first", "expected_revision": 4}
+                ],
+                "action": {"type": "add", "key": "project", "value": "agent-note"}
+            })
+        );
+    }
+
+    #[test]
+    fn batch_label_update_body_uses_the_exact_tagged_shape() {
+        assert_eq!(
+            batch_label_body(
+                &[BatchNoteTarget::new("note-1", 7)],
+                &BatchLabelAction::Update {
+                    from_key: "project".into(),
+                    key: "team".into(),
+                    value: "platform".into(),
+                },
+            ),
+            serde_json::json!({
+                "notes": [{"id": "note-1", "expected_revision": 7}],
+                "action": {
+                    "type": "update",
+                    "from_key": "project",
+                    "key": "team",
+                    "value": "platform"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn batch_label_remove_body_uses_the_exact_tagged_shape() {
+        assert_eq!(
+            batch_label_body(
+                &[BatchNoteTarget::new("note-1", 7)],
+                &BatchLabelAction::Remove {
+                    key: "obsolete".into(),
+                },
+            ),
+            serde_json::json!({
+                "notes": [{"id": "note-1", "expected_revision": 7}],
+                "action": {"type": "remove", "key": "obsolete"}
+            })
+        );
+    }
+
+    #[test]
+    fn batch_delete_body_preserves_visible_target_order_and_revisions() {
+        let targets = vec![
+            BatchNoteTarget::new("visible-second", 12),
+            BatchNoteTarget::new("visible-first", 4),
+        ];
+
+        assert_eq!(
+            batch_delete_body(&targets),
+            serde_json::json!({
+                "notes": [
+                    {"id": "visible-second", "expected_revision": 12},
+                    {"id": "visible-first", "expected_revision": 4}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn batch_label_result_deserializes_the_exact_response_body() {
+        let result = serde_json::from_value::<BatchLabelResult>(serde_json::json!({
+            "requested": 3,
+            "updated": 2,
+            "unchanged": 1
+        }))
+        .unwrap();
+
+        assert_eq!(
+            result,
+            BatchLabelResult {
+                requested: 3,
+                updated: 2,
+                unchanged: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn batch_delete_result_deserializes_the_exact_response_body() {
+        let result = serde_json::from_value::<BatchDeleteResult>(serde_json::json!({
+            "requested": 3,
+            "deleted": 3
+        }))
+        .unwrap();
+
+        assert_eq!(
+            result,
+            BatchDeleteResult {
+                requested: 3,
+                deleted: 3,
+            }
+        );
     }
 
     #[test]
