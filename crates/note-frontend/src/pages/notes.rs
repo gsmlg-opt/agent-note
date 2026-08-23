@@ -156,8 +156,9 @@ fn batch_label_toolbar(
 ) -> Html {
     let disabled = selected_count == 0 || batch_mutating;
     let open = |mode| {
-        let on_open = on_open.clone();
-        Callback::from(move |_: MouseEvent| on_open.emit(mode))
+        let callback =
+            batch_label_open_callback(selected_count, batch_mutating, mode, on_open.clone());
+        Callback::from(move |_: MouseEvent| callback.emit(()))
     };
 
     html! {
@@ -172,6 +173,23 @@ fn batch_label_toolbar(
             </div>
         </div>
     }
+}
+
+fn batch_label_open_callback(
+    selected_count: usize,
+    batch_mutating: bool,
+    mode: BatchLabelMode,
+    on_open: Callback<BatchLabelMode>,
+) -> Callback<()> {
+    Callback::from(move |_: ()| {
+        if selected_count > 0 && !batch_mutating {
+            on_open.emit(mode);
+        }
+    })
+}
+
+fn batch_label_draft_input_allowed(batch_mutating: bool) -> bool {
+    !batch_mutating
 }
 
 #[derive(Clone)]
@@ -241,7 +259,7 @@ fn batch_label_form(
     } = callbacks;
     let destination_value_type = label_keys
         .iter()
-        .find(|label| label.key == destination_key)
+        .find(|label| label.key == destination_key.trim())
         .map(|label| label.value_type.as_str())
         .unwrap_or("text");
     let disabled = batch_mutating
@@ -259,6 +277,7 @@ fn batch_label_form(
                         type="text"
                         list="notes-batch-source-label-options"
                         value={source_key.to_string()}
+                        disabled={batch_mutating}
                         oninput={on_source_input}
                         aria-label="Source label"
                     />
@@ -275,6 +294,7 @@ fn batch_label_form(
                         type="text"
                         list="notes-batch-destination-label-options"
                         value={destination_key.to_string()}
+                        disabled={batch_mutating}
                         oninput={on_destination_input}
                         aria-label="Destination label"
                     />
@@ -288,6 +308,7 @@ fn batch_label_form(
                         class="input"
                         type={label_value_input_type(destination_value_type, "=")}
                         value={value.to_string()}
+                        disabled={batch_mutating}
                         oninput={on_value_input}
                         aria-label="Label value"
                     />
@@ -901,21 +922,33 @@ pub fn notes_page() -> Html {
             };
             let on_source_input = {
                 let batch_source_key = batch_source_key.clone();
+                let batch_mutating = batch_mutating.clone();
                 Callback::from(move |event: InputEvent| {
+                    if !batch_label_draft_input_allowed(*batch_mutating) {
+                        return;
+                    }
                     let input: HtmlInputElement = event.target_unchecked_into();
                     batch_source_key.set(input.value());
                 })
             };
             let on_destination_input = {
                 let batch_destination_key = batch_destination_key.clone();
+                let batch_mutating = batch_mutating.clone();
                 Callback::from(move |event: InputEvent| {
+                    if !batch_label_draft_input_allowed(*batch_mutating) {
+                        return;
+                    }
                     let input: HtmlInputElement = event.target_unchecked_into();
                     batch_destination_key.set(input.value());
                 })
             };
             let on_value_input = {
                 let batch_value = batch_value.clone();
+                let batch_mutating = batch_mutating.clone();
                 Callback::from(move |event: InputEvent| {
+                    if !batch_label_draft_input_allowed(*batch_mutating) {
+                        return;
+                    }
                     let input: HtmlInputElement = event.target_unchecked_into();
                     batch_value.set(input.value());
                 })
@@ -2143,6 +2176,21 @@ mod tests {
     }
 
     #[test]
+    fn batch_label_toolbar_callback_guards_zero_selected_and_mutating_states() {
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let on_open = {
+            let opened = opened.clone();
+            Callback::from(move |mode| opened.borrow_mut().push(mode))
+        };
+
+        batch_label_open_callback(0, false, BatchLabelMode::Add, on_open.clone()).emit(());
+        batch_label_open_callback(2, true, BatchLabelMode::Update, on_open.clone()).emit(());
+        batch_label_open_callback(2, false, BatchLabelMode::Remove, on_open).emit(());
+
+        assert_eq!(*opened.borrow(), vec![BatchLabelMode::Remove]);
+    }
+
+    #[test]
     fn batch_label_form_renders_each_mode_with_typed_catalog_inputs_and_selected_count_copy() {
         let label_keys = vec![
             LabelKey {
@@ -2162,7 +2210,7 @@ mod tests {
             BatchLabelMode::Add,
             &label_keys,
             "",
-            "priority",
+            " priority ",
             "2",
             2,
             false,
@@ -2221,6 +2269,32 @@ mod tests {
             Some("notes-batch-source-label-options")
         );
         assert_eq!(descendants_with_tag(&remove, "datalist").len(), 1);
+    }
+
+    #[test]
+    fn batch_label_form_locks_every_draft_input_while_mutating() {
+        let label_keys = vec![LabelKey {
+            key: "priority".into(),
+            description: String::new(),
+            value_type: "number".into(),
+        }];
+        let form = batch_label_form(
+            BatchLabelMode::Update,
+            &label_keys,
+            "project",
+            "priority",
+            "2",
+            1,
+            true,
+            false,
+            BatchLabelFormCallbacks::noop(),
+        );
+
+        assert!(descendants_with_tag(&form, "input")
+            .iter()
+            .all(|input| attribute(input, "disabled").is_some()));
+        assert!(batch_label_draft_input_allowed(false));
+        assert!(!batch_label_draft_input_allowed(true));
     }
 
     #[test]
