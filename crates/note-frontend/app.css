@@ -649,6 +649,43 @@ a.dashboard-metric-detail:hover {
     margin: 0 auto;
 }
 
+.notes-batch-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.55rem;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.6rem;
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.notes-batch-selection-count {
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.notes-batch-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+
+.notes-batch-label-form {
+    display: grid;
+    gap: 0.7rem;
+}
+
+.notes-batch-label-form > label {
+    display: grid;
+    gap: 0.3rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.82rem;
+    font-weight: 650;
+}
+
 .trash-toolbar {
     display: flex;
     align-items: center;
@@ -2764,5 +2801,15 @@ a.dashboard-metric-detail:hover {
     .label-filter-operator {
         flex: 0 0 auto;
         min-width: 0;
+    }
+
+    .notes-batch-toolbar,
+    .notes-batch-actions {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .notes-batch-actions .btn {
+        width: 100%;
     }
 }

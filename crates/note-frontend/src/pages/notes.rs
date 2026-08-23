@@ -24,6 +24,13 @@ const LABEL_FILTER_PARSER_OPERATORS: [&str; 9] =
 const LABEL_FILTER_DISPLAY_OPERATORS: [&str; 10] =
     ["==", "=", "!=", "^=", "$=", "~=", ">", ">=", "<", "<="];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchLabelMode {
+    Add,
+    Update,
+    Remove,
+}
+
 #[derive(Clone, Default, PartialEq)]
 struct SelectionState(HashSet<String>);
 
@@ -100,6 +107,206 @@ fn selected_note_targets(
         .filter(|target| selected.contains(&target.id))
         .map(|target| api::BatchNoteTarget::new(target.id.clone(), target.revision))
         .collect()
+}
+
+fn selected_visible_count(visible: &[NoteSelectionTarget], selected: &HashSet<String>) -> usize {
+    visible
+        .iter()
+        .filter(|target| selected.contains(&target.id))
+        .count()
+}
+
+fn label_action_from_draft(
+    mode: BatchLabelMode,
+    source_key: &str,
+    destination_key: &str,
+    value: &str,
+) -> Option<api::BatchLabelAction> {
+    let source_key = source_key.trim();
+    let destination_key = destination_key.trim();
+
+    match mode {
+        BatchLabelMode::Add if !destination_key.is_empty() => Some(api::BatchLabelAction::Add {
+            key: destination_key.to_string(),
+            value: value.to_string(),
+        }),
+        BatchLabelMode::Update if !source_key.is_empty() && !destination_key.is_empty() => {
+            Some(api::BatchLabelAction::Update {
+                from_key: source_key.to_string(),
+                key: destination_key.to_string(),
+                value: value.to_string(),
+            })
+        }
+        BatchLabelMode::Remove if !source_key.is_empty() => Some(api::BatchLabelAction::Remove {
+            key: source_key.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn batch_label_result_message(updated: usize, requested: usize, unchanged: usize) -> String {
+    let selected_noun = if requested == 1 { "note" } else { "notes" };
+    format!("Updated {updated} of {requested} selected {selected_noun}; {unchanged} unchanged.")
+}
+
+fn batch_label_toolbar(
+    selected_count: usize,
+    batch_mutating: bool,
+    on_open: Callback<BatchLabelMode>,
+) -> Html {
+    let disabled = selected_count == 0 || batch_mutating;
+    let open = |mode| {
+        let on_open = on_open.clone();
+        Callback::from(move |_: MouseEvent| on_open.emit(mode))
+    };
+
+    html! {
+        <div class="notes-batch-toolbar">
+            <span class="notes-batch-selection-count" aria-live="polite">
+                { format!("{selected_count} selected") }
+            </span>
+            <div class="notes-batch-actions">
+                <button type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Add)}>{ "Add label" }</button>
+                <button type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Update)}>{ "Update label" }</button>
+                <button type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Remove)}>{ "Remove label" }</button>
+            </div>
+        </div>
+    }
+}
+
+#[derive(Clone)]
+struct BatchLabelFormCallbacks {
+    on_source_input: Callback<InputEvent>,
+    on_destination_input: Callback<InputEvent>,
+    on_value_input: Callback<InputEvent>,
+    on_submit: Callback<SubmitEvent>,
+    on_cancel: Callback<MouseEvent>,
+    on_reload: Callback<MouseEvent>,
+}
+
+impl BatchLabelFormCallbacks {
+    #[cfg(test)]
+    fn noop() -> Self {
+        Self {
+            on_source_input: Callback::noop(),
+            on_destination_input: Callback::noop(),
+            on_value_input: Callback::noop(),
+            on_submit: Callback::noop(),
+            on_cancel: Callback::noop(),
+            on_reload: Callback::noop(),
+        }
+    }
+}
+
+fn batch_label_submit_copy(mode: BatchLabelMode, selected_count: usize) -> String {
+    let selected_noun = if selected_count == 1 { "note" } else { "notes" };
+    match mode {
+        BatchLabelMode::Add => format!("Add label to {selected_count} selected {selected_noun}"),
+        BatchLabelMode::Update => {
+            format!("Update label on {selected_count} selected {selected_noun}")
+        }
+        BatchLabelMode::Remove => {
+            format!("Remove label from {selected_count} selected {selected_noun}")
+        }
+    }
+}
+
+fn batch_label_title(mode: BatchLabelMode) -> &'static str {
+    match mode {
+        BatchLabelMode::Add => "Add label",
+        BatchLabelMode::Update => "Update label",
+        BatchLabelMode::Remove => "Remove label",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_label_form(
+    mode: BatchLabelMode,
+    label_keys: &[LabelKey],
+    source_key: &str,
+    destination_key: &str,
+    value: &str,
+    selected_count: usize,
+    batch_mutating: bool,
+    stale_revision_blocked: bool,
+    callbacks: BatchLabelFormCallbacks,
+) -> Html {
+    let BatchLabelFormCallbacks {
+        on_source_input,
+        on_destination_input,
+        on_value_input,
+        on_submit,
+        on_cancel,
+        on_reload,
+    } = callbacks;
+    let destination_value_type = label_keys
+        .iter()
+        .find(|label| label.key == destination_key)
+        .map(|label| label.value_type.as_str())
+        .unwrap_or("text");
+    let disabled = batch_mutating
+        || stale_revision_blocked
+        || selected_count == 0
+        || label_action_from_draft(mode, source_key, destination_key, value).is_none();
+
+    html! {
+        <form class="notes-batch-label-form" onsubmit={on_submit}>
+            if matches!(mode, BatchLabelMode::Update | BatchLabelMode::Remove) {
+                <label>
+                    <span>{ "Source label" }</span>
+                    <input
+                        class="input"
+                        type="text"
+                        list="notes-batch-source-label-options"
+                        value={source_key.to_string()}
+                        oninput={on_source_input}
+                        aria-label="Source label"
+                    />
+                </label>
+                <datalist id="notes-batch-source-label-options">
+                    { for label_keys.iter().map(|label| html! { <option value={label.key.clone()} /> }) }
+                </datalist>
+            }
+            if matches!(mode, BatchLabelMode::Add | BatchLabelMode::Update) {
+                <label>
+                    <span>{ "Destination label" }</span>
+                    <input
+                        class="input"
+                        type="text"
+                        list="notes-batch-destination-label-options"
+                        value={destination_key.to_string()}
+                        oninput={on_destination_input}
+                        aria-label="Destination label"
+                    />
+                </label>
+                <datalist id="notes-batch-destination-label-options">
+                    { for label_keys.iter().map(|label| html! { <option value={label.key.clone()} /> }) }
+                </datalist>
+                <label>
+                    <span>{ "Label value" }</span>
+                    <input
+                        class="input"
+                        type={label_value_input_type(destination_value_type, "=")}
+                        value={value.to_string()}
+                        oninput={on_value_input}
+                        aria-label="Label value"
+                    />
+                </label>
+            }
+            if stale_revision_blocked {
+                <Alert variant={Some("error".to_string())}>
+                    <span>{ "Selected notes changed after the list was loaded. Reload the notes before retrying." }</span>
+                </Alert>
+            }
+            <div class="app-modal-actions">
+                if stale_revision_blocked {
+                    <button type="button" class="btn btn-outline" disabled={batch_mutating} onclick={on_reload}>{ "Reload notes" }</button>
+                }
+                <button type="button" class="btn btn-ghost" disabled={batch_mutating} onclick={on_cancel}>{ "Cancel" }</button>
+                <button type="submit" class="btn btn-primary" disabled={disabled}>{ batch_label_submit_copy(mode, selected_count) }</button>
+            </div>
+        </form>
+    }
 }
 
 fn select_all_is_indeterminate(selected_visible_count: usize, visible_count: usize) -> bool {
@@ -336,6 +543,14 @@ pub fn notes_page() -> Html {
     let delete_target = use_state(|| None::<(String, String, i64)>);
     let selected = use_reducer(SelectionState::default);
     let stale_revision_gate = use_reducer(StaleRevisionGate::default);
+    let batch_label_mode = use_state(|| None::<BatchLabelMode>);
+    let batch_source_key = use_state(String::new);
+    let batch_destination_key = use_state(String::new);
+    let batch_value = use_state(String::new);
+    let batch_mutating = use_state(|| false);
+    let batch_in_flight = use_mut_ref(|| false);
+    let batch_label_error = use_state(|| None::<String>);
+    let batch_label_success = use_state(|| None::<String>);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
     let page_size = use_state(|| DEFAULT_NOTES_PAGE_SIZE);
@@ -363,7 +578,7 @@ pub fn notes_page() -> Html {
         .iter()
         .map(|target| target.id.clone())
         .collect::<HashSet<_>>();
-    let selected_visible_count = selected_note_targets(&visible_targets, &selected).len();
+    let selected_visible_count = selected_visible_count(&visible_targets, &selected);
     let select_all_ref = use_node_ref();
 
     {
@@ -400,7 +615,11 @@ pub fn notes_page() -> Html {
     let on_select_all = {
         let selected = selected.clone();
         let visible_ids = visible_ids.clone();
+        let batch_mutating = batch_mutating.clone();
         Callback::from(move |event: Event| {
+            if *batch_mutating {
+                return;
+            }
             let input: HtmlInputElement = event.target_unchecked_into();
             if input.checked() {
                 selected.dispatch(SelectionAction::Replace(visible_ids.clone()));
@@ -412,7 +631,11 @@ pub fn notes_page() -> Html {
 
     let on_selection_change = {
         let selected = selected.clone();
+        let batch_mutating = batch_mutating.clone();
         Callback::from(move |(id, selected_now): (String, bool)| {
+            if *batch_mutating {
+                return;
+            }
             selected.dispatch(SelectionAction::Toggle {
                 id,
                 selected: selected_now,
@@ -570,6 +793,21 @@ pub fn notes_page() -> Html {
         Callback::from(move |_: ()| refresh_tick.set((*refresh_tick).saturating_add(1)))
     };
 
+    let on_open_batch_label = {
+        let batch_label_mode = batch_label_mode.clone();
+        let batch_source_key = batch_source_key.clone();
+        let batch_destination_key = batch_destination_key.clone();
+        let batch_value = batch_value.clone();
+        let batch_label_error = batch_label_error.clone();
+        Callback::from(move |mode: BatchLabelMode| {
+            batch_source_key.set(String::new());
+            batch_destination_key.set(String::new());
+            batch_value.set(String::new());
+            batch_label_error.set(None);
+            batch_label_mode.set(Some(mode));
+        })
+    };
+
     let on_query_input = {
         let query = query.clone();
         Callback::from(move |e: InputEvent| {
@@ -638,6 +876,161 @@ pub fn notes_page() -> Html {
                 invalid_labels: false,
             });
         })
+    };
+
+    let batch_label_modal = match *batch_label_mode {
+        None => html! {},
+        Some(mode) => {
+            let on_close = {
+                let batch_label_mode = batch_label_mode.clone();
+                let batch_source_key = batch_source_key.clone();
+                let batch_destination_key = batch_destination_key.clone();
+                let batch_value = batch_value.clone();
+                let batch_label_error = batch_label_error.clone();
+                let batch_mutating = batch_mutating.clone();
+                Callback::from(move |_: ()| {
+                    if *batch_mutating {
+                        return;
+                    }
+                    batch_label_mode.set(None);
+                    batch_source_key.set(String::new());
+                    batch_destination_key.set(String::new());
+                    batch_value.set(String::new());
+                    batch_label_error.set(None);
+                })
+            };
+            let on_source_input = {
+                let batch_source_key = batch_source_key.clone();
+                Callback::from(move |event: InputEvent| {
+                    let input: HtmlInputElement = event.target_unchecked_into();
+                    batch_source_key.set(input.value());
+                })
+            };
+            let on_destination_input = {
+                let batch_destination_key = batch_destination_key.clone();
+                Callback::from(move |event: InputEvent| {
+                    let input: HtmlInputElement = event.target_unchecked_into();
+                    batch_destination_key.set(input.value());
+                })
+            };
+            let on_value_input = {
+                let batch_value = batch_value.clone();
+                Callback::from(move |event: InputEvent| {
+                    let input: HtmlInputElement = event.target_unchecked_into();
+                    batch_value.set(input.value());
+                })
+            };
+            let on_cancel = {
+                let on_close = on_close.clone();
+                Callback::from(move |_: MouseEvent| on_close.emit(()))
+            };
+            let on_reload = {
+                let reload = reload.clone();
+                Callback::from(move |_: MouseEvent| reload.emit(()))
+            };
+            let on_submit = {
+                let visible_targets = visible_targets.clone();
+                let selected = selected.clone();
+                let batch_source_key = batch_source_key.clone();
+                let batch_destination_key = batch_destination_key.clone();
+                let batch_value = batch_value.clone();
+                let batch_mutating = batch_mutating.clone();
+                let batch_label_error = batch_label_error.clone();
+                let batch_label_success = batch_label_success.clone();
+                let batch_label_mode = batch_label_mode.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
+                let reload = reload.clone();
+                Callback::from(move |event: SubmitEvent| {
+                    event.prevent_default();
+                    if *batch_mutating || *batch_in_flight.borrow() || stale_revision_gate.blocked()
+                    {
+                        return;
+                    }
+                    let targets = selected_note_targets(&visible_targets, &selected);
+                    if targets.is_empty() {
+                        return;
+                    }
+                    let Some(action) = label_action_from_draft(
+                        mode,
+                        &batch_source_key,
+                        &batch_destination_key,
+                        &batch_value,
+                    ) else {
+                        return;
+                    };
+
+                    batch_mutating.set(true);
+                    *batch_in_flight.borrow_mut() = true;
+                    batch_label_error.set(None);
+                    batch_label_success.set(None);
+                    let selected = selected.clone();
+                    let batch_source_key = batch_source_key.clone();
+                    let batch_destination_key = batch_destination_key.clone();
+                    let batch_value = batch_value.clone();
+                    let batch_mutating = batch_mutating.clone();
+                    let batch_in_flight = batch_in_flight.clone();
+                    let batch_label_error = batch_label_error.clone();
+                    let batch_label_success = batch_label_success.clone();
+                    let batch_label_mode = batch_label_mode.clone();
+                    let stale_revision_gate = stale_revision_gate.clone();
+                    let reload = reload.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match api::batch_update_note_labels(&targets, &action).await {
+                            Ok(result) => {
+                                selected.dispatch(SelectionAction::Clear);
+                                batch_source_key.set(String::new());
+                                batch_destination_key.set(String::new());
+                                batch_value.set(String::new());
+                                batch_label_mode.set(None);
+                                batch_label_success.set(Some(batch_label_result_message(
+                                    result.updated,
+                                    result.requested,
+                                    result.unchanged,
+                                )));
+                                reload.emit(());
+                            }
+                            Err(error) if error.is_stale_revision() => {
+                                stale_revision_gate.dispatch(StaleRevisionGateAction::Conflict);
+                                batch_label_error.set(Some(
+                                    "Selected notes changed after the list was loaded. Reload notes before retrying.".to_string(),
+                                ));
+                            }
+                            Err(_) => {
+                                batch_label_error.set(Some(
+                                    "Could not update selected note labels. Please try again."
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                        batch_mutating.set(false);
+                        *batch_in_flight.borrow_mut() = false;
+                    });
+                })
+            };
+            let callbacks = BatchLabelFormCallbacks {
+                on_source_input,
+                on_destination_input,
+                on_value_input,
+                on_submit,
+                on_cancel,
+                on_reload,
+            };
+            html! {
+                <Modal title={batch_label_title(mode)} on_close={on_close}>
+                    { batch_label_form(
+                        mode,
+                        &label_keys,
+                        &batch_source_key,
+                        &batch_destination_key,
+                        &batch_value,
+                        selected_visible_count,
+                        *batch_mutating,
+                        stale_revision_gate.blocked(),
+                        callbacks,
+                    ) }
+                </Modal>
+            }
+        }
     };
 
     // Build the remove-confirm modal from the current target. Capturing `id`/`title` here (rather
@@ -853,14 +1246,30 @@ pub fn notes_page() -> Html {
                 <Alert variant={Some("error".to_string())}><span>{ err.clone() }</span></Alert>
             }
 
-            if *loading {
-                <p class="loading">{ "Loading…" }</p>
-            } else if let Some(hits) = &*results {
-                { search_results_view(hits, &page, &page_size, &selected, &select_all_ref, on_select_all.clone(), on_selection_change.clone(), false, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
-            } else {
-                { list_view(&notes, *total_notes, &page, &page_size, &selected, &select_all_ref, on_select_all, on_selection_change, false, &delete_target, &notes_query, on_quick_add_filter, on_page_change, on_page_size_change, on_refresh) }
+            if let Some(err) = &*batch_label_error {
+                <Alert variant={Some("error".to_string())}><span>{ err.clone() }</span></Alert>
             }
 
+            if let Some(message) = &*batch_label_success {
+                <Alert variant={Some("success".to_string())}>
+                    <span role="status">{ message.clone() }</span>
+                </Alert>
+            }
+
+            if *loading {
+                <p class="loading">{ "Loading…" }</p>
+            } else {
+                if results.as_ref().is_some_and(|hits| !hits.is_empty()) || (results.is_none() && !notes.is_empty()) {
+                    { batch_label_toolbar(selected_visible_count, *batch_mutating, on_open_batch_label) }
+                }
+                if let Some(hits) = &*results {
+                    { search_results_view(hits, &page, &page_size, &selected, &select_all_ref, on_select_all.clone(), on_selection_change.clone(), *batch_mutating, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
+                } else {
+                    { list_view(&notes, *total_notes, &page, &page_size, &selected, &select_all_ref, on_select_all, on_selection_change, *batch_mutating, &delete_target, &notes_query, on_quick_add_filter, on_page_change, on_page_size_change, on_refresh) }
+                }
+            }
+
+            { batch_label_modal }
             { delete_modal }
         </section>
     }
@@ -1276,11 +1685,18 @@ fn note_row(
     let on_remove = {
         let id = id.clone();
         let title = title.clone();
-        Callback::from(move |_| emit_delete_target(&on_delete_target, &id, &title, revision))
+        Callback::from(move |_| {
+            if !selection_disabled {
+                emit_delete_target(&on_delete_target, &id, &title, revision);
+            }
+        })
     };
     let on_select = {
         let id = id.clone();
         Callback::from(move |event: Event| {
+            if selection_disabled {
+                return;
+            }
             let input: HtmlInputElement = event.target_unchecked_into();
             on_selection_change.emit((id.clone(), input.checked()));
         })
@@ -1317,7 +1733,7 @@ fn note_row(
                     <Link<Route, NotesQueryParams> ..view_link />
                     <Link<Route, NotesQueryParams> ..edit_link />
                     <button type="button" class="btn btn-ghost btn-icon icon-danger"
-                        onclick={on_remove}>
+                        disabled={selection_disabled} onclick={on_remove}>
                         { icons::trash() }<span class="sr-only">{ "Remove" }</span>
                     </button>
                 </div>
@@ -1495,10 +1911,7 @@ mod tests {
     fn visible_text(node: &VNode) -> Vec<String> {
         match node {
             VNode::VText(text) => vec![text.text.to_string()],
-            VNode::VTag(_) => element_children(node)
-                .into_iter()
-                .flat_map(visible_text)
-                .collect(),
+            VNode::VTag(tag) => tag.children().map(visible_text).unwrap_or_default(),
             VNode::VList(children) => children.iter().flat_map(visible_text).collect(),
             _ => Vec::new(),
         }
@@ -1530,6 +1943,31 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(matches.len(), 1, "expected one {tag_name} child");
         matches[0]
+    }
+
+    fn descendants_with_tag<'a>(node: &'a VNode, tag_name: &str) -> Vec<&'a VNode> {
+        fn visit<'a>(node: &'a VNode, tag_name: &str, matches: &mut Vec<&'a VNode>) {
+            if matches!(node, VNode::VTag(tag) if tag.tag() == tag_name) {
+                matches.push(node);
+            }
+            match node {
+                VNode::VTag(tag) => {
+                    if let Some(children) = tag.children() {
+                        visit(children, tag_name, matches);
+                    }
+                }
+                VNode::VList(children) => {
+                    for child in children.iter() {
+                        visit(child, tag_name, matches);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut matches = Vec::new();
+        visit(node, tag_name, &mut matches);
+        matches
     }
 
     #[test]
@@ -1609,6 +2047,180 @@ mod tests {
                 api::BatchNoteTarget::new("first", 1),
             ]
         );
+    }
+
+    #[test]
+    fn label_action_from_draft_trims_keys_preserves_values_and_rejects_blank_requirements() {
+        assert_eq!(
+            label_action_from_draft(BatchLabelMode::Add, "", " project ", " padded "),
+            Some(api::BatchLabelAction::Add {
+                key: "project".into(),
+                value: " padded ".into(),
+            })
+        );
+        assert_eq!(
+            label_action_from_draft(BatchLabelMode::Update, " old ", " new ", "exact value ",),
+            Some(api::BatchLabelAction::Update {
+                from_key: "old".into(),
+                key: "new".into(),
+                value: "exact value ".into(),
+            })
+        );
+        assert_eq!(
+            label_action_from_draft(BatchLabelMode::Remove, " obsolete ", "", "ignored"),
+            Some(api::BatchLabelAction::Remove {
+                key: "obsolete".into(),
+            })
+        );
+
+        assert_eq!(
+            label_action_from_draft(BatchLabelMode::Add, "", " \t", "value"),
+            None
+        );
+        assert_eq!(
+            label_action_from_draft(BatchLabelMode::Update, "", "new", "value"),
+            None
+        );
+        assert_eq!(
+            label_action_from_draft(BatchLabelMode::Update, "old", " ", "value"),
+            None
+        );
+        assert_eq!(
+            label_action_from_draft(BatchLabelMode::Remove, "\n", "", ""),
+            None
+        );
+    }
+
+    #[test]
+    fn batch_label_result_message_uses_exact_singular_and_plural_copy() {
+        assert_eq!(
+            batch_label_result_message(0, 0, 0),
+            "Updated 0 of 0 selected notes; 0 unchanged."
+        );
+        assert_eq!(
+            batch_label_result_message(1, 1, 0),
+            "Updated 1 of 1 selected note; 0 unchanged."
+        );
+        assert_eq!(
+            batch_label_result_message(2, 3, 1),
+            "Updated 2 of 3 selected notes; 1 unchanged."
+        );
+        assert_eq!(
+            batch_label_result_message(1, 3, 2),
+            "Updated 1 of 3 selected notes; 2 unchanged."
+        );
+    }
+
+    #[test]
+    fn batch_label_toolbar_reports_selection_and_only_enables_its_three_actions_when_idle() {
+        let empty = batch_label_toolbar(0, false, Callback::noop());
+        let empty_children = rendered_children(&empty);
+        assert_eq!(attribute(empty_children[0], "aria-live"), Some("polite"));
+        assert_eq!(visible_text(empty_children[0]), ["0 selected"]);
+        let empty_actions = rendered_children(empty_children[1]);
+        assert_eq!(
+            empty_actions
+                .iter()
+                .flat_map(|button| visible_text(button))
+                .collect::<Vec<_>>(),
+            ["Add label", "Update label", "Remove label"]
+        );
+        assert!(empty_actions
+            .iter()
+            .all(|button| attribute(button, "disabled").is_some()));
+
+        let selected = batch_label_toolbar(2, false, Callback::noop());
+        let selected_actions = rendered_children(rendered_children(&selected)[1]);
+        assert!(selected_actions
+            .iter()
+            .all(|button| attribute(button, "disabled").is_none()));
+
+        let mutating = batch_label_toolbar(2, true, Callback::noop());
+        let mutating_actions = rendered_children(rendered_children(&mutating)[1]);
+        assert!(mutating_actions
+            .iter()
+            .all(|button| attribute(button, "disabled").is_some()));
+    }
+
+    #[test]
+    fn batch_label_form_renders_each_mode_with_typed_catalog_inputs_and_selected_count_copy() {
+        let label_keys = vec![
+            LabelKey {
+                key: "priority".into(),
+                description: String::new(),
+                value_type: "number".into(),
+            },
+            LabelKey {
+                key: "project".into(),
+                description: String::new(),
+                value_type: "text".into(),
+            },
+        ];
+        let callbacks = BatchLabelFormCallbacks::noop();
+
+        let add = batch_label_form(
+            BatchLabelMode::Add,
+            &label_keys,
+            "",
+            "priority",
+            "2",
+            2,
+            false,
+            false,
+            callbacks.clone(),
+        );
+        assert!(visible_text(&add).contains(&"Add label to 2 selected notes".to_string()));
+        let add_inputs = descendants_with_tag(&add, "input");
+        assert_eq!(
+            attribute(add_inputs[0], "list"),
+            Some("notes-batch-destination-label-options")
+        );
+        assert_eq!(attribute(add_inputs[1], "type"), Some("number"));
+        assert_eq!(descendants_with_tag(&add, "datalist").len(), 1);
+
+        let update = batch_label_form(
+            BatchLabelMode::Update,
+            &label_keys,
+            "project",
+            "priority",
+            "2",
+            1,
+            false,
+            false,
+            callbacks.clone(),
+        );
+        assert!(visible_text(&update).contains(&"Update label on 1 selected note".to_string()));
+        let update_inputs = descendants_with_tag(&update, "input");
+        assert_eq!(
+            attribute(update_inputs[0], "list"),
+            Some("notes-batch-source-label-options")
+        );
+        assert_eq!(
+            attribute(update_inputs[1], "list"),
+            Some("notes-batch-destination-label-options")
+        );
+        assert_eq!(attribute(update_inputs[2], "type"), Some("number"));
+        assert_eq!(descendants_with_tag(&update, "datalist").len(), 2);
+
+        let remove = batch_label_form(
+            BatchLabelMode::Remove,
+            &label_keys,
+            "project",
+            "",
+            "",
+            1,
+            false,
+            false,
+            callbacks,
+        );
+        assert!(visible_text(&remove).contains(&"Remove label from 1 selected note".to_string()));
+        let remove_inputs = descendants_with_tag(&remove, "input");
+        assert_eq!(remove_inputs.len(), 1);
+        assert_eq!(
+            attribute(remove_inputs[0], "list"),
+            Some("notes-batch-source-label-options")
+        );
+        assert_eq!(descendants_with_tag(&remove, "datalist").len(), 1);
     }
 
     #[test]
@@ -1740,6 +2352,39 @@ mod tests {
         let actions = only_child_with_tag(cells[5], "div");
         assert_eq!(element_children(actions).len(), 3);
         assert_eq!(visible_text(element_children(actions)[2]), ["Remove"]);
+    }
+
+    #[test]
+    fn batch_mutation_locks_table_checkboxes_and_per_row_remove() {
+        let query = NotesQueryParams {
+            current: 1,
+            page_size: 10,
+            search: None,
+            labels: None,
+        };
+        let row = note_row(
+            "note-1",
+            "Locked note",
+            4,
+            None,
+            &[],
+            0,
+            0,
+            false,
+            Callback::noop(),
+            true,
+            &query,
+            Callback::noop(),
+            Callback::noop(),
+        );
+        let cells = rendered_children(&row);
+        let checkbox = only_child_with_tag(cells[0], "input");
+        assert_eq!(attribute(checkbox, "disabled"), Some("disabled"));
+        let actions = only_child_with_tag(cells[5], "div");
+        assert_eq!(
+            attribute(element_children(actions)[2], "disabled"),
+            Some("disabled")
+        );
     }
 
     #[test]
