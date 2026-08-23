@@ -31,6 +31,98 @@ enum BatchLabelMode {
     Remove,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchLabelInputFocus {
+    Source,
+    Destination,
+}
+
+fn batch_label_initial_focus(mode: Option<BatchLabelMode>) -> Option<BatchLabelInputFocus> {
+    match mode {
+        Some(BatchLabelMode::Add) => Some(BatchLabelInputFocus::Destination),
+        Some(BatchLabelMode::Update | BatchLabelMode::Remove) => Some(BatchLabelInputFocus::Source),
+        None => None,
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BatchLabelUiState {
+    mode: Option<BatchLabelMode>,
+    source_key: String,
+    destination_key: String,
+    value: String,
+    mutating: bool,
+    error: Option<String>,
+    success: Option<String>,
+}
+
+enum BatchLabelUiAction {
+    Open(BatchLabelMode),
+    SourceKeyChanged(String),
+    DestinationKeyChanged(String),
+    ValueChanged(String),
+    SubmitStarted,
+    Success(String),
+    GenericFailure(String),
+    StaleFailure,
+    Close,
+}
+
+impl BatchLabelUiState {
+    fn reset_dialog(&mut self) {
+        self.mode = None;
+        self.source_key.clear();
+        self.destination_key.clear();
+        self.value.clear();
+        self.error = None;
+    }
+}
+
+impl Reducible for BatchLabelUiState {
+    type Action = BatchLabelUiAction;
+
+    fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
+        let mut next = (*self).clone();
+
+        match action {
+            BatchLabelUiAction::Open(mode) => {
+                next.source_key.clear();
+                next.destination_key.clear();
+                next.value.clear();
+                next.mode = Some(mode);
+                next.mutating = false;
+                next.error = None;
+                next.success = None;
+            }
+            BatchLabelUiAction::SourceKeyChanged(value) => next.source_key = value,
+            BatchLabelUiAction::DestinationKeyChanged(value) => next.destination_key = value,
+            BatchLabelUiAction::ValueChanged(value) => next.value = value,
+            BatchLabelUiAction::SubmitStarted => {
+                next.mutating = true;
+                next.error = None;
+                next.success = None;
+            }
+            BatchLabelUiAction::Success(message) => {
+                next.reset_dialog();
+                next.mutating = false;
+                next.success = Some(message);
+            }
+            BatchLabelUiAction::GenericFailure(message) => {
+                next.mutating = false;
+                next.error = Some(message);
+            }
+            BatchLabelUiAction::StaleFailure => {
+                next.mutating = false;
+                next.error = None;
+            }
+            BatchLabelUiAction::Close if !next.mutating => next.reset_dialog(),
+            BatchLabelUiAction::Close => {}
+        }
+
+        next.into()
+    }
+}
+
 #[derive(Clone, Default, PartialEq)]
 struct SelectionState(HashSet<String>);
 
@@ -152,6 +244,7 @@ fn batch_label_result_message(updated: usize, requested: usize, unchanged: usize
 fn batch_label_toolbar(
     selected_count: usize,
     batch_mutating: bool,
+    refs: BatchLabelToolbarRefs,
     on_open: Callback<BatchLabelMode>,
 ) -> Html {
     let disabled = selected_count == 0 || batch_mutating;
@@ -160,6 +253,11 @@ fn batch_label_toolbar(
             batch_label_open_callback(selected_count, batch_mutating, mode, on_open.clone());
         Callback::from(move |_: MouseEvent| callback.emit(()))
     };
+    let BatchLabelToolbarRefs {
+        add: add_ref,
+        update: update_ref,
+        remove: remove_ref,
+    } = refs;
 
     html! {
         <div class="notes-batch-toolbar">
@@ -167,9 +265,9 @@ fn batch_label_toolbar(
                 { format!("{selected_count} selected") }
             </span>
             <div class="notes-batch-actions">
-                <button type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Add)}>{ "Add label" }</button>
-                <button type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Update)}>{ "Update label" }</button>
-                <button type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Remove)}>{ "Remove label" }</button>
+                <button ref={add_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Add)}>{ "Add label" }</button>
+                <button ref={update_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Update)}>{ "Update label" }</button>
+                <button ref={remove_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Remove)}>{ "Remove label" }</button>
             </div>
         </div>
     }
@@ -192,6 +290,27 @@ fn batch_label_draft_input_allowed(batch_mutating: bool) -> bool {
     !batch_mutating
 }
 
+fn batch_label_submit_allowed(
+    batch_mutating: bool,
+    batch_in_flight: bool,
+    stale_revision_blocked: bool,
+) -> bool {
+    !batch_mutating && !batch_in_flight && !stale_revision_blocked
+}
+
+fn batch_label_error_notice(generic_error: Option<&str>, stale_revision_blocked: bool) -> Html {
+    let message = if stale_revision_blocked {
+        Some("Selected notes changed after the list was loaded. Reload notes before retrying.")
+    } else {
+        generic_error
+    };
+
+    match message {
+        Some(message) => html! { <p class="notes-batch-label-error" role="alert">{ message }</p> },
+        None => html! {},
+    }
+}
+
 #[derive(Clone)]
 struct BatchLabelFormCallbacks {
     on_source_input: Callback<InputEvent>,
@@ -200,6 +319,19 @@ struct BatchLabelFormCallbacks {
     on_submit: Callback<SubmitEvent>,
     on_cancel: Callback<MouseEvent>,
     on_reload: Callback<MouseEvent>,
+}
+
+#[derive(Clone, Default)]
+struct BatchLabelInputRefs {
+    source: NodeRef,
+    destination: NodeRef,
+}
+
+#[derive(Clone, Default)]
+struct BatchLabelToolbarRefs {
+    add: NodeRef,
+    update: NodeRef,
+    remove: NodeRef,
 }
 
 impl BatchLabelFormCallbacks {
@@ -247,6 +379,8 @@ fn batch_label_form(
     selected_count: usize,
     batch_mutating: bool,
     stale_revision_blocked: bool,
+    generic_error: Option<&str>,
+    input_refs: BatchLabelInputRefs,
     callbacks: BatchLabelFormCallbacks,
 ) -> Html {
     let BatchLabelFormCallbacks {
@@ -257,6 +391,10 @@ fn batch_label_form(
         on_cancel,
         on_reload,
     } = callbacks;
+    let BatchLabelInputRefs {
+        source: source_input_ref,
+        destination: destination_input_ref,
+    } = input_refs;
     let destination_value_type = label_keys
         .iter()
         .find(|label| label.key == destination_key.trim())
@@ -266,9 +404,14 @@ fn batch_label_form(
         || stale_revision_blocked
         || selected_count == 0
         || label_action_from_draft(mode, source_key, destination_key, value).is_none();
+    let submit_copy = if batch_mutating {
+        "Updating…".to_string()
+    } else {
+        batch_label_submit_copy(mode, selected_count)
+    };
 
     html! {
-        <form class="notes-batch-label-form" onsubmit={on_submit}>
+        <form class="notes-batch-label-form" aria-busy={batch_mutating.to_string()} onsubmit={on_submit}>
             if matches!(mode, BatchLabelMode::Update | BatchLabelMode::Remove) {
                 <label>
                     <span>{ "Source label" }</span>
@@ -277,6 +420,7 @@ fn batch_label_form(
                         type="text"
                         list="notes-batch-source-label-options"
                         value={source_key.to_string()}
+                        ref={source_input_ref}
                         disabled={batch_mutating}
                         oninput={on_source_input}
                         aria-label="Source label"
@@ -294,6 +438,7 @@ fn batch_label_form(
                         type="text"
                         list="notes-batch-destination-label-options"
                         value={destination_key.to_string()}
+                        ref={destination_input_ref}
                         disabled={batch_mutating}
                         oninput={on_destination_input}
                         aria-label="Destination label"
@@ -314,17 +459,13 @@ fn batch_label_form(
                     />
                 </label>
             }
-            if stale_revision_blocked {
-                <Alert variant={Some("error".to_string())}>
-                    <span>{ "Selected notes changed after the list was loaded. Reload the notes before retrying." }</span>
-                </Alert>
-            }
+            { batch_label_error_notice(generic_error, stale_revision_blocked) }
             <div class="app-modal-actions">
                 if stale_revision_blocked {
                     <button type="button" class="btn btn-outline" disabled={batch_mutating} onclick={on_reload}>{ "Reload notes" }</button>
                 }
                 <button type="button" class="btn btn-ghost" disabled={batch_mutating} onclick={on_cancel}>{ "Cancel" }</button>
-                <button type="submit" class="btn btn-primary" disabled={disabled}>{ batch_label_submit_copy(mode, selected_count) }</button>
+                <button type="submit" class="btn btn-primary" disabled={disabled}>{ submit_copy }</button>
             </div>
         </form>
     }
@@ -564,14 +705,19 @@ pub fn notes_page() -> Html {
     let delete_target = use_state(|| None::<(String, String, i64)>);
     let selected = use_reducer(SelectionState::default);
     let stale_revision_gate = use_reducer(StaleRevisionGate::default);
-    let batch_label_mode = use_state(|| None::<BatchLabelMode>);
-    let batch_source_key = use_state(String::new);
-    let batch_destination_key = use_state(String::new);
-    let batch_value = use_state(String::new);
-    let batch_mutating = use_state(|| false);
+    let batch_label_ui = use_reducer(BatchLabelUiState::default);
     let batch_in_flight = use_mut_ref(|| false);
-    let batch_label_error = use_state(|| None::<String>);
-    let batch_label_success = use_state(|| None::<String>);
+    let batch_toolbar_refs = BatchLabelToolbarRefs {
+        add: use_node_ref(),
+        update: use_node_ref(),
+        remove: use_node_ref(),
+    };
+    let batch_input_refs = BatchLabelInputRefs {
+        source: use_node_ref(),
+        destination: use_node_ref(),
+    };
+    let batch_success_ref = use_node_ref();
+    let batch_focus_return_mode = use_mut_ref(|| None::<BatchLabelMode>);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
     let page_size = use_state(|| DEFAULT_NOTES_PAGE_SIZE);
@@ -633,12 +779,63 @@ pub fn notes_page() -> Html {
         );
     }
 
+    {
+        let source_ref = batch_input_refs.source.clone();
+        let destination_ref = batch_input_refs.destination.clone();
+        use_effect_with(batch_label_ui.mode, move |mode| {
+            let input = match batch_label_initial_focus(*mode) {
+                Some(BatchLabelInputFocus::Source) => source_ref.cast::<HtmlInputElement>(),
+                Some(BatchLabelInputFocus::Destination) => {
+                    destination_ref.cast::<HtmlInputElement>()
+                }
+                None => None,
+            };
+            if let Some(input) = input {
+                let _ = input.focus();
+            }
+            || ()
+        });
+    }
+
+    {
+        let return_mode = batch_focus_return_mode.clone();
+        let add_ref = batch_toolbar_refs.add.clone();
+        let update_ref = batch_toolbar_refs.update.clone();
+        let remove_ref = batch_toolbar_refs.remove.clone();
+        use_effect_with(batch_label_ui.mode, move |mode| {
+            if mode.is_none() {
+                let trigger = match return_mode.borrow_mut().take() {
+                    Some(BatchLabelMode::Add) => add_ref.cast::<web_sys::HtmlElement>(),
+                    Some(BatchLabelMode::Update) => update_ref.cast::<web_sys::HtmlElement>(),
+                    Some(BatchLabelMode::Remove) => remove_ref.cast::<web_sys::HtmlElement>(),
+                    None => None,
+                };
+                if let Some(trigger) = trigger {
+                    let _ = trigger.focus();
+                }
+            }
+            || ()
+        });
+    }
+
+    {
+        let batch_success_ref = batch_success_ref.clone();
+        use_effect_with(batch_label_ui.success.clone(), move |success| {
+            if success.is_some() {
+                if let Some(status) = batch_success_ref.cast::<web_sys::HtmlElement>() {
+                    let _ = status.focus();
+                }
+            }
+            || ()
+        });
+    }
+
     let on_select_all = {
         let selected = selected.clone();
         let visible_ids = visible_ids.clone();
-        let batch_mutating = batch_mutating.clone();
+        let batch_label_ui = batch_label_ui.clone();
         Callback::from(move |event: Event| {
-            if *batch_mutating {
+            if batch_label_ui.mutating {
                 return;
             }
             let input: HtmlInputElement = event.target_unchecked_into();
@@ -652,9 +849,9 @@ pub fn notes_page() -> Html {
 
     let on_selection_change = {
         let selected = selected.clone();
-        let batch_mutating = batch_mutating.clone();
+        let batch_label_ui = batch_label_ui.clone();
         Callback::from(move |(id, selected_now): (String, bool)| {
-            if *batch_mutating {
+            if batch_label_ui.mutating {
                 return;
             }
             selected.dispatch(SelectionAction::Toggle {
@@ -815,17 +1012,9 @@ pub fn notes_page() -> Html {
     };
 
     let on_open_batch_label = {
-        let batch_label_mode = batch_label_mode.clone();
-        let batch_source_key = batch_source_key.clone();
-        let batch_destination_key = batch_destination_key.clone();
-        let batch_value = batch_value.clone();
-        let batch_label_error = batch_label_error.clone();
+        let batch_label_ui = batch_label_ui.clone();
         Callback::from(move |mode: BatchLabelMode| {
-            batch_source_key.set(String::new());
-            batch_destination_key.set(String::new());
-            batch_value.set(String::new());
-            batch_label_error.set(None);
-            batch_label_mode.set(Some(mode));
+            batch_label_ui.dispatch(BatchLabelUiAction::Open(mode));
         })
     };
 
@@ -899,58 +1088,49 @@ pub fn notes_page() -> Html {
         })
     };
 
-    let batch_label_modal = match *batch_label_mode {
+    let batch_label_modal = match batch_label_ui.mode {
         None => html! {},
         Some(mode) => {
             let on_close = {
-                let batch_label_mode = batch_label_mode.clone();
-                let batch_source_key = batch_source_key.clone();
-                let batch_destination_key = batch_destination_key.clone();
-                let batch_value = batch_value.clone();
-                let batch_label_error = batch_label_error.clone();
-                let batch_mutating = batch_mutating.clone();
+                let batch_label_ui = batch_label_ui.clone();
+                let batch_focus_return_mode = batch_focus_return_mode.clone();
                 Callback::from(move |_: ()| {
-                    if *batch_mutating {
+                    if batch_label_ui.mutating {
                         return;
                     }
-                    batch_label_mode.set(None);
-                    batch_source_key.set(String::new());
-                    batch_destination_key.set(String::new());
-                    batch_value.set(String::new());
-                    batch_label_error.set(None);
+                    *batch_focus_return_mode.borrow_mut() = Some(mode);
+                    batch_label_ui.dispatch(BatchLabelUiAction::Close);
                 })
             };
             let on_source_input = {
-                let batch_source_key = batch_source_key.clone();
-                let batch_mutating = batch_mutating.clone();
+                let batch_label_ui = batch_label_ui.clone();
                 Callback::from(move |event: InputEvent| {
-                    if !batch_label_draft_input_allowed(*batch_mutating) {
+                    if !batch_label_draft_input_allowed(batch_label_ui.mutating) {
                         return;
                     }
                     let input: HtmlInputElement = event.target_unchecked_into();
-                    batch_source_key.set(input.value());
+                    batch_label_ui.dispatch(BatchLabelUiAction::SourceKeyChanged(input.value()));
                 })
             };
             let on_destination_input = {
-                let batch_destination_key = batch_destination_key.clone();
-                let batch_mutating = batch_mutating.clone();
+                let batch_label_ui = batch_label_ui.clone();
                 Callback::from(move |event: InputEvent| {
-                    if !batch_label_draft_input_allowed(*batch_mutating) {
+                    if !batch_label_draft_input_allowed(batch_label_ui.mutating) {
                         return;
                     }
                     let input: HtmlInputElement = event.target_unchecked_into();
-                    batch_destination_key.set(input.value());
+                    batch_label_ui
+                        .dispatch(BatchLabelUiAction::DestinationKeyChanged(input.value()));
                 })
             };
             let on_value_input = {
-                let batch_value = batch_value.clone();
-                let batch_mutating = batch_mutating.clone();
+                let batch_label_ui = batch_label_ui.clone();
                 Callback::from(move |event: InputEvent| {
-                    if !batch_label_draft_input_allowed(*batch_mutating) {
+                    if !batch_label_draft_input_allowed(batch_label_ui.mutating) {
                         return;
                     }
                     let input: HtmlInputElement = event.target_unchecked_into();
-                    batch_value.set(input.value());
+                    batch_label_ui.dispatch(BatchLabelUiAction::ValueChanged(input.value()));
                 })
             };
             let on_cancel = {
@@ -964,19 +1144,16 @@ pub fn notes_page() -> Html {
             let on_submit = {
                 let visible_targets = visible_targets.clone();
                 let selected = selected.clone();
-                let batch_source_key = batch_source_key.clone();
-                let batch_destination_key = batch_destination_key.clone();
-                let batch_value = batch_value.clone();
-                let batch_mutating = batch_mutating.clone();
-                let batch_label_error = batch_label_error.clone();
-                let batch_label_success = batch_label_success.clone();
-                let batch_label_mode = batch_label_mode.clone();
+                let batch_label_ui = batch_label_ui.clone();
                 let stale_revision_gate = stale_revision_gate.clone();
                 let reload = reload.clone();
                 Callback::from(move |event: SubmitEvent| {
                     event.prevent_default();
-                    if *batch_mutating || *batch_in_flight.borrow() || stale_revision_gate.blocked()
-                    {
+                    if !batch_label_submit_allowed(
+                        batch_label_ui.mutating,
+                        *batch_in_flight.borrow(),
+                        stale_revision_gate.blocked(),
+                    ) {
                         return;
                     }
                     let targets = selected_note_targets(&visible_targets, &selected);
@@ -985,57 +1162,44 @@ pub fn notes_page() -> Html {
                     }
                     let Some(action) = label_action_from_draft(
                         mode,
-                        &batch_source_key,
-                        &batch_destination_key,
-                        &batch_value,
+                        &batch_label_ui.source_key,
+                        &batch_label_ui.destination_key,
+                        &batch_label_ui.value,
                     ) else {
                         return;
                     };
 
-                    batch_mutating.set(true);
                     *batch_in_flight.borrow_mut() = true;
-                    batch_label_error.set(None);
-                    batch_label_success.set(None);
+                    batch_label_ui.dispatch(BatchLabelUiAction::SubmitStarted);
                     let selected = selected.clone();
-                    let batch_source_key = batch_source_key.clone();
-                    let batch_destination_key = batch_destination_key.clone();
-                    let batch_value = batch_value.clone();
-                    let batch_mutating = batch_mutating.clone();
                     let batch_in_flight = batch_in_flight.clone();
-                    let batch_label_error = batch_label_error.clone();
-                    let batch_label_success = batch_label_success.clone();
-                    let batch_label_mode = batch_label_mode.clone();
+                    let batch_label_ui = batch_label_ui.clone();
                     let stale_revision_gate = stale_revision_gate.clone();
                     let reload = reload.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         match api::batch_update_note_labels(&targets, &action).await {
                             Ok(result) => {
                                 selected.dispatch(SelectionAction::Clear);
-                                batch_source_key.set(String::new());
-                                batch_destination_key.set(String::new());
-                                batch_value.set(String::new());
-                                batch_label_mode.set(None);
-                                batch_label_success.set(Some(batch_label_result_message(
-                                    result.updated,
-                                    result.requested,
-                                    result.unchanged,
-                                )));
+                                batch_label_ui.dispatch(BatchLabelUiAction::Success(
+                                    batch_label_result_message(
+                                        result.updated,
+                                        result.requested,
+                                        result.unchanged,
+                                    ),
+                                ));
                                 reload.emit(());
                             }
                             Err(error) if error.is_stale_revision() => {
                                 stale_revision_gate.dispatch(StaleRevisionGateAction::Conflict);
-                                batch_label_error.set(Some(
-                                    "Selected notes changed after the list was loaded. Reload notes before retrying.".to_string(),
-                                ));
+                                batch_label_ui.dispatch(BatchLabelUiAction::StaleFailure);
                             }
                             Err(_) => {
-                                batch_label_error.set(Some(
+                                batch_label_ui.dispatch(BatchLabelUiAction::GenericFailure(
                                     "Could not update selected note labels. Please try again."
                                         .to_string(),
                                 ));
                             }
                         }
-                        batch_mutating.set(false);
                         *batch_in_flight.borrow_mut() = false;
                     });
                 })
@@ -1053,12 +1217,14 @@ pub fn notes_page() -> Html {
                     { batch_label_form(
                         mode,
                         &label_keys,
-                        &batch_source_key,
-                        &batch_destination_key,
-                        &batch_value,
+                        &batch_label_ui.source_key,
+                        &batch_label_ui.destination_key,
+                        &batch_label_ui.value,
                         selected_visible_count,
-                        *batch_mutating,
+                        batch_label_ui.mutating,
                         stale_revision_gate.blocked(),
+                        batch_label_ui.error.as_deref(),
+                        batch_input_refs.clone(),
                         callbacks,
                     ) }
                 </Modal>
@@ -1245,6 +1411,7 @@ pub fn notes_page() -> Html {
 
     html! {
         <section class="stack">
+            <div class="notes-page-content" inert={batch_label_ui.mode.is_some()} aria-busy={batch_label_ui.mutating.to_string()}>
             <div class="search-panel">
                 <form class="search-bar" onsubmit={on_search}>
                     <input
@@ -1279,13 +1446,9 @@ pub fn notes_page() -> Html {
                 <Alert variant={Some("error".to_string())}><span>{ err.clone() }</span></Alert>
             }
 
-            if let Some(err) = &*batch_label_error {
-                <Alert variant={Some("error".to_string())}><span>{ err.clone() }</span></Alert>
-            }
-
-            if let Some(message) = &*batch_label_success {
+            if let Some(message) = &batch_label_ui.success {
                 <Alert variant={Some("success".to_string())}>
-                    <span role="status">{ message.clone() }</span>
+                    <span ref={batch_success_ref.clone()} role="status" tabindex="-1">{ message.clone() }</span>
                 </Alert>
             }
 
@@ -1293,15 +1456,16 @@ pub fn notes_page() -> Html {
                 <p class="loading">{ "Loading…" }</p>
             } else {
                 if results.as_ref().is_some_and(|hits| !hits.is_empty()) || (results.is_none() && !notes.is_empty()) {
-                    { batch_label_toolbar(selected_visible_count, *batch_mutating, on_open_batch_label) }
+                    { batch_label_toolbar(selected_visible_count, batch_label_ui.mutating, batch_toolbar_refs.clone(), on_open_batch_label) }
                 }
                 if let Some(hits) = &*results {
-                    { search_results_view(hits, &page, &page_size, &selected, &select_all_ref, on_select_all.clone(), on_selection_change.clone(), *batch_mutating, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
+                    { search_results_view(hits, &page, &page_size, &selected, &select_all_ref, on_select_all.clone(), on_selection_change.clone(), batch_label_ui.mutating, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
                 } else {
-                    { list_view(&notes, *total_notes, &page, &page_size, &selected, &select_all_ref, on_select_all, on_selection_change, *batch_mutating, &delete_target, &notes_query, on_quick_add_filter, on_page_change, on_page_size_change, on_refresh) }
+                    { list_view(&notes, *total_notes, &page, &page_size, &selected, &select_all_ref, on_select_all, on_selection_change, batch_label_ui.mutating, &delete_target, &notes_query, on_quick_add_filter, on_page_change, on_page_size_change, on_refresh) }
                 }
             }
 
+            </div>
             { batch_label_modal }
             { delete_modal }
         </section>
@@ -2146,7 +2310,8 @@ mod tests {
 
     #[test]
     fn batch_label_toolbar_reports_selection_and_only_enables_its_three_actions_when_idle() {
-        let empty = batch_label_toolbar(0, false, Callback::noop());
+        let empty =
+            batch_label_toolbar(0, false, BatchLabelToolbarRefs::default(), Callback::noop());
         let empty_children = rendered_children(&empty);
         assert_eq!(attribute(empty_children[0], "aria-live"), Some("polite"));
         assert_eq!(visible_text(empty_children[0]), ["0 selected"]);
@@ -2162,13 +2327,15 @@ mod tests {
             .iter()
             .all(|button| attribute(button, "disabled").is_some()));
 
-        let selected = batch_label_toolbar(2, false, Callback::noop());
+        let selected =
+            batch_label_toolbar(2, false, BatchLabelToolbarRefs::default(), Callback::noop());
         let selected_actions = rendered_children(rendered_children(&selected)[1]);
         assert!(selected_actions
             .iter()
             .all(|button| attribute(button, "disabled").is_none()));
 
-        let mutating = batch_label_toolbar(2, true, Callback::noop());
+        let mutating =
+            batch_label_toolbar(2, true, BatchLabelToolbarRefs::default(), Callback::noop());
         let mutating_actions = rendered_children(rendered_children(&mutating)[1]);
         assert!(mutating_actions
             .iter()
@@ -2188,6 +2355,118 @@ mod tests {
         batch_label_open_callback(2, false, BatchLabelMode::Remove, on_open).emit(());
 
         assert_eq!(*opened.borrow(), vec![BatchLabelMode::Remove]);
+    }
+
+    #[test]
+    fn batch_label_initial_focus_targets_the_mode_specific_first_input() {
+        assert_eq!(
+            batch_label_initial_focus(Some(BatchLabelMode::Add)),
+            Some(BatchLabelInputFocus::Destination)
+        );
+        assert_eq!(
+            batch_label_initial_focus(Some(BatchLabelMode::Update)),
+            Some(BatchLabelInputFocus::Source)
+        );
+        assert_eq!(
+            batch_label_initial_focus(Some(BatchLabelMode::Remove)),
+            Some(BatchLabelInputFocus::Source)
+        );
+        assert_eq!(batch_label_initial_focus(None), None);
+    }
+
+    #[test]
+    fn batch_label_ui_reducer_opens_edits_and_locks_submission() {
+        let state = Rc::new(BatchLabelUiState::default())
+            .reduce(BatchLabelUiAction::Open(BatchLabelMode::Update));
+        let state = state.reduce(BatchLabelUiAction::SourceKeyChanged("project".into()));
+        let state = state.reduce(BatchLabelUiAction::DestinationKeyChanged("team".into()));
+        let state = state.reduce(BatchLabelUiAction::ValueChanged("platform".into()));
+        let state = state.reduce(BatchLabelUiAction::SubmitStarted);
+
+        assert_eq!(state.mode, Some(BatchLabelMode::Update));
+        assert_eq!(state.source_key, "project");
+        assert_eq!(state.destination_key, "team");
+        assert_eq!(state.value, "platform");
+        assert!(state.mutating);
+        assert!(state.error.is_none());
+        assert!(batch_label_submit_allowed(false, false, false));
+        assert!(!batch_label_submit_allowed(false, true, false));
+        assert!(!batch_label_submit_allowed(state.mutating, false, false));
+    }
+
+    #[test]
+    fn batch_label_ui_reducer_success_closes_resets_and_sets_summary() {
+        let state = Rc::new(BatchLabelUiState {
+            mode: Some(BatchLabelMode::Add),
+            source_key: "source".into(),
+            destination_key: "project".into(),
+            value: "agent-note".into(),
+            mutating: true,
+            error: Some("old error".into()),
+            success: None,
+        })
+        .reduce(BatchLabelUiAction::Success(
+            "Updated 1 of 1 selected note; 0 unchanged.".into(),
+        ));
+
+        assert_eq!(state.mode, None);
+        assert_eq!(state.source_key, "");
+        assert_eq!(state.destination_key, "");
+        assert_eq!(state.value, "");
+        assert!(!state.mutating);
+        assert_eq!(state.error, None);
+        assert_eq!(
+            state.success.as_deref(),
+            Some("Updated 1 of 1 selected note; 0 unchanged.")
+        );
+    }
+
+    #[test]
+    fn batch_label_ui_reducer_failures_keep_drafts_but_only_generic_failure_keeps_error() {
+        let state = Rc::new(BatchLabelUiState {
+            mode: Some(BatchLabelMode::Update),
+            source_key: "project".into(),
+            destination_key: "team".into(),
+            value: "platform".into(),
+            mutating: true,
+            error: None,
+            success: None,
+        });
+        let generic = state.clone().reduce(BatchLabelUiAction::GenericFailure(
+            "Could not update selected note labels. Please try again.".into(),
+        ));
+        let stale = generic.clone().reduce(BatchLabelUiAction::StaleFailure);
+
+        assert_eq!(generic.mode, Some(BatchLabelMode::Update));
+        assert_eq!(generic.source_key, "project");
+        assert!(!generic.mutating);
+        assert_eq!(
+            generic.error.as_deref(),
+            Some("Could not update selected note labels. Please try again.")
+        );
+        assert_eq!(stale.mode, Some(BatchLabelMode::Update));
+        assert_eq!(stale.destination_key, "team");
+        assert!(!stale.mutating);
+        assert_eq!(stale.error, None);
+    }
+
+    #[test]
+    fn batch_label_ui_reducer_close_resets_an_idle_dialog_without_clearing_success() {
+        let state = Rc::new(BatchLabelUiState {
+            mode: Some(BatchLabelMode::Remove),
+            source_key: "obsolete".into(),
+            destination_key: String::new(),
+            value: String::new(),
+            mutating: false,
+            error: Some("retry".into()),
+            success: Some("Earlier success".into()),
+        })
+        .reduce(BatchLabelUiAction::Close);
+
+        assert_eq!(state.mode, None);
+        assert_eq!(state.source_key, "");
+        assert_eq!(state.error, None);
+        assert_eq!(state.success.as_deref(), Some("Earlier success"));
     }
 
     #[test]
@@ -2215,6 +2494,8 @@ mod tests {
             2,
             false,
             false,
+            None,
+            BatchLabelInputRefs::default(),
             callbacks.clone(),
         );
         assert!(visible_text(&add).contains(&"Add label to 2 selected notes".to_string()));
@@ -2235,6 +2516,8 @@ mod tests {
             1,
             false,
             false,
+            None,
+            BatchLabelInputRefs::default(),
             callbacks.clone(),
         );
         assert!(visible_text(&update).contains(&"Update label on 1 selected note".to_string()));
@@ -2259,6 +2542,8 @@ mod tests {
             1,
             false,
             false,
+            None,
+            BatchLabelInputRefs::default(),
             callbacks,
         );
         assert!(visible_text(&remove).contains(&"Remove label from 1 selected note".to_string()));
@@ -2287,14 +2572,81 @@ mod tests {
             1,
             true,
             false,
+            None,
+            BatchLabelInputRefs::default(),
             BatchLabelFormCallbacks::noop(),
         );
 
         assert!(descendants_with_tag(&form, "input")
             .iter()
             .all(|input| attribute(input, "disabled").is_some()));
+        assert_eq!(attribute(&form, "aria-busy"), Some("true"));
+        assert!(visible_text(&form).contains(&"Updating…".to_string()));
         assert!(batch_label_draft_input_allowed(false));
         assert!(!batch_label_draft_input_allowed(true));
+    }
+
+    #[test]
+    fn batch_label_error_notice_announces_generic_errors_and_derives_stale_copy_from_the_gate() {
+        let generic = batch_label_error_notice(
+            Some("Could not update selected note labels. Please try again."),
+            false,
+        );
+        assert_eq!(attribute(&generic, "role"), Some("alert"));
+        assert_eq!(
+            visible_text(&generic),
+            ["Could not update selected note labels. Please try again."]
+        );
+
+        let stale = batch_label_error_notice(None, true);
+        assert_eq!(attribute(&stale, "role"), Some("alert"));
+        assert_eq!(
+            visible_text(&stale),
+            ["Selected notes changed after the list was loaded. Reload notes before retrying."]
+        );
+    }
+
+    #[test]
+    fn batch_label_form_renders_the_active_generic_error_inside_the_dialog_form() {
+        let form = batch_label_form(
+            BatchLabelMode::Add,
+            &[],
+            "",
+            "project",
+            "agent-note",
+            1,
+            false,
+            false,
+            Some("Could not update selected note labels. Please try again."),
+            BatchLabelInputRefs::default(),
+            BatchLabelFormCallbacks::noop(),
+        );
+        let alert = descendants_with_tag(&form, "p")
+            .into_iter()
+            .find(|node| attribute(node, "role") == Some("alert"))
+            .expect("generic error should be announced in the dialog form");
+
+        assert_eq!(
+            visible_text(alert),
+            ["Could not update selected note labels. Please try again."]
+        );
+    }
+
+    #[test]
+    fn notes_page_source_keeps_background_inert_and_modal_outside_the_background_wrapper() {
+        let source = include_str!("notes.rs");
+        let background = source
+            .find("<div class=\"notes-page-content\"")
+            .expect("background wrapper");
+        let modal = source
+            .find("{ batch_label_modal }")
+            .expect("batch label modal");
+
+        assert!(source[background..].contains("inert={batch_label_ui.mode.is_some()}"));
+        assert!(source[background..].contains("aria-busy={batch_label_ui.mutating.to_string()}"));
+        assert!(source.contains("let batch_focus_return_mode = use_mut_ref"));
+        assert!(source.contains("ref={batch_success_ref.clone()} role=\"status\" tabindex=\"-1\""));
+        assert!(modal > background);
     }
 
     #[test]
