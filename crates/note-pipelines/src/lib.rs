@@ -13,6 +13,9 @@ pub use batch_note_targets::*;
 pub mod batch_update_note_labels;
 pub use batch_update_note_labels::*;
 
+pub mod batch_delete_notes;
+pub use batch_delete_notes::*;
+
 pub mod org;
 
 pub mod mutation_error;
