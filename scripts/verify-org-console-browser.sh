@@ -143,7 +143,12 @@ network_json() {
 }
 
 org_request_count() {
-    jq '[(.networkRequests // [])[] | select(.url | contains("/api/org"))] | length'
+    jq --arg base "$base" '[
+        (.networkRequests // [])[]
+        | select(.url == ($base + "/api/org")
+            or (.url | startswith($base + "/api/org/"))
+            or (.url | startswith($base + "/api/org?")))
+    ] | length'
 }
 
 assert_network_boundary() {
@@ -153,25 +158,15 @@ assert_network_boundary() {
     jq -e --arg base "$base" '
         [(.networkRequests // [])[]
             | select(.url | contains("/api/org"))
-            | select(((.method == "GET")
-                or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
-                or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
-                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$")))
-                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/documents$")))
-                or (.method == "PATCH" and (.url | test("/api/org/documents/[^/?]+/path$")))
-                or (.method == "POST" and (.url | test("/api/org/documents/[^/?]+/(archive|restore)$"))))
-                | not)
+            | select(((
+                (.url == ($base + "/api/org")
+                    or (.url | startswith($base + "/api/org/"))
+                    or (.url | startswith($base + "/api/org?")))
+                and .method == "GET"
+            )) | not)
         ] | length == 0
-    ' <<<"$network" >/dev/null || fail "browser issued an Org request outside approved workspace/document lifecycle traffic"
-    # Read-only queue/agenda/item GETs remain allowed. The first allowlist above rejects every
-    # unapproved non-GET route; this second check makes the source/workflow mutation boundary
-    # explicit without rejecting the legitimate reads exercised by this gate.
-    jq -e '[(.networkRequests // [])[]
-        | select(.method != "GET")
-        | select(.method == "PUT" or .method == "DELETE"
-            or (.url | test("/(claim|review|progress|result|transition|dependencies|note-links|import)(/|\\?|$)")))]
-        | length == 0' <<<"$network" >/dev/null ||
-        fail "browser issued source or workflow mutation traffic"
+    ' <<<"$network" >/dev/null ||
+        fail "browser issued a non-GET or cross-origin /api/org request"
 }
 
 assert_console_clean() {
@@ -234,8 +229,11 @@ assert_directory_refresh() {
     sleep 1
     network="$(network_json)"
     assert_network_boundary "$network"
-    new_requests="$(jq --argjson before "$before" \
-        '[(.networkRequests // [])[] | select(.url | contains("/api/org"))][$before:]' \
+    new_requests="$(jq --arg base "$base" --argjson before "$before" '
+        [(.networkRequests // [])[]
+            | select(.url == ($base + "/api/org")
+                or (.url | startswith($base + "/api/org/"))
+                or (.url | startswith($base + "/api/org?")))][$before:]' \
         <<<"$network")"
     list_prefix="$base/api/org/workspaces?"
     jq -e --arg list "$list_prefix" '
@@ -261,8 +259,11 @@ assert_workspace_refresh() {
     network="$(network_json)"
     assert_network_boundary "$network"
     after="$(org_request_count <<<"$network")"
-    new_requests="$(jq --argjson before "$before" \
-        '[(.networkRequests // [])[] | select(.url | contains("/api/org"))][$before:]' \
+    new_requests="$(jq --arg base "$base" --argjson before "$before" '
+        [(.networkRequests // [])[]
+            | select(.url == ($base + "/api/org")
+                or (.url | startswith($base + "/api/org/"))
+                or (.url | startswith($base + "/api/org?")))][$before:]' \
         <<<"$network")"
     detail_prefix="$base/api/org/workspaces/$workspace"
     list_prefix="$base/api/org/workspaces?"
@@ -295,8 +296,11 @@ assert_item_refresh() {
     sleep 1
     network="$(network_json)"
     assert_network_boundary "$network"
-    new_requests="$(jq --argjson before "$before" \
-        '[(.networkRequests // [])[] | select(.url | contains("/api/org"))][$before:]' \
+    new_requests="$(jq --arg base "$base" --argjson before "$before" '
+        [(.networkRequests // [])[]
+            | select(.url == ($base + "/api/org")
+                or (.url | startswith($base + "/api/org/"))
+                or (.url | startswith($base + "/api/org?")))][$before:]' \
         <<<"$network")"
     context_url="$base/api/org/items/$item/context?workspace_id=$workspace"
     events_url="$base/api/org/workspaces/$workspace/events?subject_kind=work_item&subject_id=$item&limit=50"
