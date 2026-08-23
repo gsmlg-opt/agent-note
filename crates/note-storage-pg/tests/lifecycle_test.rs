@@ -1,6 +1,6 @@
 mod support;
 
-use note_org::WorkspaceId;
+use note_org::{DocumentId, WorkspaceId};
 use note_storage::{NewOrgEvent, NotesRepository, OrgEventType, OrgRepository, StorageErrorKind};
 use note_storage_pg::PgStorage;
 use std::str::FromStr as _;
@@ -471,6 +471,17 @@ async fn ordered_migrations_preserve_existing_notes() {
     .await
     .expect("seed Org workspace before migration 3");
     sqlx::query(
+        "INSERT INTO org_documents (
+             id, workspace_id, path, source, content_hash, revision, created_at, updated_at
+         ) VALUES ($1, $2, 'docs/survivor.org', '* TODO Survive migration',
+                   'migration-hash', 3, 1, 2)",
+    )
+    .bind("22222222-2222-4222-8222-222222222222")
+    .bind("11111111-1111-4111-8111-111111111111")
+    .execute(&seed_pool)
+    .await
+    .expect("seed Org document before migration 3");
+    sqlx::query(
         "INSERT INTO org_events (
              id, workspace_id, sequence, subject_kind, subject_id, actor_id,
              event_type, occurred_at, summary, metadata
@@ -487,14 +498,32 @@ async fn ordered_migrations_preserve_existing_notes() {
 
     let migrated = PgStorage::connect(&database.url, 2)
         .await
-        .expect("apply pending PostgreSQL migrations 3 through 5");
+        .expect("apply pending PostgreSQL migrations 3 through 6");
     let inspection = database.inspect_pool().await;
     let versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&inspection)
             .await
             .expect("read ordered migration versions");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    let archived_at_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable
+         FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='org_documents'
+           AND column_name='archived_at'",
+    )
+    .fetch_one(&inspection)
+    .await
+    .expect("inspect Org document archival column");
+    assert_eq!(archived_at_nullable, "YES");
+    let archived_at: Option<i64> = sqlx::query_scalar(
+        "SELECT archived_at FROM org_documents
+         WHERE id='22222222-2222-4222-8222-222222222222'",
+    )
+    .fetch_one(&inspection)
+    .await
+    .expect("read migrated Org document archival state");
+    assert_eq!(archived_at, None);
     inspection.close().await;
 
     let session = migrated.connect_session().await.unwrap();
@@ -506,6 +535,14 @@ async fn ordered_migrations_preserve_existing_notes() {
         Some("preserved".to_owned())
     );
     let workspace_id = WorkspaceId::from_str("11111111-1111-4111-8111-111111111111").unwrap();
+    let document = session
+        .get_org_document(DocumentId::from_str("22222222-2222-4222-8222-222222222222").unwrap())
+        .await
+        .unwrap()
+        .expect("migrated Org document");
+    assert_eq!(document.source, "* TODO Survive migration");
+    assert_eq!(document.revision, 3);
+    assert_eq!(document.archived_at, None);
     let events = session
         .list_org_events(workspace_id, None, 50)
         .await

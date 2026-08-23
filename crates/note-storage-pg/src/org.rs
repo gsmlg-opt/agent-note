@@ -184,7 +184,7 @@ impl OrgRepository for PgSession {
     async fn get_org_document(&self, id: DocumentId) -> StorageResult<Option<OrgDocument>> {
         let mut connection = self.connection().await?;
         sqlx::query_as::<_, DocumentRow>(
-            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at
+            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at
              FROM org_documents WHERE id = $1",
         )
         .bind(id.to_string())
@@ -201,7 +201,7 @@ impl OrgRepository for PgSession {
     ) -> StorageResult<Vec<OrgDocument>> {
         let mut connection = self.connection().await?;
         sqlx::query_as::<_, DocumentRow>(
-            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at
+            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at
              FROM org_documents
              WHERE workspace_id = $1
              ORDER BY path, id",
@@ -224,7 +224,7 @@ impl OrgRepository for PgSession {
             "UPDATE org_documents
              SET path=$2, source=$3, content_hash=$4, updated_at=$5, revision=revision+1
              WHERE id=$1 AND revision=$6
-             RETURNING id, workspace_id, path, source, content_hash, revision, created_at, updated_at",
+             RETURNING id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at",
         )
             .bind(update.id.to_string())
             .bind(update.path)
@@ -280,7 +280,7 @@ impl OrgRepository for PgSession {
                  WHERE document.id=$1 AND EXISTS (SELECT 1 FROM locked)
                  RETURNING document.id, document.workspace_id, document.path, document.source,
                            document.content_hash, document.revision, document.created_at,
-                           document.updated_at
+                           document.updated_at, document.archived_at
              ), advanced_source AS (
                  UPDATE org_workspaces workspace
                  SET revision=workspace.revision+1, updated_at=$7
@@ -294,7 +294,7 @@ impl OrgRepository for PgSession {
              )
              SELECT moved_document.id, moved_document.workspace_id, moved_document.path,
                     moved_document.source, moved_document.content_hash, moved_document.revision,
-                    moved_document.created_at, moved_document.updated_at,
+                    moved_document.created_at, moved_document.updated_at, moved_document.archived_at,
                     advanced_source.revision AS source_workspace_revision,
                     advanced_target.revision AS target_workspace_revision
              FROM moved_document CROSS JOIN advanced_source CROSS JOIN advanced_target",
@@ -314,7 +314,7 @@ impl OrgRepository for PgSession {
         }
 
         let document = sqlx::query_as::<_, DocumentRow>(
-            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at
+            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at
              FROM org_documents WHERE id=$1",
         )
         .bind(update.document_id.to_string())
@@ -1375,6 +1375,7 @@ struct OwnershipMoveRow {
     revision: i64,
     created_at: i64,
     updated_at: i64,
+    archived_at: Option<i64>,
     source_workspace_revision: i64,
     target_workspace_revision: i64,
 }
@@ -1392,6 +1393,7 @@ impl OwnershipMoveRow {
                     revision: self.revision,
                     created_at: self.created_at,
                     updated_at: self.updated_at,
+                    archived_at: self.archived_at,
                 },
                 source_workspace_revision: self.source_workspace_revision,
                 target_workspace_revision: self.target_workspace_revision,
@@ -3238,6 +3240,7 @@ struct DocumentRow {
     revision: i64,
     created_at: i64,
     updated_at: i64,
+    archived_at: Option<i64>,
 }
 
 impl DocumentRow {
@@ -3251,6 +3254,7 @@ impl DocumentRow {
             revision: self.revision,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            archived_at: self.archived_at,
         })
     }
 }

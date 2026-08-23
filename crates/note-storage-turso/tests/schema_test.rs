@@ -1,11 +1,11 @@
-use note_org::WorkspaceId;
+use note_org::{DocumentId, WorkspaceId};
 use note_storage::{NewOrgEvent, NotesRepository, OrgEventType, OrgRepository, StorageErrorKind};
 use note_storage_turso::TursoStorage;
 use std::path::Path;
 use std::str::FromStr as _;
 
 const APPLICATION_ID: u32 = 0x414E4F54;
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 fn normalize_schema_sql(sql: &str) -> String {
     sql.split_whitespace()
@@ -14,6 +14,11 @@ fn normalize_schema_sql(sql: &str) -> String {
         .replace("( ", "(")
         .replace(" )", ")")
         .replace(" ,", ",")
+        .replace("CHECK (revision >= 1)", "CHECK(revision >= 1)")
+        .replace(
+            "REFERENCES org_workspaces (id)",
+            "REFERENCES org_workspaces(id)",
+        )
         .replace("length (", "length(")
         .replace("trim (", "trim(")
 }
@@ -305,6 +310,62 @@ async fn create_schema_v5_database(path: &Path) {
     while rows.next().await.unwrap().is_some() {}
 }
 
+async fn create_schema_v6_database(path: &Path) {
+    let database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let connection = database.connect().unwrap();
+    connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    connection
+        .execute_batch(include_str!("fixtures/schema-v6.sql"))
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO org_workspaces (
+                 id, slug, display_name, description, timezone,
+                 policy_schema_version, policy, revision, last_event_sequence,
+                 created_at, updated_at, archived_at
+             ) VALUES (
+                 '11111111-1111-4111-8111-111111111111', 'migration-v6',
+                 'Migration v6', '', 'UTC', 1, '{}', 1, 0, 1, 1, NULL
+             )",
+            (),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO org_documents (
+                 id, workspace_id, path, source, content_hash, revision, created_at, updated_at
+             ) VALUES (
+                 '22222222-2222-4222-8222-222222222222',
+                 '11111111-1111-4111-8111-111111111111',
+                 'docs/survivor.org', '* TODO Survive migration', 'v6-hash', 3, 1, 2
+             )",
+            (),
+        )
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA application_id = 1095651156", ())
+        .await
+        .unwrap();
+    connection
+        .execute("PRAGMA user_version = 6", ())
+        .await
+        .unwrap();
+    connection.execute("COMMIT", ()).await.unwrap();
+    connection.cacheflush().unwrap();
+    let mut rows = connection
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+}
+
 fn database_header(path: &Path) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap();
     assert!(bytes.len() >= 100);
@@ -393,7 +454,7 @@ async fn unsupported_marked_schema_is_rejected_without_modification() {
     let path = dir.path().join("future.db");
     drop(TursoStorage::open(&path).await.unwrap());
     let mut before = std::fs::read(&path).unwrap();
-    before[60..64].copy_from_slice(&7_u32.to_be_bytes());
+    before[60..64].copy_from_slice(&8_u32.to_be_bytes());
     std::fs::write(&path, &before).unwrap();
 
     let error = match TursoStorage::open(&path).await {
@@ -686,6 +747,48 @@ async fn schema_v5_is_migrated_without_losing_notes() {
         .get::<String>(0)
         .unwrap();
     assert!(normalize_schema_sql(&migrated_schema).contains("CHECK (updated_at >= created_at)"));
+}
+
+#[tokio::test]
+async fn schema_v6_is_migrated_with_active_org_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v6.db");
+    create_schema_v6_database(&path).await;
+
+    let storage = TursoStorage::open(&path).await.unwrap();
+    database_header(&path);
+    let session = storage.connect().await.unwrap();
+    let document = session
+        .get_org_document(DocumentId::from_str("22222222-2222-4222-8222-222222222222").unwrap())
+        .await
+        .unwrap()
+        .expect("migrated Org document");
+
+    assert_eq!(document.source, "* TODO Survive migration");
+    assert_eq!(document.revision, 3);
+    assert_eq!(document.archived_at, None);
+    drop(session);
+    drop(storage);
+
+    let migrated_database = turso::Builder::new_local(path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let migrated_connection = migrated_database.connect().unwrap();
+    let migrated_schema = normalized_org_schema(&migrated_connection).await;
+
+    let fresh_path = dir.path().join("fresh-v7.db");
+    drop(TursoStorage::open(&fresh_path).await.unwrap());
+    let fresh_database = turso::Builder::new_local(fresh_path.to_str().unwrap())
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let fresh_connection = fresh_database.connect().unwrap();
+    let fresh_schema = normalized_org_schema(&fresh_connection).await;
+
+    assert_eq!(migrated_schema, fresh_schema);
 }
 
 #[tokio::test]

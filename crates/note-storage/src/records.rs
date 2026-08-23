@@ -242,6 +242,7 @@ pub struct OrgDocument {
     pub revision: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub archived_at: Option<i64>,
 }
 
 pub struct NewOrgDocument<'a> {

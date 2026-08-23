@@ -21,7 +21,7 @@ use tokio::sync::OwnedMutexGuard;
 const WORKSPACE_COLUMNS: &str =
     "id, slug, display_name, description, timezone, policy_schema_version, policy, revision, created_at, updated_at, archived_at";
 const DOCUMENT_COLUMNS: &str =
-    "id, workspace_id, path, source, content_hash, revision, created_at, updated_at";
+    "id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at";
 const WORK_ITEM_COLUMNS: &str =
     "id, workspace_id, document_id, parent_id, source_order, item_type, title, state, priority,
      scheduled_raw, scheduled_local, scheduled_timezone, scheduled_utc,
@@ -3929,6 +3929,9 @@ fn decode_document(row: &turso::Row) -> StorageResult<OrgDocument> {
         updated_at: row
             .get(7)
             .map_err(|error| map_turso_error("decode Org document updated at", error))?,
+        archived_at: row
+            .get(8)
+            .map_err(|error| map_turso_error("decode Org document archived at", error))?,
     })
 }
 
