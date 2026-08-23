@@ -66,6 +66,7 @@ enum BatchLabelUiAction {
     GenericFailure(String),
     StaleFailure,
     Close,
+    ClearSuccess,
 }
 
 impl BatchLabelUiState {
@@ -117,6 +118,7 @@ impl Reducible for BatchLabelUiState {
             }
             BatchLabelUiAction::Close if !next.mutating => next.reset_dialog(),
             BatchLabelUiAction::Close => {}
+            BatchLabelUiAction::ClearSuccess => next.success = None,
         }
 
         next.into()
@@ -241,22 +243,135 @@ fn batch_label_result_message(updated: usize, requested: usize, unchanged: usize
     format!("Updated {updated} of {requested} selected {selected_noun}; {unchanged} unchanged.")
 }
 
-fn batch_label_toolbar(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BatchDeleteModalCopy {
+    title: String,
+    body: String,
+    confirm: String,
+}
+
+fn batch_delete_modal_copy(count: usize) -> BatchDeleteModalCopy {
+    let selected_noun = if count == 1 { "note" } else { "notes" };
+    let title = if count == 1 {
+        "Delete selected note"
+    } else {
+        "Delete selected notes"
+    };
+
+    BatchDeleteModalCopy {
+        title: title.to_string(),
+        body: format!("Move {count} selected {selected_noun} to Trash?"),
+        confirm: format!("Delete {count} {selected_noun}"),
+    }
+}
+
+fn batch_delete_result_message(count: usize) -> String {
+    let selected_noun = if count == 1 { "note" } else { "notes" };
+    format!("Moved {count} selected {selected_noun} to Trash.")
+}
+
+fn page_after_batch_delete(
+    current_zero_based: usize,
+    page_size: usize,
+    deleted: usize,
+    total_before: usize,
+) -> usize {
+    let total_after = total_before.saturating_sub(deleted);
+    let pages_after = total_after.div_ceil(page_size.max(1));
+    current_zero_based.min(pages_after.saturating_sub(1))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BatchDeleteUiState {
+    open: bool,
+    mutating: bool,
+    error: Option<String>,
+    success: Option<String>,
+}
+
+enum BatchDeleteUiAction {
+    Open,
+    SubmitStarted,
+    Success(String),
+    GenericFailure(String),
+    StaleFailure,
+    Close,
+    ClearSuccess,
+}
+
+impl Reducible for BatchDeleteUiState {
+    type Action = BatchDeleteUiAction;
+
+    fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
+        let mut next = (*self).clone();
+
+        match action {
+            BatchDeleteUiAction::Open => {
+                next.open = true;
+                next.mutating = false;
+                next.error = None;
+                next.success = None;
+            }
+            BatchDeleteUiAction::SubmitStarted => {
+                next.mutating = true;
+                next.error = None;
+                next.success = None;
+            }
+            BatchDeleteUiAction::Success(message) => {
+                next.open = false;
+                next.mutating = false;
+                next.error = None;
+                next.success = Some(message);
+            }
+            BatchDeleteUiAction::GenericFailure(message) => {
+                next.mutating = false;
+                next.error = Some(message);
+            }
+            BatchDeleteUiAction::StaleFailure => {
+                next.mutating = false;
+                next.error = None;
+            }
+            BatchDeleteUiAction::Close if !next.mutating => {
+                next.open = false;
+                next.error = None;
+            }
+            BatchDeleteUiAction::Close => {}
+            BatchDeleteUiAction::ClearSuccess => next.success = None,
+        }
+
+        next.into()
+    }
+}
+
+fn batch_toolbar(
     selected_count: usize,
     batch_mutating: bool,
+    workflow_open: bool,
     refs: BatchLabelToolbarRefs,
     on_open: Callback<BatchLabelMode>,
+    on_delete: Callback<()>,
 ) -> Html {
-    let disabled = selected_count == 0 || batch_mutating;
+    let disabled = selected_count == 0 || batch_mutating || workflow_open;
     let open = |mode| {
+        let callback = batch_label_open_callback(
+            selected_count,
+            batch_mutating,
+            workflow_open,
+            mode,
+            on_open.clone(),
+        );
+        Callback::from(move |_: MouseEvent| callback.emit(()))
+    };
+    let delete = {
         let callback =
-            batch_label_open_callback(selected_count, batch_mutating, mode, on_open.clone());
+            batch_delete_open_callback(selected_count, batch_mutating, workflow_open, on_delete);
         Callback::from(move |_: MouseEvent| callback.emit(()))
     };
     let BatchLabelToolbarRefs {
         add: add_ref,
         update: update_ref,
         remove: remove_ref,
+        delete: delete_ref,
     } = refs;
 
     html! {
@@ -268,6 +383,7 @@ fn batch_label_toolbar(
                 <button ref={add_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Add)}>{ "Add label" }</button>
                 <button ref={update_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Update)}>{ "Update label" }</button>
                 <button ref={remove_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Remove)}>{ "Remove label" }</button>
+                <button ref={delete_ref} type="button" class="btn btn-error" disabled={disabled} onclick={delete}>{ "Delete selected" }</button>
             </div>
         </div>
     }
@@ -276,14 +392,36 @@ fn batch_label_toolbar(
 fn batch_label_open_callback(
     selected_count: usize,
     batch_mutating: bool,
+    workflow_open: bool,
     mode: BatchLabelMode,
     on_open: Callback<BatchLabelMode>,
 ) -> Callback<()> {
     Callback::from(move |_: ()| {
-        if selected_count > 0 && !batch_mutating {
+        if selected_count > 0 && !batch_mutating && !workflow_open {
             on_open.emit(mode);
         }
     })
+}
+
+fn batch_delete_open_callback(
+    selected_count: usize,
+    batch_mutating: bool,
+    workflow_open: bool,
+    on_open: Callback<()>,
+) -> Callback<()> {
+    Callback::from(move |_: ()| {
+        if selected_count > 0 && !batch_mutating && !workflow_open {
+            on_open.emit(());
+        }
+    })
+}
+
+fn batch_delete_submit_allowed(
+    batch_mutating: bool,
+    batch_in_flight: bool,
+    stale_revision_blocked: bool,
+) -> bool {
+    !batch_mutating && !batch_in_flight && !stale_revision_blocked
 }
 
 fn batch_label_draft_input_allowed(batch_mutating: bool) -> bool {
@@ -332,6 +470,14 @@ struct BatchLabelToolbarRefs {
     add: NodeRef,
     update: NodeRef,
     remove: NodeRef,
+    delete: NodeRef,
+}
+
+#[derive(Clone)]
+struct BatchDeleteFormCallbacks {
+    on_submit: Callback<SubmitEvent>,
+    on_cancel: Callback<MouseEvent>,
+    on_reload: Callback<MouseEvent>,
 }
 
 impl BatchLabelFormCallbacks {
@@ -341,6 +487,17 @@ impl BatchLabelFormCallbacks {
             on_source_input: Callback::noop(),
             on_destination_input: Callback::noop(),
             on_value_input: Callback::noop(),
+            on_submit: Callback::noop(),
+            on_cancel: Callback::noop(),
+            on_reload: Callback::noop(),
+        }
+    }
+}
+
+impl BatchDeleteFormCallbacks {
+    #[cfg(test)]
+    fn noop() -> Self {
+        Self {
             on_submit: Callback::noop(),
             on_cancel: Callback::noop(),
             on_reload: Callback::noop(),
@@ -366,6 +523,44 @@ fn batch_label_title(mode: BatchLabelMode) -> &'static str {
         BatchLabelMode::Add => "Add label",
         BatchLabelMode::Update => "Update label",
         BatchLabelMode::Remove => "Remove label",
+    }
+}
+
+fn batch_delete_form(
+    selected_count: usize,
+    batch_mutating: bool,
+    stale_revision_blocked: bool,
+    generic_error: Option<&str>,
+    cancel_ref: NodeRef,
+    callbacks: BatchDeleteFormCallbacks,
+) -> Html {
+    let BatchDeleteFormCallbacks {
+        on_submit,
+        on_cancel,
+        on_reload,
+    } = callbacks;
+    let copy = batch_delete_modal_copy(selected_count);
+    let submit_disabled = batch_mutating || stale_revision_blocked || selected_count == 0;
+    let error = if stale_revision_blocked {
+        Some("Selected notes changed after the list was loaded. Reload notes before retrying.")
+    } else {
+        generic_error
+    };
+
+    html! {
+        <form class="notes-batch-delete-form" aria-busy={batch_mutating.to_string()} onsubmit={on_submit}>
+            <p>{ copy.body }</p>
+            if let Some(error) = error {
+                <p class="notes-batch-delete-error" role="alert">{ error }</p>
+            }
+            <div class="app-modal-actions">
+                if stale_revision_blocked {
+                    <button type="button" class="btn btn-outline" disabled={batch_mutating} onclick={on_reload}>{ "Reload notes" }</button>
+                }
+                <button ref={cancel_ref} type="button" class="btn btn-ghost" disabled={batch_mutating} onclick={on_cancel}>{ "Cancel" }</button>
+                <button type="submit" class="btn btn-error" disabled={submit_disabled}>{ if batch_mutating { "Deleting…" } else { copy.confirm.as_str() } }</button>
+            </div>
+        </form>
     }
 }
 
@@ -486,13 +681,40 @@ fn notes_load_is_current(started_generation: u64, current_generation: u64) -> bo
     started_generation == current_generation
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct NotesUrlState {
     current: usize,
     page_size: usize,
     search: String,
     pub(crate) labels: Vec<LabelFilter>,
     pub(crate) invalid_labels: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum BatchDeleteSuccessDecision {
+    Reload,
+    Replace(NotesUrlState),
+}
+
+fn batch_delete_success_decision(
+    url_state: &NotesUrlState,
+    rendered_current_page: usize,
+    total_before: usize,
+    deleted: usize,
+) -> BatchDeleteSuccessDecision {
+    let target_page = page_after_batch_delete(
+        rendered_current_page,
+        url_state.page_size,
+        deleted,
+        total_before,
+    );
+    if target_page == rendered_current_page {
+        BatchDeleteSuccessDecision::Reload
+    } else {
+        let mut next = url_state.clone();
+        next.current = target_page.saturating_add(1);
+        BatchDeleteSuccessDecision::Replace(next)
+    }
 }
 
 fn default_notes_url_state() -> NotesUrlState {
@@ -706,11 +928,13 @@ pub fn notes_page() -> Html {
     let selected = use_reducer(SelectionState::default);
     let stale_revision_gate = use_reducer(StaleRevisionGate::default);
     let batch_label_ui = use_reducer(BatchLabelUiState::default);
+    let batch_delete_ui = use_reducer(BatchDeleteUiState::default);
     let batch_in_flight = use_mut_ref(|| false);
     let batch_toolbar_refs = BatchLabelToolbarRefs {
         add: use_node_ref(),
         update: use_node_ref(),
         remove: use_node_ref(),
+        delete: use_node_ref(),
     };
     let batch_input_refs = BatchLabelInputRefs {
         source: use_node_ref(),
@@ -718,6 +942,9 @@ pub fn notes_page() -> Html {
     };
     let batch_success_ref = use_node_ref();
     let batch_focus_return_mode = use_mut_ref(|| None::<BatchLabelMode>);
+    let batch_delete_cancel_ref = use_node_ref();
+    let batch_delete_success_ref = use_node_ref();
+    let batch_delete_focus_return = use_mut_ref(|| false);
     // Current list-view page (0-based).
     let page = use_state(|| 0usize);
     let page_size = use_state(|| DEFAULT_NOTES_PAGE_SIZE);
@@ -735,6 +962,8 @@ pub fn notes_page() -> Html {
         .unwrap_or_default();
     let url_state = parse_notes_query(&query_string);
     let notes_query = notes_query_params(&url_state);
+    let batch_mutating = batch_label_ui.mutating || batch_delete_ui.mutating;
+    let batch_workflow_open = batch_label_ui.mode.is_some() || batch_delete_ui.open;
     let visible_targets = if let Some(hits) = &*results {
         let search_page = search_result_page(hits.len(), *page, *page_size, &notes_query);
         search_result_selection_targets(&hits[search_page.start..search_page.end])
@@ -830,12 +1059,50 @@ pub fn notes_page() -> Html {
         });
     }
 
+    {
+        let cancel_ref = batch_delete_cancel_ref.clone();
+        use_effect_with(batch_delete_ui.open, move |open| {
+            if *open {
+                if let Some(cancel) = cancel_ref.cast::<web_sys::HtmlElement>() {
+                    let _ = cancel.focus();
+                }
+            }
+            || ()
+        });
+    }
+
+    {
+        let return_focus = batch_delete_focus_return.clone();
+        let delete_ref = batch_toolbar_refs.delete.clone();
+        use_effect_with(batch_delete_ui.open, move |open| {
+            if !*open && *return_focus.borrow() {
+                *return_focus.borrow_mut() = false;
+                if let Some(trigger) = delete_ref.cast::<web_sys::HtmlElement>() {
+                    let _ = trigger.focus();
+                }
+            }
+            || ()
+        });
+    }
+
+    {
+        let success_ref = batch_delete_success_ref.clone();
+        use_effect_with(batch_delete_ui.success.clone(), move |success| {
+            if success.is_some() {
+                if let Some(status) = success_ref.cast::<web_sys::HtmlElement>() {
+                    let _ = status.focus();
+                }
+            }
+            || ()
+        });
+    }
+
     let on_select_all = {
         let selected = selected.clone();
         let visible_ids = visible_ids.clone();
-        let batch_label_ui = batch_label_ui.clone();
+        let batch_mutating = batch_mutating;
         Callback::from(move |event: Event| {
-            if batch_label_ui.mutating {
+            if batch_mutating {
                 return;
             }
             let input: HtmlInputElement = event.target_unchecked_into();
@@ -849,9 +1116,9 @@ pub fn notes_page() -> Html {
 
     let on_selection_change = {
         let selected = selected.clone();
-        let batch_label_ui = batch_label_ui.clone();
+        let batch_mutating = batch_mutating;
         Callback::from(move |(id, selected_now): (String, bool)| {
-            if batch_label_ui.mutating {
+            if batch_mutating {
                 return;
             }
             selected.dispatch(SelectionAction::Toggle {
@@ -1018,6 +1285,14 @@ pub fn notes_page() -> Html {
         })
     };
 
+    let on_open_batch_delete = {
+        let batch_delete_ui = batch_delete_ui.clone();
+        Callback::from(move |_: ()| {
+            batch_delete_ui.dispatch(BatchDeleteUiAction::ClearSuccess);
+            batch_delete_ui.dispatch(BatchDeleteUiAction::Open);
+        })
+    };
+
     let on_query_input = {
         let query = query.clone();
         Callback::from(move |e: InputEvent| {
@@ -1105,7 +1380,7 @@ pub fn notes_page() -> Html {
             let on_source_input = {
                 let batch_label_ui = batch_label_ui.clone();
                 Callback::from(move |event: InputEvent| {
-                    if !batch_label_draft_input_allowed(batch_label_ui.mutating) {
+                    if !batch_label_draft_input_allowed(batch_mutating) {
                         return;
                     }
                     let input: HtmlInputElement = event.target_unchecked_into();
@@ -1115,7 +1390,7 @@ pub fn notes_page() -> Html {
             let on_destination_input = {
                 let batch_label_ui = batch_label_ui.clone();
                 Callback::from(move |event: InputEvent| {
-                    if !batch_label_draft_input_allowed(batch_label_ui.mutating) {
+                    if !batch_label_draft_input_allowed(batch_mutating) {
                         return;
                     }
                     let input: HtmlInputElement = event.target_unchecked_into();
@@ -1126,7 +1401,7 @@ pub fn notes_page() -> Html {
             let on_value_input = {
                 let batch_label_ui = batch_label_ui.clone();
                 Callback::from(move |event: InputEvent| {
-                    if !batch_label_draft_input_allowed(batch_label_ui.mutating) {
+                    if !batch_label_draft_input_allowed(batch_mutating) {
                         return;
                     }
                     let input: HtmlInputElement = event.target_unchecked_into();
@@ -1147,10 +1422,11 @@ pub fn notes_page() -> Html {
                 let batch_label_ui = batch_label_ui.clone();
                 let stale_revision_gate = stale_revision_gate.clone();
                 let reload = reload.clone();
+                let batch_in_flight = batch_in_flight.clone();
                 Callback::from(move |event: SubmitEvent| {
                     event.prevent_default();
                     if !batch_label_submit_allowed(
-                        batch_label_ui.mutating,
+                        batch_mutating,
                         *batch_in_flight.borrow(),
                         stale_revision_gate.blocked(),
                     ) {
@@ -1221,7 +1497,7 @@ pub fn notes_page() -> Html {
                         &batch_label_ui.destination_key,
                         &batch_label_ui.value,
                         selected_visible_count,
-                        batch_label_ui.mutating,
+                        batch_mutating,
                         stale_revision_gate.blocked(),
                         batch_label_ui.error.as_deref(),
                         batch_input_refs.clone(),
@@ -1229,6 +1505,126 @@ pub fn notes_page() -> Html {
                     ) }
                 </Modal>
             }
+        }
+    };
+
+    let batch_delete_modal = if !batch_delete_ui.open {
+        html! {}
+    } else {
+        let (rendered_current_page, total_before) = if let Some(hits) = &*results {
+            let search_page = search_result_page(hits.len(), *page, *page_size, &notes_query);
+            (search_page.current, hits.len())
+        } else {
+            let total_pages = (*total_notes).div_ceil((*page_size).max(1));
+            ((*page).min(total_pages.saturating_sub(1)), *total_notes)
+        };
+        let on_close = {
+            let batch_delete_ui = batch_delete_ui.clone();
+            let stale_revision_gate = stale_revision_gate.clone();
+            let batch_delete_focus_return = batch_delete_focus_return.clone();
+            Callback::from(move |_: ()| {
+                if batch_mutating {
+                    return;
+                }
+                *batch_delete_focus_return.borrow_mut() = true;
+                stale_revision_gate.dispatch(StaleRevisionGateAction::Dismiss);
+                batch_delete_ui.dispatch(BatchDeleteUiAction::Close);
+            })
+        };
+        let on_cancel = {
+            let on_close = on_close.clone();
+            Callback::from(move |_: MouseEvent| on_close.emit(()))
+        };
+        let on_reload = {
+            let reload = reload.clone();
+            Callback::from(move |_: MouseEvent| {
+                if !batch_mutating {
+                    reload.emit(());
+                }
+            })
+        };
+        let on_submit = {
+            let visible_targets = visible_targets.clone();
+            let selected = selected.clone();
+            let batch_delete_ui = batch_delete_ui.clone();
+            let batch_label_ui = batch_label_ui.clone();
+            let stale_revision_gate = stale_revision_gate.clone();
+            let reload = reload.clone();
+            let replace_notes_url = replace_notes_url.clone();
+            let url_state = url_state.clone();
+            Callback::from(move |event: SubmitEvent| {
+                event.prevent_default();
+                if !batch_delete_submit_allowed(
+                    batch_mutating,
+                    *batch_in_flight.borrow(),
+                    stale_revision_gate.blocked(),
+                ) {
+                    return;
+                }
+                let targets = selected_note_targets(&visible_targets, &selected);
+                if targets.is_empty() {
+                    return;
+                }
+
+                *batch_in_flight.borrow_mut() = true;
+                batch_delete_ui.dispatch(BatchDeleteUiAction::SubmitStarted);
+                let selected = selected.clone();
+                let batch_delete_ui = batch_delete_ui.clone();
+                let batch_label_ui = batch_label_ui.clone();
+                let stale_revision_gate = stale_revision_gate.clone();
+                let reload = reload.clone();
+                let replace_notes_url = replace_notes_url.clone();
+                let batch_in_flight = batch_in_flight.clone();
+                let url_state = url_state.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match api::batch_delete_notes(&targets).await {
+                        Ok(result) => {
+                            selected.dispatch(SelectionAction::Clear);
+                            batch_label_ui.dispatch(BatchLabelUiAction::ClearSuccess);
+                            batch_delete_ui.dispatch(BatchDeleteUiAction::Success(
+                                batch_delete_result_message(result.deleted),
+                            ));
+                            match batch_delete_success_decision(
+                                &url_state,
+                                rendered_current_page,
+                                total_before,
+                                result.deleted,
+                            ) {
+                                BatchDeleteSuccessDecision::Reload => reload.emit(()),
+                                BatchDeleteSuccessDecision::Replace(state) => {
+                                    replace_notes_url.emit(state)
+                                }
+                            }
+                        }
+                        Err(error) if error.is_stale_revision() => {
+                            stale_revision_gate.dispatch(StaleRevisionGateAction::Conflict);
+                            batch_delete_ui.dispatch(BatchDeleteUiAction::StaleFailure);
+                        }
+                        Err(_) => batch_delete_ui.dispatch(BatchDeleteUiAction::GenericFailure(
+                            "Could not delete selected notes. Please try again.".to_string(),
+                        )),
+                    }
+                    *batch_in_flight.borrow_mut() = false;
+                });
+            })
+        };
+        let callbacks = BatchDeleteFormCallbacks {
+            on_submit,
+            on_cancel,
+            on_reload,
+        };
+        let copy = batch_delete_modal_copy(selected_visible_count);
+        html! {
+            <Modal title={copy.title} on_close={on_close}>
+                { batch_delete_form(
+                    selected_visible_count,
+                    batch_mutating,
+                    stale_revision_gate.blocked(),
+                    batch_delete_ui.error.as_deref(),
+                    batch_delete_cancel_ref.clone(),
+                    callbacks,
+                ) }
+            </Modal>
         }
     };
 
@@ -1411,7 +1807,7 @@ pub fn notes_page() -> Html {
 
     html! {
         <section class="stack">
-            <div class="notes-page-content" inert={batch_label_ui.mode.is_some()} aria-busy={batch_label_ui.mutating.to_string()}>
+            <div class="notes-page-content" inert={batch_workflow_open} aria-busy={batch_mutating.to_string()}>
             <div class="search-panel">
                 <form class="search-bar" onsubmit={on_search}>
                     <input
@@ -1452,21 +1848,28 @@ pub fn notes_page() -> Html {
                 </Alert>
             }
 
+            if let Some(message) = &batch_delete_ui.success {
+                <Alert variant={Some("success".to_string())}>
+                    <span ref={batch_delete_success_ref.clone()} role="status" tabindex="-1">{ message.clone() }</span>
+                </Alert>
+            }
+
             if *loading {
                 <p class="loading">{ "Loading…" }</p>
             } else {
                 if results.as_ref().is_some_and(|hits| !hits.is_empty()) || (results.is_none() && !notes.is_empty()) {
-                    { batch_label_toolbar(selected_visible_count, batch_label_ui.mutating, batch_toolbar_refs.clone(), on_open_batch_label) }
+                    { batch_toolbar(selected_visible_count, batch_mutating, batch_workflow_open, batch_toolbar_refs.clone(), on_open_batch_label, on_open_batch_delete) }
                 }
                 if let Some(hits) = &*results {
-                    { search_results_view(hits, &page, &page_size, &selected, &select_all_ref, on_select_all.clone(), on_selection_change.clone(), batch_label_ui.mutating, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
+                    { search_results_view(hits, &page, &page_size, &selected, &select_all_ref, on_select_all.clone(), on_selection_change.clone(), batch_mutating, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
                 } else {
-                    { list_view(&notes, *total_notes, &page, &page_size, &selected, &select_all_ref, on_select_all, on_selection_change, batch_label_ui.mutating, &delete_target, &notes_query, on_quick_add_filter, on_page_change, on_page_size_change, on_refresh) }
+                    { list_view(&notes, *total_notes, &page, &page_size, &selected, &select_all_ref, on_select_all, on_selection_change, batch_mutating, &delete_target, &notes_query, on_quick_add_filter, on_page_change, on_page_size_change, on_refresh) }
                 }
             }
 
             </div>
             { batch_label_modal }
+            { batch_delete_modal }
             { delete_modal }
         </section>
     }
@@ -2309,9 +2712,161 @@ mod tests {
     }
 
     #[test]
-    fn batch_label_toolbar_reports_selection_and_only_enables_its_three_actions_when_idle() {
-        let empty =
-            batch_label_toolbar(0, false, BatchLabelToolbarRefs::default(), Callback::noop());
+    fn batch_delete_copy_uses_exact_singular_and_plural_words() {
+        assert_eq!(
+            batch_delete_modal_copy(1),
+            BatchDeleteModalCopy {
+                title: "Delete selected note".to_string(),
+                body: "Move 1 selected note to Trash?".to_string(),
+                confirm: "Delete 1 note".to_string(),
+            }
+        );
+        assert_eq!(
+            batch_delete_modal_copy(3),
+            BatchDeleteModalCopy {
+                title: "Delete selected notes".to_string(),
+                body: "Move 3 selected notes to Trash?".to_string(),
+                confirm: "Delete 3 notes".to_string(),
+            }
+        );
+        assert_eq!(
+            batch_delete_result_message(1),
+            "Moved 1 selected note to Trash."
+        );
+        assert_eq!(
+            batch_delete_result_message(3),
+            "Moved 3 selected notes to Trash."
+        );
+    }
+
+    #[test]
+    fn page_after_batch_delete_backshifts_only_when_the_final_page_disappears() {
+        assert_eq!(page_after_batch_delete(2, 10, 1, 21), 1);
+        assert_eq!(page_after_batch_delete(1, 10, 1, 30), 1);
+        assert_eq!(page_after_batch_delete(0, 10, 1, 1), 0);
+        assert_eq!(page_after_batch_delete(3, 0, 1, 1), 0);
+    }
+
+    #[test]
+    fn batch_delete_ui_reducer_lifecycle_keeps_failures_open_and_success_closes() {
+        let open = Rc::new(BatchDeleteUiState::default()).reduce(BatchDeleteUiAction::Open);
+        assert!(open.open);
+        assert_eq!(open.error, None);
+        assert_eq!(open.success, None);
+
+        let submitting = open.reduce(BatchDeleteUiAction::SubmitStarted);
+        assert!(submitting.open);
+        assert!(submitting.mutating);
+        assert_eq!(submitting.error, None);
+
+        let close_ignored = submitting.clone().reduce(BatchDeleteUiAction::Close);
+        assert_eq!(*close_ignored, *submitting);
+
+        let generic = close_ignored.reduce(BatchDeleteUiAction::GenericFailure("Nope".into()));
+        assert!(generic.open);
+        assert!(!generic.mutating);
+        assert_eq!(generic.error.as_deref(), Some("Nope"));
+
+        let stale = generic.reduce(BatchDeleteUiAction::StaleFailure);
+        assert!(stale.open);
+        assert!(!stale.mutating);
+        assert_eq!(stale.error, None);
+
+        let success = stale.reduce(BatchDeleteUiAction::Success("Done".into()));
+        assert!(!success.open);
+        assert!(!success.mutating);
+        assert_eq!(success.error, None);
+        assert_eq!(success.success.as_deref(), Some("Done"));
+
+        let cleared = success.reduce(BatchDeleteUiAction::ClearSuccess);
+        assert_eq!(cleared.success, None);
+        assert!(batch_delete_submit_allowed(false, false, false));
+        assert!(!batch_delete_submit_allowed(false, true, false));
+        assert!(!batch_delete_submit_allowed(true, false, false));
+        assert!(!batch_delete_submit_allowed(false, false, true));
+    }
+
+    #[test]
+    fn batch_delete_modal_renders_copy_errors_stale_reload_and_mutation_lock() {
+        let generic = batch_delete_form(
+            2,
+            false,
+            false,
+            Some("Could not delete selected notes. Please try again."),
+            NodeRef::default(),
+            BatchDeleteFormCallbacks::noop(),
+        );
+        assert!(visible_text(&generic).contains(&"Move 2 selected notes to Trash?".to_string()));
+        let alert = descendants_with_tag(&generic, "p")
+            .into_iter()
+            .find(|node| attribute(node, "role") == Some("alert"))
+            .expect("generic failure is announced in the delete dialog");
+        assert_eq!(
+            visible_text(alert),
+            ["Could not delete selected notes. Please try again."]
+        );
+
+        let stale = batch_delete_form(
+            1,
+            false,
+            true,
+            None,
+            NodeRef::default(),
+            BatchDeleteFormCallbacks::noop(),
+        );
+        assert!(visible_text(&stale).contains(&"Reload notes".to_string()));
+
+        let mutating = batch_delete_form(
+            1,
+            true,
+            false,
+            None,
+            NodeRef::default(),
+            BatchDeleteFormCallbacks::noop(),
+        );
+        assert_eq!(attribute(&mutating, "aria-busy"), Some("true"));
+        assert!(visible_text(&mutating).contains(&"Deleting…".to_string()));
+        assert!(descendants_with_tag(&mutating, "button")
+            .iter()
+            .all(|button| attribute(button, "disabled").is_some()));
+    }
+
+    #[test]
+    fn batch_delete_success_refreshes_or_replaces_with_existing_url_fields() {
+        let state = NotesUrlState {
+            current: 3,
+            page_size: 10,
+            search: "needle".into(),
+            labels: vec![LabelFilter {
+                key: "project".into(),
+                operator: "==".into(),
+                value: "agent-note".into(),
+            }],
+            invalid_labels: false,
+        };
+        assert_eq!(
+            batch_delete_success_decision(&state, 2, 21, 1),
+            BatchDeleteSuccessDecision::Replace(NotesUrlState {
+                current: 2,
+                ..state.clone()
+            })
+        );
+        assert_eq!(
+            batch_delete_success_decision(&state, 1, 30, 1),
+            BatchDeleteSuccessDecision::Reload
+        );
+    }
+
+    #[test]
+    fn batch_toolbar_reports_selection_and_only_enables_its_four_actions_when_idle() {
+        let empty = batch_toolbar(
+            0,
+            false,
+            false,
+            BatchLabelToolbarRefs::default(),
+            Callback::noop(),
+            Callback::noop(),
+        );
         let empty_children = rendered_children(&empty);
         assert_eq!(attribute(empty_children[0], "aria-live"), Some("polite"));
         assert_eq!(visible_text(empty_children[0]), ["0 selected"]);
@@ -2321,25 +2876,45 @@ mod tests {
                 .iter()
                 .flat_map(|button| visible_text(button))
                 .collect::<Vec<_>>(),
-            ["Add label", "Update label", "Remove label"]
+            [
+                "Add label",
+                "Update label",
+                "Remove label",
+                "Delete selected"
+            ]
         );
         assert!(empty_actions
             .iter()
             .all(|button| attribute(button, "disabled").is_some()));
 
-        let selected =
-            batch_label_toolbar(2, false, BatchLabelToolbarRefs::default(), Callback::noop());
+        let selected = batch_toolbar(
+            2,
+            false,
+            false,
+            BatchLabelToolbarRefs::default(),
+            Callback::noop(),
+            Callback::noop(),
+        );
         let selected_actions = rendered_children(rendered_children(&selected)[1]);
         assert!(selected_actions
             .iter()
             .all(|button| attribute(button, "disabled").is_none()));
 
-        let mutating =
-            batch_label_toolbar(2, true, BatchLabelToolbarRefs::default(), Callback::noop());
+        let mutating = batch_toolbar(
+            2,
+            true,
+            false,
+            BatchLabelToolbarRefs::default(),
+            Callback::noop(),
+            Callback::noop(),
+        );
         let mutating_actions = rendered_children(rendered_children(&mutating)[1]);
         assert!(mutating_actions
             .iter()
             .all(|button| attribute(button, "disabled").is_some()));
+        assert!(attribute(selected_actions[3], "class")
+            .expect("delete class")
+            .contains("btn-error"));
     }
 
     #[test]
@@ -2350,11 +2925,27 @@ mod tests {
             Callback::from(move |mode| opened.borrow_mut().push(mode))
         };
 
-        batch_label_open_callback(0, false, BatchLabelMode::Add, on_open.clone()).emit(());
-        batch_label_open_callback(2, true, BatchLabelMode::Update, on_open.clone()).emit(());
-        batch_label_open_callback(2, false, BatchLabelMode::Remove, on_open).emit(());
+        batch_label_open_callback(0, false, false, BatchLabelMode::Add, on_open.clone()).emit(());
+        batch_label_open_callback(2, true, false, BatchLabelMode::Update, on_open.clone()).emit(());
+        batch_label_open_callback(2, false, false, BatchLabelMode::Remove, on_open).emit(());
 
         assert_eq!(*opened.borrow(), vec![BatchLabelMode::Remove]);
+    }
+
+    #[test]
+    fn batch_delete_toolbar_callback_guards_zero_selected_busy_and_conflicting_workflows() {
+        let opened = Rc::new(RefCell::new(0));
+        let on_open = {
+            let opened = opened.clone();
+            Callback::from(move |_: ()| *opened.borrow_mut() += 1)
+        };
+
+        batch_delete_open_callback(0, false, false, on_open.clone()).emit(());
+        batch_delete_open_callback(2, true, false, on_open.clone()).emit(());
+        batch_delete_open_callback(2, false, true, on_open.clone()).emit(());
+        batch_delete_open_callback(2, false, false, on_open).emit(());
+
+        assert_eq!(*opened.borrow(), 1);
     }
 
     #[test]
@@ -2658,10 +3249,13 @@ mod tests {
             .find("{ batch_label_modal }")
             .expect("batch label modal");
 
-        assert!(source[background..].contains("inert={batch_label_ui.mode.is_some()}"));
-        assert!(source[background..].contains("aria-busy={batch_label_ui.mutating.to_string()}"));
+        assert!(source[background..].contains("inert={batch_workflow_open}"));
+        assert!(source[background..].contains("aria-busy={batch_mutating.to_string()}"));
         assert!(source.contains("let batch_focus_return_mode = use_mut_ref"));
         assert!(source.contains("ref={batch_success_ref.clone()} role=\"status\" tabindex=\"-1\""));
+        assert!(source.contains("let batch_delete_focus_return = use_mut_ref"));
+        assert!(source
+            .contains("ref={batch_delete_success_ref.clone()} role=\"status\" tabindex=\"-1\""));
         assert!(modal > background);
     }
 
