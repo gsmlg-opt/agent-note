@@ -1109,6 +1109,7 @@ mod tests {
             fn count_notes(selectors: &[note_core::LabelSelector]) -> usize;
             fn matching_note_ids(selectors: &[note_core::LabelSelector]) -> Vec<String>;
             fn matching_note_ids_for_update(selectors: &[note_core::LabelSelector]) -> Vec<String>;
+            fn active_note_revisions_for_update(ids: &[String]) -> Vec<(String, i64)>;
             fn advance_note_updated_at(id: &str, now: i64) -> u64;
             fn list_active_note_sources() -> Vec<ActiveNoteSource>;
         }

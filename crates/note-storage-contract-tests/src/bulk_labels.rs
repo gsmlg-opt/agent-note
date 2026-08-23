@@ -8,6 +8,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         ("contract-bulk-active-a", "bulk content a", 100, 7, None),
         ("contract-bulk-active-b", "bulk content b", 200, 8, None),
         (
+            "contract-bulk-active-unrequested",
+            "unrequested bulk content",
+            250,
+            10,
+            None,
+        ),
+        (
             "contract-bulk-deleted",
             "deleted bulk content",
             300,
