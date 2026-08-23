@@ -7,6 +7,12 @@ pub use context::*;
 pub mod bulk_update_note_labels;
 pub use bulk_update_note_labels::*;
 
+mod batch_note_targets;
+pub use batch_note_targets::*;
+
+pub mod batch_update_note_labels;
+pub use batch_update_note_labels::*;
+
 pub mod org;
 
 pub mod mutation_error;

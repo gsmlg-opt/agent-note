@@ -1,0 +1,113 @@
+use crate::{
+    batch_note_targets::{preflight_batch_note_targets, validate_batch_note_targets},
+    Context,
+};
+use note_core::{validate_label_key, validate_label_value, LabelValueType, ValidationError};
+use note_storage::TransactionMode;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchLabelAction {
+    Add { key: String, value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchUpdateNoteLabelsInput {
+    pub notes: Vec<crate::BatchNoteTarget>,
+    pub action: BatchLabelAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchUpdateNoteLabelsResult {
+    pub requested: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
+pub async fn batch_update_note_labels(
+    ctx: &Context,
+    input: BatchUpdateNoteLabelsInput,
+) -> anyhow::Result<BatchUpdateNoteLabelsResult> {
+    let targets = validate_batch_note_targets(input.notes)?;
+    let BatchLabelAction::Add { key, value } = input.action;
+    validate_label_key(&key).map_err(anyhow::Error::new)?;
+
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let requested = targets.len();
+    let transaction_result = async {
+        preflight_batch_note_targets(transaction.as_ref(), &targets).await?;
+
+        let mut eligible_ids = Vec::new();
+        for target in &targets {
+            let has_key = transaction
+                .labels_for_note(&target.id)
+                .await?
+                .iter()
+                .any(|label| label.key == key);
+            if !has_key {
+                eligible_ids.push(target.id.as_str());
+            }
+        }
+        if eligible_ids.is_empty() {
+            return Ok(BatchUpdateNoteLabelsResult {
+                requested,
+                updated: 0,
+                unchanged: requested,
+            });
+        }
+
+        let existing_keys: HashMap<String, LabelValueType> = transaction
+            .list_label_keys()
+            .await?
+            .into_iter()
+            .map(|label_key| (label_key.key, label_key.value_type))
+            .collect();
+        if !existing_keys.contains_key(&key) {
+            transaction.insert_label_key_if_missing(&key, "").await?;
+        }
+        let final_types: HashMap<String, LabelValueType> = transaction
+            .list_label_keys()
+            .await?
+            .into_iter()
+            .map(|label_key| (label_key.key, label_key.value_type))
+            .collect();
+        let value_type = final_types
+            .get(&key)
+            .copied()
+            .unwrap_or(LabelValueType::Text);
+        if !validate_label_value(value_type, &value) {
+            return Err(anyhow::Error::new(ValidationError::InvalidLabelValue {
+                key,
+                value,
+                value_type,
+            }));
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let mut updated = 0;
+        for note_id in eligible_ids {
+            if transaction.set_note_label(note_id, &key, &value).await? {
+                transaction.advance_note_updated_at(note_id, now).await?;
+                updated += 1;
+            }
+        }
+        Ok(BatchUpdateNoteLabelsResult {
+            requested,
+            updated,
+            unchanged: requested - updated,
+        })
+    }
+    .await;
+
+    let result = match transaction_result {
+        Ok(result) if result.updated == 0 => {
+            transaction.rollback().await?;
+            result
+        }
+        result => crate::save_note::finish_transaction(transaction, result).await?,
+    };
+    if result.updated > 0 {
+        ctx.notify_note_mutated();
+    }
+    Ok(result)
+}
