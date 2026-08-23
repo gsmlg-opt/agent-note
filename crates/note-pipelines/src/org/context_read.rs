@@ -297,7 +297,7 @@ pub(crate) async fn get_item_context_in_transaction(
         .count_active_org_leases(workspace_id, now)
         .await
         .map_err(OrgError::storage)?;
-    let operational = operational_context(
+    let mut operational = operational_context(
         &workspace,
         &item,
         &dependencies,
@@ -306,6 +306,14 @@ pub(crate) async fn get_item_context_in_transaction(
         active_count,
         now,
     );
+    if document.archived_at.is_some() {
+        operational.classifications.clear();
+        operational.readiness = None;
+        operational.blockers = vec!["document_archived".into()];
+        operational.recovery.eligible = false;
+        operational.recovery.candidate = false;
+        operational.recovery.blockers = vec!["document_archived".into()];
+    }
     let attempts = attempts.into_iter().map(map_attempt).collect();
     let lease = lease_record.map(|lease| OrgLeaseView {
         id: lease.id,

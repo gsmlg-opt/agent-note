@@ -243,7 +243,34 @@ async fn archived_document_work_disappears_operationally_but_still_blocks_depend
         .replace_org_document_projection(dependent_document, &[dependent])
         .await
         .unwrap();
+    session
+        .append_org_event(NewOrgEvent {
+            id: "archived-document-historical-event",
+            workspace_id,
+            subject_kind: "work_item",
+            subject_id: &archived_item_ids[2].to_string(),
+            actor_id: "agent-one",
+            attempt_id: Some("operational-attempt"),
+            event_type: OrgEventType::Progress,
+            occurred_at: NOW - 50,
+            summary: "historical progress",
+            metadata: &serde_json::json!({}),
+            previous_state: Some("RUNNING"),
+            resulting_state: Some("RUNNING"),
+        })
+        .await
+        .unwrap();
     drop(session);
+
+    let active_context = get_item_context(&context, workspace_id, archived_item_ids[2])
+        .await
+        .unwrap();
+    assert!(active_context
+        .operational
+        .classifications
+        .contains(&OperationalView::Running));
+    assert_eq!(active_context.attempts.len(), 1);
+    assert_eq!(active_context.history_segments[0].events.len(), 1);
 
     let mut before_views = std::collections::BTreeMap::new();
     for view in OperationalView::ALL {
@@ -288,6 +315,33 @@ async fn archived_document_work_disappears_operationally_but_still_blocks_depend
     for view in OperationalView::ALL {
         assert_eq!(count(&archived_summary.counts, view), 0, "view {view:?}");
     }
+    let archived_context = get_item_context(&context, workspace_id, archived_item_ids[2])
+        .await
+        .unwrap();
+    assert_eq!(archived_context.item.id, archived_item_ids[2]);
+    assert_eq!(archived_context.document.id, archived_document);
+    assert_eq!(archived_context.document.archived_at, Some(NOW));
+    assert_eq!(archived_context.attempts, active_context.attempts);
+    assert_eq!(
+        archived_context.history_segments,
+        active_context.history_segments
+    );
+    assert!(archived_context.operational.classifications.is_empty());
+    assert_eq!(archived_context.operational.readiness, None);
+    assert_eq!(
+        archived_context.operational.blockers,
+        vec!["document_archived"]
+    );
+    assert!(!archived_context.operational.recovery.eligible);
+    assert!(!archived_context.operational.recovery.candidate);
+    assert_eq!(
+        archived_context.operational.recovery.blockers,
+        vec!["document_archived"]
+    );
+    assert!(!archived_context
+        .operational
+        .blockers
+        .contains(&"workspace_archived".to_string()));
     let dependent_context = get_item_context(&context, workspace_id, dependent_id)
         .await
         .unwrap();

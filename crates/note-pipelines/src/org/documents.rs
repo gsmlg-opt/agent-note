@@ -836,42 +836,81 @@ async fn apply_document_import(
             "resulting_revision": revisions[&document.input.document_id.to_string()],
             "created": document.existing.is_none(),
         });
-        let (event_type, summary) = if lifecycle_changed {
+        let events = if lifecycle_changed {
             if document.input.archived_at.is_some() {
+                vec![(
+                    OrgEventType::DocumentArchive,
+                    "Archived Org document from snapshot",
+                    metadata,
+                )]
+            } else {
+                vec![(
+                    OrgEventType::DocumentRestore,
+                    "Restored Org document from snapshot",
+                    metadata,
+                )]
+            }
+        } else if document.existing.is_some() {
+            vec![(
+                OrgEventType::DocumentImport,
+                "Imported Org document",
+                metadata,
+            )]
+        } else if let Some(archived_at) = document.input.archived_at {
+            let resulting_revision = revisions[&document.input.document_id.to_string()];
+            let creation_revision = resulting_revision - 1;
+            vec![
+                (
+                    OrgEventType::Creation,
+                    "Imported Org document",
+                    json!({
+                        "document_id": document.input.document_id,
+                        "path": document.input.path,
+                        "revision": creation_revision,
+                        "archived_at": null,
+                        "previous_archived_at": null,
+                        "resulting_archived_at": null,
+                        "previous_revision": null,
+                        "resulting_revision": creation_revision,
+                        "created": true,
+                    }),
+                ),
                 (
                     OrgEventType::DocumentArchive,
                     "Archived Org document from snapshot",
-                )
-            } else {
-                (
-                    OrgEventType::DocumentRestore,
-                    "Restored Org document from snapshot",
-                )
-            }
-        } else if document.existing.is_some() {
-            (OrgEventType::DocumentImport, "Imported Org document")
+                    json!({
+                        "path": document.input.path,
+                        "previous_archived_at": null,
+                        "resulting_archived_at": archived_at,
+                        "previous_revision": resulting_revision - 1,
+                        "resulting_revision": resulting_revision,
+                    }),
+                ),
+            ]
         } else {
-            (OrgEventType::Creation, "Imported Org document")
+            vec![(OrgEventType::Creation, "Imported Org document", metadata)]
         };
-        let event = transaction
-            .append_org_event(NewOrgEvent {
-                id: &uuid::Uuid::new_v4().to_string(),
-                workspace_id: envelope.workspace_id,
-                subject_kind: "document",
-                subject_id: &document.input.document_id.to_string(),
-                actor_id: &envelope.actor_id,
-                attempt_id: None,
-                event_type,
-                occurred_at: now,
-                summary,
-                metadata: &metadata,
-                previous_state: None,
-                resulting_state: None,
-            })
-            .await
-            .map_err(OrgError::storage)?;
-        event_ids.push(event.id);
-        context.after_workflow_phase(OrgWorkflowPhase::Events)?;
+        for (event_type, summary, metadata) in events {
+            let event = transaction
+                .append_org_event(NewOrgEvent {
+                    id: &uuid::Uuid::new_v4().to_string(),
+                    workspace_id: envelope.workspace_id,
+                    subject_kind: "document",
+                    subject_id: &document.input.document_id.to_string(),
+                    actor_id: &envelope.actor_id,
+                    attempt_id: None,
+                    event_type,
+                    occurred_at: now,
+                    summary,
+                    metadata: &metadata,
+                    previous_state: None,
+                    resulting_state: None,
+                })
+                .await
+                .map_err(OrgError::storage)?;
+            event_ids.push(event.id);
+            context.after_workflow_phase(OrgWorkflowPhase::Events)?;
+        }
     }
     for moved_item in &prepared.moved_items {
         let metadata = json!({

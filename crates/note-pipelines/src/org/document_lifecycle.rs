@@ -153,6 +153,7 @@ pub async fn rename_document(
             Box::pin(async move {
                 let current =
                     owned_document(transaction, command.workspace_id, request.document_id).await?;
+                super::validate_document_revision(&current, request.expected_revision)?;
                 ensure_path_available(
                     transaction,
                     command.workspace_id,

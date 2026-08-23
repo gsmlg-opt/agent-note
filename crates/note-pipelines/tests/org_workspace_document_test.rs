@@ -701,7 +701,7 @@ async fn document_rename_preserves_payload_and_works_before_and_after_archive() 
         &envelope(workspace, "rename-stale"),
         &RenameDocumentRequest {
             document_id: document,
-            new_path: "rename/stale.org".into(),
+            new_path: "rename/active.org".into(),
             expected_revision: 3,
         },
     )
@@ -3176,8 +3176,10 @@ async fn workspace_snapshot_round_trips_active_and_archived_document_lifecycle()
     create_test_workspace(&source_context, source_workspace, "lifecycle-source", "UTC").await;
     let active_document = document_id("20000000-0000-4000-8000-0000000000c1");
     let archived_document = document_id("20000000-0000-4000-8000-0000000000c2");
+    let advanced_archived_document = document_id("20000000-0000-4000-8000-0000000000c3");
     let active_item = work_item_id("30000000-0000-4000-8000-0000000000c1");
     let archived_item = work_item_id("30000000-0000-4000-8000-0000000000c2");
+    let advanced_archived_item = work_item_id("30000000-0000-4000-8000-0000000000c3");
     for (operation, document_id, path, source) in [
         (
             "seed-active-snapshot-document",
@@ -3190,6 +3192,16 @@ async fn workspace_snapshot_round_trips_active_and_archived_document_lifecycle()
             archived_document,
             "archive/history.org",
             source(archived_item, "READY", "Archived source.\r\n"),
+        ),
+        (
+            "seed-advanced-archived-snapshot-document",
+            advanced_archived_document,
+            "archive/advanced-history.org",
+            source(
+                advanced_archived_item,
+                "READY",
+                "Advanced archived source.\r\n",
+            ),
         ),
     ] {
         put_document(
@@ -3216,6 +3228,45 @@ async fn workspace_snapshot_round_trips_active_and_archived_document_lifecycle()
     )
     .await
     .unwrap();
+    archive_document(
+        &source_context,
+        &envelope(source_workspace, "archive-advanced-snapshot-document"),
+        &DocumentRevisionRequest {
+            document_id: advanced_archived_document,
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+    for (operation, expected_revision, path) in [
+        (
+            "advance-archived-document-three",
+            2,
+            "archive/advanced-3.org",
+        ),
+        (
+            "advance-archived-document-four",
+            3,
+            "archive/advanced-4.org",
+        ),
+        (
+            "advance-archived-document-five",
+            4,
+            "archive/advanced-history.org",
+        ),
+    ] {
+        rename_document(
+            &source_context,
+            &envelope(source_workspace, operation),
+            &RenameDocumentRequest {
+                document_id: advanced_archived_document,
+                new_path: path.into(),
+                expected_revision,
+            },
+        )
+        .await
+        .unwrap();
+    }
 
     let export = export_workspace(&source_context, source_workspace)
         .await
@@ -3258,20 +3309,21 @@ async fn workspace_snapshot_round_trips_active_and_archived_document_lifecycle()
             .collect(),
         lease_proofs: BTreeMap::new(),
     };
-    import_workspace_snapshot(
-        &target_context,
-        &envelope(target_workspace, "restore-lifecycle-snapshot"),
-        &request,
-    )
-    .await
-    .unwrap();
+    let command = envelope(target_workspace, "restore-lifecycle-snapshot");
+    let created = import_workspace_snapshot(&target_context, &command, &request)
+        .await
+        .unwrap();
+    let replay = import_workspace_snapshot(&target_context, &command, &request)
+        .await
+        .unwrap();
+    assert_eq!(replay, created);
 
     let target_session = target_backend.session().await.unwrap();
     let restored = target_session
         .list_org_documents(target_workspace)
         .await
         .unwrap();
-    assert_eq!(restored.len(), 2);
+    assert_eq!(restored.len(), 3);
     for expected in &export.documents {
         let actual = restored
             .iter()
@@ -3282,6 +3334,110 @@ async fn workspace_snapshot_round_trips_active_and_archived_document_lifecycle()
         assert_eq!(actual.content_hash, expected.content_hash);
         assert_eq!(actual.revision, expected.revision);
         assert_eq!(actual.archived_at, expected.archived_at);
+    }
+    let archived_events = target_session
+        .list_org_events(target_workspace, None, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.subject_kind == "document" && event.subject_id == archived_document.to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        archived_events
+            .iter()
+            .map(|event| event.event_type.clone())
+            .collect::<Vec<_>>(),
+        vec![OrgEventType::Creation, OrgEventType::DocumentArchive]
+    );
+    assert!(archived_events[0].sequence < archived_events[1].sequence);
+    assert!(archived_events
+        .iter()
+        .all(|event| created.event_ids.contains(&event.id)));
+    assert_eq!(
+        archived_events[0].metadata,
+        serde_json::json!({
+            "document_id": archived_document,
+            "path": "archive/history.org",
+            "revision": 1,
+            "archived_at": null,
+            "previous_archived_at": null,
+            "resulting_archived_at": null,
+            "previous_revision": null,
+            "resulting_revision": 1,
+            "created": true,
+        })
+    );
+    let archive_metadata = &archived_events[1].metadata;
+    assert_eq!(
+        archive_metadata,
+        &serde_json::json!({
+            "path": "archive/history.org",
+            "previous_archived_at": null,
+            "resulting_archived_at": NOW,
+            "previous_revision": 1,
+            "resulting_revision": 2,
+        })
+    );
+    for forbidden in ["source", "hash", "secret", "token", "lease"] {
+        for metadata in [&archived_events[0].metadata, archive_metadata] {
+            assert!(
+                !metadata.to_string().contains(forbidden),
+                "{forbidden}: {metadata}"
+            );
+        }
+    }
+    let advanced_archived_events = target_session
+        .list_org_events(target_workspace, None, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.subject_kind == "document"
+                && event.subject_id == advanced_archived_document.to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        advanced_archived_events
+            .iter()
+            .map(|event| event.event_type.clone())
+            .collect::<Vec<_>>(),
+        vec![OrgEventType::Creation, OrgEventType::DocumentArchive]
+    );
+    assert!(advanced_archived_events[0].sequence < advanced_archived_events[1].sequence);
+    assert!(advanced_archived_events
+        .iter()
+        .all(|event| created.event_ids.contains(&event.id)));
+    assert_eq!(
+        advanced_archived_events[0].metadata,
+        serde_json::json!({
+            "document_id": advanced_archived_document,
+            "path": "archive/advanced-history.org",
+            "revision": 4,
+            "archived_at": null,
+            "previous_archived_at": null,
+            "resulting_archived_at": null,
+            "previous_revision": null,
+            "resulting_revision": 4,
+            "created": true,
+        })
+    );
+    assert_eq!(
+        advanced_archived_events[1].metadata,
+        serde_json::json!({
+            "path": "archive/advanced-history.org",
+            "previous_archived_at": null,
+            "resulting_archived_at": NOW,
+            "previous_revision": 4,
+            "resulting_revision": 5,
+        })
+    );
+    for forbidden in ["source", "hash", "secret", "token", "lease"] {
+        for event in &advanced_archived_events {
+            let metadata = event.metadata.to_string();
+            assert!(!metadata.contains(forbidden), "{forbidden}: {metadata}");
+        }
     }
     let restored_projection = target_session
         .list_org_workspace_projection(target_workspace)
