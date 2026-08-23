@@ -971,6 +971,14 @@ async fn load_documents(
         if stored.workspace_id != workspace.id {
             return Err(not_found("document"));
         }
+        if stored.archived_at.is_some() {
+            return Err(OrgError::new(
+                OrgErrorCode::ArchivedDocument,
+                "Archived Org documents are read-only",
+                json!({"document_id": stored.id}),
+                false,
+            ));
+        }
         let parsed = parse_document(stored.source.clone(), &workspace.policy.parse_options())
             .map_err(parse_error)?;
         loaded.insert(document_id, LoadedDocument { stored, parsed });

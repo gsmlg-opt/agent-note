@@ -2,12 +2,14 @@ mod support;
 
 use note_org::{ClaimPolicy, DocumentId, WorkItemId, WorkspaceId, WorkspacePolicy};
 use note_pipelines::org::{
-    claim_item, create_workspace, export_document_by_id, import_documents, import_offline_document,
-    import_offline_workspace_snapshot, import_workspace_snapshot, move_document, put_document,
-    release_claim, schedule_item, update_workspace, CommandEnvelope, CreateWorkspaceRequest,
-    DocumentImport, ImportDocumentsRequest, ImportWorkspaceSnapshotRequest, LeaseProofInput,
-    MoveDocumentRequest, OrgClaimKind, OrgContext, OrgErrorCode, OrgFieldPatch, OrgWorkflowPhase,
-    PutDocumentRequest, ReleaseClaimRequest, ScheduleItemRequest, StartClaimRequest,
+    archive_document, claim_item, create_document, create_workspace, export_document_by_id,
+    import_documents, import_offline_document, import_offline_workspace_snapshot,
+    import_workspace_snapshot, move_document, put_document, release_claim, rename_document,
+    restore_document, schedule_item, update_workspace, CommandEnvelope, CreateDocumentRequest,
+    CreateWorkspaceRequest, DocumentImport, DocumentLifecycleData, DocumentRevisionRequest,
+    ImportDocumentsRequest, ImportWorkspaceSnapshotRequest, LeaseProofInput, MoveDocumentRequest,
+    OrgClaimKind, OrgContext, OrgErrorCode, OrgFieldPatch, OrgWorkflowPhase, PutDocumentRequest,
+    ReleaseClaimRequest, RenameDocumentRequest, ScheduleItemRequest, StartClaimRequest,
     UpdateWorkspaceRequest, WorkspaceImportMode, WorkspaceSnapshotMetadata,
 };
 use note_storage::{
@@ -224,6 +226,460 @@ async fn create_test_workspace(
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn document_create_is_empty_idempotent_and_records_one_creation_event() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-000000000201");
+    let document = document_id("20000000-0000-4000-8000-000000000201");
+    create_test_workspace(&context, workspace, "create-lifecycle-workspace", "UTC").await;
+    let request = CreateDocumentRequest {
+        document_id: document,
+        path: "lifecycle/empty.org".into(),
+    };
+    let command = envelope(workspace, "create-empty-document");
+
+    let created = create_document(&context, &command, &request).await.unwrap();
+    let replay = create_document(&context, &command, &request).await.unwrap();
+    assert_eq!(replay, created);
+    assert_eq!(created.workspace_revision, None);
+    assert_eq!(created.document_revisions[&document.to_string()], 1);
+    assert_eq!(created.event_ids.len(), 1);
+    assert_eq!(
+        serde_json::from_value::<DocumentLifecycleData>(created.data.clone()).unwrap(),
+        DocumentLifecycleData {
+            document_id: document,
+            path: "lifecycle/empty.org".into(),
+            archived_at: None,
+        }
+    );
+
+    let session = backend.session().await.unwrap();
+    let stored = session.get_org_document(document).await.unwrap().unwrap();
+    assert_eq!(stored.source, "");
+    assert_eq!(
+        stored.content_hash,
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(stored.revision, 1);
+    assert_eq!(stored.archived_at, None);
+    assert!(session
+        .list_org_document_projection(document)
+        .await
+        .unwrap()
+        .is_empty());
+    let events = session.list_org_events(workspace, None, 50).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.subject_kind == "document"
+                && event.subject_id == document.to_string())
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event.id == created.event_ids[0])
+            .unwrap()
+            .event_type,
+        OrgEventType::Creation
+    );
+    assert!(session
+        .get_org_operation(workspace, "create-empty-document")
+        .await
+        .unwrap()
+        .is_some());
+    drop(session);
+
+    let divergent = create_document(
+        &context,
+        &command,
+        &CreateDocumentRequest {
+            document_id: document,
+            path: "lifecycle/divergent.org".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(divergent.code, OrgErrorCode::IdempotencyConflict);
+    assert_eq!(
+        backend
+            .session()
+            .await
+            .unwrap()
+            .list_org_events(workspace, None, 50)
+            .await
+            .unwrap(),
+        events
+    );
+}
+
+#[tokio::test]
+async fn document_create_rejects_duplicate_identity_reserved_paths_and_invalid_paths_atomically() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-000000000202");
+    let first = document_id("20000000-0000-4000-8000-000000000202");
+    let second = document_id("20000000-0000-4000-8000-000000000203");
+    create_test_workspace(&context, workspace, "create-conflict-workspace", "UTC").await;
+    create_document(
+        &context,
+        &envelope(workspace, "create-conflict-first"),
+        &CreateDocumentRequest {
+            document_id: first,
+            path: "reserved.org".into(),
+        },
+    )
+    .await
+    .unwrap();
+    archive_document(
+        &context,
+        &envelope(workspace, "archive-conflict-first"),
+        &DocumentRevisionRequest {
+            document_id: first,
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let before = workspace_snapshot(backend.as_ref(), workspace).await;
+
+    let duplicate = create_document(
+        &context,
+        &envelope(workspace, "duplicate-document-id"),
+        &CreateDocumentRequest {
+            document_id: first,
+            path: "different.org".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(duplicate.code, OrgErrorCode::InvalidTransition);
+
+    let reserved = create_document(
+        &context,
+        &envelope(workspace, "reserved-archived-path"),
+        &CreateDocumentRequest {
+            document_id: second,
+            path: "reserved.org".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reserved.code, OrgErrorCode::DocumentPathConflict);
+
+    let invalid = create_document(
+        &context,
+        &envelope(workspace, "invalid-document-path"),
+        &CreateDocumentRequest {
+            document_id: second,
+            path: "../Invalid.ORG".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(invalid.code, OrgErrorCode::InvalidInput);
+    assert_eq!(
+        invalid.message,
+        "Org document path must be a portable relative lowercase .org path"
+    );
+    assert_eq!(
+        invalid.details,
+        serde_json::json!({"field": "path", "path": "../Invalid.ORG"})
+    );
+    assert_eq!(
+        workspace_snapshot(backend.as_ref(), workspace).await,
+        before
+    );
+}
+
+#[tokio::test]
+async fn document_rename_preserves_payload_and_works_before_and_after_archive() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-000000000203");
+    let document = document_id("20000000-0000-4000-8000-000000000204");
+    let replacement = document_id("20000000-0000-4000-8000-000000000205");
+    create_test_workspace(&context, workspace, "rename-lifecycle-workspace", "UTC").await;
+    create_document(
+        &context,
+        &envelope(workspace, "rename-create"),
+        &CreateDocumentRequest {
+            document_id: document,
+            path: "rename/first.org".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let original = backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_document(document)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let active = rename_document(
+        &context,
+        &envelope(workspace, "rename-active"),
+        &RenameDocumentRequest {
+            document_id: document,
+            new_path: "rename/active.org".into(),
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(active.document_revisions[&document.to_string()], 2);
+    archive_document(
+        &context,
+        &envelope(workspace, "rename-archive"),
+        &DocumentRevisionRequest {
+            document_id: document,
+            expected_revision: 2,
+        },
+    )
+    .await
+    .unwrap();
+    let archived = rename_document(
+        &context,
+        &envelope(workspace, "rename-archived"),
+        &RenameDocumentRequest {
+            document_id: document,
+            new_path: "rename/archived.org".into(),
+            expected_revision: 3,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(archived.document_revisions[&document.to_string()], 4);
+    let stored = backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_document(document)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.path, "rename/archived.org");
+    assert_eq!(stored.source, original.source);
+    assert_eq!(stored.content_hash, original.content_hash);
+    assert_eq!(stored.created_at, original.created_at);
+    assert_eq!(stored.archived_at, Some(NOW));
+
+    create_document(
+        &context,
+        &envelope(workspace, "reuse-renamed-archived-path"),
+        &CreateDocumentRequest {
+            document_id: replacement,
+            path: "rename/active.org".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let conflict = rename_document(
+        &context,
+        &envelope(workspace, "rename-reserved-target"),
+        &RenameDocumentRequest {
+            document_id: document,
+            new_path: "rename/active.org".into(),
+            expected_revision: 4,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(conflict.code, OrgErrorCode::DocumentPathConflict);
+    let stale = rename_document(
+        &context,
+        &envelope(workspace, "rename-stale"),
+        &RenameDocumentRequest {
+            document_id: document,
+            new_path: "rename/stale.org".into(),
+            expected_revision: 3,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale.code, OrgErrorCode::StaleRevision);
+}
+
+#[tokio::test]
+async fn document_archive_and_restore_preserve_content_and_replay_state_changes_once() {
+    let (context, backend, _dir) = empty_context(NOW).await;
+    let workspace = workspace_id("10000000-0000-4000-8000-000000000204");
+    let document = document_id("20000000-0000-4000-8000-000000000206");
+    create_test_workspace(&context, workspace, "archive-restore-workspace", "UTC").await;
+    create_document(
+        &context,
+        &envelope(workspace, "archive-restore-create"),
+        &CreateDocumentRequest {
+            document_id: document,
+            path: "archive/restore.org".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let before = backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_document(document)
+        .await
+        .unwrap()
+        .unwrap();
+    let archive_request = DocumentRevisionRequest {
+        document_id: document,
+        expected_revision: 1,
+    };
+    let archive_command = envelope(workspace, "archive-document");
+    let archived = archive_document(&context, &archive_command, &archive_request)
+        .await
+        .unwrap();
+    assert_eq!(
+        archive_document(&context, &archive_command, &archive_request)
+            .await
+            .unwrap(),
+        archived
+    );
+    let archived_record = backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_document(document)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(archived_record.revision, 2);
+    assert_eq!(archived_record.archived_at, Some(NOW));
+    assert_eq!(archived_record.source, before.source);
+    assert_eq!(archived_record.content_hash, before.content_hash);
+
+    let stale_archive = archive_document(
+        &context,
+        &envelope(workspace, "archive-stale-wrong-state"),
+        &DocumentRevisionRequest {
+            document_id: document,
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale_archive.code, OrgErrorCode::StaleRevision);
+    assert_eq!(stale_archive.details["current_revision"], 2);
+
+    let wrong_state = archive_document(
+        &context,
+        &envelope(workspace, "archive-wrong-state"),
+        &DocumentRevisionRequest {
+            document_id: document,
+            expected_revision: 2,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(wrong_state.code, OrgErrorCode::InvalidTransition);
+    let stale_restore = restore_document(
+        &context,
+        &envelope(workspace, "restore-stale"),
+        &DocumentRevisionRequest {
+            document_id: document,
+            expected_revision: 1,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale_restore.code, OrgErrorCode::StaleRevision);
+
+    let restored = restore_document(
+        &context,
+        &envelope(workspace, "restore-document"),
+        &DocumentRevisionRequest {
+            document_id: document,
+            expected_revision: 2,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.document_revisions[&document.to_string()], 3);
+    let stored = backend
+        .session()
+        .await
+        .unwrap()
+        .get_org_document(document)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.archived_at, None);
+    assert_eq!(stored.source, before.source);
+
+    let stale_restore = restore_document(
+        &context,
+        &envelope(workspace, "restore-stale-wrong-state"),
+        &DocumentRevisionRequest {
+            document_id: document,
+            expected_revision: 2,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale_restore.code, OrgErrorCode::StaleRevision);
+    assert_eq!(stale_restore.details["current_revision"], 3);
+    let wrong_restore_state = restore_document(
+        &context,
+        &envelope(workspace, "restore-wrong-state"),
+        &DocumentRevisionRequest {
+            document_id: document,
+            expected_revision: 3,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(wrong_restore_state.code, OrgErrorCode::InvalidTransition);
+
+    let events = backend
+        .session()
+        .await
+        .unwrap()
+        .list_org_events(workspace, None, 50)
+        .await
+        .unwrap();
+    let archive_events = events
+        .iter()
+        .filter(|event| event.event_type == OrgEventType::DocumentArchive)
+        .collect::<Vec<_>>();
+    assert_eq!(archive_events.len(), 1);
+    assert_eq!(
+        archive_events[0].metadata,
+        serde_json::json!({
+            "path": "archive/restore.org",
+            "previous_archived_at": null,
+            "resulting_archived_at": NOW,
+            "previous_revision": 1,
+            "resulting_revision": 2,
+        })
+    );
+    let restore_events = events
+        .iter()
+        .filter(|event| event.event_type == OrgEventType::DocumentRestore)
+        .collect::<Vec<_>>();
+    assert_eq!(restore_events.len(), 1);
+    assert_eq!(
+        restore_events[0].metadata,
+        serde_json::json!({
+            "path": "archive/restore.org",
+            "previous_archived_at": NOW,
+            "resulting_archived_at": null,
+            "previous_revision": 2,
+            "resulting_revision": 3,
+        })
+    );
+    for event in [archive_events[0], restore_events[0]] {
+        let metadata = serde_json::to_string(&event.metadata).unwrap();
+        for forbidden in ["source", "hash", "token", "lease"] {
+            assert!(!metadata.contains(forbidden), "{forbidden}: {metadata}");
+        }
+    }
 }
 
 #[tokio::test]

@@ -966,12 +966,21 @@ pub(crate) async fn load_document(
     workspace: &OrgWorkspace,
     document_id: note_org::DocumentId,
 ) -> Result<OrgDocument, OrgError> {
-    transaction
+    let document = transaction
         .get_org_document(document_id)
         .await
         .map_err(OrgError::storage)?
         .filter(|document| document.workspace_id == workspace.id)
-        .ok_or_else(|| not_found("document"))
+        .ok_or_else(|| not_found("document"))?;
+    if document.archived_at.is_some() {
+        return Err(OrgError::new(
+            OrgErrorCode::ArchivedDocument,
+            "Archived Org documents are read-only",
+            json!({"document_id": document.id}),
+            false,
+        ));
+    }
+    Ok(document)
 }
 
 pub(crate) fn validate_document_revision(

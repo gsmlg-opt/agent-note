@@ -866,6 +866,14 @@ pub async fn move_document(
                 if document.workspace_id != command_envelope.workspace_id {
                     return Err(not_found("document"));
                 }
+                if document.archived_at.is_some() {
+                    return Err(OrgError::new(
+                        OrgErrorCode::ArchivedDocument,
+                        "Archived Org documents are read-only",
+                        json!({"document_id": document.id}),
+                        false,
+                    ));
+                }
                 let current_projection = transaction
                     .list_org_document_projection(document.id)
                     .await
@@ -1223,6 +1231,14 @@ async fn prepare_import(
                         OrgErrorCode::InvalidTransition,
                         "Org document belongs to a different workspace",
                         json!({"document_id": input.document_id}),
+                        false,
+                    ));
+                }
+                if existing.archived_at.is_some() {
+                    return Err(OrgError::new(
+                        OrgErrorCode::ArchivedDocument,
+                        "Archived Org documents are read-only",
+                        json!({"document_id": existing.id}),
                         false,
                     ));
                 }

@@ -333,6 +333,9 @@ pub enum OrgEventType {
     TitleChange,
     PriorityChange,
     DeadlineChange,
+    DocumentRename,
+    DocumentArchive,
+    DocumentRestore,
     /// Preserves an event name written by schema v3 or a future producer.
     /// Pipelines emit the known variants, while storage keeps audit rows
     /// forward- and backward-readable.
@@ -340,7 +343,7 @@ pub enum OrgEventType {
 }
 
 impl OrgEventType {
-    pub const KNOWN: [Self; 30] = [
+    pub const KNOWN: [Self; 33] = [
         Self::Creation,
         Self::Assignment,
         Self::Claim,
@@ -371,6 +374,9 @@ impl OrgEventType {
         Self::TitleChange,
         Self::PriorityChange,
         Self::DeadlineChange,
+        Self::DocumentRename,
+        Self::DocumentArchive,
+        Self::DocumentRestore,
     ];
 
     pub fn as_str(&self) -> &str {
@@ -405,6 +411,9 @@ impl OrgEventType {
             Self::TitleChange => "title_change",
             Self::PriorityChange => "priority_change",
             Self::DeadlineChange => "deadline_change",
+            Self::DocumentRename => "document_rename",
+            Self::DocumentArchive => "document_archive",
+            Self::DocumentRestore => "document_restore",
             Self::Other(value) => value,
         }
     }
