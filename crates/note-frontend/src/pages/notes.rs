@@ -2391,6 +2391,7 @@ mod tests {
         assert!(state.error.is_none());
         assert!(batch_label_submit_allowed(false, false, false));
         assert!(!batch_label_submit_allowed(false, true, false));
+        assert!(!batch_label_submit_allowed(false, false, true));
         assert!(!batch_label_submit_allowed(state.mutating, false, false));
     }
 
@@ -2467,6 +2468,21 @@ mod tests {
         assert_eq!(state.source_key, "");
         assert_eq!(state.error, None);
         assert_eq!(state.success.as_deref(), Some("Earlier success"));
+    }
+
+    #[test]
+    fn batch_label_ui_reducer_ignores_close_while_a_mutation_is_running() {
+        let state = Rc::new(BatchLabelUiState {
+            mode: Some(BatchLabelMode::Update),
+            source_key: "project".into(),
+            destination_key: "team".into(),
+            value: "platform".into(),
+            mutating: true,
+            error: None,
+            success: None,
+        });
+
+        assert_eq!(*state.clone().reduce(BatchLabelUiAction::Close), *state);
     }
 
     #[test]
