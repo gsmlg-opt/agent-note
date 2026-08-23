@@ -7,7 +7,9 @@ use super::{
     CommandEnvelope, LeaseProofInput, OrgCommandKind, OrgCommandResult, OrgContext, OrgError,
     OrgErrorCode, OrgWorkflowPhase, TransitionLifecycle, ORG_COMMAND_SCHEMA_VERSION,
 };
-use note_org::{parse_document, ClaimPolicy, DocumentId, WorkspaceId, WorkspacePolicy};
+use note_org::{
+    parse_document, validate_document_path, ClaimPolicy, DocumentId, WorkspaceId, WorkspacePolicy,
+};
 use note_storage::{
     ConditionalUpdate, NewOrgDocument, NewOrgEvent, NewOrgWorkspace, OrgDocument,
     OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
@@ -2001,11 +2003,14 @@ fn validate_import_shape_inner(
     let mut ids = BTreeSet::new();
     let mut paths = BTreeSet::new();
     for document in &request.documents {
-        if document.path.trim().is_empty() || document.path != document.path.trim() {
-            return Err(OrgError::invalid_input(
-                "Org document path must be nonblank and trimmed",
-            ));
-        }
+        validate_document_path(&document.path).map_err(|_| {
+            OrgError::new(
+                OrgErrorCode::InvalidInput,
+                "Org document path must be a portable relative lowercase .org path",
+                json!({"field": "path", "path": document.path}),
+                false,
+            )
+        })?;
         if !ids.insert(document.document_id) || !paths.insert(document.path.clone()) {
             return Err(OrgError::invalid_input(
                 "Org import document IDs and paths must be unique",

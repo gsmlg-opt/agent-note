@@ -3,7 +3,8 @@ use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir as CapabilityDir, File as CapabilityFile, OpenOptions};
 use note_org::{
-    ClaimPolicy, DocumentId, TagRule, WorkItemId, WorkItemType, WorkspaceId, WorkspacePolicy,
+    validate_document_path, ClaimPolicy, DocumentId, TagRule, WorkItemId, WorkItemType,
+    WorkspaceId, WorkspacePolicy,
 };
 use note_pipelines::org::{
     export_document_by_id, export_workspace, import_offline_document,
@@ -356,7 +357,7 @@ pub fn parse_command(args: &[String]) -> anyhow::Result<Option<OrgOfflineCommand
                 _ => {}
             }
             let path = take_required(&options, "--path")?;
-            validate_portable_path(&path).map_err(|error| anyhow!("invalid --path: {error}"))?;
+            validate_document_path(&path).map_err(|error| anyhow!("invalid --path: {error}"))?;
             OrgOfflineCommand::ImportDocument {
                 workspace_id: parse_id(&take_required(&options, "--workspace-id")?, "workspace")?,
                 document_id: parse_id(&take_required(&options, "--document-id")?, "document")?,
@@ -643,7 +644,8 @@ async fn import_document_command(
     context: &OrgContext,
     options: ImportDocumentOptions,
 ) -> Result<OfflineReport, CommandFailure> {
-    validate_portable_path(&options.path).map_err(CommandFailure::filesystem)?;
+    validate_document_path(&options.path)
+        .map_err(|error| CommandFailure::filesystem(error.to_string()))?;
     let source = read_regular_utf8_file(&options.input).map_err(CommandFailure::filesystem)?;
     let result = import_offline_document(
         context,
@@ -781,7 +783,7 @@ fn validate_manifest(manifest: &WorkspaceManifest) -> Result<(), String> {
         if document.revision < 1 {
             return Err("Org document revision must be positive".into());
         }
-        validate_portable_path(&document.path)?;
+        validate_document_path(&document.path).map_err(|error| error.to_string())?;
         let expected_file = format!("documents/{}.org", document.id);
         if document.file != expected_file {
             return Err("Org manifest document filename is not canonical".into());
@@ -1074,36 +1076,6 @@ fn read_entry_names(directory: &CapabilityDir) -> Result<BTreeSet<String>, Strin
         names.insert(name);
     }
     Ok(names)
-}
-
-fn validate_portable_path(value: &str) -> Result<(), String> {
-    if value.trim().is_empty()
-        || value != value.trim()
-        || value.contains('\\')
-        || value.contains("//")
-        || (value.as_bytes().get(1) == Some(&b':')
-            && value
-                .as_bytes()
-                .first()
-                .is_some_and(u8::is_ascii_alphabetic))
-    {
-        return Err("Org document path must be a normalized relative path".into());
-    }
-    let path = Path::new(value);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir
-                    | Component::RootDir
-                    | Component::Prefix(_)
-                    | Component::CurDir
-            )
-        })
-    {
-        return Err("Org document path must not escape its workspace".into());
-    }
-    Ok(())
 }
 
 fn validate_content_hash(value: &str) -> Result<(), String> {
