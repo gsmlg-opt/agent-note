@@ -11,11 +11,16 @@ wasm-bindgen-futures = "0.4.76"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Clipboard",
+    "Document",
+    "Element",
+    "EventTarget",
     "HtmlElement",
     "HtmlInputElement",
     "HtmlSelectElement",
     "HtmlTextAreaElement",
     "Navigator",
+    "Node",
+    "NodeList",
     "Window",
 ] }
 gloo-net = "0.7.0"

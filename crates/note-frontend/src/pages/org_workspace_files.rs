@@ -55,6 +55,9 @@ impl Default for FilesPageState {
 }
 
 enum FilesAction {
+    WorkspaceChanged {
+        generation: u64,
+    },
     Loading {
         generation: u64,
         explicit_refresh: bool,
@@ -75,6 +78,13 @@ impl Reducible for FilesPageState {
 
     fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
         match action {
+            FilesAction::WorkspaceChanged { generation } if generation >= self.generation => Self {
+                generation,
+                load: FilesLoad::Loading,
+                requires_refresh: false,
+                refresh_generation: None,
+            }
+            .into(),
             FilesAction::Loading {
                 generation,
                 explicit_refresh,
@@ -125,6 +135,15 @@ impl FilesPageState {
             _ => None,
         }
     }
+}
+
+fn payload_for_workspace<'a>(
+    state: &'a FilesPageState,
+    workspace_id: &str,
+) -> Option<&'a FilesPayload> {
+    state
+        .payload()
+        .filter(|payload| payload.workspace.id == workspace_id)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -240,6 +259,11 @@ struct PaginationSnapshots {
 }
 
 impl PaginationSnapshots {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+
     fn remember(
         &mut self,
         workspace_id: &str,
@@ -327,6 +351,27 @@ enum PendingDocumentMutation {
     },
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PendingDocumentRequest {
+    workspace_id: String,
+    mutation: PendingDocumentMutation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceIdentity {
+    workspace_id: String,
+    generation: u64,
+}
+
+fn mutation_response_is_current(
+    request: &PendingDocumentRequest,
+    workspace_generation: u64,
+    current_workspace: &WorkspaceIdentity,
+) -> bool {
+    request.workspace_id == current_workspace.workspace_id
+        && workspace_generation == current_workspace.generation
+}
+
 impl PendingDocumentMutation {
     fn draft(&self) -> Option<&DocumentDraft> {
         match self {
@@ -347,13 +392,13 @@ impl PendingDocumentMutation {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct MutationState {
-    pending: Option<PendingDocumentMutation>,
+    pending: Option<PendingDocumentRequest>,
     error: Option<OrgApiError>,
     preserved_draft: Option<DocumentDraft>,
 }
 
 impl MutationState {
-    fn begin(mut self, pending: PendingDocumentMutation) -> Self {
+    fn begin(mut self, pending: PendingDocumentRequest) -> Self {
         self.pending = Some(pending);
         self.error = None;
         self.preserved_draft = None;
@@ -365,25 +410,40 @@ impl MutationState {
             self.preserved_draft = self
                 .pending
                 .as_ref()
-                .and_then(|pending| pending.draft().cloned());
+                .and_then(|request| request.mutation.draft().cloned());
             self.pending = None;
         }
         self.error = Some(error);
         self
     }
 
-    fn retry(&self) -> Option<PendingDocumentMutation> {
+    fn retry(&self, workspace_id: &str) -> Option<PendingDocumentRequest> {
         self.error
             .as_ref()
             .filter(|error| error.retryable)
-            .and(self.pending.clone())
+            .and_then(|_| self.pending.as_ref())
+            .filter(|request| request.workspace_id == workspace_id)
+            .cloned()
+    }
+
+    fn draft_changed(mut self, path: &str) -> Self {
+        let request_changed = self
+            .pending
+            .as_ref()
+            .and_then(|request| request.mutation.draft())
+            .is_some_and(|draft| draft.path != path);
+        if request_changed {
+            self.pending = None;
+            self.error = None;
+        }
+        self
     }
 
     #[allow(dead_code)]
     fn draft(&self) -> Option<&DocumentDraft> {
         self.pending
             .as_ref()
-            .and_then(PendingDocumentMutation::draft)
+            .and_then(|request| request.mutation.draft())
             .or(self.preserved_draft.as_ref())
     }
 
@@ -437,14 +497,22 @@ enum DialogKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DocumentDialog {
+    workspace_id: String,
     kind: DialogKind,
     document_id: Option<String>,
     path: String,
 }
 
+fn dialog_for_workspace<'a>(
+    dialog: Option<&'a DocumentDialog>,
+    workspace_id: &str,
+) -> Option<&'a DocumentDialog> {
+    dialog.filter(|dialog| dialog.workspace_id == workspace_id)
+}
+
 fn submit_document_mutation(
-    workspace_id: String,
-    pending: PendingDocumentMutation,
+    request: PendingDocumentRequest,
+    current_workspace: Rc<RefCell<WorkspaceIdentity>>,
     busy: UseStateHandle<bool>,
     mutation_state: UseStateHandle<MutationState>,
     page_state: UseReducerHandle<FilesPageState>,
@@ -453,14 +521,15 @@ fn submit_document_mutation(
     refresh_tick: UseStateHandle<u64>,
     live_announcement: UseStateHandle<LiveAnnouncement>,
 ) {
+    let workspace_generation = current_workspace.borrow().generation;
     busy.set(true);
-    mutation_state.set(MutationState::default().begin(pending.clone()));
+    mutation_state.set(MutationState::default().begin(request.clone()));
     let request_announcement = (*live_announcement).clone().start_request();
     live_announcement.set(request_announcement.clone());
     wasm_bindgen_futures::spawn_local(async move {
-        let result = match &pending {
+        let result = match &request.mutation {
             PendingDocumentMutation::Create { body, .. } => {
-                org_api::create_document(&workspace_id, body).await
+                org_api::create_document(&request.workspace_id, body).await
             }
             PendingDocumentMutation::Rename {
                 document_id, body, ..
@@ -472,10 +541,18 @@ fn submit_document_mutation(
                 document_id, body, ..
             } => org_api::restore_document(document_id, body).await,
         };
+        if !mutation_response_is_current(
+            &request,
+            workspace_generation,
+            &current_workspace.borrow(),
+        ) {
+            return;
+        }
         busy.set(false);
         match result {
             Ok(_) => {
-                live_announcement.set(request_announcement.succeeded(pending.success_message()));
+                live_announcement
+                    .set(request_announcement.succeeded(request.mutation.success_message()));
                 mutation_state.set(MutationState::default());
                 dialog.set(None);
                 *pending_load_cause.borrow_mut() = FilesLoadCause::MutationSuccess;
@@ -485,7 +562,7 @@ fn submit_document_mutation(
                 if error.code == "stale_revision" {
                     page_state.dispatch(FilesAction::RequireRefresh);
                 }
-                mutation_state.set(MutationState::default().begin(pending).failed(error));
+                mutation_state.set(MutationState::default().begin(request).failed(error));
             }
         }
     });
@@ -500,6 +577,17 @@ pub struct OrgWorkspaceFilesPageProps {
 pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
     let page_state = use_reducer(FilesPageState::default);
     let request_generation = use_mut_ref(|| 0_u64);
+    let current_workspace = use_mut_ref(|| WorkspaceIdentity {
+        workspace_id: props.workspace_id.clone(),
+        generation: 0,
+    });
+    {
+        let mut current = current_workspace.borrow_mut();
+        if current.workspace_id != props.workspace_id {
+            current.workspace_id = props.workspace_id.clone();
+            current.generation = current.generation.saturating_add(1);
+        }
+    }
     let pending_load_cause = use_mut_ref(FilesLoadCause::default);
     let refresh_tick = use_state(|| 0_u64);
     let pagination_history = use_state(Vec::<DocumentListState>::new);
@@ -523,6 +611,40 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
     let route = Route::OrgWorkspaceFiles {
         workspace_id: props.workspace_id.clone(),
     };
+
+    {
+        let page_state = page_state.clone();
+        let request_generation = request_generation.clone();
+        let pending_load_cause = pending_load_cause.clone();
+        let pagination_history = pagination_history.clone();
+        let pagination_snapshots = pagination_snapshots.clone();
+        let dialog = dialog.clone();
+        let draft = draft.clone();
+        let confirmation = confirmation.clone();
+        let validation_error = validation_error.clone();
+        let mutation_state = mutation_state.clone();
+        let busy = busy.clone();
+        let live_announcement = live_announcement.clone();
+        use_effect_with(props.workspace_id.clone(), move |_| {
+            let generation = {
+                let mut value = request_generation.borrow_mut();
+                *value = value.saturating_add(1);
+                *value
+            };
+            page_state.dispatch(FilesAction::WorkspaceChanged { generation });
+            *pending_load_cause.borrow_mut() = FilesLoadCause::Navigation;
+            pagination_history.set(Vec::new());
+            pagination_snapshots.borrow_mut().clear();
+            dialog.set(None);
+            draft.set(String::new());
+            confirmation.set(String::new());
+            validation_error.set(None);
+            mutation_state.set(MutationState::default());
+            busy.set(false);
+            live_announcement.set(LiveAnnouncement::default());
+            || ()
+        });
+    }
 
     {
         let pagination_history = pagination_history.clone();
@@ -682,8 +804,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         let pagination_snapshots = pagination_snapshots.clone();
         let workspace_id = props.workspace_id.clone();
         let navigate = navigate.clone();
-        let cursor = page_state
-            .payload()
+        let cursor = payload_for_workspace(&page_state, &props.workspace_id)
             .and_then(|payload| payload.page.next_cursor.clone());
         Callback::from(move |_| {
             if let Some(cursor) = &cursor {
@@ -723,6 +844,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
     };
 
     let open_add = {
+        let workspace_id = props.workspace_id.clone();
         let dialog = dialog.clone();
         let draft = draft.clone();
         let validation_error = validation_error.clone();
@@ -732,6 +854,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
             validation_error.set(None);
             mutation_state.set(MutationState::default());
             dialog.set(Some(DocumentDialog {
+                workspace_id: workspace_id.clone(),
                 kind: DialogKind::Add,
                 document_id: None,
                 path: String::new(),
@@ -740,6 +863,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
     };
     let open_document_dialog =
         |kind: DialogKind,
+         workspace_id: String,
          document: Document,
          dialog: UseStateHandle<Option<DocumentDialog>>,
          draft: UseStateHandle<String>,
@@ -751,12 +875,14 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
             validation_error.set(None);
             mutation_state.set(MutationState::default());
             dialog.set(Some(DocumentDialog {
+                workspace_id,
                 kind,
                 document_id: Some(document.id),
                 path: document.path,
             }));
         };
     let on_rename = {
+        let workspace_id = props.workspace_id.clone();
         let dialog = dialog.clone();
         let draft = draft.clone();
         let confirmation = confirmation.clone();
@@ -765,6 +891,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         Callback::from(move |document: Document| {
             open_document_dialog(
                 DialogKind::Rename,
+                workspace_id.clone(),
                 document,
                 dialog.clone(),
                 draft.clone(),
@@ -775,6 +902,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         })
     };
     let on_archive = {
+        let workspace_id = props.workspace_id.clone();
         let dialog = dialog.clone();
         let draft = draft.clone();
         let confirmation = confirmation.clone();
@@ -783,6 +911,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         Callback::from(move |document: Document| {
             open_document_dialog(
                 DialogKind::Archive,
+                workspace_id.clone(),
                 document,
                 dialog.clone(),
                 draft.clone(),
@@ -793,6 +922,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         })
     };
     let on_restore = {
+        let workspace_id = props.workspace_id.clone();
         let dialog = dialog.clone();
         let draft = draft.clone();
         let confirmation = confirmation.clone();
@@ -801,6 +931,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         Callback::from(move |document: Document| {
             open_document_dialog(
                 DialogKind::Restore,
+                workspace_id.clone(),
                 document,
                 dialog.clone(),
                 draft.clone(),
@@ -822,9 +953,12 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
     let on_draft = {
         let draft = draft.clone();
         let validation_error = validation_error.clone();
+        let mutation_state = mutation_state.clone();
         Callback::from(move |event: InputEvent| {
             let input: HtmlInputElement = event.target_unchecked_into();
-            draft.set(input.value());
+            let value = input.value();
+            mutation_state.set((*mutation_state).clone().draft_changed(&value));
+            draft.set(value);
             validation_error.set(None);
         })
     };
@@ -836,11 +970,11 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         })
     };
 
-    let selected_document = dialog
-        .as_ref()
+    let current_dialog = dialog_for_workspace(dialog.as_ref(), &props.workspace_id);
+    let selected_document = current_dialog
         .and_then(|dialog| dialog.document_id.as_ref())
         .and_then(|document_id| {
-            page_state.payload().and_then(|payload| {
+            payload_for_workspace(&page_state, &props.workspace_id).and_then(|payload| {
                 payload
                     .page
                     .items
@@ -849,12 +983,11 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
                     .cloned()
             })
         });
-    let loaded_workspace = page_state
-        .payload()
+    let loaded_workspace = payload_for_workspace(&page_state, &props.workspace_id)
         .map(|payload| payload.workspace.clone());
     let on_submit = {
         let workspace = loaded_workspace.clone();
-        let dialog_value = (*dialog).clone();
+        let dialog_value = current_dialog.cloned();
         let selected_document = selected_document.clone();
         let draft_value = (*draft).clone();
         let confirmation_value = (*confirmation).clone();
@@ -866,6 +999,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         let pending_load_cause = pending_load_cause.clone();
         let refresh_tick = refresh_tick.clone();
         let live_announcement = live_announcement.clone();
+        let current_workspace = current_workspace.clone();
         Callback::from(move |_| {
             if *busy || page_state.requires_refresh {
                 return;
@@ -946,9 +1080,13 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
                     }
                 }
             };
+            let request = PendingDocumentRequest {
+                workspace_id: workspace.id.clone(),
+                mutation: pending,
+            };
             submit_document_mutation(
-                workspace.id.clone(),
-                pending,
+                request,
+                current_workspace.clone(),
                 busy.clone(),
                 mutation_state.clone(),
                 page_state.clone(),
@@ -961,6 +1099,8 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
     };
     let on_retry = {
         let workspace_id = props.workspace_id.clone();
+        let dialog_is_current = current_dialog.is_some();
+        let current_workspace = current_workspace.clone();
         let busy = busy.clone();
         let mutation_state = mutation_state.clone();
         let page_state = page_state.clone();
@@ -969,13 +1109,13 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         let refresh_tick = refresh_tick.clone();
         let live_announcement = live_announcement.clone();
         Callback::from(move |_| {
-            if *busy {
+            if *busy || !dialog_is_current {
                 return;
             }
-            if let Some(pending) = mutation_state.retry() {
+            if let Some(request) = mutation_state.retry(&workspace_id) {
                 submit_document_mutation(
-                    workspace_id.clone(),
-                    pending,
+                    request,
+                    current_workspace.clone(),
                     busy.clone(),
                     mutation_state.clone(),
                     page_state.clone(),
@@ -1033,13 +1173,13 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
 
             <p class="org-live-status" role="status" aria-live="polite" aria-atomic="true">
                 <span key={live_announcement.sequence.to_string()}>
-                    { live_announcement.message.clone().unwrap_or_else(|| files_live_status(&page_state)) }
+                    { live_announcement.message.clone().unwrap_or_else(|| files_live_status(&page_state, &props.workspace_id)) }
                 </span>
             </p>
 
-            { files_content(&page_state, on_rename, on_archive, on_restore) }
+            { files_content(&page_state, &props.workspace_id, on_rename, on_archive, on_restore) }
 
-            if let Some(payload) = page_state.payload() {
+            if let Some(payload) = payload_for_workspace(&page_state, &props.workspace_id) {
                 <nav class="org-cursor-nav org-files-pagination" aria-label="File pages">
                     <span>{ format!("{} file(s) on this page", payload.page.items.len()) }</span>
                     <button type="button" class="btn btn-outline" onclick={on_previous} disabled={pagination_history.is_empty()}>{ "Previous page" }</button>
@@ -1047,7 +1187,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
                 </nav>
             }
 
-            if let Some(current_dialog) = &*dialog {
+            if let Some(current_dialog) = current_dialog {
                 <Modal title={dialog_title(current_dialog.kind).to_owned()} on_close={close_dialog.clone()}>
                     <div class="stack org-files-dialog">
                         { dialog_content(current_dialog, selected_document.as_ref(), &draft, &confirmation, on_draft.clone(), on_confirmation, *busy) }
@@ -1059,7 +1199,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
                         }
                         <div class="org-workspace-form-actions">
                             <button type="button" class="btn btn-outline" onclick={{ let close_dialog = close_dialog.clone(); Callback::from(move |_| close_dialog.emit(())) }} disabled={*busy}>{ "Cancel" }</button>
-                            if mutation_state.retry().is_some() {
+                            if mutation_state.retry(&props.workspace_id).is_some() {
                                 <button type="button" class="btn btn-outline" onclick={on_retry} disabled={*busy}>{ "Retry" }</button>
                             }
                             <button
@@ -1078,7 +1218,12 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
     }
 }
 
-fn files_live_status(state: &FilesPageState) -> String {
+fn files_live_status(state: &FilesPageState, workspace_id: &str) -> String {
+    if matches!(state.load, FilesLoad::Ready(_))
+        && payload_for_workspace(state, workspace_id).is_none()
+    {
+        return "Loading files".to_owned();
+    }
     match &state.load {
         FilesLoad::Loading => "Loading files".to_owned(),
         FilesLoad::Failed(_) => "Files could not be loaded".to_owned(),
@@ -1091,10 +1236,16 @@ fn files_live_status(state: &FilesPageState) -> String {
 
 fn files_content(
     state: &FilesPageState,
+    workspace_id: &str,
     on_rename: Callback<Document>,
     on_archive: Callback<Document>,
     on_restore: Callback<Document>,
 ) -> Html {
+    if matches!(state.load, FilesLoad::Ready(_))
+        && payload_for_workspace(state, workspace_id).is_none()
+    {
+        return html! { <p class="loading">{ "Loading workspace files..." }</p> };
+    }
     match &state.load {
         FilesLoad::Loading => html! { <p class="loading">{ "Loading workspace files..." }</p> },
         FilesLoad::Failed(error) => {
@@ -1550,15 +1701,20 @@ mod tests {
         let draft = DocumentDraft::new("roadmap/new.org");
         let body = CreateDocumentBody::from_draft(OPERATION_ID.into(), &draft);
         let document_id = body.document_id.clone();
-        let pending = PendingDocumentMutation::Create {
-            draft: draft.clone(),
-            body,
+        let request = PendingDocumentRequest {
+            workspace_id: "workspace-a".into(),
+            mutation: PendingDocumentMutation::Create {
+                draft: draft.clone(),
+                body,
+            },
         };
         let state = MutationState::default()
-            .begin(pending.clone())
+            .begin(request.clone())
             .failed(error("transport_error", true));
-        assert_eq!(state.retry(), Some(pending.clone()));
-        let PendingDocumentMutation::Create { body, draft: kept } = state.retry().unwrap() else {
+        assert_eq!(state.retry("workspace-a"), Some(request.clone()));
+        let PendingDocumentMutation::Create { body, draft: kept } =
+            state.retry("workspace-a").unwrap().mutation
+        else {
             panic!("expected create retry");
         };
         assert_eq!(kept, draft);
@@ -1568,37 +1724,251 @@ mod tests {
     }
 
     #[test]
+    fn pending_mutations_are_bound_to_their_originating_workspace() {
+        let draft = DocumentDraft::new("roadmap/new.org");
+        let request = PendingDocumentRequest {
+            workspace_id: "workspace-a".into(),
+            mutation: PendingDocumentMutation::Create {
+                body: CreateDocumentBody::from_draft(OPERATION_ID.into(), &draft),
+                draft,
+            },
+        };
+        let state = MutationState::default()
+            .begin(request.clone())
+            .failed(error("transport_error", true));
+
+        assert_eq!(state.retry("workspace-a"), Some(request.clone()));
+        assert_eq!(state.retry("workspace-b"), None);
+        let workspace_a = WorkspaceIdentity {
+            workspace_id: "workspace-a".into(),
+            generation: 3,
+        };
+        assert!(mutation_response_is_current(&request, 3, &workspace_a));
+        assert!(!mutation_response_is_current(&request, 2, &workspace_a));
+        assert!(!mutation_response_is_current(
+            &request,
+            3,
+            &WorkspaceIdentity {
+                workspace_id: "workspace-b".into(),
+                generation: 3,
+            }
+        ));
+    }
+
+    #[test]
+    fn editing_a_failed_create_or_rename_invalidates_only_the_changed_request() {
+        for mutation in [
+            PendingDocumentMutation::Create {
+                draft: DocumentDraft::new("roadmap/original.org"),
+                body: CreateDocumentBody::from_draft(
+                    OPERATION_ID.into(),
+                    &DocumentDraft::new("roadmap/original.org"),
+                ),
+            },
+            PendingDocumentMutation::Rename {
+                document_id: document(7, false).id,
+                draft: DocumentDraft::new("roadmap/original.org"),
+                body: RenameDocumentBody::new(
+                    OPERATION_ID.into(),
+                    "workspace-a".into(),
+                    "roadmap/original.org".into(),
+                    7,
+                ),
+            },
+        ] {
+            let request = PendingDocumentRequest {
+                workspace_id: "workspace-a".into(),
+                mutation,
+            };
+            let failed = MutationState::default()
+                .begin(request.clone())
+                .failed(error("transport_error", true));
+
+            let unchanged = failed.clone().draft_changed("roadmap/original.org");
+            assert_eq!(unchanged.retry("workspace-a"), Some(request.clone()));
+
+            let changed = failed.draft_changed("roadmap/changed.org");
+            assert_eq!(changed.retry("workspace-a"), None);
+            assert!(changed.error.is_none());
+
+            let replacement_mutation = match &request.mutation {
+                PendingDocumentMutation::Create { .. } => PendingDocumentMutation::Create {
+                    draft: DocumentDraft::new("roadmap/changed.org"),
+                    body: CreateDocumentBody::from_draft(
+                        "20000000-0000-4000-8000-000000000002".into(),
+                        &DocumentDraft::new("roadmap/changed.org"),
+                    ),
+                },
+                PendingDocumentMutation::Rename { document_id, .. } => {
+                    PendingDocumentMutation::Rename {
+                        document_id: document_id.clone(),
+                        draft: DocumentDraft::new("roadmap/changed.org"),
+                        body: RenameDocumentBody::new(
+                            "20000000-0000-4000-8000-000000000002".into(),
+                            "workspace-a".into(),
+                            "roadmap/changed.org".into(),
+                            7,
+                        ),
+                    }
+                }
+                PendingDocumentMutation::Archive { .. }
+                | PendingDocumentMutation::Restore { .. } => unreachable!(),
+            };
+            let replacement = PendingDocumentRequest {
+                workspace_id: "workspace-a".into(),
+                mutation: replacement_mutation,
+            };
+            assert_ne!(replacement, request);
+            let serialized = match replacement.mutation {
+                PendingDocumentMutation::Create { body, .. } => serde_json::to_value(body).unwrap(),
+                PendingDocumentMutation::Rename { body, .. } => serde_json::to_value(body).unwrap(),
+                PendingDocumentMutation::Archive { .. }
+                | PendingDocumentMutation::Restore { .. } => unreachable!(),
+            };
+            assert_eq!(
+                serialized["operation_id"],
+                "20000000-0000-4000-8000-000000000002"
+            );
+            assert!(
+                serialized["path"] == "roadmap/changed.org"
+                    || serialized["new_path"] == "roadmap/changed.org"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_change_clears_loaded_and_stale_page_state_with_a_new_generation() {
+        let state = Rc::new(FilesPageState {
+            generation: 4,
+            load: FilesLoad::Ready(payload(7)),
+            requires_refresh: true,
+            refresh_generation: Some(4),
+        })
+        .reduce(FilesAction::WorkspaceChanged { generation: 5 });
+
+        assert_eq!(state.generation, 5);
+        assert!(matches!(state.load, FilesLoad::Loading));
+        assert!(!state.requires_refresh);
+        assert_eq!(state.refresh_generation, None);
+    }
+
+    #[test]
+    fn dialog_is_hidden_synchronously_when_the_workspace_prop_changes() {
+        let dialog = DocumentDialog {
+            workspace_id: "workspace-a".into(),
+            kind: DialogKind::Add,
+            document_id: None,
+            path: String::new(),
+        };
+
+        assert_eq!(
+            dialog_for_workspace(Some(&dialog), "workspace-a"),
+            Some(&dialog)
+        );
+        assert_eq!(dialog_for_workspace(Some(&dialog), "workspace-b"), None);
+
+        let source = include_str!("org_workspace_files.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for guard in [
+            "let current_dialog = dialog_for_workspace(dialog.as_ref(), &props.workspace_id)",
+            "let dialog_value = current_dialog.cloned()",
+            "let dialog_is_current = current_dialog.is_some()",
+            "if let Some(current_dialog) = current_dialog",
+        ] {
+            assert!(
+                source.contains(guard),
+                "missing dialog origin guard: {guard}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_loaded_payload_is_not_renderable_for_a_new_workspace_prop() {
+        let state = FilesPageState {
+            generation: 4,
+            load: FilesLoad::Ready(payload(7)),
+            requires_refresh: false,
+            refresh_generation: None,
+        };
+        assert!(payload_for_workspace(&state, "workspace-a").is_some());
+        assert!(payload_for_workspace(&state, "workspace-b").is_none());
+
+        let source = include_str!("org_workspace_files.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(source.matches("payload_for_workspace").count() >= 4);
+    }
+
+    #[test]
+    fn workspace_change_resets_dialog_mutation_and_pagination_component_state() {
+        let source = include_str!("org_workspace_files.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for reset in [
+            "dialog.set(None)",
+            "draft.set(String::new())",
+            "confirmation.set(String::new())",
+            "validation_error.set(None)",
+            "mutation_state.set(MutationState::default())",
+            "busy.set(false)",
+            "live_announcement.set(LiveAnnouncement::default())",
+            "pagination_history.set(Vec::new())",
+            "pagination_snapshots.borrow_mut().clear()",
+            "FilesAction::WorkspaceChanged",
+        ] {
+            assert!(source.contains(reset), "missing workspace reset: {reset}");
+        }
+        assert!(source.contains("mutation_response_is_current"));
+        assert!(source.contains("workspace_generation"));
+        assert!(source.contains("org_api::create_document(&request.workspace_id"));
+    }
+
+    #[test]
     fn stale_revision_preserves_draft_but_disables_retry_until_refresh() {
         let draft = DocumentDraft::new("roadmap/v2.org");
-        let pending = PendingDocumentMutation::Rename {
-            document_id: document(7, false).id,
-            draft: draft.clone(),
-            body: RenameDocumentBody::new(
-                OPERATION_ID.into(),
-                "workspace-a".into(),
-                draft.path.clone(),
-                7,
-            ),
+        let request = PendingDocumentRequest {
+            workspace_id: "workspace-a".into(),
+            mutation: PendingDocumentMutation::Rename {
+                document_id: document(7, false).id,
+                draft: draft.clone(),
+                body: RenameDocumentBody::new(
+                    OPERATION_ID.into(),
+                    "workspace-a".into(),
+                    draft.path.clone(),
+                    7,
+                ),
+            },
         };
         let stale = MutationState::default()
-            .begin(pending)
+            .begin(request)
             .failed(error("stale_revision", false));
         assert_eq!(stale.draft(), Some(&draft));
-        assert_eq!(stale.retry(), None);
+        assert_eq!(stale.retry("workspace-a"), None);
 
         let refreshed = stale.refreshed();
         assert!(refreshed.error.is_none());
-        let replacement = refreshed.begin(PendingDocumentMutation::Rename {
-            document_id: document(9, false).id,
-            draft: draft.clone(),
-            body: RenameDocumentBody::new(
-                "20000000-0000-4000-8000-000000000002".into(),
-                "workspace-a".into(),
-                draft.path,
-                9,
-            ),
+        let replacement = refreshed.begin(PendingDocumentRequest {
+            workspace_id: "workspace-a".into(),
+            mutation: PendingDocumentMutation::Rename {
+                document_id: document(9, false).id,
+                draft: draft.clone(),
+                body: RenameDocumentBody::new(
+                    "20000000-0000-4000-8000-000000000002".into(),
+                    "workspace-a".into(),
+                    draft.path,
+                    9,
+                ),
+            },
         });
-        let Some(PendingDocumentMutation::Rename { body, .. }) = replacement.pending else {
+        let Some(PendingDocumentRequest {
+            mutation: PendingDocumentMutation::Rename { body, .. },
+            ..
+        }) = replacement.pending
+        else {
             panic!("expected new rename submission");
         };
         let serialized = serde_json::to_value(body).unwrap();
@@ -1628,6 +1998,7 @@ mod tests {
         let active = document(7, false);
         let archived = document(8, true);
         let archive = DocumentDialog {
+            workspace_id: "workspace-a".into(),
             kind: DialogKind::Archive,
             document_id: Some(active.id.clone()),
             path: active.path.clone(),
@@ -1646,6 +2017,7 @@ mod tests {
         ));
 
         let restore = DocumentDialog {
+            workspace_id: "workspace-a".into(),
             kind: DialogKind::Restore,
             document_id: Some(archived.id.clone()),
             path: archived.path.clone(),
@@ -1655,6 +2027,7 @@ mod tests {
 
         for document in [&active, &archived] {
             let rename = DocumentDialog {
+                workspace_id: "workspace-a".into(),
                 kind: DialogKind::Rename,
                 document_id: Some(document.id.clone()),
                 path: document.path.clone(),
