@@ -149,6 +149,27 @@ click_selector() {
     }" "could not click $1"
 }
 
+focus_and_click_selector() {
+    local selector_json
+    selector_json="$(js_string "$1")"
+    assert_eval "() => {
+        const element = document.querySelector($selector_json);
+        if (!element) return 'ORG_FAIL:missing opener';
+        element.focus();
+        if (document.activeElement !== element) return 'ORG_FAIL:opener focus';
+        element.click();
+        return 'ORG_OK';
+    }" "could not focus and click $1"
+}
+
+assert_focus_selector() {
+    local selector_json
+    selector_json="$(js_string "$1")"
+    assert_eval "() => document.activeElement === document.querySelector($selector_json)
+        ? 'ORG_OK' : 'ORG_FAIL:' + (document.activeElement?.outerHTML || 'no active element')" \
+        "$2"
+}
+
 click_button_text() {
     local text_json scope_json
     text_json="$(js_string "$1")"
@@ -439,6 +460,53 @@ assert_dialog_accessible() {
     }" "dialog focus or input labelling is invalid"
 }
 
+assert_dialog_focus_position() {
+    local expected="$1"
+    local expected_json
+    expected_json="$(js_string "$expected")"
+    assert_eval "() => {
+        const dialog = document.querySelector('[role=dialog][aria-modal=true]');
+        if (!dialog) return 'ORG_FAIL:no dialog';
+        const focusable = [...dialog.querySelectorAll(
+            'a[href]:not([aria-disabled=true]):not([hidden]),'
+            + 'button:not([disabled]):not([hidden]),'
+            + 'input:not([disabled]):not([type=hidden]):not([hidden]),'
+            + 'select:not([disabled]):not([hidden]),'
+            + 'textarea:not([disabled]):not([hidden]),'
+            + '[tabindex]:not([tabindex=\"-1\"]):not([hidden])'
+        )].filter((element) => {
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none'
+                && (rect.width > 0 || rect.height > 0);
+        });
+        const expected = $expected_json;
+        const matches = expected === 'inside'
+            ? dialog.contains(document.activeElement)
+            : expected === 'first'
+                ? document.activeElement === focusable[0]
+                : document.activeElement === focusable[focusable.length - 1];
+        return matches ? 'ORG_OK' : 'ORG_FAIL:' + JSON.stringify({
+            expected,
+            active: document.activeElement?.outerHTML,
+            first: focusable[0]?.outerHTML,
+            last: focusable[focusable.length - 1]?.outerHTML,
+        });
+    }" "dialog focus is not at the expected $expected position"
+}
+
+exercise_dialog_focus_trap() {
+    assert_dialog_accessible
+    devtools_json press_key Shift+Tab >/dev/null
+    assert_dialog_focus_position last
+    devtools_json press_key Tab >/dev/null
+    assert_dialog_focus_position first
+    for key in Tab Tab Shift+Tab Shift+Tab Tab; do
+        devtools_json press_key "$key" >/dev/null
+        assert_dialog_focus_position inside
+    done
+}
+
 assert_interactive_targets() {
     assert_eval "() => {
         const controls = [...document.querySelectorAll(
@@ -501,15 +569,21 @@ assert_network_boundary() {
     local network="$1"
     jq -e --arg base "$base" '
         [(.networkRequests // [])[]
-            | select(.url | startswith($base + "/api/org"))
-            | select(((.method == "GET")
-                or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
-                or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
-                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$")))
-                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/documents$")))
-                or (.method == "PATCH" and (.url | test("/api/org/documents/[^/?]+/path$")))
-                or (.method == "POST" and (.url | test("/api/org/documents/[^/?]+/(archive|restore)$"))))
-                | not)
+            | select((.url | contains("/api/org")) or (.url | startswith($base + "/api/")))
+            | select(((
+                (.url == ($base + "/api/org")
+                    or (.url | startswith($base + "/api/org/"))
+                    or (.url | startswith($base + "/api/org?")))
+                and (
+                    .method == "GET"
+                    or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
+                    or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
+                    or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$")))
+                    or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/documents$")))
+                    or (.method == "PATCH" and (.url | test("/api/org/documents/[^/?]+/path$")))
+                    or (.method == "POST" and (.url | test("/api/org/documents/[^/?]+/(archive|restore)$")))
+                )
+            )) | not)
         ] | length == 0
     ' <<<"$network" >/dev/null || {
         printf '%s\n' "$network" >&2
@@ -614,20 +688,23 @@ assert_eval "() => location.pathname === '/org/$workspace_id/files'
     ? 'ORG_OK' : 'ORG_FAIL:route'" "files route, page, or active filter is invalid"
 
 # Modal focus, Escape, and Cancel are independently exercised before the real create.
-click_selector "[data-testid=org-files-add]"
+focus_and_click_selector "[data-testid=org-files-add]"
 wait_for "document.querySelector('[role=dialog]')" "add dialog did not open"
 assert_dialog_accessible
 devtools_json take_snapshot --verbose=true --filePath="$ARTIFACT_PREFIX-add-dialog.snapshot.txt" >/dev/null
+exercise_dialog_focus_trap
 devtools_json press_key Escape >/dev/null
 wait_for "!document.querySelector('[role=dialog]')" "Escape did not dismiss the add dialog"
-click_selector "[data-testid=org-files-add]"
+assert_focus_selector "[data-testid=org-files-add]" "Escape closed the dialog but focus restored to Add opener failed"
+focus_and_click_selector "[data-testid=org-files-add]"
 wait_for "document.querySelector('[role=dialog]')" "add dialog did not reopen"
-assert_dialog_accessible
+exercise_dialog_focus_trap
 click_button_text "Cancel" ".app-modal-panel"
 wait_for "!document.querySelector('[role=dialog]')" "Cancel did not dismiss the add dialog"
+assert_focus_selector "[data-testid=org-files-add]" "Cancel closed the dialog but focus restored to Add opener failed"
 assert_console_and_issues_clean "initial-dialogs"
 
-click_selector "[data-testid=org-files-add]"
+focus_and_click_selector "[data-testid=org-files-add]"
 wait_for "document.querySelector('#org-files-path')" "add file input is missing"
 fill_input "#org-files-path" "$PRIMARY_INITIAL_PATH"
 reset_live_observer
@@ -647,7 +724,7 @@ capture_browser_phase "empty-create"
 
 click_file_action Rename "$PRIMARY_INITIAL_PATH"
 wait_for "document.querySelector('#org-files-path')" "rename dialog did not open"
-assert_dialog_accessible
+exercise_dialog_focus_trap
 fill_input "#org-files-path" "$PRIMARY_FIRST_RENAME"
 reset_live_observer
 click_button_text "Rename file" ".app-modal-panel"
@@ -704,7 +781,7 @@ capture_browser_phase "refreshed-rename"
 
 click_file_action Archive "$PRIMARY_FINAL_PATH"
 wait_for "document.querySelector('#org-files-archive-confirmation')" "archive dialog did not open"
-assert_dialog_accessible
+exercise_dialog_focus_trap
 assert_eval "() => [...document.querySelectorAll('.app-modal-panel button')]
     .find((button) => button.textContent.trim() === 'Archive file')?.disabled
     ? 'ORG_OK' : 'ORG_FAIL:confirmation gate'" "archive did not require exact-path confirmation"
