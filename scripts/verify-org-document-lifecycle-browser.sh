@@ -570,13 +570,23 @@ assert_network_boundary() {
     jq -e --arg base "$base" '
         def route_without_query:
             split("?")[0];
-        def approved_request($method; $route; $has_query):
+        def uuid_pattern:
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+        def approved_get($relative):
+            $relative == "/api/org/workspaces?limit=1"
+            or ($relative | test("^/api/org/workspaces/" + uuid_pattern + "$"))
+            or ($relative | test(
+                "^/api/org/workspaces/" + uuid_pattern
+                + "/documents\\?status=(active|archived|all)"
+                + "(&cursor=[^&]+)?&limit=(10|25|50|100|200)$"
+            ))
+            or ($relative | test(
+                "^/api/org/documents/" + uuid_pattern
+                + "\\?workspace_id=" + uuid_pattern + "$"
+            ));
+        def approved_request($method; $relative; $route; $has_query):
             if $method == "GET" then
-                $route == "/api/org"
-                or $route == "/api/org/workspaces"
-                or ($route | test("^/api/org/workspaces/[^/]+$"))
-                or ($route | test("^/api/org/workspaces/[^/]+/documents$"))
-                or ($route | test("^/api/org/documents/[^/]+$"))
+                approved_get($relative)
             elif $has_query then
                 false
             elif $method == "POST" then
@@ -591,20 +601,19 @@ assert_network_boundary() {
                 false
             end;
         [(.networkRequests // [])[]
-            | select((.url | contains("/api/org")) or (.url | startswith($base + "/api/")))
+            | select(.url | contains("/api/"))
             | . as $request
             | ($request.url | startswith($base + "/")) as $same_origin
             | (if $same_origin then
-                    ($request.url | .[($base | length):] | route_without_query)
+                    ($request.url | .[($base | length):])
                 else
                     null
-                end) as $route
+                end) as $relative
+            | (($relative // "") | route_without_query) as $route
             | ($request.url | contains("?")) as $has_query
             | select((
                 $same_origin
-                and ($route == "/api/org"
-                    or ($route | startswith("/api/org/")))
-                and approved_request($request.method; $route; $has_query)
+                and approved_request($request.method; $relative; $route; $has_query)
             ) | not)
         ] | length == 0
     ' <<<"$network" >/dev/null || {
@@ -744,6 +753,7 @@ reset_live_observer
 click_button_text "Add file" ".app-modal-panel"
 assert_new_live_text "Created"
 wait_files_settled
+assert_focus_selector "#org-files-title" "create success did not focus the stable files heading"
 assert_path_visible "$PRIMARY_INITIAL_PATH"
 primary_document_id="$(list_documents 'status=active&limit=50' |
     jq -r --arg path "$PRIMARY_INITIAL_PATH" '.items[] | select(.path == $path) | .id')"
@@ -763,6 +773,7 @@ reset_live_observer
 click_button_text "Rename file" ".app-modal-panel"
 assert_new_live_text "Renamed"
 wait_files_settled
+assert_focus_selector "#org-files-title" "rename success did not focus the stable files heading"
 assert_path_visible "$PRIMARY_FIRST_RENAME"
 capture_browser_phase "initial-rename"
 
@@ -804,6 +815,7 @@ reset_live_observer
 click_button_text "Rename file" ".app-modal-panel"
 assert_new_live_text "Renamed"
 wait_files_settled
+assert_focus_selector "#org-files-title" "refreshed rename success did not focus the stable files heading"
 assert_path_visible "$PRIMARY_FINAL_PATH"
 primary_source="$(get_document "$primary_document_id")"
 jq -e --arg id "$primary_document_id" --arg path "$PRIMARY_FINAL_PATH" --arg hash "$primary_hash" '
@@ -823,6 +835,7 @@ reset_live_observer
 click_button_text "Archive file" ".app-modal-panel"
 assert_new_live_text "Archived"
 wait_files_settled
+assert_focus_selector "#org-files-title" "archive success did not focus the stable files heading"
 assert_path_absent "$PRIMARY_FINAL_PATH"
 capture_browser_phase "archive"
 click_button_text "Archived" "nav[aria-label=\"File status\"]"
@@ -842,6 +855,7 @@ reset_live_observer
 click_button_text "Rename file" ".app-modal-panel"
 assert_new_live_text "Renamed"
 wait_files_settled
+assert_focus_selector "#org-files-title" "archived rename success did not focus the stable files heading"
 assert_path_visible "$PRIMARY_ARCHIVED_PATH"
 reserved_id="$(new_uuid)"
 reserved_body="$(jq -n \
@@ -870,6 +884,7 @@ reset_live_observer
 click_button_text "Restore file" ".app-modal-panel"
 assert_new_live_text "Restored"
 wait_files_settled
+assert_focus_selector "#org-files-title" "restore success did not focus the stable files heading"
 capture_browser_phase "restore"
 click_button_text "Active" "nav[aria-label=\"File status\"]"
 wait_files_settled
