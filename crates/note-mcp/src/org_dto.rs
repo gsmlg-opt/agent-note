@@ -1758,6 +1758,7 @@ pub(crate) struct DocumentOutput {
     pub id: String,
     pub path: String,
     pub revision: i64,
+    #[schemars(required, schema_with = "nullable_i64_schema")]
     pub archived_at: Option<i64>,
 }
 
@@ -1770,6 +1771,7 @@ pub(crate) struct DocumentSourceOutput {
     pub source: String,
     pub content_hash: String,
     pub revision: i64,
+    #[schemars(required, schema_with = "nullable_i64_schema")]
     pub archived_at: Option<i64>,
 }
 
@@ -2047,6 +2049,8 @@ pub(crate) struct DocumentCountData {
 pub(crate) struct DocumentLifecycleDataOutput {
     pub document_id: String,
     pub path: String,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required, schema_with = "nullable_i64_schema")]
     pub archived_at: Option<i64>,
 }
 
@@ -2245,6 +2249,10 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer)
+}
+
+fn nullable_i64_schema(generator: &mut SchemaGenerator) -> Schema {
+    generator.subschema_for::<Option<i64>>()
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -2859,6 +2867,61 @@ fn wire_name<T: Serialize>(value: T) -> Result<String, OrgError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn document_lifecycle_result(data: serde_json::Value) -> OrgCommandResult {
+        OrgCommandResult {
+            schema_version: 1,
+            workspace_id: "10000000-0000-4000-8000-000000000001".parse().unwrap(),
+            operation_id: "document-lifecycle".into(),
+            event_ids: vec![],
+            workspace_revision: Some(1),
+            document_revisions: BTreeMap::new(),
+            data,
+        }
+    }
+
+    #[test]
+    fn document_lifecycle_output_accepts_explicit_null_archive_state() {
+        let output = document_lifecycle_command_output(document_lifecycle_result(json!({
+            "document_id": "20000000-0000-4000-8000-000000000001",
+            "path": "main.org",
+            "archived_at": null
+        })))
+        .unwrap();
+
+        assert_eq!(output.data.archived_at, None);
+    }
+
+    #[test]
+    fn document_lifecycle_output_accepts_archived_timestamp() {
+        let output = document_lifecycle_command_output(document_lifecycle_result(json!({
+            "document_id": "20000000-0000-4000-8000-000000000001",
+            "path": "main.org",
+            "archived_at": 1_800_000_000
+        })))
+        .unwrap();
+
+        assert_eq!(output.data.archived_at, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn document_lifecycle_output_rejects_missing_archive_state() {
+        let error = document_lifecycle_command_output(document_lifecycle_result(json!({
+            "document_id": "20000000-0000-4000-8000-000000000001",
+            "path": "main.org"
+        })))
+        .err()
+        .expect("missing archived_at must be incompatible");
+
+        assert_eq!(
+            error.code,
+            note_pipelines::org::OrgErrorCode::StorageFailure
+        );
+        assert_eq!(
+            error.message,
+            "Org pipeline returned an incompatible command result"
+        );
+    }
 
     #[test]
     fn safe_metadata_preserves_structure_and_number_types_and_redacts_tokens() {

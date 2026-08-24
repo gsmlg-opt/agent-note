@@ -340,15 +340,38 @@ async fn org_schemas_are_closed_and_expose_concurrency_contracts() {
         "mutual exclusion must reject only two non-null filters"
     );
 
-    for name in ["org_list_documents", "org_get_document"] {
-        let output = Value::Object((**tool(name).output_schema.as_ref().unwrap()).clone());
-        let mut keys = Vec::new();
-        collect_property_keys(&output, &mut keys);
-        assert!(
-            keys.contains(&"archived_at"),
-            "{name} output lifecycle status"
-        );
-    }
+    let document_list_output = tool("org_list_documents").output_schema.as_ref().unwrap();
+    let document_list_item = resolve_schema(
+        document_list_output,
+        &document_list_output["properties"]["items"]["items"],
+    );
+    assert_required_nullable_field(
+        document_list_output,
+        document_list_item,
+        "archived_at",
+        "org_list_documents item",
+    );
+
+    let document_source_output = tool("org_get_document").output_schema.as_ref().unwrap();
+    assert_required_nullable_field(
+        document_source_output,
+        &Value::Object((**document_source_output).clone()),
+        "archived_at",
+        "org_get_document output",
+    );
+
+    let workspace_export_output = tool("org_export_workspace").output_schema.as_ref().unwrap();
+    let exported_document = resolve_schema(
+        workspace_export_output,
+        &workspace_export_output["properties"]["documents"]["items"],
+    );
+    assert_required_nullable_field(
+        workspace_export_output,
+        exported_document,
+        "archived_at",
+        "org_export_workspace document",
+    );
+
     for name in [
         "org_create_document",
         "org_rename_document",
@@ -357,6 +380,7 @@ async fn org_schemas_are_closed_and_expose_concurrency_contracts() {
     ] {
         let output = tool(name).output_schema.as_ref().unwrap();
         let data = resolve_schema(output, &output["properties"]["data"]);
+        assert_required_nullable_field(output, data, "archived_at", name);
         let mut fields = data["properties"]
             .as_object()
             .unwrap()
@@ -544,6 +568,26 @@ fn resolve_schema<'a>(root: &'a serde_json::Map<String, Value>, schema: &'a Valu
         .strip_prefix("#/$defs/")
         .and_then(|name| root.get("$defs")?.get(name))
         .expect("local schema reference")
+}
+
+fn assert_required_nullable_field(
+    root: &serde_json::Map<String, Value>,
+    schema: &Value,
+    field: &str,
+    context: &str,
+) {
+    let schema = resolve_schema(root, schema);
+    assert!(
+        schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|value| value == field)),
+        "{context} must require {field}"
+    );
+    assert_eq!(
+        schema["properties"][field]["type"],
+        serde_json::json!(["integer", "null"]),
+        "{context} {field} must be nullable"
+    );
 }
 
 fn collect_property_keys<'a>(value: &'a Value, keys: &mut Vec<&'a str>) {
