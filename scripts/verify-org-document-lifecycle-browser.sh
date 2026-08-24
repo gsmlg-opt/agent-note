@@ -568,34 +568,67 @@ assert_console_and_issues_clean() {
 assert_network_boundary() {
     local network="$1"
     jq -e --arg base "$base" '
+        def route_without_query:
+            split("?")[0];
+        def approved_request($method; $route; $has_query):
+            if $method == "GET" then
+                $route == "/api/org"
+                or $route == "/api/org/workspaces"
+                or ($route | test("^/api/org/workspaces/[^/]+$"))
+                or ($route | test("^/api/org/workspaces/[^/]+/documents$"))
+                or ($route | test("^/api/org/documents/[^/]+$"))
+            elif $has_query then
+                false
+            elif $method == "POST" then
+                $route == "/api/org/workspaces"
+                or ($route | test("^/api/org/workspaces/[^/]+/archive$"))
+                or ($route | test("^/api/org/workspaces/[^/]+/documents$"))
+                or ($route | test("^/api/org/documents/[^/]+/(archive|restore)$"))
+            elif $method == "PATCH" then
+                ($route | test("^/api/org/workspaces/[^/]+$"))
+                or ($route | test("^/api/org/documents/[^/]+/path$"))
+            else
+                false
+            end;
         [(.networkRequests // [])[]
             | select((.url | contains("/api/org")) or (.url | startswith($base + "/api/")))
-            | select(((
-                (.url == ($base + "/api/org")
-                    or (.url | startswith($base + "/api/org/"))
-                    or (.url | startswith($base + "/api/org?")))
-                and (
-                    .method == "GET"
-                    or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
-                    or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
-                    or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$")))
-                    or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/documents$")))
-                    or (.method == "PATCH" and (.url | test("/api/org/documents/[^/?]+/path$")))
-                    or (.method == "POST" and (.url | test("/api/org/documents/[^/?]+/(archive|restore)$")))
-                )
-            )) | not)
+            | . as $request
+            | ($request.url | startswith($base + "/")) as $same_origin
+            | (if $same_origin then
+                    ($request.url | .[($base | length):] | route_without_query)
+                else
+                    null
+                end) as $route
+            | ($request.url | contains("?")) as $has_query
+            | select((
+                $same_origin
+                and ($route == "/api/org"
+                    or ($route | startswith("/api/org/")))
+                and approved_request($request.method; $route; $has_query)
+            ) | not)
         ] | length == 0
     ' <<<"$network" >/dev/null || {
         printf '%s\n' "$network" >&2
         fail "browser issued an Org request outside approved workspace/document lifecycle traffic"
     }
-    jq -e '
+    jq -e --arg base "$base" '
+        def cross_origin_api_path:
+            [capture("^[A-Za-z][A-Za-z0-9+.-]*://[^/]+(?<path>/api/[^?#]*)").path][0] // null;
         [(.networkRequests // [])[]
-            | select(.method == "PUT" or .method == "DELETE"
-                or (.url | contains("/mcp"))
-                or (.url | test("/api/org/(items|queue|agenda|notes)(/|\\?|$)"))
-                or (.url | test("/(claim|review|progress|result|transition|dependencies|note-links|import|export)(/|\\?|$)"))
-                or (.url | test("/(auth|login|session)(/|\\?|$)")))
+            | . as $request
+            | (if ($request.url | startswith($base + "/api/")) then
+                    ($request.url | .[($base | length):] | split("?")[0])
+                else
+                    ($request.url | cross_origin_api_path)
+                end) as $api_path
+            | select(($request.url | contains("/mcp"))
+                or ($api_path != null and (
+                    $request.method == "PUT"
+                    or $request.method == "DELETE"
+                    or ($api_path | test("^/api/org/(items|queue|agenda|notes)(/|$)"))
+                    or ($api_path | test("/(claim|review|progress|result|transition|dependencies|note-links|import|export)(/|$)"))
+                    or ($api_path | test("/(auth|login|session)(/|$)"))
+                )))
         ] | length == 0
     ' <<<"$network" >/dev/null || {
         printf '%s\n' "$network" >&2
