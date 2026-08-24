@@ -363,6 +363,25 @@ struct WorkspaceIdentity {
     generation: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PostMutationFocus {
+    target: Option<WorkspaceIdentity>,
+}
+
+impl PostMutationFocus {
+    fn succeeded(mut self, target: WorkspaceIdentity) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    fn consume(&self, current_workspace: &WorkspaceIdentity) -> (Self, bool) {
+        (
+            Self::default(),
+            self.target.as_ref() == Some(current_workspace),
+        )
+    }
+}
+
 fn mutation_response_is_current(
     request: &PendingDocumentRequest,
     workspace_generation: u64,
@@ -453,6 +472,27 @@ impl MutationState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmissionMode {
+    Primary,
+    RetryOnly,
+    RefreshOnly,
+}
+
+fn submission_mode(
+    state: &MutationState,
+    workspace_id: &str,
+    requires_refresh: bool,
+) -> SubmissionMode {
+    if requires_refresh {
+        SubmissionMode::RefreshOnly
+    } else if state.retry(workspace_id).is_some() {
+        SubmissionMode::RetryOnly
+    } else {
+        SubmissionMode::Primary
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SafeErrorView {
     code: String,
@@ -520,6 +560,7 @@ fn submit_document_mutation(
     pending_load_cause: Rc<RefCell<FilesLoadCause>>,
     refresh_tick: UseStateHandle<u64>,
     live_announcement: UseStateHandle<LiveAnnouncement>,
+    post_mutation_focus: UseStateHandle<PostMutationFocus>,
 ) {
     let workspace_generation = current_workspace.borrow().generation;
     busy.set(true);
@@ -553,6 +594,12 @@ fn submit_document_mutation(
             Ok(_) => {
                 live_announcement
                     .set(request_announcement.succeeded(request.mutation.success_message()));
+                post_mutation_focus.set(PostMutationFocus::default().succeeded(
+                    WorkspaceIdentity {
+                        workspace_id: request.workspace_id.clone(),
+                        generation: workspace_generation,
+                    },
+                ));
                 mutation_state.set(MutationState::default());
                 dialog.set(None);
                 *pending_load_cause.borrow_mut() = FilesLoadCause::MutationSuccess;
@@ -599,6 +646,9 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
     let mutation_state = use_state(MutationState::default);
     let busy = use_state(|| false);
     let live_announcement = use_state(LiveAnnouncement::default);
+    let post_mutation_focus = use_state(PostMutationFocus::default);
+    let page_heading_ref = use_node_ref();
+    let dialog_closed = dialog.is_none();
     let navigator = use_navigator();
     let location = use_location();
     let raw_location_query = location
@@ -625,6 +675,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         let mutation_state = mutation_state.clone();
         let busy = busy.clone();
         let live_announcement = live_announcement.clone();
+        let post_mutation_focus = post_mutation_focus.clone();
         use_effect_with(props.workspace_id.clone(), move |_| {
             let generation = {
                 let mut value = request_generation.borrow_mut();
@@ -642,8 +693,30 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
             mutation_state.set(MutationState::default());
             busy.set(false);
             live_announcement.set(LiveAnnouncement::default());
+            post_mutation_focus.set(PostMutationFocus::default());
             || ()
         });
+    }
+
+    {
+        let current_workspace = current_workspace.clone();
+        let page_heading_ref = page_heading_ref.clone();
+        let post_mutation_focus = post_mutation_focus.clone();
+        use_effect_with(
+            ((*post_mutation_focus).clone(), dialog_closed),
+            move |(focus, dialog_closed)| {
+                if *dialog_closed && focus.target.is_some() {
+                    let (consumed, should_focus) = focus.consume(&current_workspace.borrow());
+                    post_mutation_focus.set(consumed);
+                    if should_focus {
+                        if let Some(heading) = page_heading_ref.cast::<web_sys::HtmlElement>() {
+                            let _ = heading.focus();
+                        }
+                    }
+                }
+                || ()
+            },
+        );
     }
 
     {
@@ -985,6 +1058,11 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         });
     let loaded_workspace = payload_for_workspace(&page_state, &props.workspace_id)
         .map(|payload| payload.workspace.clone());
+    let current_submission_mode = submission_mode(
+        &mutation_state,
+        &props.workspace_id,
+        page_state.requires_refresh,
+    );
     let on_submit = {
         let workspace = loaded_workspace.clone();
         let dialog_value = current_dialog.cloned();
@@ -1000,8 +1078,10 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         let refresh_tick = refresh_tick.clone();
         let live_announcement = live_announcement.clone();
         let current_workspace = current_workspace.clone();
+        let post_mutation_focus = post_mutation_focus.clone();
+        let submission_mode = current_submission_mode;
         Callback::from(move |_| {
-            if *busy || page_state.requires_refresh {
+            if *busy || submission_mode != SubmissionMode::Primary {
                 return;
             }
             let (Some(workspace), Some(dialog_value)) = (&workspace, &dialog_value) else {
@@ -1094,12 +1174,14 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
                 pending_load_cause.clone(),
                 refresh_tick.clone(),
                 live_announcement.clone(),
+                post_mutation_focus.clone(),
             );
         })
     };
     let on_retry = {
         let workspace_id = props.workspace_id.clone();
         let dialog_is_current = current_dialog.is_some();
+        let submission_mode = current_submission_mode;
         let current_workspace = current_workspace.clone();
         let busy = busy.clone();
         let mutation_state = mutation_state.clone();
@@ -1108,8 +1190,9 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
         let pending_load_cause = pending_load_cause.clone();
         let refresh_tick = refresh_tick.clone();
         let live_announcement = live_announcement.clone();
+        let post_mutation_focus = post_mutation_focus.clone();
         Callback::from(move |_| {
-            if *busy || !dialog_is_current {
+            if *busy || !dialog_is_current || submission_mode != SubmissionMode::RetryOnly {
                 return;
             }
             if let Some(request) = mutation_state.retry(&workspace_id) {
@@ -1123,6 +1206,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
                     pending_load_cause.clone(),
                     refresh_tick.clone(),
                     live_announcement.clone(),
+                    post_mutation_focus.clone(),
                 );
             }
         })
@@ -1140,7 +1224,7 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
                 <div>
                     <Link<Route> to={Route::OrgWorkspace { workspace_id: props.workspace_id.clone() }} classes={classes!("org-breadcrumb")}>{ "Workspace operations" }</Link<Route>>
                     <p class="org-kicker">{ "File lifecycle ledger" }</p>
-                    <h1 id="org-files-title" class="page-title">
+                    <h1 ref={page_heading_ref} tabindex="-1" id="org-files-title" class="page-title">
                         { loaded_workspace.as_ref().map_or("Loading files", |workspace| workspace.display_name.as_str()) }
                     </h1>
                     if let Some(workspace) = &loaded_workspace {
@@ -1199,14 +1283,14 @@ pub fn org_workspace_files_page(props: &OrgWorkspaceFilesPageProps) -> Html {
                         }
                         <div class="org-workspace-form-actions">
                             <button type="button" class="btn btn-outline" onclick={{ let close_dialog = close_dialog.clone(); Callback::from(move |_| close_dialog.emit(())) }} disabled={*busy}>{ "Cancel" }</button>
-                            if mutation_state.retry(&props.workspace_id).is_some() {
+                            if current_submission_mode == SubmissionMode::RetryOnly {
                                 <button type="button" class="btn btn-outline" onclick={on_retry} disabled={*busy}>{ "Retry" }</button>
                             }
                             <button
                                 type="button"
                                 class={classes!("btn", (current_dialog.kind == DialogKind::Archive).then_some("btn-danger"), (current_dialog.kind != DialogKind::Archive).then_some("btn-primary"))}
                                 onclick={on_submit}
-                                disabled={*busy || page_state.requires_refresh || !dialog_can_submit(current_dialog, selected_document.as_ref(), &draft, &confirmation)}
+                                disabled={*busy || current_submission_mode != SubmissionMode::Primary || !dialog_can_submit(current_dialog, selected_document.as_ref(), &draft, &confirmation)}
                             >
                                 { if *busy { "Working…" } else { dialog_submit_label(current_dialog.kind) } }
                             </button>
@@ -1756,6 +1840,97 @@ mod tests {
     }
 
     #[test]
+    fn retryable_failures_are_retry_only_for_every_lifecycle_mutation() {
+        let draft = DocumentDraft::new("roadmap/original.org");
+        let mutations = [
+            PendingDocumentMutation::Create {
+                body: CreateDocumentBody::from_draft(OPERATION_ID.into(), &draft),
+                draft: draft.clone(),
+            },
+            PendingDocumentMutation::Rename {
+                document_id: document(7, false).id,
+                draft: draft.clone(),
+                body: RenameDocumentBody::new(
+                    OPERATION_ID.into(),
+                    "workspace-a".into(),
+                    draft.path.clone(),
+                    7,
+                ),
+            },
+            PendingDocumentMutation::Archive {
+                document_id: document(7, false).id,
+                path: document(7, false).path,
+                body: DocumentRevisionBody::new(OPERATION_ID.into(), "workspace-a".into(), 7),
+            },
+            PendingDocumentMutation::Restore {
+                document_id: document(7, true).id,
+                path: document(7, true).path,
+                body: DocumentRevisionBody::new(OPERATION_ID.into(), "workspace-a".into(), 7),
+            },
+        ];
+
+        for mutation in mutations {
+            let request = PendingDocumentRequest {
+                workspace_id: "workspace-a".into(),
+                mutation,
+            };
+            let failed = MutationState::default()
+                .begin(request.clone())
+                .failed(error("transport_error", true));
+
+            assert_eq!(
+                submission_mode(&failed, "workspace-a", false),
+                SubmissionMode::RetryOnly
+            );
+            assert_eq!(failed.retry("workspace-a"), Some(request));
+        }
+
+        let source = include_str!("org_workspace_files.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for guard in [
+            "let current_submission_mode = submission_mode(",
+            "submission_mode != SubmissionMode::Primary",
+            "submission_mode != SubmissionMode::RetryOnly",
+            "current_submission_mode == SubmissionMode::RetryOnly",
+            "current_submission_mode != SubmissionMode::Primary",
+        ] {
+            assert!(
+                source.contains(guard),
+                "missing submission mode guard: {guard}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonretryable_failures_keep_primary_submission_and_stale_is_refresh_only() {
+        let request = PendingDocumentRequest {
+            workspace_id: "workspace-a".into(),
+            mutation: PendingDocumentMutation::Archive {
+                document_id: document(7, false).id,
+                path: document(7, false).path,
+                body: DocumentRevisionBody::new(OPERATION_ID.into(), "workspace-a".into(), 7),
+            },
+        };
+        let nonretryable = MutationState::default()
+            .begin(request.clone())
+            .failed(error("active_lease", false));
+        assert_eq!(
+            submission_mode(&nonretryable, "workspace-a", false),
+            SubmissionMode::Primary
+        );
+
+        let stale = MutationState::default()
+            .begin(request)
+            .failed(error("stale_revision", false));
+        assert_eq!(
+            submission_mode(&stale, "workspace-a", true),
+            SubmissionMode::RefreshOnly
+        );
+    }
+
+    #[test]
     fn editing_a_failed_create_or_rename_invalidates_only_the_changed_request() {
         for mutation in [
             PendingDocumentMutation::Create {
@@ -1790,6 +1965,10 @@ mod tests {
             let changed = failed.draft_changed("roadmap/changed.org");
             assert_eq!(changed.retry("workspace-a"), None);
             assert!(changed.error.is_none());
+            assert_eq!(
+                submission_mode(&changed, "workspace-a", false),
+                SubmissionMode::Primary
+            );
 
             let replacement_mutation = match &request.mutation {
                 PendingDocumentMutation::Create { .. } => PendingDocumentMutation::Create {
@@ -1850,6 +2029,54 @@ mod tests {
         assert!(matches!(state.load, FilesLoad::Loading));
         assert!(!state.requires_refresh);
         assert_eq!(state.refresh_generation, None);
+    }
+
+    #[test]
+    fn successful_mutation_focus_is_workspace_scoped_and_consumed_once() {
+        let origin = WorkspaceIdentity {
+            workspace_id: "workspace-a".into(),
+            generation: 3,
+        };
+        let scheduled = PostMutationFocus::default().succeeded(origin.clone());
+        assert_eq!(scheduled.target.as_ref(), Some(&origin));
+
+        let (consumed, should_focus) = scheduled.clone().consume(&origin);
+        assert!(should_focus);
+        assert_eq!(consumed, PostMutationFocus::default());
+        assert!(!consumed.consume(&origin).1);
+        assert!(consumed.succeeded(origin.clone()).consume(&origin).1);
+
+        let other_workspace = WorkspaceIdentity {
+            workspace_id: "workspace-b".into(),
+            generation: 4,
+        };
+        assert!(!scheduled.consume(&other_workspace).1);
+        assert_eq!(PostMutationFocus::default().target, None);
+    }
+
+    #[test]
+    fn successful_close_focus_targets_the_stable_page_heading_only() {
+        let source = include_str!("org_workspace_files.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let success = source.split("Ok(_) =>").nth(1).unwrap();
+        let success = success.split("Err(error)").next().unwrap();
+        assert!(success.contains("post_mutation_focus.set("));
+        assert!(success.contains(".succeeded("));
+        assert!(success.contains("WorkspaceIdentity {"));
+        let failure = source.split("Err(error) =>").nth(1).unwrap();
+        let failure = failure.split("});").next().unwrap();
+        assert!(!failure.contains("post_mutation_focus.set("));
+        assert!(source.contains("let page_heading_ref = use_node_ref()"));
+        assert!(source.contains("let dialog_closed = dialog.is_none()"));
+        assert!(source.contains("((*post_mutation_focus).clone(), dialog_closed)"));
+        assert!(source.contains("if *dialog_closed && focus.target.is_some()"));
+        assert!(source.contains("ref={page_heading_ref} tabindex=\"-1\""));
+        assert!(source
+            .contains("let (consumed, should_focus) = focus.consume(&current_workspace.borrow())"));
+        assert!(source.contains("page_heading_ref.cast::<web_sys::HtmlElement>()"));
+        assert!(source.contains("post_mutation_focus.set(PostMutationFocus::default())"));
     }
 
     #[test]
@@ -2121,7 +2348,9 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(source.matches("<h1").count(), 1);
-        assert!(source.contains("<h1 id=\"org-files-title\" class=\"page-title\">"));
+        assert!(source.contains(
+            "<h1 ref={page_heading_ref} tabindex=\"-1\" id=\"org-files-title\" class=\"page-title\">"
+        ));
         assert!(source.contains("aria-labelledby=\"org-files-title\""));
 
         let modal = include_str!("../components/modal.rs")
