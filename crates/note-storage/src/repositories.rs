@@ -337,6 +337,13 @@ pub trait NotesRepository: Send + Sync {
         &self,
         selectors: &[note_core::LabelSelector],
     ) -> StorageResult<Vec<String>>;
+    /// Returns sorted `(id, revision)` pairs for requested active notes while
+    /// locking those rows until the enclosing immediate transaction ends.
+    /// Missing and soft-deleted IDs are omitted.
+    async fn active_note_revisions_for_update(
+        &self,
+        ids: &[String],
+    ) -> StorageResult<Vec<(String, i64)>>;
     /// Advances an active note's label-only mutation timestamp monotonically
     /// without changing its content or note revision.
     async fn advance_note_updated_at(&self, id: &str, now: i64) -> StorageResult<u64>;

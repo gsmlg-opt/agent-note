@@ -560,6 +560,7 @@ a.dashboard-metric-detail:hover {
     max-width: 100%;
     min-width: 0;
     box-sizing: border-box;
+    contain: layout;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     border: 1px solid var(--color-outline-variant, #c7c5d0);
@@ -647,6 +648,53 @@ a.dashboard-metric-detail:hover {
 .note-table .col-select .checkbox {
     display: block;
     margin: 0 auto;
+}
+
+.notes-batch-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.55rem;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.6rem;
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.notes-batch-selection-count {
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.notes-batch-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+}
+
+.notes-batch-label-form {
+    display: grid;
+    gap: 0.7rem;
+}
+
+.notes-batch-label-form > label {
+    display: grid;
+    gap: 0.3rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.82rem;
+    font-weight: 650;
+}
+
+.notes-batch-label-error {
+    margin: 0;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid var(--color-error, #ba1a1a);
+    border-radius: 0.45rem;
+    background: var(--color-error-container, #ffdad6);
+    color: var(--color-on-error-container, #410002);
+    font-size: 0.85rem;
 }
 
 .trash-toolbar {
@@ -1506,6 +1554,10 @@ a.dashboard-metric-detail:hover {
     font: inherit;
     line-height: 1.6;
     resize: vertical;
+}
+
+.note-content-input .markdown-input-field {
+    field-sizing: content;
 }
 
 .markdown-input-field::placeholder {
@@ -2805,5 +2857,15 @@ a.dashboard-metric-detail:hover {
     .label-filter-operator {
         flex: 0 0 auto;
         min-width: 0;
+    }
+
+    .notes-batch-toolbar,
+    .notes-batch-actions {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .notes-batch-actions .btn {
+        width: 100%;
     }
 }

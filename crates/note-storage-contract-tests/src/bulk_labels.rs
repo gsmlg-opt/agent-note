@@ -8,6 +8,13 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         ("contract-bulk-active-a", "bulk content a", 100, 7, None),
         ("contract-bulk-active-b", "bulk content b", 200, 8, None),
         (
+            "contract-bulk-active-unrequested",
+            "unrequested bulk content",
+            250,
+            10,
+            None,
+        ),
+        (
             "contract-bulk-deleted",
             "deleted bulk content",
             300,
@@ -66,6 +73,21 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
             .await
             .unwrap(),
         vec!["contract-bulk-active-a", "contract-bulk-active-b"]
+    );
+    assert_eq!(
+        selection
+            .active_note_revisions_for_update(&[
+                "contract-bulk-deleted".to_owned(),
+                "contract-bulk-active-b".to_owned(),
+                "contract-bulk-missing".to_owned(),
+                "contract-bulk-active-a".to_owned(),
+            ])
+            .await
+            .unwrap(),
+        vec![
+            ("contract-bulk-active-a".to_owned(), 7),
+            ("contract-bulk-active-b".to_owned(), 8),
+        ]
     );
     selection.commit().await.unwrap();
 

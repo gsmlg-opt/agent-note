@@ -690,6 +690,34 @@ async fn bulk_update_selection_requires_an_immediate_transaction() {
 }
 
 #[tokio::test]
+async fn active_note_revisions_for_update_requires_an_immediate_transaction() {
+    let (_dir, storage) = storage().await;
+    let deferred = storage.begin(TransactionMode::Deferred).await.unwrap();
+
+    let error = deferred
+        .active_note_revisions_for_update(&[])
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), StorageErrorKind::Transaction);
+    assert_eq!(
+        error.to_string(),
+        "locking active note revisions requires an immediate transaction"
+    );
+    deferred.rollback().await.unwrap();
+
+    let immediate = storage.begin(TransactionMode::Immediate).await.unwrap();
+    assert_eq!(
+        immediate
+            .active_note_revisions_for_update(&[])
+            .await
+            .unwrap(),
+        Vec::<(String, i64)>::new()
+    );
+    immediate.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn immediate_transaction_commits_repository_writes() {
     let (_dir, storage) = storage().await;
     let transaction = storage.begin(TransactionMode::Immediate).await.unwrap();

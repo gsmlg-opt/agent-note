@@ -763,6 +763,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn note_markdown_textarea_uses_native_content_sizing() {
+        let app_css = include_str!("../../app.css");
+        assert!(app_css.contains(
+            ".note-content-input .markdown-input-field {\n    field-sizing: content;\n}"
+        ));
+    }
+
+    #[test]
     fn editing_a_draft_label_replaces_its_key_and_value_in_place() {
         let mut labels = vec![
             ("status".to_string(), "draft".to_string()),
