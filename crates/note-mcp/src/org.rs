@@ -13,22 +13,23 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::{
     org_dto::{
         AgendaViewInput, ApproveInput, AssignItemInput, ClaimInput, ClaimOutput, CommandOutput,
-        ContextCommandData, CreateFollowUpInput, CreateItemInput, DependencyInput,
-        DocumentCountData, DocumentOutput, DocumentReadInput, DocumentSourceOutput, EventListInput,
-        EventOutput, HeartbeatClaimInput, HeartbeatCommandData, ImportWorkspaceInput,
-        ItemCommandData, ItemContextOutput, ItemOutput, ItemReadInput, ListInput, MoveDocumentData,
-        MoveDocumentInput, MoveItemData, MoveItemInput, NoteItemsInput, NoteLinkInput,
-        NoteUnlinkInput, OperationalPageOutput, OperationalQueryInput, PageOutput, ProgressInput,
-        PutDocumentInput, QueueViewInput, RejectInput, ReleaseClaimInput, RequestReviewInput,
-        RetryInput, ScheduleItemInput, SubmitResultInput, TransitionInput, WorkspaceArchiveData,
-        WorkspaceArchiveInput, WorkspaceCreateInput, WorkspaceExportOutput, WorkspaceListInput,
-        WorkspaceOutput, WorkspaceReadInput, WorkspaceRevisionData, WorkspaceSummaryOutput,
-        WorkspaceUpdateInput,
+        ContextCommandData, CreateDocumentInput, CreateFollowUpInput, CreateItemInput,
+        DependencyInput, DocumentCountData, DocumentLifecycleDataOutput, DocumentListInput,
+        DocumentOutput, DocumentReadInput, DocumentRevisionInput, DocumentSourceOutput,
+        EventListInput, EventOutput, HeartbeatClaimInput, HeartbeatCommandData,
+        ImportWorkspaceInput, ItemCommandData, ItemContextOutput, ItemOutput, ItemReadInput,
+        ListInput, MoveDocumentData, MoveDocumentInput, MoveItemData, MoveItemInput,
+        NoteItemsInput, NoteLinkInput, NoteUnlinkInput, OperationalPageOutput,
+        OperationalQueryInput, PageOutput, ProgressInput, PutDocumentInput, QueueViewInput,
+        RejectInput, ReleaseClaimInput, RenameDocumentInput, RequestReviewInput, RetryInput,
+        ScheduleItemInput, SubmitResultInput, TransitionInput, WorkspaceArchiveData,
+        WorkspaceArchiveInput, WorkspaceCreateInput, WorkspaceExportOutput, WorkspaceOutput,
+        WorkspaceReadInput, WorkspaceRevisionData, WorkspaceSummaryOutput, WorkspaceUpdateInput,
     },
     NoteMcpServer,
 };
 
-pub const ORG_TOOL_NAMES: [&str; 36] = [
+pub const ORG_TOOL_NAMES: [&str; 40] = [
     "org_list_workspaces",
     "org_create_workspace",
     "org_get_workspace",
@@ -37,6 +38,10 @@ pub const ORG_TOOL_NAMES: [&str; 36] = [
     "org_list_documents",
     "org_get_document",
     "org_put_document",
+    "org_create_document",
+    "org_rename_document",
+    "org_archive_document",
+    "org_restore_document",
     "org_move_document",
     "org_move_item",
     "org_import_workspace",
@@ -85,6 +90,7 @@ pub const NOTE_TOOL_NAMES: [&str; 12] = [
 type WorkspaceRevisionOutput = CommandOutput<WorkspaceRevisionData>;
 type WorkspaceArchiveOutput = CommandOutput<WorkspaceArchiveData>;
 type DocumentCountOutput = CommandOutput<DocumentCountData>;
+type DocumentLifecycleOutput = CommandOutput<DocumentLifecycleDataOutput>;
 type MoveDocumentOutput = CommandOutput<MoveDocumentData>;
 type ItemMutationOutput = CommandOutput<ItemCommandData>;
 type MoveItemOutput = CommandOutput<MoveItemData>;
@@ -187,7 +193,7 @@ pub(crate) fn org_tool_router() -> ToolRouter<NoteMcpServer> {
         "Archive an Org workspace",
         archive_workspace_handler,
     );
-    add_handler::<WorkspaceListInput, PageOutput<DocumentOutput>, _, _>(
+    add_handler::<DocumentListInput, PageOutput<DocumentOutput>, _, _>(
         &mut router,
         ORG_TOOL_NAMES[5],
         "List Org documents",
@@ -205,171 +211,195 @@ pub(crate) fn org_tool_router() -> ToolRouter<NoteMcpServer> {
         "Put an Org document",
         put_document_handler,
     );
-    add_handler::<MoveDocumentInput, MoveDocumentOutput, _, _>(
+    add_handler::<CreateDocumentInput, DocumentLifecycleOutput, _, _>(
         &mut router,
         ORG_TOOL_NAMES[8],
+        "Create an empty Org document",
+        create_document_handler,
+    );
+    add_handler::<RenameDocumentInput, DocumentLifecycleOutput, _, _>(
+        &mut router,
+        ORG_TOOL_NAMES[9],
+        "Rename an Org document",
+        rename_document_handler,
+    );
+    add_handler::<DocumentRevisionInput, DocumentLifecycleOutput, _, _>(
+        &mut router,
+        ORG_TOOL_NAMES[10],
+        "Archive an Org document",
+        archive_document_handler,
+    );
+    add_handler::<DocumentRevisionInput, DocumentLifecycleOutput, _, _>(
+        &mut router,
+        ORG_TOOL_NAMES[11],
+        "Restore an Org document",
+        restore_document_handler,
+    );
+    add_handler::<MoveDocumentInput, MoveDocumentOutput, _, _>(
+        &mut router,
+        ORG_TOOL_NAMES[12],
         "Move an Org document",
         move_document_handler,
     );
     add_handler::<MoveItemInput, MoveItemOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[9],
+        ORG_TOOL_NAMES[13],
         "Move an Org item",
         move_item_handler,
     );
     add_handler::<ImportWorkspaceInput, DocumentCountOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[10],
+        ORG_TOOL_NAMES[14],
         "Import an Org workspace",
         import_workspace_handler,
     );
     add_handler::<WorkspaceReadInput, WorkspaceExportOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[11],
+        ORG_TOOL_NAMES[15],
         "Export an Org workspace",
         export_workspace_handler,
     );
     add_handler::<CreateItemInput, ItemMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[12],
+        ORG_TOOL_NAMES[16],
         "Create an Org item",
         create_item_handler,
     );
     add_handler::<ItemReadInput, ItemOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[13],
+        ORG_TOOL_NAMES[17],
         "Get an Org item",
         get_item_handler,
     );
     add_handler::<ItemReadInput, ItemContextOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[14],
+        ORG_TOOL_NAMES[18],
         "Get an Org item context",
         get_item_context_handler,
     );
     add_handler::<CreateFollowUpInput, ItemMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[15],
+        ORG_TOOL_NAMES[19],
         "Create a follow-up item",
         create_follow_up_handler,
     );
     add_handler::<AssignItemInput, ItemMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[16],
+        ORG_TOOL_NAMES[20],
         "Assign an Org item",
         assign_item_handler,
     );
     add_handler::<ScheduleItemInput, ItemMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[17],
+        ORG_TOOL_NAMES[21],
         "Schedule an Org item",
         schedule_item_handler,
     );
     add_handler::<OperationalQueryInput<QueueViewInput>, OperationalPageOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[18],
+        ORG_TOOL_NAMES[22],
         "Query the Org queue",
         query_queue_handler,
     );
     add_handler::<OperationalQueryInput<AgendaViewInput>, OperationalPageOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[19],
+        ORG_TOOL_NAMES[23],
         "Query the Org agenda",
         query_agenda_handler,
     );
     add_handler::<ClaimInput, ClaimOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[20],
+        ORG_TOOL_NAMES[24],
         "Claim an Org item",
         claim_item_handler,
     );
     add_handler::<HeartbeatClaimInput, HeartbeatMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[21],
+        ORG_TOOL_NAMES[25],
         "Heartbeat an active Org claim",
         heartbeat_claim_handler,
     );
     add_handler::<ReleaseClaimInput, ContextMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[22],
+        ORG_TOOL_NAMES[26],
         "Release an active Org claim",
         release_claim_handler,
     );
     add_handler::<ProgressInput, ContextMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[23],
+        ORG_TOOL_NAMES[27],
         "Report progress on an active Org claim",
         progress_handler,
     );
     add_handler::<SubmitResultInput, ContextMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[24],
+        ORG_TOOL_NAMES[28],
         "Submit an Org result",
         submit_result_handler,
     );
     add_handler::<TransitionInput, ContextMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[25],
+        ORG_TOOL_NAMES[29],
         "Transition an Org item",
         transition_item_handler,
     );
     add_handler::<RetryInput, ClaimOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[26],
+        ORG_TOOL_NAMES[30],
         "Retry and reclaim an Org item",
         retry_item_handler,
     );
     add_handler::<RequestReviewInput, ContextMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[27],
+        ORG_TOOL_NAMES[31],
         "Request Org review",
         request_review_handler,
     );
     add_handler::<ApproveInput, ContextMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[28],
+        ORG_TOOL_NAMES[32],
         "Approve an Org item",
         approve_item_handler,
     );
     add_handler::<RejectInput, ContextMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[29],
+        ORG_TOOL_NAMES[33],
         "Reject an Org item",
         reject_item_handler,
     );
     add_handler::<DependencyInput, ItemMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[30],
+        ORG_TOOL_NAMES[34],
         "Add an Org dependency",
         add_dependency_handler,
     );
     add_handler::<DependencyInput, ItemMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[31],
+        ORG_TOOL_NAMES[35],
         "Remove an Org dependency",
         remove_dependency_handler,
     );
     add_handler::<NoteLinkInput, ItemMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[32],
+        ORG_TOOL_NAMES[36],
         "Link a note to an Org item",
         link_note_handler,
     );
     add_handler::<NoteUnlinkInput, ItemMutationOutput, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[33],
+        ORG_TOOL_NAMES[37],
         "Unlink a note from an Org item",
         unlink_note_handler,
     );
     add_handler::<NoteItemsInput, PageOutput<ItemOutput>, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[34],
+        ORG_TOOL_NAMES[38],
         "List Org work items linked to a note",
         list_note_work_items_handler,
     );
     add_handler::<EventListInput, PageOutput<EventOutput>, _, _>(
         &mut router,
-        ORG_TOOL_NAMES[35],
+        ORG_TOOL_NAMES[39],
         "List Org event history",
         list_events_handler,
     );
@@ -425,7 +455,7 @@ async fn archive_workspace_handler(
 
 async fn list_documents_handler(
     context: Arc<note_pipelines::org::OrgContext>,
-    input: WorkspaceListInput,
+    input: DocumentListInput,
 ) -> Result<PageOutput<DocumentOutput>, note_pipelines::org::OrgError> {
     let (workspace_id, query) = input.into_pipeline()?;
     note_pipelines::org::list_documents(&context, workspace_id, &query)
@@ -450,6 +480,42 @@ async fn put_document_handler(
     let (envelope, request) = input.into_pipeline()?;
     let result = note_pipelines::org::put_document(&context, &envelope, &request).await?;
     crate::org_dto::command_output(result)
+}
+
+async fn create_document_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: CreateDocumentInput,
+) -> Result<DocumentLifecycleOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::create_document(&context, &envelope, &request).await?;
+    crate::org_dto::document_lifecycle_command_output(result)
+}
+
+async fn rename_document_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: RenameDocumentInput,
+) -> Result<DocumentLifecycleOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::rename_document(&context, &envelope, &request).await?;
+    crate::org_dto::document_lifecycle_command_output(result)
+}
+
+async fn archive_document_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: DocumentRevisionInput,
+) -> Result<DocumentLifecycleOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::archive_document(&context, &envelope, &request).await?;
+    crate::org_dto::document_lifecycle_command_output(result)
+}
+
+async fn restore_document_handler(
+    context: Arc<note_pipelines::org::OrgContext>,
+    input: DocumentRevisionInput,
+) -> Result<DocumentLifecycleOutput, note_pipelines::org::OrgError> {
+    let (envelope, request) = input.into_pipeline()?;
+    let result = note_pipelines::org::restore_document(&context, &envelope, &request).await?;
+    crate::org_dto::document_lifecycle_command_output(result)
 }
 
 async fn import_workspace_handler(
@@ -899,7 +965,7 @@ mod tests {
         });
         let client = ().serve(client_transport).await.unwrap();
         let error = client
-            .call_tool(CallToolRequestParams::new(ORG_TOOL_NAMES[12]).with_arguments(arguments))
+            .call_tool(CallToolRequestParams::new(ORG_TOOL_NAMES[16]).with_arguments(arguments))
             .await
             .unwrap_err();
         let ServiceError::McpError(error) = error else {

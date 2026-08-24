@@ -6,6 +6,7 @@ set -euo pipefail
 # uniquely named archived workspace as audit evidence.
 
 readonly BASE_URL="${ORG_CONSOLE_BASE_URL:?set ORG_CONSOLE_BASE_URL}"
+readonly DISPOSABLE="${ORG_CONSOLE_DISPOSABLE:-}"
 readonly DEVTOOLS="${CHROME_DEVTOOLS_BIN:-chrome-devtools}"
 readonly WAIT_MS="${ORG_CONSOLE_WAIT_MS:-20000}"
 readonly SLUG="org-ui-$(date +%s)-$$"
@@ -25,8 +26,23 @@ command -v curl >/dev/null 2>&1 || fail "curl is unavailable"
 command -v jq >/dev/null 2>&1 || fail "jq is unavailable"
 [[ -r /proc/sys/kernel/random/uuid ]] || fail "kernel UUID source is unavailable"
 
+lowercase_ascii() {
+    LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
 base="${BASE_URL%/}"
 [[ "$base" =~ ^https?:// ]] || fail "ORG_CONSOLE_BASE_URL must be an http(s) URL"
+[[ "$DISPOSABLE" == "1" ]] || fail "set ORG_CONSOLE_DISPOSABLE=1 for an explicitly disposable target"
+normalized_base="$(printf '%s' "$base" | lowercase_ascii)"
+case "$normalized_base" in
+    *agent-note.gsmlg.net*|*gsmlg.net*)
+        fail "refusing the public production host"
+        ;;
+esac
+if [[ ! "$normalized_base" =~ ^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:[0-9]+)?$ ]] \
+    && [[ "${ORG_CONSOLE_ALLOW_NON_LOOPBACK_DISPOSABLE:-}" != "1" ]]; then
+    fail "non-loopback targets require ORG_CONSOLE_ALLOW_NON_LOOPBACK_DISPOSABLE=1"
+fi
 
 devtools_json() {
     "$DEVTOOLS" "$@" --output-format=json
@@ -111,18 +127,29 @@ assert_console_clean() {
 
 assert_network_boundary() {
     local network="$1"
+    # Preserve workspace create/update/archive while admitting only the approved document
+    # create/rename/archive/restore lifecycle exception; raw source and workflow stay forbidden.
     jq -e --arg base "$base" '
         [(.networkRequests // [])[]
             | select(.url | contains("/api/org"))
-            | select(((.method == "GET")
-                or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
-                or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
-                or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$"))))
-                | not)
+            | select(((
+                (.url == ($base + "/api/org")
+                    or (.url | startswith($base + "/api/org/"))
+                    or (.url | startswith($base + "/api/org?")))
+                and (
+                    .method == "GET"
+                    or (.method == "POST" and .url == ($base + "/api/org/workspaces"))
+                    or (.method == "PATCH" and (.url | test("/api/org/workspaces/[^/?]+$")))
+                    or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/archive$")))
+                    or (.method == "POST" and (.url | test("/api/org/workspaces/[^/?]+/documents$")))
+                    or (.method == "PATCH" and (.url | test("/api/org/documents/[^/?]+/path$")))
+                    or (.method == "POST" and (.url | test("/api/org/documents/[^/?]+/(archive|restore)$")))
+                )
+            )) | not)
         ] | length == 0
     ' <<<"$network" >/dev/null || {
         printf '%s\n' "$network" >&2
-        fail "browser issued an Org request outside workspace create/update/archive"
+        fail "browser issued an Org request outside approved workspace/document lifecycle traffic"
     }
     jq -e '[(.networkRequests // [])[] | select(.url | contains("/mcp"))] | length == 0' \
         <<<"$network" >/dev/null || fail "browser contacted /mcp"

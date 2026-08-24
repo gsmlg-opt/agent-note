@@ -59,6 +59,7 @@ pub struct Document {
     pub id: String,
     pub path: String,
     pub revision: i64,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -314,6 +315,36 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn document_deserializes_lifecycle_state_and_rejects_unknown_fields() {
+        let active: Document = serde_json::from_value(json!({
+            "id": "20000000-0000-4000-8000-000000000001",
+            "path": "work.org",
+            "revision": 4,
+            "archived_at": null
+        }))
+        .unwrap();
+        assert_eq!(active.archived_at, None);
+
+        let archived: Document = serde_json::from_value(json!({
+            "id": "20000000-0000-4000-8000-000000000001",
+            "path": "work.org",
+            "revision": 5,
+            "archived_at": 1787539200
+        }))
+        .unwrap();
+        assert_eq!(archived.archived_at, Some(1787539200));
+
+        assert!(serde_json::from_value::<Document>(json!({
+            "id": "20000000-0000-4000-8000-000000000001",
+            "path": "work.org",
+            "revision": 5,
+            "archived_at": null,
+            "source": "forbidden"
+        }))
+        .is_err());
+    }
+
     fn item() -> Value {
         json!({
             "id": "30000000-0000-4000-8000-000000000001",
@@ -400,7 +431,7 @@ mod tests {
             "workspace":{"id":"10000000-0000-4000-8000-000000000001","slug":"delivery",
                 "display_name":"Delivery","description":"Operations","timezone":"Asia/Shanghai",
                 "policy_schema_version":1,"policy":WorkspacePolicy::engineering_default(),"revision":7,"archived_at":null},
-            "workspace_revision":7,"document":{"id":"20000000-0000-4000-8000-000000000001","path":"work.org","revision":4},
+            "workspace_revision":7,"document":{"id":"20000000-0000-4000-8000-000000000001","path":"work.org","revision":4,"archived_at":null},
             "item":item(),"parent":null,"children":[child],
             "dependencies":[{"item":dependency,"satisfied":true}],
             "note_links":[{"purpose":"context","note_id":"note-1","description":"deleted source","available":false}],

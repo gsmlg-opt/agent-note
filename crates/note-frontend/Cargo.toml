@@ -11,11 +11,16 @@ wasm-bindgen-futures = "0.4.76"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Clipboard",
+    "Document",
+    "Element",
+    "EventTarget",
     "HtmlElement",
     "HtmlInputElement",
     "HtmlSelectElement",
     "HtmlTextAreaElement",
     "Navigator",
+    "Node",
+    "NodeList",
     "Window",
 ] }
 gloo-net = "0.7.0"
@@ -32,3 +37,4 @@ chrono-tz = "0.10"
 yew-duskmoon = "0.8.1"
 yew-router = "0.20.0"
 note-core = { path = "../note-core" }
+note-org = { path = "../note-org" }

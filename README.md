@@ -44,23 +44,25 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
                    • org — transport-free, revision-safe workspace/document/item commands,
                      append-only audit reads, and recovery-context assembly
    ▲
-   ├── note-mcp     12 Markdown-note + 36 Org tools over stdio and Streamable HTTP (one registry)
+   ├── note-mcp     12 Markdown-note + 40 Org tools over stdio and Streamable HTTP (one registry)
    └── note-server  Axum REST (/api/notes, /api/labels, /api/org) + /mcp
                         ▲
                    note-frontend   Yew MVU (AppState + pure reducer) → talks to note-server over REST
 ```
 
 **Org canonical persistence.** `note-org` supplies the pure Org domain and workspace-time behavior.
-Storage schema v5 persists canonical Org workspaces and documents, durable execution attempts,
+Storage schema v7 persists canonical Org workspaces and documents, durable execution attempts,
 exclusive leases, richer append-only events, idempotent operation results, and derived, rebuildable
-work-item projections. The embedded Turso adapter atomically upgrades marked v2, v3, or v4
-databases to v5; PostgreSQL applies the ordered `0002_org_canonical.sql`,
-`0003_org_workflow_audit.sql`, and `0004_org_claims_operational_views.sql` migrations. Markdown
+work-item projections. Documents also carry nullable `archived_at` lifecycle state. The embedded
+Turso adapter upgrades supported marked databases through v7, including the v6-to-v7 document
+lifecycle migration; PostgreSQL applies the ordered Org migrations through
+`0006_org_document_lifecycle.sql` (with `0005_attachment_operations.sql` preceding it). Markdown
 notes and their storage remain unchanged. Projection rebuilds preserve attempts, events, leases,
 and operation results.
 
 The transport-free `note_pipelines::org` boundary provides atomic, revision-safe commands for
-workspace and document management and for item creation, follow-ups, movement, reparenting,
+workspace and document management—including empty create, rename, reversible archive, and
+restore—and for item creation, follow-ups, movement, reparenting,
 assignment, scheduling, dependencies, and Markdown-note links. It also provides workspace-sequenced
 audit pages and recovery context assembled from canonical document revisions, projections,
 dependencies, weak-note availability, attempts, artifacts, origins, and cross-workspace event
@@ -77,13 +79,14 @@ counts active execution and review leases and is checked in the same transaction
 idempotent operation replay returns the original result without duplicate attempts, events, state
 changes, or tokens. Actor IDs are client-asserted audit data, not trusted identities.
 
-Delivery Slice 6 exposes the same 36 Org operations through REST/OpenAPI, MCP, and four
+Delivery Slice 6 originally exposed the same 36 Org operations through REST/OpenAPI, MCP, and four
 storage-only offline commands where applicable. REST and MCP call the same pipeline boundary and
 share the same `Arc<OrgContext>`; no transport duplicates policy, revision, idempotency, or lease
 logic. Delivery Slice 7 adds a read-only Org-content and operations console. The workspace
 management slice adds only create, complete structured update, and reversible archive over REST;
-Org source and workflow operations remain read-only. The browser adds no polling or application
-authentication layer.
+the document lifecycle slice adds four matching operations for empty create, rename, reversible
+archive, and restore. Raw Org source editing and workflow operations remain Web-read-only. The
+browser adds no polling or application authentication layer.
 Agent Note implements no inbound authentication, authorization, proxy-identity-header, or workspace
 ACL behavior. A front proxy owns TLS, authentication, authorization, and network access; direct
 exposure to an untrusted network is unsupported.
@@ -216,11 +219,12 @@ not change timestamps or create catalog keys.
 
 ### Org Web operations console and workspace management
 
-The Org console is available at five client-side routes:
+The Org console is available at six client-side routes:
 
 - `/org` — active/archived workspace directory with counts for all operational views;
 - `/org/new` — create a workspace from the structured engineering-default policy;
 - `/org/:workspace_id` — one workspace's server-computed operational ledger;
+- `/org/:workspace_id/files` — status-filtered document lifecycle management;
 - `/org/:workspace_id/settings` — edit the complete structured workspace policy;
 - `/org/:workspace_id/items/:item_id` — recovery context and subject-filtered event history.
 
@@ -230,6 +234,8 @@ The workspace ledger exposes exactly ten views: `ready`, `assigned`, `running`, 
 `from`, and `to`), opaque cursor, and page limit live in the URL. Item links carry that complete
 typed state with `return_` parameters, so **Back** restores the exact originating ledger URL.
 Workspace-directory archive selection, cursor, and limit are also URL-backed.
+The files route defaults to `status=active` and exposes Active and Archived filters plus opaque
+cursor pagination and limits of 10, 25, 50, 100, or 200. It never renders or edits raw Org source.
 
 Data loads once on navigation and changes only on an explicit **Refresh** action; there is no
 automatic polling. Server-provided workspace time is the primary timestamp and browser-local time
@@ -237,22 +243,27 @@ is secondary. Invalid timestamps or timezones render as **Unavailable**, and wea
 links whose target is missing remain visible as unavailable rather than disappearing. Loading,
 empty, and structured error states are explicit.
 
-The browser uses same-origin REST. Its only mutations are `POST /api/org/workspaces`,
+The browser uses same-origin REST. Its workspace mutations are `POST /api/org/workspaces`,
 `PATCH /api/org/workspaces/:workspace_id`, and
-`POST /api/org/workspaces/:workspace_id/archive`, attributed to `actor_id: "web-ui"` with generated
-idempotent operation IDs. Org documents, work items, claims, transitions, and reviews remain
-read-only. The browser never calls MCP or stores a fencing token. Agent Note itself has no
+`POST /api/org/workspaces/:workspace_id/archive`. Its approved document-container exception is
+`POST /api/org/workspaces/:workspace_id/documents`,
+`PATCH /api/org/documents/:document_id/path`, and
+`POST /api/org/documents/:document_id/archive|restore`. These requests use
+`actor_id: "web-ui"` and generated idempotent operation IDs; revision-bearing operations use the
+loaded document or workspace revision. Raw Org source updates, work items, claims, transitions,
+reviews, import/move, and hard delete remain unavailable in the browser. The browser never calls
+MCP or stores a fencing token. Agent Note itself has no
 authentication, session, trusted proxy-identity-header, or workspace ACL feature; the front proxy
 must own TLS, authentication, authorization, Host/origin policy, and network access.
 
 For local development, Trunk proxies `/api/` to `127.0.0.1:6222` while retaining `/org` routes for
 the Yew router. Packaged builds set `NOTE_STATIC_DIR`; any unclaimed direct load or refresh of the
-five routes returns the frontend `index.html` with HTTP 200, while `/api/org` remains claimed by
+six routes returns the frontend `index.html` with HTTP 200, while `/api/org` remains claimed by
 the REST router.
 
 ### Org REST API
 
-The Org REST surface has exact one-to-one parity with the 36 `org_*` MCP tools. Each generated
+The Org REST surface has exact one-to-one parity with the 40 `org_*` MCP tools. Each generated
 OpenAPI `operationId` is the matching MCP tool name:
 
 | Method | Path | `operationId` |
@@ -263,8 +274,12 @@ OpenAPI `operationId` is the matching MCP tool name:
 | `PATCH` | `/api/org/workspaces/{workspace_id}` | `org_update_workspace` |
 | `POST` | `/api/org/workspaces/{workspace_id}/archive` | `org_archive_workspace` |
 | `GET` | `/api/org/workspaces/{workspace_id}/documents` | `org_list_documents` |
+| `POST` | `/api/org/workspaces/{workspace_id}/documents` | `org_create_document` |
 | `GET` | `/api/org/documents/{document_id}` | `org_get_document` |
 | `PUT` | `/api/org/documents/{document_id}` | `org_put_document` |
+| `PATCH` | `/api/org/documents/{document_id}/path` | `org_rename_document` |
+| `POST` | `/api/org/documents/{document_id}/archive` | `org_archive_document` |
+| `POST` | `/api/org/documents/{document_id}/restore` | `org_restore_document` |
 | `POST` | `/api/org/documents/{document_id}/move` | `org_move_document` |
 | `POST` | `/api/org/items/{item_id}/move` | `org_move_item` |
 | `POST` | `/api/org/workspaces/{workspace_id}/import` | `org_import_workspace` |
@@ -302,6 +317,17 @@ is audit attribution supplied by the caller, not a verified identity or authoriz
 An identical operation replay returns its original result, including after restart; reusing the
 operation ID for different input returns `idempotency_conflict`.
 
+Document list reads accept `status=active|archived|all` and default to `active`. The legacy
+`include_archived=false|true` alias means `active|all`; combining it with `status` is invalid.
+Filtering happens before cursor pagination, and status is bound into the opaque cursor. List,
+raw-source, export, and snapshot document records include required-but-nullable `archived_at`.
+Empty create returns revision 1 and stable caller-supplied identity. Rename is revision-safe for
+active or archived documents and preserves ID, source, content hash, projection identity, and
+archive state. Archive is reversible, rejects active execution or review leases, reserves the
+current path, and removes the document's items from operational views without satisfying unfinished
+dependencies. Restore reactivates the same document and projections. There is no document hard
+delete.
+
 REST success bodies serialize the same pipeline DTOs returned as MCP structured content. REST
 errors are always JSON with this common shape:
 
@@ -315,7 +341,8 @@ errors are always JSON with this common shape:
 ```
 
 `invalid_input` and `unsupported_semantic_edit` map to HTTP 400; missing requested resources map to
-404; workflow, revision, idempotency, dependency, review, lease, and retry conflicts map to 409;
+404; `archived_document`, `document_path_conflict`, workflow, revision, idempotency, dependency,
+review, lease, and retry conflicts map to 409;
 `concurrency_limit` maps to 429 with `retryable: true`; and storage failures map to 500 with a safe
 generic message. Protocol framing and HTTP status are transport metadata; result fields and the
 four error fields have MCP/REST parity.
@@ -659,13 +686,16 @@ Ordinary-note MCP conflicts use the same `code`, `message`, `details`, and `retr
 REST, including `stale_revision` with the expected and current revision. Missing required inputs
 are protocol caller errors; missing notes are `not_found`; storage failures use safe messages.
 
-The same registry also exposes exactly these 36 Org tools over both transports (48 tools total):
+The same registry also exposes exactly these 40 Org tools over both transports (52 tools total,
+including the 12 Markdown-note tools):
 
 ```text
 org_list_workspaces       org_create_workspace      org_get_workspace
 org_update_workspace      org_archive_workspace     org_list_documents
-org_get_document          org_put_document           org_move_document
-org_move_item             org_import_workspace       org_export_workspace
+org_get_document          org_put_document           org_create_document
+org_rename_document       org_archive_document       org_restore_document
+org_move_document         org_move_item              org_import_workspace
+org_export_workspace
 org_create_item           org_get_item               org_get_item_context
 org_create_follow_up      org_assign_item            org_schedule_item
 org_query_queue           org_query_agenda           org_claim_item
@@ -681,9 +711,10 @@ Opaque fencing tokens are sensitive ownership proofs: only successful claim and 
 results return them. Do not log them or expose them through general reads, errors, events, or
 exports. Agent Note has no inbound authentication, authorization, sessions, or trusted
 proxy-identity-header contract; a front proxy is responsible for TLS, authentication,
-authorization, Host/origin, and network restrictions. The exact same 36 operation names are REST
-`operationId`s under `/api/org`; the Org console consumes the GET subset plus only workspace
-create/update/archive and adds no application-authentication behavior.
+authorization, Host/origin, and network restrictions. The exact same 40 operation names are REST
+`operationId`s under `/api/org`; the Org console consumes the GET subset, workspace
+create/update/archive, and document-container create/rename/archive/restore. Raw source and workflow
+mutations remain absent, and the console adds no application-authentication behavior.
 
 ### Org offline commands
 
@@ -709,7 +740,10 @@ documents/<document-uuid>.org
 ```
 
 The manifest records its format version, workspace metadata/policy/revision, and each document's
-stable ID, canonical Org path, revision, content hash, and relative UUID filename. Imports validate
+stable ID, canonical Org path, revision, content hash, nullable `archived_at`, and relative UUID
+filename. Workspace snapshots include active and archived documents; omission of `archived_at` in a
+legacy manifest means active, while ordinary single-document import cannot set lifecycle state.
+Imports validate
 the complete snapshot before mutation; exports write atomically and do not implicitly replace a
 non-empty destination. On Linux, Android, and Apple-vendor targets, publication uses an atomic
 `NOREPLACE` rename. On Windows and other targets without that primitive, exports fail closed with

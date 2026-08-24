@@ -65,6 +65,7 @@ pub struct OrgDocumentView {
     pub id: DocumentId,
     pub path: String,
     pub revision: i64,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +270,22 @@ pub struct OrgReadQuery {
     pub include_archived: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentStatus {
+    #[default]
+    Active,
+    Archived,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OrgDocumentReadQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+    pub status: DocumentStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgReadPage<T> {
     pub items: Vec<T>,
@@ -283,6 +300,7 @@ pub struct OrgDocumentSourceView {
     pub source: String,
     pub content_hash: String,
     pub revision: i64,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

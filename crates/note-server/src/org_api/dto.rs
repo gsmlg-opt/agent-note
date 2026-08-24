@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 
 use note_org::{DocumentId, WorkItemId, WorkItemType, WorkspaceId};
 use note_pipelines::org::{
-    ApproveItemRequest, AssignItemRequest, CommandEnvelope, CreateFollowUpRequest,
-    CreateItemRequest, DependencyRequest, DocumentImport, FollowUpOrigin, HeartbeatClaimRequest,
+    ApproveItemRequest, AssignItemRequest, CommandEnvelope, CreateDocumentRequest,
+    CreateFollowUpRequest, CreateItemRequest, DependencyRequest, DocumentImport,
+    DocumentRevisionRequest, DocumentStatus, FollowUpOrigin, HeartbeatClaimRequest,
     ImportDocumentsRequest, LeaseProofInput, MoveDocumentRequest, MoveItemRequest, NoteLinkRequest,
-    OperationalQuery, OperationalView, OrgClaimKind, OrgClaimResult, OrgError, OrgEventQuery,
-    OrgFieldPatch, OrgReadQuery, PutDocumentRequest, RejectItemRequest, ReleaseClaimRequest,
-    ReportProgressRequest, RequestReviewRequest, RetryItemRequest, ScheduleItemRequest,
-    StartClaimRequest, SubmitResultRequest, TransitionItemRequest, UnlinkNoteRequest,
+    OperationalQuery, OperationalView, OrgClaimKind, OrgClaimResult, OrgDocumentReadQuery,
+    OrgError, OrgEventQuery, OrgFieldPatch, OrgReadQuery, PutDocumentRequest, RejectItemRequest,
+    ReleaseClaimRequest, RenameDocumentRequest, ReportProgressRequest, RequestReviewRequest,
+    RetryItemRequest, ScheduleItemRequest, StartClaimRequest, SubmitResultRequest,
+    TransitionItemRequest, UnlinkNoteRequest,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -59,6 +61,61 @@ impl From<OrgPageQuery> for OrgReadQuery {
             limit: Some(usize::from(value.limit)),
             include_archived: value.include_archived,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentStatusBody {
+    Active,
+    Archived,
+    All,
+}
+
+impl From<DocumentStatusBody> for DocumentStatus {
+    fn from(value: DocumentStatusBody) -> Self {
+        match value {
+            DocumentStatusBody::Active => Self::Active,
+            DocumentStatusBody::Archived => Self::Archived,
+            DocumentStatusBody::All => Self::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, ToSchema, utoipa::IntoParams)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentListQuery {
+    /// Opaque cursor returned by the preceding page; clients must not inspect or modify it.
+    pub cursor: Option<String>,
+    #[serde(default = "default_limit")]
+    #[schema(default = 50, minimum = 1, maximum = 200)]
+    #[param(default = 50, minimum = 1, maximum = 200)]
+    pub limit: u16,
+    /// Document lifecycle filter. Mutually exclusive with the legacy `include_archived` parameter.
+    pub status: Option<DocumentStatusBody>,
+    /// Legacy alias: true means `status=all`, false means `status=active`. Mutually exclusive with `status`.
+    pub include_archived: Option<bool>,
+}
+
+impl DocumentListQuery {
+    pub fn into_pipeline(self) -> Result<OrgDocumentReadQuery, OrgError> {
+        if self.status.is_some() && self.include_archived.is_some() {
+            return Err(OrgError::invalid_input(
+                "Org document status and include_archived cannot be used together",
+            ));
+        }
+        let status = self.status.map(Into::into).unwrap_or_else(|| {
+            if self.include_archived.unwrap_or(false) {
+                DocumentStatus::All
+            } else {
+                DocumentStatus::Active
+            }
+        });
+        Ok(OrgDocumentReadQuery {
+            cursor: self.cursor,
+            limit: Some(usize::from(self.limit)),
+            status,
+        })
     }
 }
 
@@ -1227,6 +1284,80 @@ fn metadata_value(values: BTreeMap<String, serde_json::Value>) -> serde_json::Va
 
 #[derive(Clone, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct CreateDocumentBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub document_id: String,
+    pub path: String,
+}
+
+impl CreateDocumentBody {
+    pub fn into_pipeline(
+        self,
+        workspace_id: WorkspaceId,
+    ) -> Result<(CommandEnvelope, CreateDocumentRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&workspace_id.to_string())?,
+            CreateDocumentRequest {
+                document_id: parse_id(self.document_id, "document_id")?,
+                path: self.path,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RenameDocumentBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub new_path: String,
+    pub expected_revision: i64,
+}
+
+impl RenameDocumentBody {
+    pub fn into_pipeline(
+        self,
+        document_id: DocumentId,
+    ) -> Result<(CommandEnvelope, RenameDocumentRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            RenameDocumentRequest {
+                document_id,
+                new_path: self.new_path,
+                expected_revision: self.expected_revision,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentRevisionBody {
+    #[serde(flatten)]
+    pub command: OrgMutationEnvelope,
+    pub workspace_id: String,
+    pub expected_revision: i64,
+}
+
+impl DocumentRevisionBody {
+    pub fn into_pipeline(
+        self,
+        document_id: DocumentId,
+    ) -> Result<(CommandEnvelope, DocumentRevisionRequest), OrgError> {
+        Ok((
+            self.command.into_pipeline(&self.workspace_id)?,
+            DocumentRevisionRequest {
+                document_id,
+                expected_revision: self.expected_revision,
+            },
+        ))
+    }
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PutDocumentBody {
     #[serde(flatten)]
     pub command: OrgMutationEnvelope,
@@ -1356,6 +1487,7 @@ impl ImportWorkspaceBody {
                     document_id: parse_id(document.document_id, "document_id")?,
                     path: document.path,
                     source: document.source,
+                    archived_at: None,
                 })
             })
             .collect::<Result<Vec<_>, OrgError>>()?;
@@ -1525,5 +1657,18 @@ mod tests {
 
         assert_eq!(error.code, note_pipelines::org::OrgErrorCode::InvalidInput);
         assert_eq!(error.message, "document_id keys must be unique UUIDs");
+    }
+
+    #[test]
+    fn ordinary_document_import_rejects_archived_state() {
+        assert!(
+            serde_json::from_value::<DocumentImportBody>(serde_json::json!({
+                "document_id": "20000000-0000-4000-8000-000000000001",
+                "path": "main.org",
+                "source": "",
+                "archived_at": 1
+            }))
+            .is_err()
+        );
     }
 }

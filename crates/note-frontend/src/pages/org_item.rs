@@ -834,6 +834,7 @@ mod tests {
                 id: "document-a".into(),
                 path: "ops.org".into(),
                 revision: 4,
+                archived_at: None,
             },
             item,
             parent: Some(work_item("parent-a", None)),

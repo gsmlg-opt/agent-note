@@ -687,25 +687,55 @@ fn not_found(resource: &'static str, id: String) -> OrgError {
 }
 
 pub(crate) fn paginate_read<T>(
-    mut items: Vec<T>,
+    items: Vec<T>,
     query: &super::OrgReadQuery,
     signer: &dyn super::OrgCursorSigner,
     family: &str,
     scope: Option<&str>,
     id: impl Fn(&T) -> String,
 ) -> Result<super::OrgReadPage<T>, OrgError> {
-    let limit = query.limit.unwrap_or(DEFAULT_OPERATIONAL_LIMIT);
+    let fingerprint = super::read_fingerprint(family, scope, query.include_archived);
+    paginate_read_with_fingerprint(
+        items,
+        query.cursor.as_deref(),
+        query.limit,
+        signer,
+        &fingerprint,
+        id,
+    )
+}
+
+pub(crate) fn paginate_read_with_discriminator<T>(
+    items: Vec<T>,
+    cursor: Option<&str>,
+    requested_limit: Option<usize>,
+    signer: &dyn super::OrgCursorSigner,
+    family: &str,
+    scope: Option<&str>,
+    discriminator: &serde_json::Value,
+    id: impl Fn(&T) -> String,
+) -> Result<super::OrgReadPage<T>, OrgError> {
+    let fingerprint = super::read_fingerprint_with_discriminator(family, scope, discriminator);
+    paginate_read_with_fingerprint(items, cursor, requested_limit, signer, &fingerprint, id)
+}
+
+fn paginate_read_with_fingerprint<T>(
+    mut items: Vec<T>,
+    cursor: Option<&str>,
+    requested_limit: Option<usize>,
+    signer: &dyn super::OrgCursorSigner,
+    fingerprint: &str,
+    id: impl Fn(&T) -> String,
+) -> Result<super::OrgReadPage<T>, OrgError> {
+    let limit = requested_limit.unwrap_or(DEFAULT_OPERATIONAL_LIMIT);
     if !(1..=MAX_OPERATIONAL_LIMIT).contains(&limit) {
         return Err(OrgError::invalid_input(
             "Org read limit must be between 1 and 200",
         ));
     }
     items.sort_by_key(&id);
-    let fingerprint = super::read_fingerprint(family, scope, query.include_archived);
-    let after = query
-        .cursor
-        .as_deref()
-        .map(|cursor| super::decode_read_cursor(signer, cursor, &fingerprint))
+    let after = cursor
+        .map(|cursor| super::decode_read_cursor(signer, cursor, fingerprint))
         .transpose()?;
     if let Some(after) = after {
         items.retain(|item| id(item).as_str() > after.as_str());
@@ -715,7 +745,7 @@ pub(crate) fn paginate_read<T>(
     let next_cursor = if has_more {
         items
             .last()
-            .map(|item| super::encode_read_cursor(signer, &fingerprint, &id(item)))
+            .map(|item| super::encode_read_cursor(signer, fingerprint, &id(item)))
             .transpose()?
     } else {
         None

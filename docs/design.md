@@ -441,19 +441,21 @@ Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than 
 
 ## 8. MCP Integration
 
-One `NoteMcpServer` registry exposes 48 tools through both transports. The twelve Markdown-note
+One `NoteMcpServer` registry exposes 52 tools through both transports. The twelve Markdown-note
 tools are `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`, `edit_note`,
 `update_note`, `delete_note`, `list_notes`, `semantic_search`, `put_note_attachment`,
 `get_note_attachment_content`, and `delete_note_attachment`. Explicit label-key catalog management
 remains REST/UI-only.
 
-The exact 36 Org tools are:
+The exact 40 Org tools are:
 
 ```text
 org_list_workspaces       org_create_workspace      org_get_workspace
 org_update_workspace      org_archive_workspace     org_list_documents
-org_get_document          org_put_document           org_move_document
-org_move_item             org_import_workspace       org_export_workspace
+org_get_document          org_put_document           org_create_document
+org_rename_document       org_archive_document       org_restore_document
+org_move_document         org_move_item              org_import_workspace
+org_export_workspace
 org_create_item           org_get_item               org_get_item_context
 org_create_follow_up      org_assign_item            org_schedule_item
 org_query_queue           org_query_agenda           org_claim_item
@@ -499,8 +501,12 @@ unique `operationId`:
 | `PATCH /api/org/workspaces/{workspace_id}` | `org_update_workspace` |
 | `POST /api/org/workspaces/{workspace_id}/archive` | `org_archive_workspace` |
 | `GET /api/org/workspaces/{workspace_id}/documents` | `org_list_documents` |
+| `POST /api/org/workspaces/{workspace_id}/documents` | `org_create_document` |
 | `GET /api/org/documents/{document_id}` | `org_get_document` |
 | `PUT /api/org/documents/{document_id}` | `org_put_document` |
+| `PATCH /api/org/documents/{document_id}/path` | `org_rename_document` |
+| `POST /api/org/documents/{document_id}/archive` | `org_archive_document` |
+| `POST /api/org/documents/{document_id}/restore` | `org_restore_document` |
 | `POST /api/org/documents/{document_id}/move` | `org_move_document` |
 | `POST /api/org/items/{item_id}/move` | `org_move_item` |
 | `POST /api/org/workspaces/{workspace_id}/import` | `org_import_workspace` |
@@ -537,6 +543,21 @@ match. `actor_id` is audit attribution, not an authenticated identity. An identi
 replay returns its durable original result, including after restart; a divergent reuse returns
 `idempotency_conflict` without applying effects.
 
+Document collection reads accept `status=active|archived|all`, default to `active`, and retain the
+legacy alias `include_archived=false|true` for `active|all`. Supplying both is invalid. Filtering
+precedes pagination and status is part of the opaque cursor discriminator. Document list,
+raw-source, and snapshot DTOs carry required-but-nullable `archived_at`.
+
+Create writes an empty active document at revision 1 with the caller-supplied stable UUID and a
+portable, unique lowercase `.org` path. Rename accepts active or archived documents and changes
+only path and revision. Archive/restore toggle `archived_at` and advance revision without changing
+source, content hash, stable identity, or projections. Archived paths stay reserved; renaming an
+archived document releases the old path and reserves the new one. Archive rejects any active
+execution or review lease in the document. Archived documents remain directly readable and
+exportable but are excluded from operational views and counts; unfinished dependencies on their
+items remain blocking. Source/workflow mutation returns `archived_document`, path collisions return
+`document_path_conflict`, and no hard-delete operation exists.
+
 REST success JSON and MCP structured content serialize the same pipeline DTO. Every REST failure
 is `{code, message, details, retryable}` JSON. Invalid input maps to 400, missing requested
 resources to 404, workflow/revision/idempotency/lease conflicts to 409, concurrency limits to 429,
@@ -571,7 +592,9 @@ Document update requires the expected revision; create rejects that option and a
 Workspace update consumes the workspace/document revisions in the exported manifest. The portable
 layout is `manifest.json` plus `documents/<document-uuid>.org`. The manifest carries its format
 version, workspace metadata/policy/revision, and stable document ID, canonical Org path, revision,
-content hash, and relative UUID filename. Import validates path containment, file inventory,
+content hash, nullable `archived_at`, and relative UUID filename. Snapshots include both lifecycle
+states; omission of `archived_at` in a legacy manifest means active, while ordinary document import
+cannot set lifecycle state. Import validates path containment, file inventory,
 uniqueness, hashes, format, and UTF-8 before mutation. Export uses sibling temporary output and an
 atomic `NOREPLACE` rename on Linux, Android, and Apple-vendor targets and never silently overwrites
 a non-empty destination. Windows and other targets without that primitive fail export closed with
@@ -581,13 +604,14 @@ worker, HTTP, or MCP runtime state.
 
 ### 8.3 Org Web Operations Console and Workspace Management
 
-The Yew frontend exposes read-only Org content and operational views plus workspace lifecycle
-management on five client-side routes:
+The Yew frontend exposes read-only Org content and operational views plus workspace and approved
+document-container lifecycle management on six client-side routes:
 
 ```text
 /org
 /org/new
 /org/:workspace_id
+/org/:workspace_id/files
 /org/:workspace_id/settings
 /org/:workspace_id/items/:item_id
 ```
@@ -611,6 +635,16 @@ idempotent operation UUID, and compare-and-swap revisions where applicable. Arch
 remain readable and expose no edit or archive controls; the UI provides neither restore nor hard
 delete.
 
+The files route is the explicit exception to the raw-source read-only boundary. It defaults to the
+active document ledger and offers URL-backed Active/Archived status, opaque cursor, and page-limit
+state. On an active workspace it can create an empty file, rename an active or archived file,
+archive after exact-path confirmation, and restore. It calls only
+`POST /api/org/workspaces/{workspace_id}/documents`,
+`PATCH /api/org/documents/{document_id}/path`, and
+`POST /api/org/documents/{document_id}/archive|restore`; stale revisions preserve the user's draft
+and require an explicit Refresh before deliberate resubmission. Archived workspaces keep the list
+readable but expose none of those controls.
+
 The item route displays the pipeline recovery context and subject-filtered workspace event page,
 including hierarchy, dependencies, readiness/blockers, attempts, sanitized lease status,
 artifacts, origins, weak note links, recovery data, and event sequence. A weak Markdown-note link
@@ -618,10 +652,10 @@ whose note is missing remains visible and is marked **Unavailable**. Workspace-t
 primary; browser-local time is secondary. Invalid timezones or timestamps are explicit
 **Unavailable** values rather than silently using a different zone.
 
-Navigation performs one load and does not poll. Directory, workspace, and item pages have explicit
+Navigation performs one load and does not poll. Directory, workspace, files, and item pages have explicit
 manual Refresh controls plus loading, empty, and structured error states. Outside the three
-workspace lifecycle requests above, the browser issues only same-origin `GET /api/org/...`
-requests: no MCP call, Org source/document mutation, item/claim/transition/review action,
+workspace and four document lifecycle requests above, the browser issues only same-origin
+`GET /api/org/...` requests: no MCP call, raw Org source update, item/claim/transition/review action,
 fencing-token storage/display, or application authentication/session/ACL behavior is present.
 `actor_id` is audit attribution rather than authenticated identity. Agent Note trusts no proxy
 identity header. The front proxy owns TLS, authentication, authorization, Host/origin validation,
@@ -629,7 +663,7 @@ and network restriction.
 
 In development, Trunk's `/api/` proxy forwards REST calls to `note-server` while `/org` remains a
 frontend route. In a packaged build, `NOTE_STATIC_DIR` enables the Axum SPA fallback: direct loads
-and refreshes of all five routes return `index.html` with HTTP 200, but the composed REST router
+and refreshes of all six routes return `index.html` with HTTP 200, but the composed REST router
 claims `/api/org` first and therefore cannot be shadowed by the fallback.
 
 ## 9. Org Orchestration Pipeline
@@ -638,9 +672,9 @@ Org is a separate subsystem from canonical Markdown notes. Org source documents 
 policy are canonical, while ordered events, execution attempts, leases, and idempotent operation
 results are durable runtime data. Work-item projections are derived and rebuildable from canonical
 Org documents without discarding that runtime history. A weak note link may refer to an existing
-Markdown note without changing the note storage contract. Turso schema v5 and PostgreSQL migration
-`0004_org_claims_operational_views.sql` add the lease and operational-query data needed by this
-pipeline.
+Markdown note without changing the note storage contract. Turso schema v7 and PostgreSQL migration
+`0006_org_document_lifecycle.sql` add nullable document archival state after the lease,
+operational-query, and attachment-operation migrations.
 
 All Org commands execute through `note_pipelines::org` with explicit command envelopes, a
 controllable clock, and storage transactions. Source- and workspace-mutating commands also carry
@@ -684,12 +718,17 @@ Archived workspaces remain readable and auditable but reject mutation. Archive a
 workspace with any active lease and accepts no ownership proof. Raw import may change an actively
 leased item only when it supplies and validates that item's exact current proof. Import reuses the
 same lifecycle decisions and typed events as structured commands rather than bypassing fencing.
+Document archive likewise rejects active execution or review leases in that document. It removes
+the document's projections from all operational views without deleting direct history or making an
+unfinished dependency appear satisfied; restore makes the same IDs eligible again.
 
 Delivery Slice 6 exposes Org through 36 matching MCP and REST/OpenAPI operations plus four
 storage-only offline commands where applicable. Delivery Slice 7 adds the read-only Org-content
 and operations console defined in §8.3. The workspace-management slice adds only browser create,
 structured update, and reversible archive, with explicit manual refresh and no Org source/workflow
-mutation, session, or polling behavior. Actor IDs are asserted audit attribution, not authenticated
+mutation, session, or polling behavior. The document-lifecycle slice extends the current transport
+inventory to 40 matching operations and adds only empty create, path rename, reversible archive,
+and restore to the browser; raw source editing and workflow actions remain read-only. Actor IDs are asserted audit attribution, not authenticated
 identity.
 Agent Note implements no inbound authentication, authorization, trusted proxy-identity protocol,
 or workspace ACL. A front proxy owns TLS, authentication, authorization, Host/origin validation,

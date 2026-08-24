@@ -386,7 +386,7 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn encode_query(pairs: &[(&str, String)]) -> String {
+pub(crate) fn encode_query(pairs: &[(&str, String)]) -> String {
     pairs
         .iter()
         .map(|(key, value)| {

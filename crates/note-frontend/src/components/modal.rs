@@ -1,5 +1,123 @@
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{closure::Closure, JsCast};
 use yew::prelude::*;
+
+const FOCUSABLE_SELECTOR: &str = concat!(
+    "a[href]:not([aria-disabled=\"true\"]):not([hidden]),",
+    "button:not([disabled]):not([hidden]),",
+    "input:not([disabled]):not([type=\"hidden\"]):not([hidden]),",
+    "select:not([disabled]):not([hidden]),",
+    "textarea:not([disabled]):not([hidden]),",
+    "[tabindex]:not([tabindex=\"-1\"]):not([hidden])"
+);
+const TOPMOST_MODAL_SELECTOR: &str = "[role=\"dialog\"][aria-modal=\"true\"]";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusTrapAction {
+    None,
+    FocusPanel,
+    FocusFirst,
+    FocusLast,
+}
+
+fn focus_trap_action(
+    key: &str,
+    shift_key: bool,
+    active_index: Option<usize>,
+    focusable_count: usize,
+) -> FocusTrapAction {
+    if key != "Tab" {
+        return FocusTrapAction::None;
+    }
+    if focusable_count == 0 {
+        return FocusTrapAction::FocusPanel;
+    }
+    match (shift_key, active_index) {
+        (true, None | Some(0)) => FocusTrapAction::FocusLast,
+        (false, None) => FocusTrapAction::FocusFirst,
+        (false, Some(index)) if index + 1 == focusable_count => FocusTrapAction::FocusFirst,
+        _ => FocusTrapAction::None,
+    }
+}
+
+fn element_is_focusable(element: &web_sys::HtmlElement) -> bool {
+    element.matches(FOCUSABLE_SELECTOR).unwrap_or(false)
+        && element.get_attribute("aria-hidden").as_deref() != Some("true")
+        && (element.offset_width() > 0 || element.offset_height() > 0)
+}
+
+fn focusable_elements(panel: &web_sys::HtmlElement) -> Vec<web_sys::HtmlElement> {
+    let Ok(nodes) = panel.query_selector_all(FOCUSABLE_SELECTOR) else {
+        return Vec::new();
+    };
+    (0..nodes.length())
+        .filter_map(|index| nodes.item(index))
+        .filter_map(|node| node.dyn_into::<web_sys::HtmlElement>().ok())
+        .filter(element_is_focusable)
+        .collect()
+}
+
+fn is_topmost_dialog_index(panel_index: Option<usize>, dialog_count: usize) -> bool {
+    panel_index.is_some_and(|index| dialog_count.checked_sub(1) == Some(index))
+}
+
+fn panel_is_topmost(panel: &web_sys::HtmlElement) -> bool {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return false;
+    };
+    let Ok(dialogs) = document.query_selector_all(TOPMOST_MODAL_SELECTOR) else {
+        return false;
+    };
+    let panel: &web_sys::Element = panel.as_ref();
+    let panel_index = (0..dialogs.length()).position(|index| {
+        dialogs
+            .item(index)
+            .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+            .as_ref()
+            .is_some_and(|dialog| dialog == panel)
+    });
+    is_topmost_dialog_index(panel_index, dialogs.length() as usize)
+}
+
+fn handle_modal_keydown(
+    event: &web_sys::KeyboardEvent,
+    panel: &web_sys::HtmlElement,
+    on_close: &Callback<()>,
+) {
+    if !panel_is_topmost(panel) {
+        return;
+    }
+    if event.key() == "Escape" {
+        event.prevent_default();
+        on_close.emit(());
+        return;
+    }
+    if event.key() != "Tab" {
+        return;
+    }
+    let focusable = focusable_elements(panel);
+    let active = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.active_element());
+    let active_index = focusable.iter().position(|element| {
+        let element: &web_sys::Element = element.as_ref();
+        active.as_ref().is_some_and(|active| active == element)
+    });
+    let target = match focus_trap_action(
+        &event.key(),
+        event.shift_key(),
+        active_index,
+        focusable.len(),
+    ) {
+        FocusTrapAction::None => None,
+        FocusTrapAction::FocusPanel => Some(panel),
+        FocusTrapAction::FocusFirst => focusable.first(),
+        FocusTrapAction::FocusLast => focusable.last(),
+    };
+    if let Some(target) = target {
+        event.prevent_default();
+        let _ = target.focus();
+    }
+}
 
 #[derive(Properties, PartialEq)]
 pub struct ModalProps {
@@ -7,90 +125,6 @@ pub struct ModalProps {
     /// Called when the user dismisses the modal (backdrop click or Cancel).
     pub on_close: Callback<()>,
     pub children: Children,
-}
-
-const FOCUSABLE_SELECTOR: &str = "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex=\"-1\"])";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FocusWrapTarget {
-    Panel,
-    First,
-    Last,
-    None,
-}
-
-fn focus_wrap_target(
-    focusable_count: usize,
-    active_index: Option<usize>,
-    shift_pressed: bool,
-) -> FocusWrapTarget {
-    if focusable_count == 0 {
-        return FocusWrapTarget::Panel;
-    }
-
-    match active_index {
-        None if shift_pressed => FocusWrapTarget::Last,
-        None => FocusWrapTarget::First,
-        Some(0) if shift_pressed => FocusWrapTarget::Last,
-        Some(index) if index + 1 == focusable_count => FocusWrapTarget::First,
-        _ => FocusWrapTarget::None,
-    }
-}
-
-fn focusable_descendants(panel: &web_sys::HtmlElement) -> Vec<web_sys::HtmlElement> {
-    panel
-        .query_selector_all(FOCUSABLE_SELECTOR)
-        .ok()
-        .into_iter()
-        .flat_map(|nodes| (0..nodes.length()).filter_map(move |index| nodes.item(index)))
-        .filter_map(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
-        .collect()
-}
-
-fn active_focusable_index(focusables: &[web_sys::HtmlElement]) -> Option<usize> {
-    let active = web_sys::window()?.document()?.active_element()?;
-    let same_element = |focusable: &web_sys::HtmlElement| {
-        let focusable: &web_sys::Element = focusable.as_ref();
-        focusable == &active
-    };
-
-    if focusables.first().is_some_and(same_element) {
-        return Some(0);
-    }
-    if focusables.last().is_some_and(same_element) {
-        return Some(focusables.len().saturating_sub(1));
-    }
-
-    focusables.iter().position(same_element)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tab_from_last_focusable_wraps_to_first() {
-        assert_eq!(focus_wrap_target(3, Some(2), false), FocusWrapTarget::First);
-    }
-
-    #[test]
-    fn shift_tab_from_first_focusable_wraps_to_last() {
-        assert_eq!(focus_wrap_target(3, Some(0), true), FocusWrapTarget::Last);
-    }
-
-    #[test]
-    fn middle_focusable_does_not_intercept_tab() {
-        assert_eq!(focus_wrap_target(3, Some(1), false), FocusWrapTarget::None);
-        assert_eq!(focus_wrap_target(3, Some(1), true), FocusWrapTarget::None);
-    }
-
-    #[test]
-    fn empty_panel_keeps_focus_on_the_panel_and_single_control_wraps_safely() {
-        assert_eq!(focus_wrap_target(0, None, false), FocusWrapTarget::Panel);
-        assert_eq!(focus_wrap_target(0, None, true), FocusWrapTarget::Panel);
-        assert_eq!(focus_wrap_target(1, Some(0), false), FocusWrapTarget::First);
-        assert_eq!(focus_wrap_target(1, Some(0), true), FocusWrapTarget::Last);
-    }
 }
 
 /// A centered overlay dialog, styled entirely with app.css (`.app-modal-*`). The classes are
@@ -105,10 +139,20 @@ pub fn modal(props: &ModalProps) -> Html {
     {
         let panel_ref = panel_ref.clone();
         use_effect_with((), move |_| {
+            let opener = web_sys::window()
+                .and_then(|window| window.document())
+                .and_then(|document| document.active_element())
+                .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok());
             if let Some(panel) = panel_ref.cast::<web_sys::HtmlElement>() {
                 let _ = panel.focus();
             }
-            || ()
+            move || {
+                if let Some(opener) = opener {
+                    if opener.is_connected() && element_is_focusable(&opener) {
+                        let _ = opener.focus();
+                    }
+                }
+            }
         });
     }
 
@@ -128,48 +172,40 @@ pub fn modal(props: &ModalProps) -> Html {
             }
         })
     };
-    let on_keydown = {
-        let on_close = props.on_close.clone();
+    {
         let panel_ref = panel_ref.clone();
-        Callback::from(move |event: KeyboardEvent| {
-            if event.key() == "Escape" {
-                event.prevent_default();
-                on_close.emit(());
-                return;
-            }
-            if event.key() != "Tab" {
-                return;
-            }
-            let Some(panel) = panel_ref.cast::<web_sys::HtmlElement>() else {
-                return;
-            };
-            let focusables = focusable_descendants(&panel);
-            let target = focus_wrap_target(
-                focusables.len(),
-                active_focusable_index(&focusables),
-                event.shift_key(),
-            );
-            match target {
-                FocusWrapTarget::Panel => {
-                    event.prevent_default();
-                    let _ = panel.focus();
-                }
-                FocusWrapTarget::First => {
-                    event.prevent_default();
-                    if let Some(first) = focusables.first() {
-                        let _ = first.focus();
+        use_effect_with(props.on_close.clone(), move |on_close| {
+            let listener = web_sys::window()
+                .and_then(|window| window.document())
+                .map(|document| {
+                    let panel_ref = panel_ref.clone();
+                    let on_close = on_close.clone();
+                    let listener =
+                        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |event| {
+                            if let Some(panel) = panel_ref.cast::<web_sys::HtmlElement>() {
+                                handle_modal_keydown(&event, &panel, &on_close);
+                            }
+                        });
+                    let registered = document
+                        .add_event_listener_with_callback(
+                            "keydown",
+                            listener.as_ref().unchecked_ref(),
+                        )
+                        .is_ok();
+                    (document, listener, registered)
+                });
+            move || {
+                if let Some((document, listener, registered)) = listener {
+                    if registered {
+                        let _ = document.remove_event_listener_with_callback(
+                            "keydown",
+                            listener.as_ref().unchecked_ref(),
+                        );
                     }
                 }
-                FocusWrapTarget::Last => {
-                    event.prevent_default();
-                    if let Some(last) = focusables.last() {
-                        let _ = last.focus();
-                    }
-                }
-                FocusWrapTarget::None => {}
             }
-        })
-    };
+        });
+    }
 
     html! {
         <div ref={backdrop_ref} class="app-modal-backdrop" onclick={on_backdrop}>
@@ -180,7 +216,6 @@ pub fn modal(props: &ModalProps) -> Html {
                 aria-modal="true"
                 aria-labelledby="app-modal-title"
                 tabindex="-1"
-                onkeydown={on_keydown}
             >
                 <h2 id="app-modal-title" class="app-modal-title">{ props.title.clone() }</h2>
                 <div class="app-modal-body">
@@ -188,5 +223,90 @@ pub fn modal(props: &ModalProps) -> Html {
                 </div>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_key_wraps_at_focusable_endpoints_and_from_the_panel() {
+        assert_eq!(
+            focus_trap_action("Tab", false, Some(2), 3),
+            FocusTrapAction::FocusFirst
+        );
+        assert_eq!(
+            focus_trap_action("Tab", true, Some(0), 3),
+            FocusTrapAction::FocusLast
+        );
+        assert_eq!(
+            focus_trap_action("Tab", false, None, 3),
+            FocusTrapAction::FocusFirst
+        );
+        assert_eq!(
+            focus_trap_action("Tab", true, None, 3),
+            FocusTrapAction::FocusLast
+        );
+        assert_eq!(
+            focus_trap_action("Tab", false, Some(1), 3),
+            FocusTrapAction::None
+        );
+        assert_eq!(
+            focus_trap_action("Tab", true, Some(1), 3),
+            FocusTrapAction::None
+        );
+        assert_eq!(
+            focus_trap_action("Enter", false, Some(2), 3),
+            FocusTrapAction::None
+        );
+        assert_eq!(
+            focus_trap_action("Tab", false, None, 0),
+            FocusTrapAction::FocusPanel
+        );
+        assert_eq!(
+            focus_trap_action("Tab", true, None, 0),
+            FocusTrapAction::FocusPanel
+        );
+        assert_eq!(
+            focus_trap_action("Enter", false, None, 0),
+            FocusTrapAction::None
+        );
+    }
+
+    #[test]
+    fn only_the_last_mounted_modal_is_topmost() {
+        assert!(is_topmost_dialog_index(Some(0), 1));
+        assert!(is_topmost_dialog_index(Some(1), 2));
+        assert!(!is_topmost_dialog_index(Some(0), 2));
+        assert!(!is_topmost_dialog_index(None, 2));
+        assert!(!is_topmost_dialog_index(Some(0), 0));
+    }
+
+    #[test]
+    fn modal_source_captures_and_restores_the_opener_and_scopes_focusables() {
+        let source = include_str!("modal.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let capture = source.find("document.active_element()").unwrap();
+        let panel_focus = source.find("panel.focus()").unwrap();
+        assert!(capture < panel_focus);
+        assert!(source.contains("if opener.is_connected() && element_is_focusable(&opener)"));
+        assert!(source.contains("let _ = opener.focus()"));
+        assert!(source.contains("panel.query_selector_all(FOCUSABLE_SELECTOR)"));
+        assert!(source.contains("FocusTrapAction::FocusPanel => Some(panel)"));
+        assert!(source.contains("add_event_listener_with_callback("));
+        assert!(source.contains("remove_event_listener_with_callback("));
+        assert!(!source.contains("onkeydown={on_keydown}"));
+        assert!(source.contains("query_selector_all(TOPMOST_MODAL_SELECTOR)"));
+        let handler = source.split("fn handle_modal_keydown").nth(1).unwrap();
+        assert!(
+            handler.find("if !panel_is_topmost(panel)").unwrap()
+                < handler.find("event.key() == \"Escape\"").unwrap()
+        );
+        assert!(source.contains("event.key() == \"Escape\""));
+        assert!(source.contains("event.prevent_default()"));
+        assert!(source.contains("clicked_backdrop"));
     }
 }

@@ -5,11 +5,12 @@ use note_storage::{
     CompareAndSwap, ConditionalUpdate, ExpiredOrgLeaseClosure, NewOrgAttempt,
     NewOrgAttemptAllocation, NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace,
     OrgArtifactReference, OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate,
-    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEventType,
-    OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind, OrgLeaseOwnershipMove,
-    OrgLeaseProof, OrgOperationalQuery, OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker,
-    OrgReviewLeaseMarker, OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StoredOrgOperation,
-    StoredOrgTimestamp, TransactionMode,
+    OrgDocumentLifecycleUpdate, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult,
+    OrgDocumentUpdate, OrgEventType, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat,
+    OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof, OrgOperationalCounts, OrgOperationalQuery,
+    OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker, OrgReviewLeaseMarker,
+    OrgWorkspaceUpdate, StorageBackend, StorageErrorKind, StoredOrgOperation, StoredOrgTimestamp,
+    TransactionMode,
 };
 use serde_json::json;
 use std::str::FromStr as _;
@@ -1027,7 +1028,243 @@ pub(crate) async fn run(storage: Arc<dyn StorageBackend>) {
         ]
     );
 
+    run_document_lifecycle_contracts(storage.clone()).await;
     run_workflow_audit_contracts(storage).await;
+}
+
+async fn run_document_lifecycle_contracts(storage: Arc<dyn StorageBackend>) {
+    let workspace = workspace_id("24000000-0000-4000-8000-000000000001");
+    let document = document_id("24100000-0000-4000-8000-000000000001");
+    let reserved_document = document_id("24100000-0000-4000-8000-000000000002");
+    let projected = projected_item(
+        work_item_id("24200000-0000-4000-8000-000000000001"),
+        workspace,
+        document,
+        None,
+        0,
+        "Lifecycle projection",
+    );
+    let policy = WorkspacePolicy::engineering_default();
+    let session = storage.session().await.unwrap();
+    session
+        .insert_org_workspace(NewOrgWorkspace {
+            id: workspace,
+            slug: "document-lifecycle",
+            display_name: "Document lifecycle",
+            description: "document lifecycle storage contract",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            now: 100,
+        })
+        .await
+        .unwrap();
+    session
+        .insert_org_document(NewOrgDocument {
+            id: document,
+            workspace_id: workspace,
+            path: "lifecycle.org",
+            source: "* TODO Lifecycle",
+            content_hash: "lifecycle-hash",
+            now: 101,
+        })
+        .await
+        .unwrap();
+    session
+        .insert_org_document(NewOrgDocument {
+            id: reserved_document,
+            workspace_id: workspace,
+            path: "reserved-active.org",
+            source: "* TODO Reserved",
+            content_hash: "reserved-hash",
+            now: 102,
+        })
+        .await
+        .unwrap();
+    session
+        .replace_org_document_projection(document, std::slice::from_ref(&projected))
+        .await
+        .unwrap();
+
+    let original = session.get_org_document(document).await.unwrap().unwrap();
+    let reserved_original = session
+        .get_org_document(reserved_document)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.archived_at, None);
+    let assert_content_identity = |actual: &note_storage::OrgDocument| {
+        assert_eq!(actual.id, original.id);
+        assert_eq!(actual.workspace_id, original.workspace_id);
+        assert_eq!(actual.source, original.source);
+        assert_eq!(actual.content_hash, original.content_hash);
+        assert_eq!(actual.created_at, original.created_at);
+    };
+
+    let CompareAndSwap::Applied(renamed) = session
+        .compare_and_swap_org_document_lifecycle(OrgDocumentLifecycleUpdate {
+            id: document,
+            expected_revision: 1,
+            expected_archived_at: None,
+            path: "lifecycle-renamed.org",
+            archived_at: None,
+            updated_at: 110,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("active document rename should apply");
+    };
+    assert_content_identity(&renamed);
+    assert_eq!(renamed.path, "lifecycle-renamed.org");
+    assert_eq!(renamed.revision, 2);
+    assert_eq!(renamed.updated_at, 110);
+    assert_eq!(renamed.archived_at, None);
+    assert_eq!(
+        session
+            .list_org_document_projection(document)
+            .await
+            .unwrap(),
+        vec![projected.clone()]
+    );
+
+    let archived_at = 120;
+    let CompareAndSwap::Applied(archived) = session
+        .compare_and_swap_org_document_lifecycle(OrgDocumentLifecycleUpdate {
+            id: document,
+            expected_revision: 2,
+            expected_archived_at: None,
+            path: "lifecycle-renamed.org",
+            archived_at: Some(archived_at),
+            updated_at: archived_at,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("active document archive should apply");
+    };
+    assert_content_identity(&archived);
+    assert_eq!(archived.path, renamed.path);
+    assert_eq!(archived.revision, 3);
+    assert_eq!(archived.updated_at, archived_at);
+    assert_eq!(archived.archived_at, Some(archived_at));
+    assert_eq!(
+        session
+            .list_org_document_projection(document)
+            .await
+            .unwrap(),
+        vec![projected.clone()]
+    );
+
+    for update in [
+        OrgDocumentLifecycleUpdate {
+            id: document,
+            expected_revision: 2,
+            expected_archived_at: Some(archived_at),
+            path: "stale-lifecycle.org",
+            archived_at: None,
+            updated_at: 121,
+        },
+        OrgDocumentLifecycleUpdate {
+            id: document,
+            expected_revision: 3,
+            expected_archived_at: None,
+            path: "wrong-archive-state.org",
+            archived_at: None,
+            updated_at: 122,
+        },
+    ] {
+        assert_eq!(
+            session
+                .compare_and_swap_org_document_lifecycle(update)
+                .await
+                .unwrap(),
+            CompareAndSwap::Conflict {
+                current_revision: 3
+            }
+        );
+        assert_eq!(
+            session.get_org_document(document).await.unwrap(),
+            Some(archived.clone())
+        );
+    }
+
+    let duplicate_archived_path = session
+        .insert_org_document(NewOrgDocument {
+            id: document_id("24100000-0000-4000-8000-000000000003"),
+            workspace_id: workspace,
+            path: "lifecycle-renamed.org",
+            source: "duplicate archived path",
+            content_hash: "duplicate-archived-path",
+            now: 123,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate_archived_path.kind(), StorageErrorKind::Constraint);
+
+    let rename_into_archived_path = session
+        .compare_and_swap_org_document_lifecycle(OrgDocumentLifecycleUpdate {
+            id: reserved_document,
+            expected_revision: 1,
+            expected_archived_at: None,
+            path: "lifecycle-renamed.org",
+            archived_at: None,
+            updated_at: 124,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        rename_into_archived_path.kind(),
+        StorageErrorKind::Constraint
+    );
+    assert_eq!(
+        session.get_org_document(reserved_document).await.unwrap(),
+        Some(reserved_original)
+    );
+
+    let rename_into_active_path = session
+        .compare_and_swap_org_document_lifecycle(OrgDocumentLifecycleUpdate {
+            id: document,
+            expected_revision: 3,
+            expected_archived_at: Some(archived_at),
+            path: "reserved-active.org",
+            archived_at: Some(archived_at),
+            updated_at: 125,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(rename_into_active_path.kind(), StorageErrorKind::Constraint);
+    assert_eq!(
+        session.get_org_document(document).await.unwrap(),
+        Some(archived.clone())
+    );
+
+    let CompareAndSwap::Applied(restored) = session
+        .compare_and_swap_org_document_lifecycle(OrgDocumentLifecycleUpdate {
+            id: document,
+            expected_revision: 3,
+            expected_archived_at: Some(archived_at),
+            path: "lifecycle-renamed.org",
+            archived_at: None,
+            updated_at: 130,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("archived document restore should apply");
+    };
+    assert_content_identity(&restored);
+    assert_eq!(restored.path, archived.path);
+    assert_eq!(restored.revision, 4);
+    assert_eq!(restored.updated_at, 130);
+    assert_eq!(restored.archived_at, None);
+    assert_eq!(
+        session
+            .list_org_document_projection(document)
+            .await
+            .unwrap(),
+        vec![projected]
+    );
 }
 
 async fn run_workflow_audit_contracts(storage: Arc<dyn StorageBackend>) {
@@ -2670,6 +2907,298 @@ async fn run_operational_ready_contract(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap()
         .is_none());
+
+    let active_document = document_id("1b000000-0000-0000-0000-000000000002");
+    let active_ready_id = work_item_id("1c000000-0000-0000-0000-000000000018");
+    session
+        .insert_org_document(NewOrgDocument {
+            id: active_document,
+            workspace_id: workspace,
+            path: "operational-active.org",
+            source: "* READY Active document item",
+            content_hash: "operational-active-hash",
+            now: 1_300,
+        })
+        .await
+        .unwrap();
+    let mut active_ready = projected_item(
+        active_ready_id,
+        workspace,
+        active_document,
+        None,
+        0,
+        "Active document item",
+    );
+    active_ready.state = Some("READY".into());
+    active_ready.assignee = None;
+    active_ready.priority = None;
+    session
+        .replace_org_document_projection(active_document, &[active_ready])
+        .await
+        .unwrap();
+    let CompareAndSwap::Applied(archived_document_record) = session
+        .compare_and_swap_org_document_lifecycle(OrgDocumentLifecycleUpdate {
+            id: document,
+            expected_revision: 1,
+            expected_archived_at: None,
+            path: "operational-ready.org",
+            archived_at: Some(1_300),
+            updated_at: 1_300,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("operational fixture document archive should apply");
+    };
+    assert_eq!(archived_document_record.archived_at, Some(1_300));
+    assert_eq!(
+        session.get_org_document(document).await.unwrap(),
+        Some(archived_document_record.clone())
+    );
+    assert!(session
+        .list_org_documents(workspace)
+        .await
+        .unwrap()
+        .iter()
+        .any(|stored| stored.id == document && stored.archived_at == Some(1_300)));
+    let workspace_projection = session
+        .list_org_workspace_projection(workspace)
+        .await
+        .unwrap();
+    assert!(workspace_projection
+        .iter()
+        .any(|item| item.document_id == document));
+    assert!(workspace_projection
+        .iter()
+        .any(|item| item.document_id == active_document));
+
+    let operational_workspace_ids = [workspace];
+    for view in OrgOperationalView::ALL {
+        for include_archived in [false, true] {
+            let mut query = operational_query(view, &operational_workspace_ids, 1_300);
+            query.include_archived = include_archived;
+            let rows = session.query_org_operational(query).await.unwrap();
+            assert!(
+                rows.iter()
+                    .all(|row| row.item.document_id != archived_document_record.id),
+                "archived document leaked into {view:?} with include_archived={include_archived}"
+            );
+            if view == OrgOperationalView::Ready {
+                assert_eq!(
+                    rows.iter().map(|row| row.item.id).collect::<Vec<_>>(),
+                    vec![active_ready_id]
+                );
+            } else {
+                assert!(rows.is_empty(), "unexpected active rows in {view:?}");
+            }
+        }
+    }
+    assert_eq!(
+        session
+            .get_org_workspace_operational_summary(workspace, 1_300)
+            .await
+            .unwrap()
+            .unwrap()
+            .counts,
+        OrgOperationalCounts {
+            ready: 1,
+            assigned: 0,
+            running: 0,
+            blocked: 0,
+            review: 0,
+            scheduled: 0,
+            upcoming_deadline: 0,
+            failed: 0,
+            expired_lease: 0,
+            completed: 0,
+        }
+    );
+
+    run_archived_document_capacity_contract(storage).await;
+}
+
+async fn run_archived_document_capacity_contract(storage: Arc<dyn StorageBackend>) {
+    let workspace = workspace_id("25000000-0000-4000-8000-000000000001");
+    let active_document = document_id("25100000-0000-4000-8000-000000000001");
+    let leased_document = document_id("25100000-0000-4000-8000-000000000002");
+    let active_item_id = work_item_id("25200000-0000-4000-8000-000000000001");
+    let leased_item_id = work_item_id("25200000-0000-4000-8000-000000000002");
+    let workspace_ids = [workspace];
+    let now = 2_000;
+    let mut policy = WorkspacePolicy::engineering_default();
+    policy.concurrency_limit = 1;
+    let session = storage.session().await.unwrap();
+
+    session
+        .insert_org_workspace(NewOrgWorkspace {
+            id: workspace,
+            slug: "archived-document-capacity",
+            display_name: "Archived document capacity",
+            description: "archived document leases are operationally inert",
+            timezone: "UTC",
+            policy_schema_version: 1,
+            policy: &policy,
+            now,
+        })
+        .await
+        .unwrap();
+    for (id, path, source, hash) in [
+        (
+            active_document,
+            "capacity-active.org",
+            "* READY Active item",
+            "capacity-active-hash",
+        ),
+        (
+            leased_document,
+            "capacity-leased.org",
+            "* RUNNING Leased item",
+            "capacity-leased-hash",
+        ),
+    ] {
+        session
+            .insert_org_document(NewOrgDocument {
+                id,
+                workspace_id: workspace,
+                path,
+                source,
+                content_hash: hash,
+                now,
+            })
+            .await
+            .unwrap();
+    }
+    let mut active_item = projected_item(
+        active_item_id,
+        workspace,
+        active_document,
+        None,
+        0,
+        "Active item",
+    );
+    active_item.state = Some("READY".into());
+    active_item.assignee = None;
+    active_item.priority = None;
+    let mut leased_item = projected_item(
+        leased_item_id,
+        workspace,
+        leased_document,
+        None,
+        0,
+        "Leased item",
+    );
+    leased_item.state = Some("RUNNING".into());
+    leased_item.assignee = Some("capacity-agent".into());
+    session
+        .replace_org_document_projection(active_document, &[active_item])
+        .await
+        .unwrap();
+    session
+        .replace_org_document_projection(leased_document, &[leased_item])
+        .await
+        .unwrap();
+
+    let baseline_rows = session
+        .query_org_operational(operational_query(
+            OrgOperationalView::Ready,
+            &workspace_ids,
+            now,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        baseline_rows
+            .iter()
+            .map(|row| row.item.id)
+            .collect::<Vec<_>>(),
+        vec![active_item_id]
+    );
+    let baseline_ready = session
+        .get_org_workspace_operational_summary(workspace, now)
+        .await
+        .unwrap()
+        .unwrap()
+        .counts
+        .ready;
+    assert_eq!(baseline_ready, 1);
+
+    session
+        .insert_org_attempt(NewOrgAttempt {
+            id: "archived-document-capacity-attempt",
+            workspace_id: workspace,
+            work_item_id: leased_item_id,
+            attempt_number: 1,
+            actor_id: "capacity-agent",
+            status: OrgAttemptStatus::Running,
+            started_at: now,
+            note_refs: &[],
+            artifacts: &[],
+            metadata: &json!({}),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        session
+            .insert_org_lease_if_capacity(
+                NewOrgLease {
+                    id: "archived-document-capacity-lease",
+                    workspace_id: workspace,
+                    work_item_id: leased_item_id,
+                    attempt_id: "archived-document-capacity-attempt",
+                    kind: OrgLeaseKind::Execution,
+                    actor_id: "capacity-agent",
+                    fencing_token_hash:
+                        "5050505050505050505050505050505050505050505050505050505050505050",
+                    acquired_at: now,
+                    last_heartbeat_at: now,
+                    expires_at: now + 100,
+                },
+                1,
+                now,
+            )
+            .await
+            .unwrap(),
+        ConditionalUpdate::Applied(_)
+    ));
+    assert!(matches!(
+        session
+            .compare_and_swap_org_document_lifecycle(OrgDocumentLifecycleUpdate {
+                id: leased_document,
+                expected_revision: 1,
+                expected_archived_at: None,
+                path: "capacity-leased.org",
+                archived_at: Some(now + 1),
+                updated_at: now + 1,
+            })
+            .await
+            .unwrap(),
+        CompareAndSwap::Applied(_)
+    ));
+
+    let ready_rows = session
+        .query_org_operational(operational_query(
+            OrgOperationalView::Ready,
+            &workspace_ids,
+            now,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        ready_rows.iter().map(|row| row.item.id).collect::<Vec<_>>(),
+        vec![active_item_id],
+        "an open lease owned by an archived document must not consume workspace capacity"
+    );
+    assert_eq!(
+        session
+            .get_org_workspace_operational_summary(workspace, now)
+            .await
+            .unwrap()
+            .unwrap()
+            .counts
+            .ready,
+        baseline_ready,
+        "archiving a leased document must not change the active document Ready count"
+    );
 }
 
 async fn run_lease_and_attempt_contracts(storage: Arc<dyn StorageBackend>) {

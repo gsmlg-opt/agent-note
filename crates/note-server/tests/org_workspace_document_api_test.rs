@@ -381,14 +381,14 @@ async fn document_routes_preserve_raw_bytes_import_export_moves_and_archived_rea
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(archived_raw["source"].as_str().unwrap().contains(ITEM_ID));
-    let (_, hidden_documents) = api
+    let (_, active_documents) = api
         .call(
             Method::GET,
             &format!("/api/org/workspaces/{WORKSPACE_B}/documents?limit=50"),
             None,
         )
         .await;
-    assert_eq!(hidden_documents["items"], json!([]));
+    assert_eq!(active_documents["items"].as_array().unwrap().len(), 2);
     let (_, visible_documents) = api
         .call(
             Method::GET,
@@ -658,6 +658,356 @@ async fn document_mutations_accept_valid_item_keyed_fencing_token_maps() {
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(result["document_revisions"][DOCUMENT_A], 3);
     assert!(!result.to_string().contains(&raw_token));
+}
+
+#[tokio::test]
+async fn document_lifecycle_routes_cover_filters_replays_and_conflicts() {
+    let api = TestApp::new().await;
+    api.call(
+        Method::POST,
+        "/api/org/workspaces",
+        Some(create_workspace(WORKSPACE_A, "lifecycle-workspace")),
+    )
+    .await;
+
+    let create_a = with_fields(
+        envelope("create-document-a"),
+        &[
+            ("document_id", json!(DOCUMENT_A)),
+            ("path", json!("tasks/first.org")),
+        ],
+    );
+    let (status, created_a) = api
+        .call(
+            Method::POST,
+            &format!("/api/org/workspaces/{WORKSPACE_A}/documents"),
+            Some(create_a.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created_a["document_revisions"][DOCUMENT_A], 1);
+    assert_eq!(created_a["data"]["document_id"], DOCUMENT_A);
+    assert_eq!(created_a["data"]["path"], "tasks/first.org");
+    assert_eq!(created_a["data"]["archived_at"], Value::Null);
+
+    let events_after_create = api.events(WORKSPACE_A).await;
+    let (status, replayed) = api
+        .call(
+            Method::POST,
+            &format!("/api/org/workspaces/{WORKSPACE_A}/documents"),
+            Some(create_a),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replayed, created_a);
+    assert_eq!(api.events(WORKSPACE_A).await, events_after_create);
+    let (_, empty_source) = api
+        .call(
+            Method::GET,
+            &format!("/api/org/documents/{DOCUMENT_A}?workspace_id={WORKSPACE_A}"),
+            None,
+        )
+        .await;
+    assert_eq!(empty_source["source"], "");
+    assert_eq!(empty_source["revision"], 1);
+
+    let create_b = with_fields(
+        envelope("create-document-b"),
+        &[
+            ("document_id", json!(DOCUMENT_B)),
+            ("path", json!("tasks/second.org")),
+        ],
+    );
+    let (status, _) = api
+        .call(
+            Method::POST,
+            &format!("/api/org/workspaces/{WORKSPACE_A}/documents"),
+            Some(create_b),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rename = with_fields(
+        envelope("rename-document-a"),
+        &[
+            ("workspace_id", json!(WORKSPACE_A)),
+            ("new_path", json!("tasks/renamed.org")),
+            ("expected_revision", json!(1)),
+        ],
+    );
+    let (status, renamed) = api
+        .call(
+            Method::PATCH,
+            &format!("/api/org/documents/{DOCUMENT_A}/path"),
+            Some(rename),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed["document_revisions"][DOCUMENT_A], 2);
+    assert_eq!(renamed["data"]["path"], "tasks/renamed.org");
+
+    let stale = with_fields(
+        envelope("stale-rename"),
+        &[
+            ("workspace_id", json!(WORKSPACE_A)),
+            ("new_path", json!("tasks/stale.org")),
+            ("expected_revision", json!(1)),
+        ],
+    );
+    let (status, error) = api
+        .call(
+            Method::PATCH,
+            &format!("/api/org/documents/{DOCUMENT_A}/path"),
+            Some(stale),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "stale_revision");
+    assert!(!error.to_string().contains("fencing"));
+
+    let conflict = with_fields(
+        envelope("path-conflict"),
+        &[
+            ("workspace_id", json!(WORKSPACE_A)),
+            ("new_path", json!("tasks/renamed.org")),
+            ("expected_revision", json!(1)),
+        ],
+    );
+    let (status, error) = api
+        .call(
+            Method::PATCH,
+            &format!("/api/org/documents/{DOCUMENT_B}/path"),
+            Some(conflict),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "document_path_conflict");
+    assert_eq!(error["details"]["path"], "tasks/renamed.org");
+    assert!(!error.to_string().contains("fencing"));
+
+    let archive = with_fields(
+        envelope("archive-document-a"),
+        &[
+            ("workspace_id", json!(WORKSPACE_A)),
+            ("expected_revision", json!(2)),
+        ],
+    );
+    let (status, archived) = api
+        .call(
+            Method::POST,
+            &format!("/api/org/documents/{DOCUMENT_A}/archive"),
+            Some(archive),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(archived["document_revisions"][DOCUMENT_A], 3);
+    assert_eq!(archived["data"]["archived_at"], NOW);
+
+    let (_, active) = api
+        .call(
+            Method::GET,
+            &format!("/api/org/workspaces/{WORKSPACE_A}/documents?status=active&limit=1"),
+            None,
+        )
+        .await;
+    assert_eq!(active["items"].as_array().unwrap().len(), 1);
+    assert_eq!(active["items"][0]["id"], DOCUMENT_B);
+    assert_eq!(active["next_cursor"], Value::Null);
+    let (_, default_active) = api
+        .call(
+            Method::GET,
+            &format!("/api/org/workspaces/{WORKSPACE_A}/documents?limit=1"),
+            None,
+        )
+        .await;
+    assert_eq!(default_active, active);
+    let (_, archived_list) = api
+        .call(
+            Method::GET,
+            &format!("/api/org/workspaces/{WORKSPACE_A}/documents?status=archived&limit=50"),
+            None,
+        )
+        .await;
+    assert_eq!(archived_list["items"].as_array().unwrap().len(), 1);
+    assert_eq!(archived_list["items"][0]["id"], DOCUMENT_A);
+    assert_eq!(archived_list["items"][0]["archived_at"], NOW);
+    for query in ["status=all", "include_archived=true"] {
+        let (_, all) = api
+            .call(
+                Method::GET,
+                &format!("/api/org/workspaces/{WORKSPACE_A}/documents?{query}&limit=50"),
+                None,
+            )
+            .await;
+        assert_eq!(all["items"].as_array().unwrap().len(), 2);
+    }
+    let (_, legacy_active) = api
+        .call(
+            Method::GET,
+            &format!("/api/org/workspaces/{WORKSPACE_A}/documents?include_archived=false&limit=50"),
+            None,
+        )
+        .await;
+    assert_eq!(legacy_active["items"].as_array().unwrap().len(), 1);
+    let (status, error) = api
+        .call(
+            Method::GET,
+            &format!(
+                "/api/org/workspaces/{WORKSPACE_A}/documents?status=all&include_archived=true"
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["code"], "invalid_input");
+
+    let (status, archived_source) = api
+        .call(
+            Method::GET,
+            &format!("/api/org/documents/{DOCUMENT_A}?workspace_id={WORKSPACE_A}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(archived_source["archived_at"], NOW);
+
+    let archived_put = with_fields(
+        envelope("put-archived"),
+        &[
+            ("workspace_id", json!(WORKSPACE_A)),
+            ("path", json!("tasks/renamed.org")),
+            ("source", json!("#+TITLE: Archived\n")),
+            ("expected_revision", json!(3)),
+            ("lease_proofs", json!({})),
+        ],
+    );
+    let (status, error) = api
+        .call(
+            Method::PUT,
+            &format!("/api/org/documents/{DOCUMENT_A}"),
+            Some(archived_put),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "archived_document");
+    assert!(!error.to_string().contains("fencing"));
+
+    let restore = with_fields(
+        envelope("restore-document-a"),
+        &[
+            ("workspace_id", json!(WORKSPACE_A)),
+            ("expected_revision", json!(3)),
+        ],
+    );
+    let (status, restored) = api
+        .call(
+            Method::POST,
+            &format!("/api/org/documents/{DOCUMENT_A}/restore"),
+            Some(restore),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(restored["document_revisions"][DOCUMENT_A], 4);
+    assert_eq!(restored["data"]["archived_at"], Value::Null);
+
+    for (method, uri, body) in [
+        (
+            Method::POST,
+            format!("/api/org/workspaces/{WORKSPACE_A}/documents"),
+            with_fields(
+                envelope("create-with-source"),
+                &[
+                    ("document_id", json!("20000000-0000-4000-8000-000000000099")),
+                    ("path", json!("tasks/forbidden.org")),
+                    ("source", json!("forbidden")),
+                ],
+            ),
+        ),
+        (
+            Method::PATCH,
+            format!("/api/org/documents/{DOCUMENT_A}/path"),
+            with_fields(
+                envelope("rename-with-lease"),
+                &[
+                    ("workspace_id", json!(WORKSPACE_A)),
+                    ("new_path", json!("tasks/forbidden.org")),
+                    ("expected_revision", json!(4)),
+                    ("lease_proofs", json!({})),
+                ],
+            ),
+        ),
+        (
+            Method::POST,
+            format!("/api/org/documents/{DOCUMENT_A}/archive"),
+            with_fields(
+                envelope("archive-with-source"),
+                &[
+                    ("workspace_id", json!(WORKSPACE_A)),
+                    ("expected_revision", json!(4)),
+                    ("source", json!("forbidden")),
+                ],
+            ),
+        ),
+    ] {
+        let (status, error) = api.call(method, &uri, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error["code"], "invalid_input");
+    }
+
+    let put_b = with_fields(
+        envelope("put-document-b"),
+        &[
+            ("workspace_id", json!(WORKSPACE_A)),
+            ("path", json!("tasks/second.org")),
+            ("source", json!(raw_source("\n"))),
+            ("expected_revision", json!(1)),
+            ("lease_proofs", json!({})),
+        ],
+    );
+    let (status, put_b) = api
+        .call(
+            Method::PUT,
+            &format!("/api/org/documents/{DOCUMENT_B}"),
+            Some(put_b),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{put_b}");
+    assert_eq!(put_b["document_revisions"][DOCUMENT_B], 2);
+    let claim = claim_item(
+        &api.org,
+        &CommandEnvelope {
+            schema_version: 1,
+            workspace_id: WORKSPACE_A.parse().unwrap(),
+            actor_id: "lease-holder".into(),
+            operation_id: "claim-document-b".into(),
+        },
+        &StartClaimRequest {
+            work_item_id: ITEM_ID.parse().unwrap(),
+            document_id: DOCUMENT_B.parse().unwrap(),
+            expected_document_revision: 2,
+            kind: OrgClaimKind::Execution,
+        },
+    )
+    .await
+    .unwrap();
+    let archive_b = with_fields(
+        envelope("archive-document-b"),
+        &[
+            ("workspace_id", json!(WORKSPACE_A)),
+            ("expected_revision", json!(claim.context.document.revision)),
+        ],
+    );
+    let (status, error) = api
+        .call(
+            Method::POST,
+            &format!("/api/org/documents/{DOCUMENT_B}/archive"),
+            Some(archive_b),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "active_lease");
+    assert_eq!(error["details"]["work_item_ids"], json!([ITEM_ID]));
+    assert!(!error.to_string().contains("fencing"));
 }
 
 #[tokio::test]

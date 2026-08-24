@@ -6,9 +6,8 @@ use crate::{
     org::{
         api::{self as org_api, OrgApiError},
         model::Workspace,
-        workspace_management::{
-            UpdateWorkspaceBody, WorkspaceDraft, WorkspaceSubmission, WorkspaceValidationError,
-        },
+        mutation::MutationSubmission,
+        workspace_management::{UpdateWorkspaceBody, WorkspaceDraft, WorkspaceValidationError},
     },
     routes::Route,
 };
@@ -146,7 +145,7 @@ pub fn org_workspace_settings_page(props: &OrgWorkspaceSettingsPageProps) -> Htm
                     }
                     validation_errors.set(Vec::new());
                     let body = UpdateWorkspaceBody::from_draft(
-                        WorkspaceSubmission::new().operation_id,
+                        MutationSubmission::new().operation_id,
                         revision,
                         &draft,
                     );

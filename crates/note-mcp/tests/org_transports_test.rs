@@ -891,15 +891,15 @@ fn normalized_inventory(response: &Value) -> Vec<Value> {
 }
 
 #[tokio::test]
-async fn production_transport_factories_share_the_same_48_tool_registry() {
+async fn production_transport_factories_share_the_same_52_tool_registry() {
     let bundle = Bundle::new("inventory").await;
     let mut stdio = StdioClient::start(&bundle).await;
     let mut http = HttpClient::start(&bundle).await;
     let stdio_tools = stdio.request("tools/list", json!({})).await;
     let http_tools = http.request("tools/list", json!({})).await;
 
-    assert_eq!(stdio_tools["result"]["tools"].as_array().unwrap().len(), 48);
-    assert_eq!(http_tools["result"]["tools"].as_array().unwrap().len(), 48);
+    assert_eq!(stdio_tools["result"]["tools"].as_array().unwrap().len(), 52);
+    assert_eq!(http_tools["result"]["tools"].as_array().unwrap().len(), 52);
     let stdio_inventory = normalized_inventory(&stdio_tools);
     let http_inventory = normalized_inventory(&http_tools);
     assert_eq!(
@@ -907,7 +907,7 @@ async fn production_transport_factories_share_the_same_48_tool_registry() {
             .iter()
             .filter(|tool| tool["name"].as_str().unwrap().starts_with("org_"))
             .count(),
-        36
+        40
     );
     assert_eq!(stdio_inventory, http_inventory);
 

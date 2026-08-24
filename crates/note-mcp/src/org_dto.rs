@@ -70,6 +70,101 @@ pub(crate) struct WorkspaceListInput {
     pub include_archived: bool,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DocumentStatusInput {
+    Active,
+    Archived,
+    All,
+}
+
+impl From<DocumentStatusInput> for note_pipelines::org::DocumentStatus {
+    fn from(value: DocumentStatusInput) -> Self {
+        match value {
+            DocumentStatusInput::Active => Self::Active,
+            DocumentStatusInput::Archived => Self::Archived,
+            DocumentStatusInput::All => Self::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DocumentListInput {
+    pub workspace_id: String,
+    pub cursor: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: u16,
+    pub status: Option<DocumentStatusInput>,
+    pub include_archived: Option<bool>,
+}
+
+impl JsonSchema for DocumentListInput {
+    fn schema_name() -> Cow<'static, str> {
+        "DocumentListInput".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string"},
+                "cursor": {"type": ["string", "null"]},
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 200
+                },
+                "status": {
+                    "type": ["string", "null"],
+                    "enum": ["active", "archived", "all", null]
+                },
+                "include_archived": {"type": ["boolean", "null"]}
+            },
+            "required": ["workspace_id"],
+            "additionalProperties": false,
+            "not": {
+                "properties": {
+                    "status": {"not": {"type": "null"}},
+                    "include_archived": {"not": {"type": "null"}}
+                },
+                "required": ["status", "include_archived"]
+            }
+        })
+    }
+}
+
+impl DocumentListInput {
+    pub(crate) fn into_pipeline<T>(
+        self,
+    ) -> Result<(T, note_pipelines::org::OrgDocumentReadQuery), OrgError>
+    where
+        T: std::str::FromStr,
+    {
+        if self.status.is_some() && self.include_archived.is_some() {
+            return Err(OrgError::invalid_input(
+                "Org document status and include_archived cannot be used together",
+            ));
+        }
+        let status = self.status.map(Into::into).unwrap_or_else(|| {
+            if self.include_archived.unwrap_or(false) {
+                note_pipelines::org::DocumentStatus::All
+            } else {
+                note_pipelines::org::DocumentStatus::Active
+            }
+        });
+        Ok((
+            parse_id(self.workspace_id, "workspace_id")?,
+            note_pipelines::org::OrgDocumentReadQuery {
+                cursor: self.cursor,
+                limit: Some(usize::from(self.limit)),
+                status,
+            },
+        ))
+    }
+}
+
 impl WorkspaceListInput {
     pub(crate) fn into_pipeline<T>(self) -> Result<(T, OrgReadQuery), OrgError>
     where
@@ -520,6 +615,107 @@ impl PutDocumentInput {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct CreateDocumentInput {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub operation_id: String,
+    pub document_id: String,
+    pub path: String,
+}
+
+impl CreateDocumentInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::CreateDocumentRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::CreateDocumentRequest {
+                document_id: parse_id(self.document_id, "document_id")?,
+                path: self.path,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct RenameDocumentInput {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub operation_id: String,
+    pub document_id: String,
+    pub new_path: String,
+    pub expected_revision: i64,
+}
+
+impl RenameDocumentInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<(CommandEnvelope, note_pipelines::org::RenameDocumentRequest), OrgError> {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::RenameDocumentRequest {
+                document_id: parse_id(self.document_id, "document_id")?,
+                new_path: self.new_path,
+                expected_revision: self.expected_revision,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub(crate) struct DocumentRevisionInput {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub operation_id: String,
+    pub document_id: String,
+    pub expected_revision: i64,
+}
+
+impl DocumentRevisionInput {
+    pub(crate) fn into_pipeline(
+        self,
+    ) -> Result<
+        (
+            CommandEnvelope,
+            note_pipelines::org::DocumentRevisionRequest,
+        ),
+        OrgError,
+    > {
+        Ok((
+            mutation_envelope(
+                self.schema_version,
+                self.workspace_id,
+                self.actor_id,
+                self.operation_id,
+            )?,
+            note_pipelines::org::DocumentRevisionRequest {
+                document_id: parse_id(self.document_id, "document_id")?,
+                expected_revision: self.expected_revision,
+            },
+        ))
+    }
+}
+
 #[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
@@ -585,6 +781,7 @@ impl ImportWorkspaceInput {
                     document_id: parse_id(document.document_id, "document_id")?,
                     path: document.path,
                     source: document.source,
+                    archived_at: None,
                 })
             })
             .collect::<Result<Vec<_>, OrgError>>()?;
@@ -1561,6 +1758,8 @@ pub(crate) struct DocumentOutput {
     pub id: String,
     pub path: String,
     pub revision: i64,
+    #[schemars(required, schema_with = "nullable_i64_schema")]
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1572,6 +1771,8 @@ pub(crate) struct DocumentSourceOutput {
     pub source: String,
     pub content_hash: String,
     pub revision: i64,
+    #[schemars(required, schema_with = "nullable_i64_schema")]
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1845,6 +2046,17 @@ pub(crate) struct DocumentCountData {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
+pub(crate) struct DocumentLifecycleDataOutput {
+    pub document_id: String,
+    pub path: String,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(required, schema_with = "nullable_i64_schema")]
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub(crate) struct MoveDocumentData {
     pub document_id: String,
     pub source_workspace_id: String,
@@ -2039,6 +2251,10 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+fn nullable_i64_schema(generator: &mut SchemaGenerator) -> Schema {
+    generator.subschema_for::<Option<i64>>()
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub(crate) struct ContextCommandData {
@@ -2145,6 +2361,7 @@ impl From<OrgDocumentView> for DocumentOutput {
             id: value.id.to_string(),
             path: value.path,
             revision: value.revision,
+            archived_at: value.archived_at,
         }
     }
 }
@@ -2158,6 +2375,7 @@ impl From<OrgDocumentSourceView> for DocumentSourceOutput {
             source: value.source,
             content_hash: value.content_hash,
             revision: value.revision,
+            archived_at: value.archived_at,
         }
     }
 }
@@ -2194,6 +2412,12 @@ where
         document_revisions: value.document_revisions,
         data,
     })
+}
+
+pub(crate) fn document_lifecycle_command_output(
+    value: OrgCommandResult,
+) -> Result<CommandOutput<DocumentLifecycleDataOutput>, OrgError> {
+    command_output(value)
 }
 
 #[derive(Deserialize)]
@@ -2644,6 +2868,61 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn document_lifecycle_result(data: serde_json::Value) -> OrgCommandResult {
+        OrgCommandResult {
+            schema_version: 1,
+            workspace_id: "10000000-0000-4000-8000-000000000001".parse().unwrap(),
+            operation_id: "document-lifecycle".into(),
+            event_ids: vec![],
+            workspace_revision: Some(1),
+            document_revisions: BTreeMap::new(),
+            data,
+        }
+    }
+
+    #[test]
+    fn document_lifecycle_output_accepts_explicit_null_archive_state() {
+        let output = document_lifecycle_command_output(document_lifecycle_result(json!({
+            "document_id": "20000000-0000-4000-8000-000000000001",
+            "path": "main.org",
+            "archived_at": null
+        })))
+        .unwrap();
+
+        assert_eq!(output.data.archived_at, None);
+    }
+
+    #[test]
+    fn document_lifecycle_output_accepts_archived_timestamp() {
+        let output = document_lifecycle_command_output(document_lifecycle_result(json!({
+            "document_id": "20000000-0000-4000-8000-000000000001",
+            "path": "main.org",
+            "archived_at": 1_800_000_000
+        })))
+        .unwrap();
+
+        assert_eq!(output.data.archived_at, Some(1_800_000_000));
+    }
+
+    #[test]
+    fn document_lifecycle_output_rejects_missing_archive_state() {
+        let error = document_lifecycle_command_output(document_lifecycle_result(json!({
+            "document_id": "20000000-0000-4000-8000-000000000001",
+            "path": "main.org"
+        })))
+        .err()
+        .expect("missing archived_at must be incompatible");
+
+        assert_eq!(
+            error.code,
+            note_pipelines::org::OrgErrorCode::StorageFailure
+        );
+        assert_eq!(
+            error.message,
+            "Org pipeline returned an incompatible command result"
+        );
+    }
+
     #[test]
     fn safe_metadata_preserves_structure_and_number_types_and_redacts_tokens() {
         let source = json!({
@@ -2786,6 +3065,19 @@ mod tests {
                 .metadata["phase"],
             "build"
         );
+    }
+
+    #[test]
+    fn ordinary_document_import_rejects_and_omits_archived_state() {
+        assert!(serde_json::from_value::<DocumentImportInput>(json!({
+            "document_id": "20000000-0000-4000-8000-000000000001",
+            "path": "main.org",
+            "source": "",
+            "archived_at": 1
+        }))
+        .is_err());
+        let schema = serde_json::to_value(schemars::schema_for!(DocumentImportInput)).unwrap();
+        assert!(schema["properties"].get("archived_at").is_none());
     }
 
     #[test]

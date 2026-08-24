@@ -242,6 +242,7 @@ pub struct OrgDocument {
     pub revision: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub archived_at: Option<i64>,
 }
 
 pub struct NewOrgDocument<'a> {
@@ -259,6 +260,15 @@ pub struct OrgDocumentUpdate<'a> {
     pub path: &'a str,
     pub source: &'a str,
     pub content_hash: &'a str,
+    pub updated_at: i64,
+}
+
+pub struct OrgDocumentLifecycleUpdate<'a> {
+    pub id: note_org::DocumentId,
+    pub expected_revision: i64,
+    pub expected_archived_at: Option<i64>,
+    pub path: &'a str,
+    pub archived_at: Option<i64>,
     pub updated_at: i64,
 }
 
@@ -323,6 +333,9 @@ pub enum OrgEventType {
     TitleChange,
     PriorityChange,
     DeadlineChange,
+    DocumentRename,
+    DocumentArchive,
+    DocumentRestore,
     /// Preserves an event name written by schema v3 or a future producer.
     /// Pipelines emit the known variants, while storage keeps audit rows
     /// forward- and backward-readable.
@@ -330,7 +343,7 @@ pub enum OrgEventType {
 }
 
 impl OrgEventType {
-    pub const KNOWN: [Self; 30] = [
+    pub const KNOWN: [Self; 33] = [
         Self::Creation,
         Self::Assignment,
         Self::Claim,
@@ -361,6 +374,9 @@ impl OrgEventType {
         Self::TitleChange,
         Self::PriorityChange,
         Self::DeadlineChange,
+        Self::DocumentRename,
+        Self::DocumentArchive,
+        Self::DocumentRestore,
     ];
 
     pub fn as_str(&self) -> &str {
@@ -395,6 +411,9 @@ impl OrgEventType {
             Self::TitleChange => "title_change",
             Self::PriorityChange => "priority_change",
             Self::DeadlineChange => "deadline_change",
+            Self::DocumentRename => "document_rename",
+            Self::DocumentArchive => "document_archive",
+            Self::DocumentRestore => "document_restore",
             Self::Other(value) => value,
         }
     }

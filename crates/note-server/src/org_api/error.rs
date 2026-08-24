@@ -139,6 +139,8 @@ fn status_for(code: OrgErrorCode) -> StatusCode {
         }
         OrgErrorCode::NotFound | OrgErrorCode::NoteUnavailable => StatusCode::NOT_FOUND,
         OrgErrorCode::ArchivedWorkspace
+        | OrgErrorCode::ArchivedDocument
+        | OrgErrorCode::DocumentPathConflict
         | OrgErrorCode::StaleRevision
         | OrgErrorCode::IdempotencyConflict
         | OrgErrorCode::InvalidTransition

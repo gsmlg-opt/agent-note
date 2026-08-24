@@ -8,6 +8,8 @@ pub enum OrgErrorCode {
     InvalidInput,
     NotFound,
     ArchivedWorkspace,
+    ArchivedDocument,
+    DocumentPathConflict,
     StaleRevision,
     IdempotencyConflict,
     InvalidTransition,

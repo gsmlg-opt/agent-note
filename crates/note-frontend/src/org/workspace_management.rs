@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-pub const WEB_ACTOR_ID: &str = "web-ui";
-pub const ORG_SCHEMA_VERSION: u32 = 1;
+use super::mutation::MutationEnvelope;
 
 pub const WORK_ITEM_TYPES: [&str; 9] = [
     "project",
@@ -335,52 +334,6 @@ pub struct WorkspaceValidationError {
     pub message: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkspaceSubmission {
-    pub operation_id: String,
-}
-
-impl WorkspaceSubmission {
-    pub fn new() -> Self {
-        Self {
-            operation_id: uuid::Uuid::new_v4().to_string(),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn retry(&self) -> Self {
-        self.clone()
-    }
-}
-
-impl Default for WorkspaceSubmission {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn new_workspace_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct MutationEnvelope {
-    schema_version: u32,
-    actor_id: &'static str,
-    operation_id: String,
-}
-
-impl MutationEnvelope {
-    fn new(operation_id: String) -> Self {
-        Self {
-            schema_version: ORG_SCHEMA_VERSION,
-            actor_id: WEB_ACTOR_ID,
-            operation_id,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateWorkspaceBody {
@@ -458,18 +411,6 @@ impl ArchiveWorkspaceBody {
             expected_revision,
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceMutationResult {
-    pub schema_version: u32,
-    pub workspace_id: String,
-    pub operation_id: String,
-    pub event_ids: Vec<String>,
-    pub workspace_revision: Option<i64>,
-    pub document_revisions: BTreeMap<String, i64>,
-    pub data: serde_json::Value,
 }
 
 fn required(errors: &mut Vec<WorkspaceValidationError>, field: &str, value: &str) {
@@ -668,6 +609,7 @@ fn validate_policy(policy: &WorkspacePolicy, errors: &mut Vec<WorkspaceValidatio
 mod tests {
     use super::*;
     use crate::org::model::Workspace;
+    use crate::org::mutation::{new_id, MutationSubmission, WEB_ACTOR_ID};
     use std::collections::BTreeMap;
 
     fn valid_draft() -> WorkspaceDraft {
@@ -823,11 +765,11 @@ mod tests {
 
     #[test]
     fn submission_identity_is_a_valid_uuid_and_is_reused_for_retry() {
-        let submission = WorkspaceSubmission::new();
+        let submission = MutationSubmission::new();
         assert!(uuid::Uuid::parse_str(&submission.operation_id).is_ok());
         assert_eq!(submission.retry(), submission);
-        assert_ne!(WorkspaceSubmission::new(), submission);
-        assert!(uuid::Uuid::parse_str(&new_workspace_id()).is_ok());
+        assert_ne!(MutationSubmission::new(), submission);
+        assert!(uuid::Uuid::parse_str(&new_id()).is_ok());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use axum::Router;
+use std::collections::BTreeMap;
 use utoipa::{
     openapi::{
         path::ParameterIn,
@@ -25,6 +26,28 @@ impl PartialSchema for Binary {
 }
 
 impl ToSchema for Binary {}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct OrgDocumentLifecycleData {
+    pub document_id: String,
+    pub path: String,
+    #[schema(required = true)]
+    pub archived_at: Option<i64>,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct OrgDocumentLifecycleCommandResult {
+    pub schema_version: u32,
+    pub workspace_id: String,
+    pub operation_id: String,
+    pub event_ids: Vec<String>,
+    #[schema(required = true)]
+    pub workspace_revision: Option<i64>,
+    pub document_revisions: BTreeMap<String, i64>,
+    pub data: OrgDocumentLifecycleData,
+}
 
 #[derive(ToSchema)]
 #[allow(dead_code)]
@@ -244,6 +267,10 @@ fn org_success_schema_name(operation_id: &str) -> &'static str {
         "org_list_documents" => "OrgDocumentPageResult",
         "org_get_document" => "OrgDocumentSourceResult",
         "org_put_document" | "org_import_workspace" => "OrgDocumentCountCommandResult",
+        "org_create_document"
+        | "org_rename_document"
+        | "org_archive_document"
+        | "org_restore_document" => "OrgDocumentLifecycleCommandResult",
         "org_move_document" => "OrgMoveDocumentCommandResult",
         "org_move_item" => "OrgMoveItemCommandResult",
         "org_export_workspace" => "OrgWorkspaceExportResult",
@@ -437,6 +464,7 @@ fn normalize_org_success_schemas(mut openapi: OpenApi) -> OpenApi {
             ("id", string(), true),
             ("path", string(), true),
             ("revision", integer(), true),
+            ("archived_at", nullable_scalar(Type::Integer), true),
         ]),
     );
     add(
@@ -449,6 +477,7 @@ fn normalize_org_success_schemas(mut openapi: OpenApi) -> OpenApi {
             ("source", string(), true),
             ("content_hash", string(), true),
             ("revision", integer(), true),
+            ("archived_at", nullable_scalar(Type::Integer), true),
         ]),
     );
     add(
@@ -678,6 +707,15 @@ fn normalize_org_success_schemas(mut openapi: OpenApi) -> OpenApi {
     );
     add(
         components,
+        "OrgDocumentLifecycleData",
+        typed_object(vec![
+            ("document_id", string(), true),
+            ("path", string(), true),
+            ("archived_at", nullable_scalar(Type::Integer), true),
+        ]),
+    );
+    add(
+        components,
         "OrgMoveDocumentData",
         typed_object(vec![
             ("document_id", string(), true),
@@ -889,6 +927,10 @@ fn normalize_org_success_schemas(mut openapi: OpenApi) -> OpenApi {
             command_schema("OrgDocumentCountData"),
         ),
         (
+            "OrgDocumentLifecycleCommandResult",
+            command_schema("OrgDocumentLifecycleData"),
+        ),
+        (
             "OrgMoveDocumentCommandResult",
             command_schema("OrgMoveDocumentData"),
         ),
@@ -1017,9 +1059,23 @@ fn normalize_org_query_parameters(mut openapi: OpenApi) -> OpenApi {
                 }
                 "include_archived" => {
                     parameter.required = Required::False;
-                    if let Some(RefOr::T(Schema::Object(schema))) = &mut parameter.schema {
+                    if path.ends_with("/documents") {
+                        parameter.description = Some(
+                            "Legacy alias: true means `status=all`, false means `status=active`. Mutually exclusive with `status`."
+                                .to_owned(),
+                        );
+                        parameter.schema = Some(scalar(Type::Boolean));
+                    } else if let Some(RefOr::T(Schema::Object(schema))) = &mut parameter.schema {
                         schema.default = Some(serde_json::json!(false));
                     }
+                }
+                "status" if path.ends_with("/documents") => {
+                    parameter.required = Required::False;
+                    parameter.description = Some(
+                        "Document lifecycle filter. Mutually exclusive with the legacy `include_archived` parameter."
+                            .to_owned(),
+                    );
+                    parameter.schema = Some(enum_string(&["active", "archived", "all"]));
                 }
                 "priority" => {
                     parameter.required = Required::False;

@@ -46,8 +46,9 @@ workspace workflow policy, and record execution events. Agents and API clients
 will interact through equivalent structured MCP and REST operations for
 queues, claims, transitions, dependencies, reviews, and progress rather than
 rewriting whole documents. A workspace-first Web operations console will
-expose the resulting state to human operators without adding browser mutations
-in its first release.
+expose the resulting state to human operators. Raw Org source and workflow
+actions remain Web-read-only; workspace administration and document-container
+create/rename/archive/restore are the approved lifecycle exceptions.
 
 The subsystem will establish two complementary product planes:
 
@@ -60,8 +61,9 @@ data models.
 
 The first release will support concurrent agents through one active Agent Note
 server process, complete MCP and REST interfaces, offline import/export, and a
-read-only Web operations console. Autonomous scheduling and browser mutation or
-administration controls remain deferred.
+Web operations console with scoped workspace and document lifecycle controls.
+Autonomous scheduling, raw-source editing, and browser workflow execution remain
+deferred.
 
 ## Goals and Success Measures
 
@@ -83,9 +85,10 @@ administration controls remain deferred.
 9. Keep existing Markdown note behavior and APIs unchanged.
 10. Provide complete and equivalent MCP and REST access to every initial Org
     operation.
-11. Provide a read-only, workspace-first Web operations console without
-    exposing mutation controls.
-12. Keep automatic dispatch and browser administration out of this release.
+11. Provide a workspace-first Web operations console that keeps raw source and
+    workflow actions read-only while exposing approved lifecycle administration.
+12. Keep automatic dispatch, source editing, hard delete, and browser workflow
+    execution out of this release.
 
 ### Success Measures
 
@@ -106,8 +109,11 @@ administration controls remain deferred.
    and cross-transport conformance tests produce equivalent normalized results
    and errors.
 10. Operators can inspect workspaces, operational queues, agendas, work-item
-    context, leases, and ordered event history through a read-only Web UI.
-11. Existing Markdown behavior remains unchanged and its tests continue to pass.
+    context, leases, and ordered event history through a Web UI that performs
+    no workflow mutation.
+11. MCP exposes 40 Org tools plus 12 Markdown-note tools (52 total), and OpenAPI
+    exposes the 40 matching Org operation IDs while excluding `/mcp`.
+12. Existing Markdown behavior remains unchanged and its tests continue to pass.
    Aggregate MCP inventory assertions are intentionally updated for the added
    Org tools.
 
@@ -248,6 +254,14 @@ administration controls remain deferred.
     list filters when I return, so that investigation does not disrupt triage.
 64. As an operator, I want the first browser console to be read-only, so that
     observing work does not accidentally mutate workflow state.
+65. As an operator, I want to create an empty `.org` file with a stable UUID and
+    portable path, so that source can be populated later through approved APIs.
+66. As an operator, I want to rename active or archived files without changing
+    source, projections, dependencies, or history.
+67. As an operator, I want reversible document archive and restore with active
+    lease protection, so that operational work can be withdrawn without deletion.
+68. As an operator, I want active and archived file ledgers with revision-safe
+    conflicts and no hard delete or raw-source editor.
 
 ## Functional Requirements
 
@@ -343,6 +357,31 @@ administration controls remain deferred.
     document.
 20. Source text, derived projections, links, and the corresponding execution
     event must commit atomically.
+21. Every document must carry nullable `archived_at`; active documents have
+    `null`, and archived documents have the archive timestamp in direct reads,
+    lists, exports, and snapshots.
+22. Document paths must be portable relative paths ending in lowercase `.org`.
+    Leading/trailing whitespace, absolute or drive-prefixed paths, backslashes,
+    repeated separators, and empty, `.` or `..` segments are invalid.
+23. Empty create must store `source == ""`, revision 1, active state, and the
+    caller-supplied stable document UUID.
+24. Rename must accept active or archived documents, require the current
+    document revision, increment that revision, and preserve source, content
+    hash, stable IDs, projections, dependencies, direct history, and archive
+    state.
+25. Archive must require an active workspace, active document, current revision,
+    and no active execution or review lease for any item in that document. It
+    must preserve path and content, set `archived_at`, and increment revision.
+26. Restore must require an active workspace, archived document, and current
+    revision. It must clear `archived_at`, increment revision, and reactivate the
+    same identities and projections.
+27. A path remains reserved while its document is archived. Renaming an archived
+    document releases the old path and reserves the new one.
+28. Archived documents remain directly readable and exportable, but their items
+    are excluded from every operational view and count. An unfinished dependency
+    on an archived document's item remains unsatisfied and blocking.
+29. Raw source and workflow mutations against archived documents must return
+    `archived_document`. Document hard delete is not supported.
 
 ### Work Items, State, and Dependencies
 
@@ -502,8 +541,9 @@ administration controls remain deferred.
 1. A raw document read must return Org source, document ID, path, and revision.
 2. A raw document update must require the expected revision and return the new
    revision.
-3. A workspace export must include all canonical Org documents and a
-   machine-readable workspace manifest containing policy and revisions.
+3. A workspace export must include all active and archived canonical Org
+   documents and a machine-readable workspace manifest containing policy,
+   revisions, and each document's nullable `archived_at`.
 4. A workspace import must support create and revision-safe update modes.
 5. Import must report document-level validation or conflict errors without
    partially applying a document.
@@ -513,6 +553,9 @@ administration controls remain deferred.
    background conflict merging are not required.
 8. Multi-document moves and imports must commit all affected document sources,
    projections, and events atomically or change nothing.
+9. A missing `archived_at` in a legacy snapshot means active. Ordinary document
+   import must not set archival state; only snapshot restore and lifecycle
+   commands may do so.
 
 ### MCP and REST Interfaces
 
@@ -520,7 +563,7 @@ administration controls remain deferred.
 2. Org tools must use an `org_` prefix and remain separate from Markdown note
    tools. REST must expose an equivalent operation for every initial Org MCP
    tool.
-3. The initial MCP tool family must expose these operations:
+3. The initial 36-tool MCP family exposes these operations:
    - `org_list_workspaces`, `org_create_workspace`, `org_get_workspace`,
      `org_update_workspace`, and `org_archive_workspace`;
    - `org_list_documents`, `org_get_document`, `org_put_document`,
@@ -537,36 +580,49 @@ administration controls remain deferred.
    - `org_add_dependency` and `org_remove_dependency`;
    - `org_link_note`, `org_unlink_note`, and `org_list_note_work_items`; and
    - `org_list_events`.
-4. `org_transition_item` must cover valid block, unblock, cancellation, and
+4. The document lifecycle extension must add `org_create_document`,
+   `org_rename_document`, `org_archive_document`, and `org_restore_document`,
+   producing a current inventory of 40 Org tools plus 12 Markdown-note tools
+   (52 MCP tools total).
+5. The four matching REST operations are exactly:
+   - `POST /api/org/workspaces/{workspace_id}/documents`;
+   - `PATCH /api/org/documents/{document_id}/path`;
+   - `POST /api/org/documents/{document_id}/archive`; and
+   - `POST /api/org/documents/{document_id}/restore`.
+6. `org_transition_item` must cover valid block, unblock, cancellation, and
    other workspace-defined transitions that do not have a more specific tool.
-5. Routine tools must perform semantic operations and must not require clients
+7. Routine tools must perform semantic operations and must not require clients
    to rewrite complete documents.
-6. Every source-changing mutation must accept the expected revision of every
+8. Every source-changing mutation must accept the expected revision of every
    affected document.
-7. Workspace mutations must accept the expected workspace revision.
+9. Workspace mutations must accept the expected workspace revision.
    `org_move_document` must accept the document revision plus source and target
    workspace revisions.
-8. Every lease-bound operation must accept the opaque fencing token.
-9. Every client mutation must accept a non-empty actor ID and operation ID.
-10. Actor ID in this release is an asserted client identity, not an
+10. Every lease-bound operation must accept the opaque fencing token.
+11. Every client mutation must accept a non-empty actor ID and operation ID.
+12. Actor ID in this release is an asserted client identity, not an
    authenticated principal.
-11. MCP stdio and Streamable HTTP must register the same schemas and call the
+13. MCP stdio and Streamable HTTP must register the same schemas and call the
     same pipelines.
-12. MCP and REST errors must distinguish invalid input, missing resource, stale
+14. MCP and REST errors must distinguish invalid input, missing resource, stale
     revision, idempotency conflict, invalid transition, unmet dependency,
-    active lease, stale lease, concurrency limit, and storage failure.
-13. REST must expose all 36 initial Org operations under `/api/org` and include
-    every operation in the generated OpenAPI document.
-14. Each Org REST OpenAPI `operationId` must equal the corresponding `org_*`
+    active lease, stale lease, `archived_document`, `document_path_conflict`,
+    concurrency limit, and storage failure.
+15. REST must expose all 40 current Org operations under `/api/org` and include
+    every operation in the generated OpenAPI document; `/mcp` is excluded.
+16. Each Org REST OpenAPI `operationId` must equal the corresponding `org_*`
     MCP tool name.
-15. REST and MCP must use the same pipeline operations, transport-neutral DTOs,
+17. REST and MCP must use the same pipeline operations, transport-neutral DTOs,
     validation rules, idempotency behavior, result semantics, and error codes.
-16. REST must use structured JSON errors with stable `code`, `message`,
+18. REST must use structured JSON errors with stable `code`, `message`,
     `details`, and `retryable` fields. MCP structured errors must expose the
     same fields.
-17. List operations must use opaque cursors, a default limit of 50, and a
+19. List operations must use opaque cursors, a default limit of 50, and a
     maximum limit of 200 unless an operation defines a stricter bound.
-18. Fencing tokens must be returned to a successful claiming client and must
+20. Document lists must accept `status=active|archived|all`, default to active,
+    and retain `include_archived=false|true` as the legacy alias for active/all.
+    Supplying both is invalid, and status must bind the opaque cursor.
+21. Fencing tokens must be returned to a successful claiming client and must
     never be included in general read-only operational DTOs.
 
 ### Human Import and Export Interface
@@ -591,28 +647,45 @@ administration controls remain deferred.
 4. `/org/:workspace_id/items/:item_id` must expose hierarchy, dependencies,
    Markdown note availability, attempts, lease metadata, recovery context, and
    sequence-ordered event history.
-5. Operational views must use tables rather than a board. Current view,
+5. `/org/:workspace_id/files` must expose a semantic file ledger with File,
+   Revision, Status, and Actions columns; Active and Archived URL-backed filters;
+   opaque cursor pagination; and explicit loading, empty, error, and refresh
+   states. It must never render or edit raw Org source.
+6. Operational views must use tables rather than a board. Current view,
    filters, cursor or page state, and typed return context must be represented
    in the URL so returning from an item restores its originating list.
-6. The UI must default to workspace time and may show browser-local time as
+7. The UI must default to workspace time and may show browser-local time as
    secondary information.
-7. Missing or deleted Markdown note targets must remain visible and be marked
+8. Missing or deleted Markdown note targets must remain visible and be marked
    unavailable.
-8. The UI must provide explicit loading, empty, structured error, and manual
+9. The UI must provide explicit loading, empty, structured error, and manual
    refresh states.
-9. `/org/new` must create a workspace from a complete structured engineering
+10. `/org/new` must create a workspace from a complete structured engineering
    default, and `/org/:workspace_id/settings` must edit every workspace policy
    field using the loaded revision.
-10. Active workspace pages must expose edit and reversible archive controls.
+11. Active workspace pages must expose edit and reversible archive controls.
     Archive requires exact-slug confirmation; archived workspaces remain
     readable and expose neither lifecycle control. Restore and hard delete are
     not part of this UI.
-11. Browser mutations are limited to workspace create, update, and archive over
-    the matching REST endpoints. Org source/documents, work items, claims,
-    transitions, review, import, and raw Org editing remain read-only.
-12. Workspace mutation requests must use `actor_id: "web-ui"`, a generated
+12. Browser mutations are limited to the three workspace lifecycle endpoints
+    and four document-container lifecycle endpoints specified above. Raw Org
+    source, work items, claims, transitions, review, import/move, and hard delete
+    remain unavailable.
+13. Document create must make an empty file. Rename must work in active and
+    archived ledgers. Archive requires exact-path confirmation; restore reuses
+    the same ID, source, and projections. An archived workspace exposes the
+    file lists read-only with no Add, Rename, Archive, or Restore controls.
+14. A stale document submission must preserve the requested draft, disable
+    automatic Retry and submit, require **Refresh files**, load the latest
+    revision, then allow only a new deliberate submission with a new operation
+    UUID.
+15. Workspace and document mutation requests must use `actor_id: "web-ui"`, a generated
     idempotent operation UUID, and an expected revision for update/archive.
-13. The UI must not display fencing tokens, call MCP directly, add polling, or
+16. Dialogs must move focus inside, close with Escape or Cancel, label every
+    input, name row actions with the exact path, and announce each success
+    through a changing polite live region. Interactive targets must be at least
+    44 CSS pixels in each dimension and the page must not overflow at 390px.
+17. The UI must not display fencing tokens, call MCP directly, add polling, or
     implement authentication/session behavior.
 
 ## Implementation Decisions
@@ -652,16 +725,17 @@ administration controls remain deferred.
   modes and a complete Org REST surface. REST handlers call the same pipelines
   as MCP, and every operation is included in OpenAPI.
 - Extend the Yew frontend with a REST-backed Org operations console. Org source
-  and workflow operations remain read-only; workspace create, structured
-  update, and reversible archive are the only browser mutation controls.
+  and workflow operations remain read-only; workspace create/structured
+  update/reversible archive and document-container create/rename/archive/restore
+  are the only browser mutation controls.
 - Keep the embedding and attachment modules unchanged.
 
 ### Canonical Source and Projections
 
 - Canonical Org source is stored in the selected database backend, not in a
   watched filesystem.
-- A document row contains the original Org text and its current monotonic
-  revision.
+- A document row contains the original Org text, current monotonic revision,
+  stable UUID, portable unique path, and nullable `archived_at`.
 - Work-item, dependency, schedule, queue, and link records are projections
   derived from canonical source. They are never an independent source of
   truth.
@@ -745,14 +819,19 @@ administration controls remain deferred.
   stores its canonical request fingerprint and transport-neutral result;
   identical retries replay that result and divergent reuse returns an
   idempotency conflict.
-- Source-changing mutations return the resulting item and new document
-  revision. Event-only and lease-only mutations leave the document revision
-  unchanged and return the resulting event or lease state.
+- Source-changing mutations return the resulting item and new document revision.
+  Lifecycle commands return `{document_id, path, archived_at}` plus exactly one
+  document revision and no workspace revision. Event-only and lease-only
+  mutations leave the document revision unchanged and return the resulting
+  event or lease state.
 - Multi-document operations accept an expected-revision map keyed by document
   ID. Raw imports that touch leased items additionally accept a fencing-token
   map keyed by work-item ID.
 - A conflict never partially mutates source, projections, leases, events, or
   operation results.
+- Document archive active-lease and lifecycle-state checks run in the same
+  atomic transaction as the revision change; rejected commands reserve no
+  operation result.
 - Claim responses include complete execution context: item, parent, workspace
   policy, dependencies, linked notes, prior attempts, recent events, lease,
   and current revision.
@@ -797,6 +876,14 @@ administration controls remain deferred.
    - URL-backed filters, pagination, and typed return context;
    - loading, empty, error, time, missing-note, and archived-workspace states;
    - browser create/update/archive for workspaces only; no Org source or workflow mutation.
+8. **Document lifecycle management**
+   - portable path contract, nullable archive state, and cross-backend migration;
+   - empty create, rename, lease-guarded reversible archive, and restore with
+     stable IDs, direct history, dependencies, source, and projections preserved;
+   - four additional matching MCP/REST operations, making 40 Org and 52 total
+     MCP tools, with `/mcp` excluded from OpenAPI; and
+   - `/org/:workspace_id/files` with active/archived cursor ledgers and the four
+     approved lifecycle controls, without raw-source/workflow/hard-delete UI.
 
 ## Testing Decisions
 
@@ -853,22 +940,26 @@ administration controls remain deferred.
   - idempotent original-result replay without duplicate events;
   - no partial events or projections after conflict.
 - MCP
-  - exact 36-tool Org inventory and schemas;
+  - exact 40-tool Org inventory and schemas, plus 12 note tools for 52 total;
   - DTO mapping and stable error categories;
   - identical registration for stdio and Streamable HTTP;
   - complete claimed-task context.
 - REST and OpenAPI
-  - all 36 equivalent Org operation IDs;
+  - all 40 equivalent Org operation IDs with `/mcp` excluded;
   - shared DTO, validation, result, idempotency, and error semantics;
   - cursor bounds and structured error envelopes;
   - cross-transport conformance against MCP.
 - Frontend
-  - workspace directory, operational table, and work-item context routes;
+  - workspace directory, file lifecycle ledger, operational table, and
+    work-item context routes;
   - URL-backed views, filters, pagination, and return context;
   - workspace and browser-local time rendering;
   - archived workspaces, unavailable notes, lease metadata without fencing
     tokens, event sequence, loading, empty, and error states;
-  - absence of mutation and raw Org editing controls.
+  - accessible dialog focus, exact-path action names, live announcements,
+    44px targets, desktop/mobile overflow, and browser history across three
+    cursor pages; and
+  - absence of raw Org editing, workflow, hard-delete, MCP, polling, and auth controls.
 - Offline command modes
   - raw document and workspace export;
   - revision-safe import and conflict reporting;
@@ -917,13 +1008,27 @@ administration controls remain deferred.
 16. A browser operator opens a filtered workspace queue, inspects one item, and
     returns to the same view, filters, and pagination context without any
     mutation control or exposed fencing token.
+17. The browser creates an empty `projects/roadmap.org`, then direct read proves
+    source `""`, revision 1, active state, and the same UUID.
+18. A concurrent rename makes a browser draft stale; `stale_revision` preserves
+    the draft and forbids retry until explicit refresh, after which a new
+    deliberate rename succeeds with a new operation UUID.
+19. Archive requires exact-path confirmation, omits the document from active
+    and operational views, keeps direct history and unfinished dependencies,
+    and rejects while any contained item has an active execution or review lease.
+20. An archived document can be renamed; its new path remains reserved, its old
+    path becomes reusable, and restore returns the same UUID, source, hash,
+    projections, dependencies, and history to active operation.
+21. Snapshot round-trip preserves `archived_at`, while a legacy snapshot without
+    the field restores the document as active.
 
 ## Out of Scope
 
 - Autonomous scheduling, agent dispatch, or continuous task execution.
 - Agent capability matching, resource scoring, or performance-based assignment.
-- Browser create, edit, claim, release, transition, review, archive, import, or
-  administration controls.
+- Browser raw Org editing, document source replacement/import/move/hard delete,
+  work-item create/edit, claim, release, transition, review, or workspace
+  restore/delete controls.
 - A browser raw Org editor, board view, or global cross-workspace operations
   homepage.
 - Automatic Web UI polling, push updates, or live event streaming.
@@ -965,8 +1070,9 @@ administration controls remain deferred.
   that Agent Note implements no authentication or authorization and must not be
   exposed directly to an untrusted network; a front proxy owns that boundary.
 - MCP and REST are complete peers at the application contract. The Web UI
-  consumes reads plus the three workspace lifecycle operations; all other Org
-  mutations remain transport-only and are not exposed as browser controls.
+  consumes reads plus the three workspace and four document-container lifecycle
+  operations; all raw-source and workflow mutations remain transport-only and
+  are not exposed as browser controls.
 - Each delivery slice must receive a scoped implementation plan and scoped test
   commands before implementation begins.
 - The repository currently has no configured GitHub issue tracker or

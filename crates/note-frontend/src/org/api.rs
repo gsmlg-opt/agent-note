@@ -6,11 +6,13 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
-    model::{Event, ItemContext, OperationalPage, Page, Workspace, WorkspaceSummary},
-    url::{rfc3339_to_epoch, WorkspaceListState, WorkspaceQueryState},
-    workspace_management::{
-        ArchiveWorkspaceBody, CreateWorkspaceBody, UpdateWorkspaceBody, WorkspaceMutationResult,
+    document_management::{
+        CreateDocumentBody, DocumentListState, DocumentRevisionBody, RenameDocumentBody,
     },
+    model::{Document, Event, ItemContext, OperationalPage, Page, Workspace, WorkspaceSummary},
+    mutation::OrgMutationResult,
+    url::{rfc3339_to_epoch, WorkspaceListState, WorkspaceQueryState},
+    workspace_management::{ArchiveWorkspaceBody, CreateWorkspaceBody, UpdateWorkspaceBody},
 };
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -63,7 +65,7 @@ pub async fn get_workspace(workspace_id: &str) -> Result<Workspace, OrgApiError>
 
 pub async fn create_workspace(
     body: &CreateWorkspaceBody,
-) -> Result<WorkspaceMutationResult, OrgApiError> {
+) -> Result<OrgMutationResult, OrgApiError> {
     let response = Request::post("/api/org/workspaces")
         .json(body)
         .map_err(|_| OrgApiError::transport("The workspace request could not be encoded"))?
@@ -76,7 +78,7 @@ pub async fn create_workspace(
 pub async fn update_workspace(
     workspace_id: &str,
     body: &UpdateWorkspaceBody,
-) -> Result<WorkspaceMutationResult, OrgApiError> {
+) -> Result<OrgMutationResult, OrgApiError> {
     let response = Request::patch(&workspace_url(workspace_id))
         .json(body)
         .map_err(|_| OrgApiError::transport("The workspace request could not be encoded"))?
@@ -89,10 +91,69 @@ pub async fn update_workspace(
 pub async fn archive_workspace(
     workspace_id: &str,
     body: &ArchiveWorkspaceBody,
-) -> Result<WorkspaceMutationResult, OrgApiError> {
+) -> Result<OrgMutationResult, OrgApiError> {
     let response = Request::post(&workspace_archive_url(workspace_id))
         .json(body)
         .map_err(|_| OrgApiError::transport("The workspace request could not be encoded"))?
+        .send()
+        .await
+        .map_err(|_| OrgApiError::transport("The Org service could not be reached"))?;
+    decode_response(response).await
+}
+
+pub async fn list_documents(
+    workspace_id: &str,
+    state: &DocumentListState,
+) -> Result<Page<Document>, OrgApiError> {
+    get_json(&document_list_url(workspace_id, state)).await
+}
+
+pub async fn create_document(
+    workspace_id: &str,
+    body: &CreateDocumentBody,
+) -> Result<OrgMutationResult, OrgApiError> {
+    let response = Request::post(&document_collection_url(workspace_id))
+        .json(body)
+        .map_err(|_| OrgApiError::transport("The document request could not be encoded"))?
+        .send()
+        .await
+        .map_err(|_| OrgApiError::transport("The Org service could not be reached"))?;
+    decode_response(response).await
+}
+
+pub async fn rename_document(
+    document_id: &str,
+    body: &RenameDocumentBody,
+) -> Result<OrgMutationResult, OrgApiError> {
+    let response = Request::patch(&document_path_url(document_id))
+        .json(body)
+        .map_err(|_| OrgApiError::transport("The document request could not be encoded"))?
+        .send()
+        .await
+        .map_err(|_| OrgApiError::transport("The Org service could not be reached"))?;
+    decode_response(response).await
+}
+
+pub async fn archive_document(
+    document_id: &str,
+    body: &DocumentRevisionBody,
+) -> Result<OrgMutationResult, OrgApiError> {
+    let response = Request::post(&document_archive_url(document_id))
+        .json(body)
+        .map_err(|_| OrgApiError::transport("The document request could not be encoded"))?
+        .send()
+        .await
+        .map_err(|_| OrgApiError::transport("The Org service could not be reached"))?;
+    decode_response(response).await
+}
+
+pub async fn restore_document(
+    document_id: &str,
+    body: &DocumentRevisionBody,
+) -> Result<OrgMutationResult, OrgApiError> {
+    let response = Request::post(&document_restore_url(document_id))
+        .json(body)
+        .map_err(|_| OrgApiError::transport("The document request could not be encoded"))?
         .send()
         .await
         .map_err(|_| OrgApiError::transport("The Org service could not be reached"))?;
@@ -182,6 +243,30 @@ pub fn workspace_archive_url(workspace_id: &str) -> String {
     format!("{}/archive", workspace_url(workspace_id))
 }
 
+pub fn document_list_url(workspace_id: &str, state: &DocumentListState) -> String {
+    format!(
+        "{}?{}",
+        document_collection_url(workspace_id),
+        state.canonical_query()
+    )
+}
+
+pub fn document_collection_url(workspace_id: &str) -> String {
+    format!("/api/org/workspaces/{}/documents", encode(workspace_id))
+}
+
+pub fn document_path_url(document_id: &str) -> String {
+    format!("/api/org/documents/{}/path", encode(document_id))
+}
+
+pub fn document_archive_url(document_id: &str) -> String {
+    format!("/api/org/documents/{}/archive", encode(document_id))
+}
+
+pub fn document_restore_url(document_id: &str) -> String {
+    format!("/api/org/documents/{}/restore", encode(document_id))
+}
+
 pub fn operational_url(
     family: &str,
     workspace_id: &str,
@@ -269,7 +354,11 @@ fn push_optional(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::org::{model::OperationalView, url::PriorityFilter};
+    use crate::org::{
+        document_management::{DocumentListState, DocumentStatus},
+        model::OperationalView,
+        url::PriorityFilter,
+    };
     use serde_json::json;
 
     #[test]
@@ -352,6 +441,41 @@ mod tests {
     }
 
     #[test]
+    fn document_url_builders_encode_ids_and_use_only_status_pagination() {
+        let active = DocumentListState::default();
+        assert_eq!(
+            document_list_url("workspace/one", &active),
+            "/api/org/workspaces/workspace%2Fone/documents?status=active&limit=50"
+        );
+
+        let archived = DocumentListState {
+            status: DocumentStatus::Archived,
+            cursor: Some("opaque/+= cursor".into()),
+            limit: 25,
+        };
+        assert_eq!(
+            document_list_url("workspace/one", &archived),
+            "/api/org/workspaces/workspace%2Fone/documents?status=archived&cursor=opaque%2F%2B%3D%20cursor&limit=25"
+        );
+        assert_eq!(
+            document_collection_url("workspace/one"),
+            "/api/org/workspaces/workspace%2Fone/documents"
+        );
+        assert_eq!(
+            document_path_url("document/one"),
+            "/api/org/documents/document%2Fone/path"
+        );
+        assert_eq!(
+            document_archive_url("document/one"),
+            "/api/org/documents/document%2Fone/archive"
+        );
+        assert_eq!(
+            document_restore_url("document/one"),
+            "/api/org/documents/document%2Fone/restore"
+        );
+    }
+
+    #[test]
     fn successful_payloads_deserialize_without_transport_envelopes() {
         let value: Value =
             decode_body(200, &json!({"items":[],"next_cursor":null}).to_string()).unwrap();
@@ -359,11 +483,16 @@ mod tests {
     }
 
     #[test]
-    fn workspace_mutation_clients_share_the_typed_result_contract() {
+    fn lifecycle_mutation_clients_share_the_typed_result_contract() {
         let _create = create_workspace;
         let _update = update_workspace;
         let _archive = archive_workspace;
-        let result: WorkspaceMutationResult = decode_body(
+        let _list_documents = list_documents;
+        let _create_document = create_document;
+        let _rename_document = rename_document;
+        let _archive_document = archive_document;
+        let _restore_document = restore_document;
+        let result: OrgMutationResult = decode_body(
             200,
             &json!({
                 "schema_version": 1,
@@ -381,16 +510,20 @@ mod tests {
     }
 
     #[test]
-    fn org_client_source_allows_only_workspace_lifecycle_mutations() {
+    fn org_client_source_allows_only_workspace_and_document_lifecycle_mutations() {
         let source = include_str!("api.rs").split("#[cfg(test)]").next().unwrap();
         assert_eq!(source.matches("Request::get").count(), 1);
-        assert_eq!(source.matches("Request::post").count(), 2);
-        assert_eq!(source.matches("Request::patch").count(), 1);
+        assert_eq!(source.matches("Request::post").count(), 5);
+        assert_eq!(source.matches("Request::patch").count(), 2);
         for required in [
             "create_workspace",
             "update_workspace",
             "archive_workspace",
-            "/archive",
+            "list_documents",
+            "create_document",
+            "rename_document",
+            "archive_document",
+            "restore_document",
         ] {
             assert!(
                 source.contains(required),
@@ -413,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn org_console_browser_mutation_boundary_allows_only_workspace_lifecycle() {
+    fn org_console_browser_mutation_boundary_allows_only_lifecycle_calls() {
         let production =
             |source: &'static str| source.split("#[cfg(test)]\nmod tests").next().unwrap();
         let api = production(include_str!("api.rs"));
@@ -437,18 +570,25 @@ mod tests {
             production(include_str!("url.rs")),
             production(include_str!("time.rs")),
             production(include_str!("workspace_management.rs")),
+            production(include_str!("document_management.rs")),
+            production(include_str!("mutation.rs")),
             redaction,
             control_sources.as_str(),
         ]
         .join("\n");
 
         assert_eq!(production_sources.matches("Request::get").count(), 1);
-        assert_eq!(production_sources.matches("Request::post").count(), 2);
-        assert_eq!(production_sources.matches("Request::patch").count(), 1);
+        assert_eq!(production_sources.matches("Request::post").count(), 5);
+        assert_eq!(production_sources.matches("Request::patch").count(), 2);
         for required in [
             "Request::post(\"/api/org/workspaces\")",
             "Request::patch(&workspace_url(workspace_id))",
             "Request::post(&workspace_archive_url(workspace_id))",
+            "get_json(&document_list_url(workspace_id, state))",
+            "Request::post(&document_collection_url(workspace_id))",
+            "Request::patch(&document_path_url(document_id))",
+            "Request::post(&document_archive_url(document_id))",
+            "Request::post(&document_restore_url(document_id))",
             "org_api::create_workspace",
             "org_api::update_workspace",
             "org_api::archive_workspace",
@@ -469,6 +609,9 @@ mod tests {
             "/mcp",
             "fetch(",
             "put_document",
+            "get_document",
+            "document_source",
+            "pub source:",
             "import_workspace",
             "create_item",
             "claim_item",

@@ -113,15 +113,13 @@ CREATE TABLE org_workspaces (
 
 CREATE TABLE org_documents (
     id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL REFERENCES org_workspaces(id) ON DELETE RESTRICT,
     path TEXT NOT NULL,
     source TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK (revision >= 1),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    archived_at INTEGER,
-    FOREIGN KEY (workspace_id) REFERENCES org_workspaces(id) ON DELETE RESTRICT,
     UNIQUE (workspace_id, path)
 );
 

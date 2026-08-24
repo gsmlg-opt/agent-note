@@ -1506,14 +1506,14 @@ mod tests {
             .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 48);
+        assert_eq!(names.len(), 52);
         names.sort();
         for name in crate::org::NOTE_TOOL_NAMES {
             assert!(names.iter().any(|registered| registered == name));
         }
         assert_eq!(
             names.iter().filter(|name| name.starts_with("org_")).count(),
-            36
+            40
         );
     }
 

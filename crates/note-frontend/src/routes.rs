@@ -3,8 +3,8 @@ use yew_router::prelude::*;
 
 use crate::pages::{
     DashboardPage, LabelsPage, NewNotePage, NoteEditPage, NoteShowPage, NotesPage, OrgItemPage,
-    OrgWorkspaceNewPage, OrgWorkspacePage, OrgWorkspaceSettingsPage, OrgWorkspacesPage, SystemPage,
-    TrashPage,
+    OrgWorkspaceFilesPage, OrgWorkspaceNewPage, OrgWorkspacePage, OrgWorkspaceSettingsPage,
+    OrgWorkspacesPage, SystemPage, TrashPage,
 };
 
 pub const DEFAULT_NOTES_PAGE_SIZE: usize = 10;
@@ -37,6 +37,8 @@ pub enum Route {
     OrgWorkspaceNew,
     #[at("/org/:workspace_id/settings")]
     OrgWorkspaceSettings { workspace_id: String },
+    #[at("/org/:workspace_id/files")]
+    OrgWorkspaceFiles { workspace_id: String },
     #[at("/org/:workspace_id")]
     OrgWorkspace { workspace_id: String },
     #[at("/org/:workspace_id/items/:item_id")]
@@ -71,6 +73,9 @@ impl Route {
             Self::OrgWorkspaceSettings { workspace_id } => {
                 format!("Edit Org workspace {workspace_id} | agent-note")
             }
+            Self::OrgWorkspaceFiles { workspace_id } => {
+                format!("Org files {workspace_id} | agent-note")
+            }
             Self::OrgWorkspace { workspace_id } => {
                 format!("Org workspace {workspace_id} | agent-note")
             }
@@ -94,6 +99,9 @@ pub fn switch(route: Route) -> Html {
         Route::OrgWorkspaceNew => html! { <OrgWorkspaceNewPage /> },
         Route::OrgWorkspaceSettings { workspace_id } => {
             html! { <OrgWorkspaceSettingsPage {workspace_id} /> }
+        }
+        Route::OrgWorkspaceFiles { workspace_id } => {
+            html! { <OrgWorkspaceFilesPage {workspace_id} /> }
         }
         Route::OrgWorkspace { workspace_id } => {
             html! { <OrgWorkspacePage {workspace_id} /> }
@@ -156,6 +164,40 @@ mod tests {
             }
             .to_path(),
             "/org/workspace-a/settings"
+        );
+    }
+
+    #[test]
+    fn recognizes_org_workspace_files_before_the_terminal_workspace_route() {
+        assert_eq!(
+            Route::recognize("/org/workspace-a/files"),
+            Some(Route::OrgWorkspaceFiles {
+                workspace_id: "workspace-a".into(),
+            })
+        );
+        assert_eq!(
+            Route::OrgWorkspaceFiles {
+                workspace_id: "workspace-a".into(),
+            }
+            .to_path(),
+            "/org/workspace-a/files"
+        );
+        assert_eq!(
+            Route::OrgWorkspaceFiles {
+                workspace_id: "workspace-a".into(),
+            }
+            .document_title(),
+            "Org files workspace-a | agent-note"
+        );
+
+        let switch_source = include_str!("routes.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(switch_source.contains("<OrgWorkspaceFilesPage {workspace_id} />"));
+        assert!(
+            switch_source.find("/org/:workspace_id/files")
+                < switch_source.find("/org/:workspace_id\")")
         );
     }
 

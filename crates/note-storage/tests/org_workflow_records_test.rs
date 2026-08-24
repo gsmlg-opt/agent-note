@@ -8,9 +8,12 @@ use std::str::FromStr;
 
 #[test]
 fn complete_org_event_vocabulary_has_stable_string_and_json_forms() {
-    assert_eq!(OrgEventType::KNOWN.len(), 30);
+    assert_eq!(OrgEventType::KNOWN.len(), 33);
     assert_eq!(OrgEventType::ResultSubmission.as_str(), "result_submission");
     assert_eq!(OrgEventType::Transition.as_str(), "transition");
+    assert_eq!(OrgEventType::DocumentRename.as_str(), "document_rename");
+    assert_eq!(OrgEventType::DocumentArchive.as_str(), "document_archive");
+    assert_eq!(OrgEventType::DocumentRestore.as_str(), "document_restore");
     for event_type in OrgEventType::KNOWN {
         assert_eq!(
             OrgEventType::from_str(event_type.as_str()),

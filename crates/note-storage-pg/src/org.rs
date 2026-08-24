@@ -6,13 +6,13 @@ use note_storage::{
     ConditionalUpdate, ExpiredOrgLeaseClosure, NewOrgAttempt, NewOrgAttemptAllocation,
     NewOrgDocument, NewOrgEvent, NewOrgLease, NewOrgWorkspace, OrgArtifactReference, OrgAttempt,
     OrgAttemptNoteReference, OrgAttemptStatus, OrgAttemptUpdate, OrgDocument,
-    OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult, OrgDocumentUpdate, OrgEvent,
-    OrgEventType, OrgLease, OrgLeaseClosure, OrgLeaseEndReason, OrgLeaseHeartbeat, OrgLeaseKind,
-    OrgLeaseOwnershipMove, OrgLeaseProof, OrgOperationalCounts, OrgOperationalQuery,
-    OrgOperationalRow, OrgOperationalView, OrgProjectedWorkItem, OrgReadyMarker, OrgRepository,
-    OrgReviewLeaseMarker, OrgWorkspace, OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate,
-    SanitizedOrgLease, StorageError, StorageErrorKind, StorageResult, StoredOrgOperation,
-    StoredOrgTimestamp,
+    OrgDocumentLifecycleUpdate, OrgDocumentOwnershipMove, OrgDocumentOwnershipMoveResult,
+    OrgDocumentUpdate, OrgEvent, OrgEventType, OrgLease, OrgLeaseClosure, OrgLeaseEndReason,
+    OrgLeaseHeartbeat, OrgLeaseKind, OrgLeaseOwnershipMove, OrgLeaseProof, OrgOperationalCounts,
+    OrgOperationalQuery, OrgOperationalRow, OrgOperationalView, OrgProjectedWorkItem,
+    OrgReadyMarker, OrgRepository, OrgReviewLeaseMarker, OrgWorkspace,
+    OrgWorkspaceOperationalSummary, OrgWorkspaceUpdate, SanitizedOrgLease, StorageError,
+    StorageErrorKind, StorageResult, StoredOrgOperation, StoredOrgTimestamp,
 };
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
@@ -184,7 +184,7 @@ impl OrgRepository for PgSession {
     async fn get_org_document(&self, id: DocumentId) -> StorageResult<Option<OrgDocument>> {
         let mut connection = self.connection().await?;
         sqlx::query_as::<_, DocumentRow>(
-            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at
+            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at
              FROM org_documents WHERE id = $1",
         )
         .bind(id.to_string())
@@ -201,7 +201,7 @@ impl OrgRepository for PgSession {
     ) -> StorageResult<Vec<OrgDocument>> {
         let mut connection = self.connection().await?;
         sqlx::query_as::<_, DocumentRow>(
-            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at
+            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at
              FROM org_documents
              WHERE workspace_id = $1
              ORDER BY path, id",
@@ -224,7 +224,7 @@ impl OrgRepository for PgSession {
             "UPDATE org_documents
              SET path=$2, source=$3, content_hash=$4, updated_at=$5, revision=revision+1
              WHERE id=$1 AND revision=$6
-             RETURNING id, workspace_id, path, source, content_hash, revision, created_at, updated_at",
+             RETURNING id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at",
         )
             .bind(update.id.to_string())
             .bind(update.path)
@@ -235,6 +235,43 @@ impl OrgRepository for PgSession {
             .fetch_optional(&mut *connection)
             .await
             .map_err(|error| map_sqlx_error("compare-and-swap Org document", error))?;
+        if let Some(row) = row {
+            return row.into_document().map(CompareAndSwap::Applied);
+        }
+
+        let current_revision: Option<i64> =
+            sqlx::query_scalar("SELECT revision FROM org_documents WHERE id = $1")
+                .bind(update.id.to_string())
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(|error| map_sqlx_error("query current Org document revision", error))?;
+        Ok(match current_revision {
+            Some(current_revision) => CompareAndSwap::Conflict { current_revision },
+            None => CompareAndSwap::NotFound,
+        })
+    }
+
+    async fn compare_and_swap_org_document_lifecycle(
+        &self,
+        update: OrgDocumentLifecycleUpdate<'_>,
+    ) -> StorageResult<CompareAndSwap<OrgDocument>> {
+        let mut connection = self.connection().await?;
+        let row = sqlx::query_as::<_, DocumentRow>(
+            "UPDATE org_documents
+             SET path=$2, archived_at=$3, updated_at=$4, revision=revision+1
+             WHERE id=$1 AND revision=$5
+               AND archived_at IS NOT DISTINCT FROM $6
+             RETURNING id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at",
+        )
+        .bind(update.id.to_string())
+        .bind(update.path)
+        .bind(update.archived_at)
+        .bind(update.updated_at)
+        .bind(update.expected_revision)
+        .bind(update.expected_archived_at)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("compare-and-swap Org document lifecycle", error))?;
         if let Some(row) = row {
             return row.into_document().map(CompareAndSwap::Applied);
         }
@@ -280,7 +317,7 @@ impl OrgRepository for PgSession {
                  WHERE document.id=$1 AND EXISTS (SELECT 1 FROM locked)
                  RETURNING document.id, document.workspace_id, document.path, document.source,
                            document.content_hash, document.revision, document.created_at,
-                           document.updated_at
+                           document.updated_at, document.archived_at
              ), advanced_source AS (
                  UPDATE org_workspaces workspace
                  SET revision=workspace.revision+1, updated_at=$7
@@ -294,7 +331,7 @@ impl OrgRepository for PgSession {
              )
              SELECT moved_document.id, moved_document.workspace_id, moved_document.path,
                     moved_document.source, moved_document.content_hash, moved_document.revision,
-                    moved_document.created_at, moved_document.updated_at,
+                    moved_document.created_at, moved_document.updated_at, moved_document.archived_at,
                     advanced_source.revision AS source_workspace_revision,
                     advanced_target.revision AS target_workspace_revision
              FROM moved_document CROSS JOIN advanced_source CROSS JOIN advanced_target",
@@ -314,7 +351,7 @@ impl OrgRepository for PgSession {
         }
 
         let document = sqlx::query_as::<_, DocumentRow>(
-            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at
+            "SELECT id, workspace_id, path, source, content_hash, revision, created_at, updated_at, archived_at
              FROM org_documents WHERE id=$1",
         )
         .bind(update.document_id.to_string())
@@ -1139,12 +1176,18 @@ impl OrgRepository for PgSession {
                      WHERE candidate.work_item_id=attempt.work_item_id
                  )
              ), active_counts AS (
-                 SELECT workspace_id, COUNT(*)::bigint AS active_count
-                 FROM org_leases
-                 WHERE ended_at IS NULL AND expires_at>",
+                 SELECT counted_lease.workspace_id, COUNT(*)::bigint AS active_count
+                 FROM org_leases counted_lease
+                 JOIN org_work_items counted_item
+                   ON counted_item.id=counted_lease.work_item_id
+                 JOIN org_documents counted_document
+                   ON counted_document.id=counted_item.document_id
+                 WHERE counted_lease.ended_at IS NULL
+                   AND counted_document.archived_at IS NULL
+                   AND counted_lease.expires_at>",
         );
         sql.push_bind(query.now).push(
-            " GROUP BY workspace_id
+            " GROUP BY counted_lease.workspace_id
              ), completion_events AS (
                  SELECT subject_id, MAX(occurred_at) AS completion_at
                  FROM org_events
@@ -1197,6 +1240,7 @@ impl OrgRepository for PgSession {
         sql.push(OPERATIONAL_RELATION_COLUMNS).push(
             "
              FROM org_work_items item
+             JOIN org_documents document ON document.id=item.document_id
              JOIN org_workspaces workspace ON workspace.id=item.workspace_id
              LEFT JOIN attempt_stats ON attempt_stats.work_item_id=item.id
              LEFT JOIN current_attempt ON current_attempt.work_item_id=item.id
@@ -1211,7 +1255,7 @@ impl OrgRepository for PgSession {
                 ids.push_bind(workspace_id.to_string());
             }
         }
-        sql.push(") AND ");
+        sql.push(") AND document.archived_at IS NULL AND ");
         push_pg_view_predicate(&mut sql, query.view, query.now);
         if !query.include_archived {
             sql.push(" AND workspace.archived_at IS NULL");
@@ -1256,12 +1300,18 @@ impl OrgRepository for PgSession {
                      WHERE candidate.work_item_id=attempt.work_item_id
                  )
              ), active_counts AS (
-                 SELECT workspace_id, COUNT(*)::bigint AS active_count
-                 FROM org_leases
-                 WHERE ended_at IS NULL AND expires_at>",
+                 SELECT counted_lease.workspace_id, COUNT(*)::bigint AS active_count
+                 FROM org_leases counted_lease
+                 JOIN org_work_items counted_item
+                   ON counted_item.id=counted_lease.work_item_id
+                 JOIN org_documents counted_document
+                   ON counted_document.id=counted_item.document_id
+                 WHERE counted_lease.ended_at IS NULL
+                   AND counted_document.archived_at IS NULL
+                   AND counted_lease.expires_at>",
         );
         sql.push_bind(now).push(
-            " GROUP BY workspace_id
+            " GROUP BY counted_lease.workspace_id
              )
              SELECT workspace.id AS workspace_id, workspace.timezone,
                     workspace.archived_at, workspace.revision AS workspace_revision",
@@ -1280,11 +1330,13 @@ impl OrgRepository for PgSession {
         ] {
             sql.push(", COUNT(item.id) FILTER (WHERE ");
             push_pg_view_predicate(&mut sql, view, now);
+            sql.push(" AND document.archived_at IS NULL");
             sql.push(")::bigint AS ").push(alias);
         }
         sql.push(
             " FROM org_workspaces workspace
              LEFT JOIN org_work_items item ON item.workspace_id=workspace.id
+             LEFT JOIN org_documents document ON document.id=item.document_id
              LEFT JOIN attempt_stats ON attempt_stats.work_item_id=item.id
              LEFT JOIN current_attempt ON current_attempt.work_item_id=item.id
              LEFT JOIN org_leases lease ON lease.work_item_id=item.id AND lease.ended_at IS NULL
@@ -1375,6 +1427,7 @@ struct OwnershipMoveRow {
     revision: i64,
     created_at: i64,
     updated_at: i64,
+    archived_at: Option<i64>,
     source_workspace_revision: i64,
     target_workspace_revision: i64,
 }
@@ -1392,6 +1445,7 @@ impl OwnershipMoveRow {
                     revision: self.revision,
                     created_at: self.created_at,
                     updated_at: self.updated_at,
+                    archived_at: self.archived_at,
                 },
                 source_workspace_revision: self.source_workspace_revision,
                 target_workspace_revision: self.target_workspace_revision,
@@ -3238,6 +3292,7 @@ struct DocumentRow {
     revision: i64,
     created_at: i64,
     updated_at: i64,
+    archived_at: Option<i64>,
 }
 
 impl DocumentRow {
@@ -3251,6 +3306,7 @@ impl DocumentRow {
             revision: self.revision,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            archived_at: self.archived_at,
         })
     }
 }
