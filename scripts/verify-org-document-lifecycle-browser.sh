@@ -58,10 +58,13 @@ case "$normalized_base" in
         fail "refusing the public production host"
         ;;
 esac
+[[ "$normalized_base" =~ ^https?://(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:[0-9]+)?$ ]] ||
+    fail "ORG_CONSOLE_BASE_URL must be an origin-only http(s) URL"
 if [[ ! "$normalized_base" =~ ^https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(:[0-9]+)?$ ]] \
     && [[ "${ORG_CONSOLE_ALLOW_NON_LOOPBACK_DISPOSABLE:-}" != "1" ]]; then
     fail "non-loopback targets require ORG_CONSOLE_ALLOW_NON_LOOPBACK_DISPOSABLE=1"
 fi
+base="$normalized_base"
 
 tmp_dir="$(mktemp -d /tmp/org-document-lifecycle-browser.XXXXXX)"
 
@@ -568,80 +571,91 @@ assert_console_and_issues_clean() {
 assert_network_boundary() {
     local network="$1"
     jq -e --arg base "$base" '
-        def route_without_query:
-            split("?")[0];
+        def parse_http_url:
+            ([capture(
+                "^(?<scheme>https?)://(?<authority>[^/?#]+)"
+                + "(?<pathname>/[^?#]*)?(?:\\?(?<query>[^#]*))?(?:#.*)?$"
+            )][0] // null) as $match
+            | if $match == null then
+                null
+            else
+                {
+                    origin: ($match.scheme + "://" + $match.authority),
+                    pathname: ($match.pathname // "/"),
+                    query: ($match.query // null)
+                }
+            end;
+        def is_api_path($pathname):
+            $pathname == "/api" or ($pathname | startswith("/api/"));
+        def is_mcp_path($pathname):
+            $pathname == "/mcp" or ($pathname | startswith("/mcp/"));
         def uuid_pattern:
             "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-        def approved_get($relative):
-            $relative == "/api/org/workspaces?limit=1"
-            or ($relative | test("^/api/org/workspaces/" + uuid_pattern + "$"))
-            or ($relative | test(
-                "^/api/org/workspaces/" + uuid_pattern
-                + "/documents\\?status=(active|archived|all)"
-                + "(&cursor=[^&]+)?&limit=(10|25|50|100|200)$"
+        def approved_get($pathname; $query):
+            ($pathname == "/api/org/workspaces" and $query == "limit=1")
+            or (($pathname | test("^/api/org/workspaces/" + uuid_pattern + "$"))
+                and $query == null)
+            or (($pathname | test(
+                "^/api/org/workspaces/" + uuid_pattern + "/documents$"
             ))
-            or ($relative | test(
-                "^/api/org/documents/" + uuid_pattern
-                + "\\?workspace_id=" + uuid_pattern + "$"
-            ));
-        def approved_request($method; $relative; $route; $has_query):
+                and $query != null
+                and ($query | test(
+                    "^status=(active|archived|all)"
+                    + "(&cursor=[^&]+)?&limit=(10|25|50|100|200)$"
+                )))
+            or (($pathname | test("^/api/org/documents/" + uuid_pattern + "$"))
+                and $query != null
+                and ($query | test("^workspace_id=" + uuid_pattern + "$")));
+        def approved_request($method; $pathname; $query):
             if $method == "GET" then
-                approved_get($relative)
-            elif $has_query then
+                approved_get($pathname; $query)
+            elif $query != null then
                 false
             elif $method == "POST" then
-                $route == "/api/org/workspaces"
-                or ($route | test("^/api/org/workspaces/[^/]+/archive$"))
-                or ($route | test("^/api/org/workspaces/[^/]+/documents$"))
-                or ($route | test("^/api/org/documents/[^/]+/(archive|restore)$"))
+                $pathname == "/api/org/workspaces"
+                or ($pathname | test("^/api/org/workspaces/[^/]+/archive$"))
+                or ($pathname | test("^/api/org/workspaces/[^/]+/documents$"))
+                or ($pathname | test("^/api/org/documents/[^/]+/(archive|restore)$"))
             elif $method == "PATCH" then
-                ($route | test("^/api/org/workspaces/[^/]+$"))
-                or ($route | test("^/api/org/documents/[^/]+/path$"))
+                ($pathname | test("^/api/org/workspaces/[^/]+$"))
+                or ($pathname | test("^/api/org/documents/[^/]+/path$"))
             else
                 false
             end;
+        def blacklisted_api_request($method; $pathname):
+            $method == "PUT"
+            or $method == "DELETE"
+            or ($pathname | test("^/api/org/(items|queue|agenda|notes)(/|$)"))
+            or ($pathname | test(
+                "/(claim|review|progress|result|transition|dependencies|note-links|import|export)(/|$)"
+            ))
+            or ($pathname | test("/(auth|login|session)(/|$)"));
         [(.networkRequests // [])[]
-            | select(.url | contains("/api/"))
             | . as $request
-            | ($request.url | startswith($base + "/")) as $same_origin
-            | (if $same_origin then
-                    ($request.url | .[($base | length):])
+            | ($request.url | parse_http_url) as $parsed
+            | select(
+                if $parsed == null then
+                    ($request.url | test("^https?://"; "i"))
+                elif is_mcp_path($parsed.pathname) then
+                    true
+                elif is_api_path($parsed.pathname) then
+                    $parsed.origin != $base
+                    or ($parsed.pathname != "/api/org"
+                        and (($parsed.pathname | startswith("/api/org/")) | not))
+                    or (approved_request(
+                        $request.method;
+                        $parsed.pathname;
+                        $parsed.query
+                    ) | not)
+                    or blacklisted_api_request($request.method; $parsed.pathname)
                 else
-                    null
-                end) as $relative
-            | (($relative // "") | route_without_query) as $route
-            | ($request.url | contains("?")) as $has_query
-            | select((
-                $same_origin
-                and approved_request($request.method; $relative; $route; $has_query)
-            ) | not)
+                    false
+                end
+            )
         ] | length == 0
     ' <<<"$network" >/dev/null || {
         printf '%s\n' "$network" >&2
         fail "browser issued an Org request outside approved workspace/document lifecycle traffic"
-    }
-    jq -e --arg base "$base" '
-        def cross_origin_api_path:
-            [capture("^[A-Za-z][A-Za-z0-9+.-]*://[^/]+(?<path>/api/[^?#]*)").path][0] // null;
-        [(.networkRequests // [])[]
-            | . as $request
-            | (if ($request.url | startswith($base + "/api/")) then
-                    ($request.url | .[($base | length):] | split("?")[0])
-                else
-                    ($request.url | cross_origin_api_path)
-                end) as $api_path
-            | select(($request.url | contains("/mcp"))
-                or ($api_path != null and (
-                    $request.method == "PUT"
-                    or $request.method == "DELETE"
-                    or ($api_path | test("^/api/org/(items|queue|agenda|notes)(/|$)"))
-                    or ($api_path | test("/(claim|review|progress|result|transition|dependencies|note-links|import|export)(/|$)"))
-                    or ($api_path | test("/(auth|login|session)(/|$)"))
-                )))
-        ] | length == 0
-    ' <<<"$network" >/dev/null || {
-        printf '%s\n' "$network" >&2
-        fail "browser contacted source/workflow/auth/MCP traffic outside the lifecycle boundary"
     }
 }
 
