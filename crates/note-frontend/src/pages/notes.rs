@@ -3679,6 +3679,20 @@ mod tests {
     }
 
     #[test]
+    fn note_page_content_spaces_search_toolbar_and_table_with_flex_gap() {
+        let app_css = include_str!("../../app.css");
+        let content_rule = app_css
+            .split_once(".notes-page-content {")
+            .and_then(|(_, remainder)| remainder.split_once('}'))
+            .map(|(rule, _)| rule)
+            .expect("notes-page-content CSS rule should exist");
+
+        assert!(content_rule.contains("display: flex;"));
+        assert!(content_rule.contains("flex-direction: column;"));
+        assert!(content_rule.contains("gap: 0.75rem;"));
+    }
+
+    #[test]
     fn search_result_table_renders_select_then_score_with_normal_note_row_content() {
         let query = NotesQueryParams {
             current: 2,

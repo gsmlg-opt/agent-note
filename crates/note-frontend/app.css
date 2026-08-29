@@ -650,6 +650,13 @@ a.dashboard-metric-detail:hover {
     margin: 0 auto;
 }
 
+.notes-page-content {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    width: 100%;
+}
+
 .notes-batch-toolbar {
     display: flex;
     flex-wrap: wrap;
