@@ -46,7 +46,7 @@ pub enum Route {
         workspace_id: String,
         item_id: String,
     },
-    #[at("/new")]
+    #[at("/notes/new")]
     NewNote,
     #[at("/notes/:id/show")]
     NoteShow { id: String },
@@ -244,6 +244,28 @@ mod tests {
         };
 
         assert_eq!(query.clone().validated(), Some(query));
+    }
+
+    #[test]
+    fn recognizes_new_note_route_and_distinguishes_it_from_other_notes_routes() {
+        assert_eq!(Route::recognize("/notes/new"), Some(Route::NewNote));
+        assert_eq!(Route::NewNote.to_path(), "/notes/new");
+        assert_eq!(Route::NewNote.document_title(), "New note | agent-note");
+
+        assert_eq!(Route::recognize("/notes"), Some(Route::Notes));
+        assert_eq!(
+            Route::recognize("/notes/note-123/show"),
+            Some(Route::NoteShow {
+                id: "note-123".into()
+            })
+        );
+        assert_eq!(
+            Route::recognize("/notes/note-123/edit"),
+            Some(Route::NoteEdit {
+                id: "note-123".into()
+            })
+        );
+        assert_ne!(Route::recognize("/new"), Some(Route::NewNote));
     }
 
     #[test]

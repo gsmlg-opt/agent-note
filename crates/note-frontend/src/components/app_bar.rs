@@ -4,9 +4,7 @@ use yew_router::prelude::*;
 use crate::components::icons;
 use crate::routes::Route;
 
-const PRIMARY_NAV_LABELS: [&str; 7] = [
-    "Home", "Notes", "Org", "New note", "Labels", "Trash", "System",
-];
+const PRIMARY_NAV_LABELS: [&str; 6] = ["Home", "Notes", "Org", "Labels", "Trash", "System"];
 
 /// Primary application navigation in a full-width header with a centered inner row.
 #[function_component(AppBar)]
@@ -14,12 +12,8 @@ pub fn app_bar() -> Html {
     let route = use_route::<Route>().unwrap_or(Route::NotFound);
     let navigator = use_navigator();
     let home_active = route == Route::Home;
-    let notes_active = matches!(
-        &route,
-        Route::Notes | Route::NoteShow { .. } | Route::NoteEdit { .. }
-    );
+    let notes_active = is_notes_route(&route);
     let org_active = is_org_route(&route);
-    let new_note_active = route == Route::NewNote;
     let labels_active = route == Route::Labels;
     let trash_active = route == Route::Trash;
     let system_active = route == Route::System;
@@ -43,15 +37,21 @@ pub fn app_bar() -> Html {
                         { nav_link(Route::Home, "", PRIMARY_NAV_LABELS[0], home_active, navigator.clone()) }
                         { nav_link(Route::Notes, "", PRIMARY_NAV_LABELS[1], notes_active, navigator.clone()) }
                         { nav_link(Route::Org, "", PRIMARY_NAV_LABELS[2], org_active, navigator.clone()) }
-                        { nav_link(Route::NewNote, "", PRIMARY_NAV_LABELS[3], new_note_active, navigator.clone()) }
-                        { nav_link(Route::Labels, "", PRIMARY_NAV_LABELS[4], labels_active, navigator.clone()) }
-                        { nav_link(Route::Trash, "", PRIMARY_NAV_LABELS[5], trash_active, navigator.clone()) }
+                        { nav_link(Route::Labels, "", PRIMARY_NAV_LABELS[3], labels_active, navigator.clone()) }
+                        { nav_link(Route::Trash, "", PRIMARY_NAV_LABELS[4], trash_active, navigator.clone()) }
                     </div>
-                    { nav_link(Route::System, "nav-link-system", PRIMARY_NAV_LABELS[6], system_active, navigator) }
+                    { nav_link(Route::System, "nav-link-system", PRIMARY_NAV_LABELS[5], system_active, navigator) }
                 </nav>
             </div>
         </header>
     }
+}
+
+fn is_notes_route(route: &Route) -> bool {
+    matches!(
+        route,
+        Route::Notes | Route::NoteShow { .. } | Route::NoteEdit { .. } | Route::NewNote
+    )
 }
 
 fn is_org_route(route: &Route) -> bool {
@@ -128,8 +128,27 @@ fn nav_classes_with(active: bool, extra: &'static str) -> Classes {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_org_route, nav_aria_current, PRIMARY_NAV_LABELS};
+    use super::{is_notes_route, is_org_route, nav_aria_current, PRIMARY_NAV_LABELS};
     use crate::routes::Route;
+
+    #[test]
+    fn notes_navigation_includes_new_note_and_excludes_other_top_level_routes() {
+        assert!(is_notes_route(&Route::Notes));
+        assert!(is_notes_route(&Route::NewNote));
+        assert!(is_notes_route(&Route::NoteShow {
+            id: "note-1".into()
+        }));
+        assert!(is_notes_route(&Route::NoteEdit {
+            id: "note-1".into()
+        }));
+
+        assert!(!is_notes_route(&Route::Home));
+        assert!(!is_notes_route(&Route::Org));
+        assert!(!is_notes_route(&Route::OrgWorkspaceNew));
+        assert!(!is_notes_route(&Route::Labels));
+        assert!(!is_notes_route(&Route::Trash));
+        assert!(!is_notes_route(&Route::System));
+    }
 
     #[test]
     fn org_navigation_is_distinct_and_reports_current_page() {
@@ -148,7 +167,7 @@ mod tests {
     fn mobile_navigation_keeps_every_target_visible_and_focusable() {
         assert_eq!(
             PRIMARY_NAV_LABELS,
-            ["Home", "Notes", "Org", "New note", "Labels", "Trash", "System"]
+            ["Home", "Notes", "Org", "Labels", "Trash", "System"]
         );
 
         let css = include_str!("../../app.css");

@@ -10,6 +10,7 @@ ENV CARGO_HTTP_TIMEOUT=600 \
 RUN mkdir -p /usr/local/cargo \
     && printf '[source.crates-io]\nreplace-with = "rsproxy"\n\n[source.rsproxy]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[net]\nretry = 5\n' > /usr/local/cargo/config.toml
 RUN rustup target add wasm32-unknown-unknown \
+    && cargo install --locked wasm-bindgen-cli --version 0.2.126 \
     && cargo install --locked trunk
 WORKDIR /build
 COPY . .

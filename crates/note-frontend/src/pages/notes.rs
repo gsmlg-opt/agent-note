@@ -384,6 +384,7 @@ fn batch_toolbar(
                 <button ref={update_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Update)}>{ "Update label" }</button>
                 <button ref={remove_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Remove)}>{ "Remove label" }</button>
                 <button ref={delete_ref} type="button" class="btn btn-error" disabled={disabled} onclick={delete}>{ "Delete selected" }</button>
+                <Link<Route> to={Route::NewNote} classes={classes!("btn", "btn-primary")}>{ "New note" }</Link<Route>>
             </div>
         </div>
     }
@@ -3089,9 +3090,11 @@ mod tests {
                 "Delete selected"
             ]
         );
-        assert!(empty_actions
+        assert_eq!(empty_actions.len(), 5);
+        assert!(empty_actions[..4]
             .iter()
             .all(|button| attribute(button, "disabled").is_some()));
+        assert!(matches!(empty_actions[4], VNode::VComp(_)));
 
         let selected = batch_toolbar(
             2,
@@ -3102,9 +3105,10 @@ mod tests {
             Callback::noop(),
         );
         let selected_actions = rendered_children(rendered_children(&selected)[1]);
-        assert!(selected_actions
+        assert!(selected_actions[..4]
             .iter()
             .all(|button| attribute(button, "disabled").is_none()));
+        assert!(matches!(selected_actions[4], VNode::VComp(_)));
 
         let mutating = batch_toolbar(
             2,
@@ -3115,12 +3119,13 @@ mod tests {
             Callback::noop(),
         );
         let mutating_actions = rendered_children(rendered_children(&mutating)[1]);
-        assert!(mutating_actions
+        assert!(mutating_actions[..4]
             .iter()
             .all(|button| attribute(button, "disabled").is_some()));
         assert!(attribute(selected_actions[3], "class")
             .expect("delete class")
             .contains("btn-error"));
+        assert!(matches!(mutating_actions[4], VNode::VComp(_)));
     }
 
     #[test]
@@ -3457,12 +3462,29 @@ mod tests {
 
         assert!(source[background..].contains("inert={batch_workflow_open}"));
         assert!(source[background..].contains("aria-busy={batch_mutating.to_string()}"));
+        assert!(source[background..].contains("<Link<Route> to={Route::NewNote}"));
         assert!(source.contains("let batch_focus_return_mode = use_mut_ref"));
         assert!(source.contains("ref={batch_success_ref.clone()} role=\"status\" tabindex=\"-1\""));
         assert!(source.contains("let batch_delete_focus_return = use_mut_ref"));
         assert!(source
             .contains("ref={batch_delete_success_ref.clone()} role=\"status\" tabindex=\"-1\""));
         assert!(modal > background);
+    }
+
+    #[test]
+    fn batch_toolbar_exposes_new_note_action_button_with_route_link() {
+        let source = include_str!("notes.rs");
+        let toolbar_start = source
+            .find(r#"<div class="notes-batch-actions""#)
+            .expect("batch actions container");
+        let toolbar_end = source[toolbar_start..]
+            .find("</div>")
+            .expect("end of batch actions container");
+        let toolbar_snippet = &source[toolbar_start..toolbar_start + toolbar_end];
+
+        assert!(toolbar_snippet.contains("<Link<Route> to={Route::NewNote}"));
+        assert!(toolbar_snippet.contains(r#"classes={classes!("btn", "btn-primary")}"#));
+        assert!(toolbar_snippet.contains(r#"{ "New note" }"#));
     }
 
     #[test]

@@ -6,6 +6,8 @@ use yew_duskmoon::Alert;
 use crate::api;
 use crate::components::icons;
 use crate::state::{DuplicateCheckRule, DuplicateCheckTerm, LabelKey, SystemConfig, SystemInfo};
+use crate::theme::{apply_theme, get_saved_theme, ThemeMode};
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CategoryLabelMode {
@@ -45,6 +47,8 @@ pub fn system_page() -> Html {
     let category_mode_draft = use_state(|| CategoryLabelMode::All);
     let category_value_draft = use_state(String::new);
     let category_draft_error = use_state(|| None::<String>);
+    let theme_mode = use_state(get_saved_theme);
+
 
     {
         let config = config.clone();
@@ -186,6 +190,14 @@ pub fn system_page() -> Html {
         })
     };
 
+    let on_theme_select = {
+        let theme_mode = theme_mode.clone();
+        Callback::from(move |mode: ThemeMode| {
+            theme_mode.set(mode);
+            apply_theme(mode);
+        })
+    };
+
     let on_save = {
         let config = config.clone();
         let saving = saving.clone();
@@ -240,9 +252,53 @@ pub fn system_page() -> Html {
                 <Alert variant={Some("success".to_string())}><span>{ "System settings saved." }</span></Alert>
             }
 
+            <section class="system-section" aria-labelledby="appearance-title">
+                <div class="system-section-head">
+                    <div>
+                        <h3 id="appearance-title">{ "Appearance" }</h3>
+                        <p>{ "Choose system theme preference: automatic, light, or dark." }</p>
+                    </div>
+                </div>
+
+                <div class="appearance-controls">
+                    <div class="theme-controller" role="radiogroup" aria-label="System theme">
+                        { for ThemeMode::ALL.iter().map(|&mode| {
+                            let on_select = {
+                                let on_theme_select = on_theme_select.clone();
+                                Callback::from(move |_| on_theme_select.emit(mode))
+                            };
+                            let id = format!("theme-option-{}", mode.as_str());
+                            let icon = match mode {
+                                ThemeMode::Auto => icons::monitor(),
+                                ThemeMode::Light => icons::sun(),
+                                ThemeMode::Dark => icons::moon(),
+                            };
+                            html! {
+                                <>
+                                    <input
+                                        type="radio"
+                                        id={id.clone()}
+                                        name="system-theme-preference"
+                                        class="theme-controller-item"
+                                        value={mode.as_str()}
+                                        checked={*theme_mode == mode}
+                                        onchange={on_select}
+                                    />
+                                    <label for={id} class="theme-controller-label">
+                                        { icon }
+                                        <span>{ mode.label() }</span>
+                                    </label>
+                                </>
+                            }
+                        }) }
+                    </div>
+                </div>
+            </section>
+
             if *loading {
                 <p class="loading">{ "Loading..." }</p>
             } else if let Some(current) = &*config {
+
                 <section class="system-section" aria-labelledby="category-labels-title">
                     <div class="system-section-head">
                         <div>
@@ -1057,6 +1113,18 @@ mod tests {
             "minimum-score-help minimum-score-error"
         );
     }
+
+    #[test]
+    fn system_page_includes_appearance_theme_section() {
+        let source = include_str!("system.rs");
+
+        assert!(source.contains("Appearance"));
+        assert!(source.contains("theme-controller"));
+        assert!(source.contains("aria-label=\"System theme\""));
+        assert!(source.contains("theme-option-"));
+        assert!(source.contains("system-theme-preference"));
+    }
+
 
     fn label_key(key: &str) -> LabelKey {
         LabelKey {

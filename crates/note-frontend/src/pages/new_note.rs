@@ -33,12 +33,12 @@ pub fn new_note_page() -> Html {
         let error = error.clone();
         let submitting = submitting.clone();
         Callback::from(
-            move |(
-                title,
-                content,
-                labels,
-                attachments,
-            ): (String, String, Vec<(String, String)>, Vec<NoteAttachment>)| {
+            move |(title, content, labels, attachments): (
+                String,
+                String,
+                Vec<(String, String)>,
+                Vec<NoteAttachment>,
+            )| {
                 if *submitting {
                     return;
                 }
