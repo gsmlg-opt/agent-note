@@ -1191,8 +1191,9 @@ mod tests {
     #[test]
     fn document_publish_stays_on_the_validated_parent_handle_during_ambient_swap() {
         let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("parent");
-        let validated_parent = root.path().join("validated-parent");
+        let root_path = root.path().canonicalize().unwrap();
+        let parent = root_path.join("parent");
+        let validated_parent = root_path.join("validated-parent");
         fs::create_dir(&parent).unwrap();
         let output = parent.join("document.org");
 
@@ -1217,7 +1218,8 @@ mod tests {
     #[test]
     fn failed_document_publish_removes_its_parent_relative_temporary_file() {
         let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("parent");
+        let root_path = root.path().canonicalize().unwrap();
+        let parent = root_path.join("parent");
         fs::create_dir(&parent).unwrap();
         let output = parent.join("document.org");
 
@@ -1240,7 +1242,8 @@ mod tests {
     #[test]
     fn unsupported_document_publish_is_structured_and_leaves_no_output_or_temp() {
         let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("parent");
+        let root_path = root.path().canonicalize().unwrap();
+        let parent = root_path.join("parent");
         fs::create_dir(&parent).unwrap();
         let output = parent.join("document.org");
 

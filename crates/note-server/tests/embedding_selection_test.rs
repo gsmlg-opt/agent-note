@@ -210,11 +210,12 @@ async fn all_four_org_offline_modes_are_storage_only() {
     const SECOND_DOCUMENT_ID: &str = "20000000-0000-4000-8000-000000000002";
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    let config_path = write_remote_config(dir.path(), &server);
-    let snapshot = write_org_snapshot(dir.path());
+    let dir_path = dir.path().canonicalize().unwrap();
+    let config_path = write_remote_config(&dir_path, &server);
+    let snapshot = write_org_snapshot(&dir_path);
 
     let import_workspace = run_offline_args(
-        dir.path(),
+        &dir_path,
         &config_path,
         &[
             "org",
@@ -237,9 +238,9 @@ async fn all_four_org_offline_modes_are_storage_only() {
         String::from_utf8_lossy(&import_workspace.stderr)
     );
 
-    let exported = dir.path().join("exported");
+    let exported = dir_path.join("exported");
     let export_workspace = run_offline_args(
-        dir.path(),
+        &dir_path,
         &config_path,
         &[
             "org",
@@ -254,9 +255,9 @@ async fn all_four_org_offline_modes_are_storage_only() {
     .await;
     assert!(export_workspace.status.success());
 
-    let exported_document = dir.path().join("exported-document.org");
+    let exported_document = dir_path.join("exported-document.org");
     let export_document = run_offline_args(
-        dir.path(),
+        &dir_path,
         &config_path,
         &[
             "org",
@@ -271,10 +272,10 @@ async fn all_four_org_offline_modes_are_storage_only() {
     .await;
     assert!(export_document.status.success());
 
-    let second = dir.path().join("second.org");
+    let second = dir_path.join("second.org");
     std::fs::write(&second, b"#+TITLE: Second\nOpaque.\n").unwrap();
     let import_document = run_offline_args(
-        dir.path(),
+        &dir_path,
         &config_path,
         &[
             "org",
@@ -300,8 +301,8 @@ async fn all_four_org_offline_modes_are_storage_only() {
     assert!(import_document.status.success());
 
     assert!(server.received_requests().await.unwrap().is_empty());
-    assert!(!dir.path().join("attachments").exists());
-    let storage = note_storage_turso::TursoStorage::open(dir.path().join("notes.db"))
+    assert!(!dir_path.join("attachments").exists());
+    let storage = note_storage_turso::TursoStorage::open(dir_path.join("notes.db"))
         .await
         .unwrap();
     assert!(storage

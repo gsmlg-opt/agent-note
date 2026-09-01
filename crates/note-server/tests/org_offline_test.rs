@@ -96,9 +96,26 @@ async fn seed_workspace(context: &OrgContext) -> (String, String) {
     (first, second)
 }
 
+struct TempTestDir {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl TempTestDir {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        Self { _dir: dir, path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[tokio::test]
 async fn workspace_manifest_round_trips_document_archive_state_and_accepts_legacy_omission() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (source_context, _source_storage) = test_context(&dir.path().join("source.db")).await;
     let (first, second) = seed_workspace(&source_context).await;
     archive_document(
@@ -466,7 +483,7 @@ fn preserves_legacy_non_org_modes() {
 
 #[tokio::test]
 async fn workspace_and_document_exports_are_deterministic_byte_exact_and_refuse_nonempty_targets() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, _storage) = test_context(&dir.path().join("source.db")).await;
     let (first, second) = seed_workspace(&context).await;
     let snapshot = dir.path().join("snapshot");
@@ -675,7 +692,7 @@ async fn assert_snapshot_rejected_without_writes(snapshot: &Path, database: &Pat
 async fn workspace_import_rejects_manifest_and_filesystem_escape_or_corruption_before_writes() {
     use std::os::unix::fs::symlink;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, _storage) = test_context(&dir.path().join("source.db")).await;
     seed_workspace(&context).await;
     let base = dir.path().join("base");
@@ -798,7 +815,7 @@ async fn workspace_import_rejects_manifest_and_filesystem_escape_or_corruption_b
 async fn export_rejects_a_symlinked_output_ancestor_without_external_side_effects() {
     use std::os::unix::fs::symlink;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, _storage) = test_context(&dir.path().join("source.db")).await;
     seed_workspace(&context).await;
     let outside = dir.path().join("outside");
@@ -831,7 +848,7 @@ async fn export_rejects_a_symlinked_output_ancestor_without_external_side_effect
 
 #[tokio::test]
 async fn workspace_manifest_rejects_nested_unknown_policy_and_tag_rule_fields() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, _storage) = test_context(&dir.path().join("source.db")).await;
     seed_workspace(&context).await;
     let base = dir.path().join("base");
@@ -873,7 +890,7 @@ async fn workspace_manifest_rejects_nested_unknown_policy_and_tag_rule_fields() 
 
 #[tokio::test]
 async fn workspace_manifest_rejects_duplicate_outer_policy_and_tag_rule_fields() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, _storage) = test_context(&dir.path().join("source.db")).await;
     seed_workspace(&context).await;
     let base = dir.path().join("base");
@@ -971,7 +988,7 @@ async fn workspace_manifest_rejects_duplicate_outer_policy_and_tag_rule_fields()
 
 #[tokio::test]
 async fn workspace_update_is_revision_safe_and_all_or_nothing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, storage) = test_context(&dir.path().join("update.db")).await;
     let (first, second) = seed_workspace(&context).await;
     let snapshot = dir.path().join("update-snapshot");
@@ -1127,7 +1144,7 @@ async fn workspace_update_is_revision_safe_and_all_or_nothing() {
 
 #[tokio::test]
 async fn active_lease_without_a_manifest_token_rejects_import_and_reports_no_token_material() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, _storage) = test_context(&dir.path().join("lease.db")).await;
     let (first, _second) = seed_workspace(&context).await;
     let claim = claim_item(
@@ -1186,7 +1203,7 @@ async fn active_lease_without_a_manifest_token_rejects_import_and_reports_no_tok
 
 #[tokio::test]
 async fn document_import_create_and_update_enforce_existence_revision_and_raw_bytes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, storage) = test_context(&dir.path().join("document.db")).await;
     create_workspace(
         &context,
@@ -1286,7 +1303,7 @@ async fn document_import_create_and_update_enforce_existence_revision_and_raw_by
 
 #[tokio::test]
 async fn offline_document_import_keeps_unresolved_note_links_without_note_rows() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, storage) = test_context(&dir.path().join("offline-note-links.db")).await;
     create_workspace(
         &context,
@@ -1338,7 +1355,7 @@ async fn offline_document_import_keeps_unresolved_note_links_without_note_rows()
 
 #[tokio::test]
 async fn reopened_turso_offline_exports_preserve_ids_revisions_and_raw_bytes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let database = dir.path().join("offline-reopen.db");
     let (context, storage) = test_context(&database).await;
     let (first, second) = seed_workspace(&context).await;
@@ -1408,7 +1425,7 @@ async fn reopened_turso_offline_exports_preserve_ids_revisions_and_raw_bytes() {
 async fn document_import_rejects_a_symlinked_input_ancestor() {
     use std::os::unix::fs::symlink;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let (context, storage) = test_context(&dir.path().join("symlink-ancestor.db")).await;
     create_workspace(
         &context,
@@ -1458,7 +1475,7 @@ async fn document_import_rejects_a_symlinked_input_ancestor() {
 
 #[tokio::test]
 async fn domain_failure_exits_nonzero_with_a_machine_readable_stdout_report() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
@@ -1503,7 +1520,7 @@ path = "attachments"
 
 #[tokio::test]
 async fn every_org_startup_failure_is_a_sanitized_machine_readable_stdout_report() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = TempTestDir::new();
     let malformed_config = dir.path().join("malformed.toml");
     std::fs::write(&malformed_config, "private_database_detail = [").unwrap();
     let storage_dir = dir.path().join("database-directory");

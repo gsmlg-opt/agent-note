@@ -88,7 +88,6 @@ pub fn apply_theme(mode: ThemeMode) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

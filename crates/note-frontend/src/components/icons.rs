@@ -119,4 +119,3 @@ pub fn monitor() -> Html {
         </>
     })
 }
-

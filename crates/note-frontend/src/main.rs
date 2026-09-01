@@ -34,4 +34,3 @@ fn main() {
     apply_theme(get_saved_theme());
     yew::Renderer::<App>::new().render();
 }
-

@@ -2408,8 +2408,8 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_handlers_use_metadata_and_exclusive_content_shapes() {
-        let (ctx, backend, dir) = test_context().await;
-        let server = test_server(ctx, backend);
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend.clone());
         let saved = server
             .save_note(Parameters(SaveNoteRequest {
                 title: "Standalone".into(),
@@ -2537,13 +2537,27 @@ mod tests {
             })
         );
 
-        std::fs::remove_file(
-            dir.path()
-                .join("attachments")
-                .join(&saved.id)
-                .join("blob.bin"),
-        )
-        .unwrap();
+        let transaction = backend
+            .begin(note_storage::TransactionMode::Deferred)
+            .await
+            .unwrap();
+        let note = transaction.get_note(&saved.id).await.unwrap().unwrap();
+        let blob_key = note
+            .attachments
+            .iter()
+            .find(|a| a.id == "blob")
+            .unwrap()
+            .storage
+            .as_ref()
+            .unwrap()
+            .object_key
+            .clone();
+        server
+            .ctx
+            .attachments()
+            .delete_object(&blob_key)
+            .await
+            .unwrap();
         let updated = server
             .update_note(Parameters(UpdateNoteRequest {
                 id: saved.id.clone(),

@@ -258,10 +258,11 @@ impl S3AttachmentStore {
     }
 
     fn safe_location(&self) -> String {
-        let suffix = if self.prefix.is_empty() {
+        let trimmed_prefix = self.prefix.trim_matches('/');
+        let suffix = if trimmed_prefix.is_empty() {
             String::new()
         } else {
-            format!("/{}", self.prefix)
+            format!("/{}", trimmed_prefix)
         };
         format!("s3://{}{suffix}", self.bucket)
     }

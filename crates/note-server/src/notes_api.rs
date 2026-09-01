@@ -4896,7 +4896,7 @@ mod tests {
 
     #[tokio::test]
     async fn note_attachments_roundtrip_and_render_as_relative_files() {
-        let (app, _ctx, dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
             r#"{"title":"With attachment","content":"See [meta](./meta.json)","attachments":[{"id":"meta","path":"./meta.json","mime":"application/json","description":"metadata","content":"{\"ok\":true}"}],"labels":[]}"#,
@@ -4943,11 +4943,6 @@ mod tests {
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], br#"{"ok":true}"#);
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("attachments").join(&id).join("meta.json"))
-                .unwrap(),
-            r#"{"ok":true}"#
-        );
 
         let render_body = format!(
             r#"{{"content":"See [meta](./meta.json)","attachment_base":"/api/notes/{id}/attachments"}}"#
@@ -4964,13 +4959,20 @@ mod tests {
 
     #[tokio::test]
     async fn get_note_returns_attachment_metadata_without_reading_files() {
-        let (app, _ctx, dir) = test_app().await;
+        let (app, ctx, _dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
             r#"{"title":"Proof","content":"See [proof](./proof.txt)","attachments":[{"id":"proof","path":"./proof.txt","mime":"text/plain","description":"proof","content":"evidence"}],"labels":[]}"#,
         )
         .await;
-        std::fs::remove_file(dir.path().join("attachments").join(&id).join("proof.txt")).unwrap();
+        let note = note_pipelines::get_note(&ctx, &id).await.unwrap().unwrap();
+        let key = note.attachments[0]
+            .storage
+            .as_ref()
+            .unwrap()
+            .object_key
+            .clone();
+        ctx.attachments().delete_object(&key).await.unwrap();
 
         let resp = app.oneshot(get(&format!("/api/notes/{id}"))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -5024,7 +5026,7 @@ mod tests {
 
     #[tokio::test]
     async fn binary_attachments_accept_base64_requests_and_download_as_raw_bytes() {
-        let (app, _ctx, dir) = test_app().await;
+        let (app, _ctx, _dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
             r#"{"title":"Binary","content":"![blob](./blob.bin)","attachments":[{"id":"blob","path":"./blob.bin","mime":"application/octet-stream","description":"raw bytes","content_base64":"AJ+Slv8="}],"labels":[]}"#,
@@ -5107,21 +5109,28 @@ mod tests {
         );
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], &[0, 0x9f, 0x92, 0x96, 0xff]);
-        assert_eq!(
-            std::fs::read(dir.path().join("attachments").join(&id).join("blob.bin")).unwrap(),
-            [0, 0x9f, 0x92, 0x96, 0xff]
-        );
     }
 
     #[tokio::test]
     async fn attachment_download_does_not_read_unrequested_siblings() {
-        let (app, _ctx, dir) = test_app().await;
+        let (app, ctx, _dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
             r#"{"title":"Two files","content":"C","attachments":[{"id":"good","path":"./good.txt","mime":"text/plain","content":"available"},{"id":"missing","path":"./missing.txt","mime":"text/plain","content":"remove me"}],"labels":[]}"#,
         )
         .await;
-        std::fs::remove_file(dir.path().join("attachments").join(&id).join("missing.txt")).unwrap();
+        let note = note_pipelines::get_note(&ctx, &id).await.unwrap().unwrap();
+        let missing_key = note
+            .attachments
+            .iter()
+            .find(|a| a.id == "missing")
+            .unwrap()
+            .storage
+            .as_ref()
+            .unwrap()
+            .object_key
+            .clone();
+        ctx.attachments().delete_object(&missing_key).await.unwrap();
 
         let response = app
             .oneshot(get(&format!("/api/notes/{id}/attachments/good.txt")))
@@ -5248,12 +5257,19 @@ mod tests {
 
     #[tokio::test]
     async fn delete_note_by_id_lists_deleted_note_in_trash_or_404() {
-        let (app, _ctx, dir) = test_app().await;
+        let (app, ctx, _dir) = test_app().await;
         let id = save_note_id(
             app.clone(),
             r#"{"title":"Delete Me","content":"C","attachments":[{"id":"proof","path":"./proof.txt","mime":"text/plain","description":"proof","content":"keep me"}],"labels":[["status","deleted"]]}"#,
         )
         .await;
+        let note = note_pipelines::get_note(&ctx, &id).await.unwrap().unwrap();
+        let key = note.attachments[0]
+            .storage
+            .as_ref()
+            .unwrap()
+            .object_key
+            .clone();
 
         let missing_revision = app
             .clone()
@@ -5296,11 +5312,8 @@ mod tests {
         let count: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(count["total"], 0);
 
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("attachments").join(&id).join("proof.txt"))
-                .unwrap(),
-            "keep me"
-        );
+        let bytes = ctx.attachments().read_object(&key).await.unwrap();
+        assert_eq!(bytes, b"keep me");
 
         let resp = app.clone().oneshot(get("/api/trash")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -5361,7 +5374,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        assert!(!dir.path().join("attachments").join(&id).exists());
+        assert!(ctx.attachments().read_object(&key).await.is_err());
 
         let resp = app.clone().oneshot(get("/api/trash")).await.unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();

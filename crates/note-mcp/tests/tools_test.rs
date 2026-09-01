@@ -126,7 +126,7 @@ fn tool_input_deserialization_preserves_intended_compatibility() {
 
 #[tokio::test]
 async fn save_then_put_text_and_binary_attachments() {
-    let (ctx, _backend, dir) = test_context().await;
+    let (ctx, _backend, _dir) = test_context().await;
     let note_id = save(&ctx, "Attachments", "Body").await;
 
     let text = put_note_attachment_tool(
@@ -175,16 +175,17 @@ async fn save_then_put_text_and_binary_attachments() {
     assert_eq!(description, "text description");
     assert!(binary.created);
     assert_eq!(binary.attachment.id, "blob");
-    assert_eq!(
-        std::fs::read(
-            dir.path()
-                .join("attachments")
-                .join(&note_id)
-                .join("blob.bin")
-        )
-        .unwrap(),
-        binary_bytes
-    );
+    let fetched = get_note_attachment_content_tool(
+        &ctx,
+        GetNoteAttachmentContentToolInput {
+            note_id: note_id.clone(),
+            attachment_id: "blob".into(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(fetched.content, binary_bytes);
 
     let replacement_bytes = vec![3, 2, 1];
     let replacement = put_note_attachment_tool(
@@ -218,7 +219,7 @@ async fn save_then_put_text_and_binary_attachments() {
 
 #[tokio::test]
 async fn get_update_list_and_line_read_do_not_require_attachment_content() {
-    let (ctx, _backend, dir) = test_context().await;
+    let (ctx, backend, _dir) = test_context().await;
     let note_id = save(&ctx, "Metadata", "First line").await;
     put_note_attachment_tool(
         &ctx,
@@ -233,13 +234,22 @@ async fn get_update_list_and_line_read_do_not_require_attachment_content() {
     )
     .await
     .unwrap();
-    std::fs::remove_file(
-        dir.path()
-            .join("attachments")
-            .join(&note_id)
-            .join("missing.bin"),
-    )
-    .unwrap();
+    let transaction = backend
+        .begin(note_storage::TransactionMode::Deferred)
+        .await
+        .unwrap();
+    let note = transaction.get_note(&note_id).await.unwrap().unwrap();
+    let missing_key = note
+        .attachments
+        .iter()
+        .find(|a| a.id == "missing")
+        .unwrap()
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    ctx.attachments().delete_object(&missing_key).await.unwrap();
 
     let fetched = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
     assert_eq!(fetched.content, "First line");
@@ -305,7 +315,7 @@ async fn get_update_list_and_line_read_do_not_require_attachment_content() {
 
 #[tokio::test]
 async fn line_edit_preserves_attachment_metadata_without_reading_bytes() {
-    let (ctx, _backend, dir) = test_context().await;
+    let (ctx, backend, _dir) = test_context().await;
     let note_id = save(&ctx, "Line edit", "First line").await;
     put_note_attachment_tool(
         &ctx,
@@ -320,13 +330,22 @@ async fn line_edit_preserves_attachment_metadata_without_reading_bytes() {
     )
     .await
     .unwrap();
-    std::fs::remove_file(
-        dir.path()
-            .join("attachments")
-            .join(&note_id)
-            .join("blob.bin"),
-    )
-    .unwrap();
+    let transaction = backend
+        .begin(note_storage::TransactionMode::Deferred)
+        .await
+        .unwrap();
+    let note = transaction.get_note(&note_id).await.unwrap().unwrap();
+    let missing_key = note
+        .attachments
+        .iter()
+        .find(|a| a.id == "blob")
+        .unwrap()
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    ctx.attachments().delete_object(&missing_key).await.unwrap();
     let read = read_note_lines_tool(&ctx, &note_id).await.unwrap().unwrap();
 
     let edited = edit_note_tool(
@@ -350,7 +369,7 @@ async fn line_edit_preserves_attachment_metadata_without_reading_bytes() {
 
 #[tokio::test]
 async fn selected_attachment_content_read_does_not_read_siblings() {
-    let (ctx, _backend, dir) = test_context().await;
+    let (ctx, backend, _dir) = test_context().await;
     let note_id = save(&ctx, "Selected read", "Body").await;
     put_note_attachment_tool(
         &ctx,
@@ -378,13 +397,22 @@ async fn selected_attachment_content_read_does_not_read_siblings() {
     )
     .await
     .unwrap();
-    std::fs::remove_file(
-        dir.path()
-            .join("attachments")
-            .join(&note_id)
-            .join("missing.bin"),
-    )
-    .unwrap();
+    let transaction = backend
+        .begin(note_storage::TransactionMode::Deferred)
+        .await
+        .unwrap();
+    let note = transaction.get_note(&note_id).await.unwrap().unwrap();
+    let sibling_key = note
+        .attachments
+        .iter()
+        .find(|a| a.id == "missing-sibling")
+        .unwrap()
+        .storage
+        .as_ref()
+        .unwrap()
+        .object_key
+        .clone();
+    ctx.attachments().delete_object(&sibling_key).await.unwrap();
 
     let selected = get_note_attachment_content_tool(
         &ctx,

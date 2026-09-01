@@ -8,7 +8,6 @@ use crate::components::icons;
 use crate::state::{DuplicateCheckRule, DuplicateCheckTerm, LabelKey, SystemConfig, SystemInfo};
 use crate::theme::{apply_theme, get_saved_theme, ThemeMode};
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CategoryLabelMode {
     All,
@@ -48,7 +47,6 @@ pub fn system_page() -> Html {
     let category_value_draft = use_state(String::new);
     let category_draft_error = use_state(|| None::<String>);
     let theme_mode = use_state(get_saved_theme);
-
 
     {
         let config = config.clone();
@@ -1124,7 +1122,6 @@ mod tests {
         assert!(source.contains("theme-option-"));
         assert!(source.contains("system-theme-preference"));
     }
-
 
     fn label_key(key: &str) -> LabelKey {
         LabelKey {
