@@ -634,6 +634,7 @@ async fn main() -> anyhow::Result<()> {
                                 Some("json") => "application/json",
                                 Some("svg") => "image/svg+xml",
                                 Some("ico") => "image/x-icon",
+                                Some("png") => "image/png",
                                 _ => "application/octet-stream",
                             };
                             return ([(axum::http::header::CONTENT_TYPE, content_type)], bytes)

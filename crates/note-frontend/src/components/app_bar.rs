@@ -30,7 +30,14 @@ pub fn app_bar() -> Html {
         <header class="app-bar">
             <div class="app-bar-inner">
                 <Link<Route> to={Route::Home} classes={classes!("app-brand")}>
-                    { "agent-note" }
+                    <img
+                        class="app-brand-icon"
+                        src="/agent-note-icon.svg"
+                        alt=""
+                        width="24"
+                        height="24"
+                    />
+                    <span>{ "agent-note" }</span>
                 </Link<Route>>
                 <nav class="app-nav-group" aria-label="Primary navigation">
                     <div class="app-nav">
@@ -175,5 +182,19 @@ mod tests {
         assert!(css.contains("grid-template-columns: 1fr"));
         assert!(css.contains(".app-nav {\n        display: contents;"));
         assert!(!css.contains(".app-nav-group .nav-link-system span {"));
+    }
+
+    #[test]
+    fn app_brand_includes_icon_and_branding_elements() {
+        let source = include_str!("app_bar.rs");
+        assert!(source.contains("class=\"app-brand-icon\""));
+        assert!(source.contains("src=\"/agent-note-icon.svg\""));
+
+        let css = include_str!("../../app.css");
+        assert!(css.contains(".app-brand-icon"));
+
+        let index = include_str!("../../index.html");
+        assert!(index.contains("agent-note-icon.svg"));
+        assert!(index.contains("agent-note-icon.png"));
     }
 }

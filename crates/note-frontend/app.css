@@ -270,11 +270,21 @@ body {
 }
 
 .app-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
     font-size: 1.25rem;
     font-weight: 800;
     letter-spacing: 0;
     color: var(--color-primary, #6750a4);
     text-decoration: none;
+}
+
+.app-brand-icon {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    display: block;
 }
 
 .app-nav-group,
@@ -333,6 +343,11 @@ body {
 
     .app-brand {
         font-size: 1rem;
+    }
+
+    .app-brand-icon {
+        width: 20px;
+        height: 20px;
     }
 
     .app-nav-group {

@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1024" height="1024" viewBox="0 0 1024 1024"
+     fill="none" role="img" aria-label="Agent Note icon">
+  <defs>
+    <linearGradient id="networkPath" x1="105" y1="560" x2="918" y2="822" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#10D8C7"/>
+      <stop offset="0.46" stop-color="#159FFF"/>
+      <stop offset="0.76" stop-color="#247FF5"/>
+      <stop offset="1" stop-color="#6850F2"/>
+    </linearGradient>
+    <linearGradient id="leftNode" x1="81" y1="416" x2="181" y2="524" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#18E3D2"/>
+      <stop offset="1" stop-color="#0FBBD7"/>
+    </linearGradient>
+    <linearGradient id="rightNode" x1="852" y1="418" x2="944" y2="523" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22B4FF"/>
+      <stop offset="1" stop-color="#136CEB"/>
+    </linearGradient>
+    <linearGradient id="bottomNode" x1="474" y1="775" x2="555" y2="858" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#536DFF"/>
+      <stop offset="1" stop-color="#7448ED"/>
+    </linearGradient>
+
+    <linearGradient id="document" x1="310" y1="108" x2="696" y2="755" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0C347B"/>
+      <stop offset="0.43" stop-color="#0A43A2"/>
+      <stop offset="0.75" stop-color="#0A54CF"/>
+      <stop offset="1" stop-color="#0B65F2"/>
+    </linearGradient>
+    <radialGradient id="documentGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse"
+                    gradientTransform="translate(664 675) rotate(-137) scale(421 365)">
+      <stop stop-color="#2278FF" stop-opacity="0.48"/>
+      <stop offset="1" stop-color="#2278FF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="fold" x1="622" y1="108" x2="748" y2="260" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.58" stop-color="#EEF8FF"/>
+      <stop offset="1" stop-color="#C9E4FF"/>
+    </linearGradient>
+    <linearGradient id="rule" x1="386" y1="0" x2="703" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F9FDFF"/>
+      <stop offset="1" stop-color="#D8EAFF"/>
+    </linearGradient>
+    <linearGradient id="dotTop" x1="343" y1="318" x2="414" y2="390" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2DE9D3"/>
+      <stop offset="1" stop-color="#14C4C7"/>
+    </linearGradient>
+    <linearGradient id="dotMiddle" x1="342" y1="446" x2="414" y2="518" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#27B7FF"/>
+      <stop offset="1" stop-color="#1287F8"/>
+    </linearGradient>
+    <linearGradient id="dotBottom" x1="343" y1="575" x2="414" y2="647" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A17DFF"/>
+      <stop offset="1" stop-color="#6750EF"/>
+    </linearGradient>
+
+  </defs>
+
+  <!-- Agent connection loop -->
+  <g stroke-linecap="round" stroke-linejoin="round">
+    <path d="M125 532V650C125 742 198 815 290 815H450"
+          stroke="url(#networkPath)" stroke-width="38"/>
+    <path d="M574 815H734C826 815 899 742 899 650V532"
+          stroke="url(#networkPath)" stroke-width="38"/>
+    <path d="M169 470H271" stroke="url(#leftNode)" stroke-width="38"/>
+    <path d="M753 470H855" stroke="url(#rightNode)" stroke-width="38"/>
+  </g>
+
+  <!-- Network nodes -->
+  <circle cx="125" cy="470" r="43" stroke="url(#leftNode)" stroke-width="38"/>
+  <circle cx="899" cy="470" r="43" stroke="url(#rightNode)" stroke-width="38"/>
+  <circle cx="512" cy="815" r="43" stroke="url(#bottomNode)" stroke-width="38"/>
+
+  <!-- Shared note document -->
+  <g>
+    <path d="M306 112H620C632 112 643 117 652 126L754 228C763 237 768 249 768 262V688C768 724 738 754 702 754H306C270 754 240 724 240 688V178C240 142 270 112 306 112Z"
+          fill="url(#document)"/>
+    <path d="M306 112H620C632 112 643 117 652 126L754 228C763 237 768 249 768 262V688C768 724 738 754 702 754H306C270 754 240 724 240 688V178C240 142 270 112 306 112Z"
+          fill="url(#documentGlow)"/>
+
+    <!-- Folded corner -->
+    <path d="M620 112L768 260H665C640 260 620 240 620 215V112Z" fill="url(#fold)"/>
+    <path d="M620 112L768 260" stroke="#FFFFFF" stroke-opacity="0.44" stroke-width="3" stroke-linecap="round"/>
+
+    <!-- Note rows -->
+    <rect x="376" y="336" width="326" height="36" rx="18" fill="url(#rule)"/>
+    <rect x="376" y="464" width="326" height="36" rx="18" fill="url(#rule)"/>
+    <rect x="376" y="593" width="326" height="36" rx="18" fill="url(#rule)"/>
+
+    <circle cx="378" cy="354" r="42" fill="url(#dotTop)"/>
+    <circle cx="378" cy="482" r="42" fill="url(#dotMiddle)"/>
+    <circle cx="378" cy="611" r="42" fill="url(#dotBottom)"/>
+  </g>
+</svg>
