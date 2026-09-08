@@ -1,10 +1,14 @@
 interface:
-  display_name: "Agent Note"
-  short_description: "Save and retrieve project-scoped notes"
-  default_prompt: "Use $agent-note to save this as a project-scoped note."
-
+  display_name: Agent Note
+  short_description: Set up and maintain project knowledge
+  default_prompt: Use $agent-note to set up the project AGENTS.md entry point when
+    explicitly requested, or recall relevant knowledge and evaluate durable findings.
+    Respect project scope and write authorization; skip routine progress.
+policy:
+  allow_implicit_invocation: true
 dependencies:
   tools:
-    - type: "mcp"
-      value: "agent_note"
-      description: "Agent Note MCP server"
+  - type: mcp
+    value: agent_note
+    description: Agent Note MCP server; use the configured connection and its exposed
+      schemas
