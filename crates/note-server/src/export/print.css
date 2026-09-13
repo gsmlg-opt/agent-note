@@ -1,0 +1,51 @@
+@page {
+  size: A4 portrait;
+  margin: 18mm;
+}
+
+:root {
+  color-scheme: light;
+  --ink: #202124;
+  --muted: #5f6368;
+  --line: #dadce0;
+  --surface: #f8f9fa;
+  --link: #0757b2;
+}
+
+* { box-sizing: border-box; }
+html, body { background: #fff; }
+body {
+  margin: 0;
+  color: var(--ink);
+  font: 10.5pt/1.55 "Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans", "DejaVu Sans", sans-serif;
+}
+.export-document { overflow-wrap: anywhere; }
+.export-title { margin: 0 0 1.4rem; font-size: 24pt; line-height: 1.2; }
+h1, h2, h3, h4, h5, h6 { break-after: avoid-page; line-height: 1.3; }
+a { color: var(--link); text-decoration: underline; }
+pre, code { font-family: "Noto Sans Mono CJK SC", "Noto Sans Mono", "DejaVu Sans Mono", monospace; }
+pre {
+  max-width: 100%;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.dm-code-block { max-width: 100%; }
+.dm-code-block-header { color: var(--muted); font-size: 8pt; }
+table { width: 100%; border-collapse: collapse; table-layout: auto; }
+thead { display: table-header-group; }
+th, td { padding: 0.35rem 0.5rem; border: 1px solid var(--line); overflow-wrap: anywhere; }
+th { background: var(--surface); }
+img, svg { display: block; max-width: 100%; height: auto; object-fit: contain; }
+.export-notice, .export-omission, .export-removal-notice {
+  margin: 0.8rem 0;
+  padding: 0.55rem 0.75rem;
+  border-left: 3px solid #b06000;
+  background: #fff7e6;
+  color: #5f3700;
+}
+.attachment-path { color: var(--muted); font-family: monospace; }
+.footnote-definition { font-size: 9pt; }
