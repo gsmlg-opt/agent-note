@@ -9,8 +9,9 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::components::Modal;
 use crate::export::{
-    export_menu_decision, initiate_browser_download, initiate_captured_markdown_download,
-    prepare_markdown_download, ExportMenuDecision, ExportMenuKey,
+    export_menu_decision, export_menu_should_prevent_default, initiate_browser_download,
+    initiate_captured_markdown_download, prepare_markdown_download, ExportMenuDecision,
+    ExportMenuKey,
 };
 use crate::routes::{NotesQueryParams, Route};
 use crate::state::{stale_retry_blocked, AttachmentContent, NoteSummary};
@@ -77,6 +78,11 @@ fn copy_generation_is_current(current: u64, completed: u64) -> bool {
 
 fn note_load_is_current(started_generation: u64, current_generation: u64) -> bool {
     started_generation == current_generation
+}
+
+fn next_note_load_generation(generation: &mut u64) -> u64 {
+    *generation = generation.saturating_add(1);
+    *generation
 }
 
 fn delete_confirmation_message(title: &str) -> String {
@@ -150,8 +156,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         use_effect_with(props.id.clone(), move |_| {
             let started_generation = {
                 let mut generation = load_generation.borrow_mut();
-                *generation = generation.saturating_add(1);
-                *generation
+                next_note_load_generation(&mut generation)
             };
             loading.set(true);
             note.set(None);
@@ -341,7 +346,10 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                     let error = error.clone();
                     let load_generation = load_generation.clone();
                     let id = id.clone();
-                    let started_generation = *load_generation.borrow();
+                    let started_generation = {
+                        let mut generation = load_generation.borrow_mut();
+                        next_note_load_generation(&mut generation)
+                    };
                     wasm_bindgen_futures::spawn_local(async move {
                         let result = api::get_note(&id).await;
                         if note_load_is_current(started_generation, *load_generation.borrow()) {
@@ -520,12 +528,15 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                                                     *export_focused_item,
                                                     key,
                                                 );
-                                                if !matches!(decision, ExportMenuDecision::Stay) {
+                                                if export_menu_should_prevent_default(decision) {
                                                     event.prevent_default();
                                                 }
                                                 match decision {
                                                     ExportMenuDecision::Focus(item) => {
                                                         export_focused_item.set(item);
+                                                    }
+                                                    ExportMenuDecision::CloseWithoutRestoreFocus => {
+                                                        export_open.set(false);
                                                     }
                                                     ExportMenuDecision::CloseAndRestoreFocus => {
                                                         export_open.set(false);
@@ -801,8 +812,8 @@ mod tests {
     use super::{
         content_copy_announcement, content_copy_chip_text, content_copy_payload, copy_announcement,
         copy_chip_text, copy_generation_is_current, delete_confirmation_message,
-        next_copy_generation, note_load_is_current, rewrite_attachment_urls, try_start_delete,
-        CopyStatus,
+        next_copy_generation, next_note_load_generation, note_load_is_current,
+        rewrite_attachment_urls, try_start_delete, CopyStatus,
     };
     use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
@@ -917,8 +928,16 @@ mod tests {
 
     #[test]
     fn note_load_generation_rejects_late_initial_and_conflict_reload_completions() {
-        assert!(note_load_is_current(7, 7));
-        assert!(!note_load_is_current(6, 7));
+        let mut generation = 6;
+        let initial = next_note_load_generation(&mut generation);
+        assert!(note_load_is_current(initial, generation));
+
+        let older_reload = next_note_load_generation(&mut generation);
+        let newer_reload = next_note_load_generation(&mut generation);
+
+        assert!(!note_load_is_current(initial, generation));
+        assert!(!note_load_is_current(older_reload, generation));
+        assert!(note_load_is_current(newer_reload, generation));
     }
 
     #[test]

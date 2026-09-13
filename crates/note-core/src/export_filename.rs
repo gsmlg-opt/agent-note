@@ -62,7 +62,12 @@ fn is_windows_reserved_name(stem: &str) -> bool {
         || upper
             .strip_prefix("COM")
             .or_else(|| upper.strip_prefix("LPT"))
-            .is_some_and(|number| number.len() == 1 && matches!(number.as_bytes()[0], b'1'..=b'9'))
+            .is_some_and(is_windows_device_number)
+}
+
+fn is_windows_device_number(number: &str) -> bool {
+    (number.len() == 1 && matches!(number.as_bytes()[0], b'1'..=b'9'))
+        || matches!(number, "¹" | "²" | "³")
 }
 
 #[cfg(test)]
@@ -95,7 +100,20 @@ mod tests {
 
     #[test]
     fn rejects_windows_reserved_device_stems() {
-        for title in ["CON", "con.txt", "AUX", "NUL", "COM1", "lpt9.report"] {
+        for title in [
+            "CON",
+            "con.txt",
+            "AUX",
+            "NUL",
+            "COM1",
+            "lpt9.report",
+            "COM¹",
+            "com².txt",
+            "Com³.report",
+            "LPT¹",
+            "lpt².txt",
+            "Lpt³.report",
+        ] {
             assert_eq!(
                 export_filename(title, "abc-123", ExportFormat::Markdown),
                 "note-abc-123.md"

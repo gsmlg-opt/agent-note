@@ -51,6 +51,7 @@ pub enum ExportMenuKey {
     Enter,
     Space,
     Escape,
+    Tab,
     Other,
 }
 
@@ -64,6 +65,7 @@ impl ExportMenuKey {
             "Enter" => Self::Enter,
             " " => Self::Space,
             "Escape" => Self::Escape,
+            "Tab" => Self::Tab,
             _ => Self::Other,
         }
     }
@@ -73,6 +75,7 @@ impl ExportMenuKey {
 pub enum ExportMenuDecision {
     OpenAt(usize),
     Focus(usize),
+    CloseWithoutRestoreFocus,
     CloseAndRestoreFocus,
     DownloadMarkdownAndRestoreFocus,
     Stay,
@@ -98,12 +101,20 @@ pub fn export_menu_decision(
         ExportMenuKey::ArrowUp => ExportMenuDecision::Focus((focused_item + 1) % 2),
         ExportMenuKey::Home => ExportMenuDecision::Focus(0),
         ExportMenuKey::End => ExportMenuDecision::Focus(1),
+        ExportMenuKey::Tab => ExportMenuDecision::CloseWithoutRestoreFocus,
         ExportMenuKey::Escape => ExportMenuDecision::CloseAndRestoreFocus,
         ExportMenuKey::Enter | ExportMenuKey::Space if focused_item == 0 => {
             ExportMenuDecision::DownloadMarkdownAndRestoreFocus
         }
         _ => ExportMenuDecision::Stay,
     }
+}
+
+pub fn export_menu_should_prevent_default(decision: ExportMenuDecision) -> bool {
+    !matches!(
+        decision,
+        ExportMenuDecision::Stay | ExportMenuDecision::CloseWithoutRestoreFocus
+    )
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -158,8 +169,9 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::{
-        export_menu_decision, initiate_captured_markdown_download, prepare_markdown_download,
-        ExportMenuDecision, ExportMenuKey,
+        export_menu_decision, export_menu_should_prevent_default,
+        initiate_captured_markdown_download, prepare_markdown_download, ExportMenuDecision,
+        ExportMenuKey,
     };
 
     #[test]
@@ -289,6 +301,20 @@ mod tests {
             export_menu_decision(true, 0, ExportMenuKey::Enter),
             ExportMenuDecision::DownloadMarkdownAndRestoreFocus
         );
+    }
+
+    #[test]
+    fn tab_closes_without_focus_restoration_or_preventing_native_traversal() {
+        let decision = export_menu_decision(true, 0, ExportMenuKey::Tab);
+
+        assert_eq!(decision, ExportMenuDecision::CloseWithoutRestoreFocus);
+        assert!(!export_menu_should_prevent_default(decision));
+        assert!(export_menu_should_prevent_default(
+            ExportMenuDecision::CloseAndRestoreFocus
+        ));
+        assert!(export_menu_should_prevent_default(
+            ExportMenuDecision::Focus(1)
+        ));
     }
 
     #[test]
