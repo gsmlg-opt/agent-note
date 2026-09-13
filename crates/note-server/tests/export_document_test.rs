@@ -308,6 +308,12 @@ fn animated_gif_is_flattened_to_one_png_frame() {
         image::guess_format(&package.assets[0].bytes).unwrap(),
         image::ImageFormat::Png
     );
+    let flattened =
+        image::load_from_memory_with_format(&package.assets[0].bytes, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+    assert_eq!(flattened.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    assert_ne!(flattened.get_pixel(0, 0).0, [0, 0, 255, 255]);
     assert_ne!(package.assets[0].bytes, original);
 }
 
@@ -524,6 +530,115 @@ fn print_css_has_bounded_a4_contract_without_tall_block_avoidance() {
     assert!(!package.index_html.contains("pre { break-inside: avoid"));
     assert!(package.footer_html.contains("pageNumber"));
     assert!(package.footer_html.contains("totalPages"));
+}
+
+#[test]
+fn print_css_preserves_non_flow_mermaid_diagram_semantics() {
+    let markdown = r#"```mermaid
+journey
+  title Customer journey
+  section Purchase
+    Checkout: 4: Customer
+```
+
+```mermaid
+sankey
+  Source,Target,10
+```
+
+```mermaid
+kanban
+  todo[To Do]
+    task[Write tests]
+```
+
+```mermaid
+pie showData
+  "Complete" : 70
+  "Remaining" : 30
+```"#;
+    let package =
+        build_export_document(&frozen(markdown, vec![]), ExportDocumentLimits::default()).unwrap();
+
+    for rendered_class in [
+        "dm-mermaid-journey",
+        "dm-journey-task",
+        "dm-mermaid-sankey",
+        "dm-sankey-link",
+        "dm-sankey-node",
+        "dm-mermaid-kanban",
+        "dm-kanban-column",
+        "dm-kanban-card",
+        "dm-mermaid-pie",
+        "dm-mermaid-pie-graphic",
+        "dm-mermaid-swatch-1",
+    ] {
+        assert!(
+            package.index_html.contains(rendered_class),
+            "missing rendered class {rendered_class}"
+        );
+    }
+
+    for css_contract in [
+        "--dm-mermaid-slice-1: #6750a4",
+        "--dm-mermaid-slice-6: #386a20",
+        ".dm-journey-task { fill: #eaddff; stroke: #6750a4",
+        ".dm-sankey-link { fill: none; stroke: #6750a4",
+        ".dm-sankey-node rect { fill: #e8def8; stroke: #6750a4",
+        ".dm-kanban-column > rect { fill: #f7f2fa; stroke: #79747e",
+        ".dm-kanban-card { fill: #ffffff; stroke: #6750a4",
+        ".dm-mermaid-swatch-1 { background: var(--dm-mermaid-slice-1)",
+    ] {
+        assert!(
+            package.index_html.contains(css_contract),
+            "missing print CSS contract {css_contract}"
+        );
+    }
+}
+
+#[test]
+fn print_css_covers_every_supported_mermaid_shape_family() {
+    let package =
+        build_export_document(&frozen("body", vec![]), ExportDocumentLimits::default()).unwrap();
+
+    for css_selector in [
+        ".dm-mermaid-node rect",
+        ".dm-swimlane-lane rect",
+        ".dm-sequence-lane rect",
+        ".dm-class-node rect",
+        ".dm-state-start",
+        ".dm-er-entity rect",
+        ".dm-journey-task",
+        ".dm-gantt-bar",
+        ".dm-mermaid-pie-graphic",
+        ".dm-git-commit circle",
+        ".dm-c4-node rect",
+        ".dm-mindmap-node rect",
+        ".dm-timeline-event",
+        ".dm-zenuml-participant rect",
+        ".dm-sankey-node rect",
+        ".dm-xy-bar",
+        ".dm-block-node rect",
+        ".dm-packet-field rect",
+        ".dm-kanban-column > rect",
+        ".dm-architecture-service rect",
+        ".dm-radar-area",
+        ".dm-event-modeling-node rect",
+        ".dm-treemap-leaf rect",
+        ".dm-venn-left",
+        ".dm-ishikawa-head",
+        ".dm-wardley-plane",
+        ".dm-cynefin-domain rect",
+        ".dm-treeview-glyph",
+        ".dm-mermaid-quadrant-plane",
+        ".dm-requirement-node rect",
+        ".dm-mermaid-summary-grid span",
+    ] {
+        assert!(
+            package.index_html.contains(css_selector),
+            "missing export-owned styling for {css_selector}"
+        );
+    }
 }
 
 #[test]
