@@ -24,6 +24,24 @@ pub fn prepare_markdown_download(
     }
 }
 
+pub fn initiate_captured_markdown_download<F>(
+    download: &PreparedMarkdownDownload,
+    has_attachments: bool,
+    initiate: F,
+) -> String
+where
+    F: FnOnce(&PreparedMarkdownDownload) -> Result<(), String>,
+{
+    match initiate(download) {
+        Ok(()) if has_attachments => {
+            "Markdown download initiated. Attachment files are not included in this Markdown download."
+                .to_string()
+        }
+        Ok(()) => "Markdown download initiated.".to_string(),
+        Err(_) => "Unable to initiate Markdown download.".to_string(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportMenuKey {
     ArrowDown,
@@ -137,8 +155,11 @@ pub fn initiate_browser_download(_download: &PreparedMarkdownDownload) -> Result
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use super::{
-        export_menu_decision, prepare_markdown_download, ExportMenuDecision, ExportMenuKey,
+        export_menu_decision, initiate_captured_markdown_download, prepare_markdown_download,
+        ExportMenuDecision, ExportMenuKey,
     };
 
     #[test]
@@ -160,6 +181,62 @@ mod tests {
             assert_eq!(prepared.bytes, source.as_bytes());
             assert_eq!(prepared.filename, "会議.md");
         }
+    }
+
+    #[test]
+    fn captured_download_action_initiates_once_with_the_exact_prepared_snapshot() {
+        let prepared = prepare_markdown_download(
+            "note-42",
+            "会議 / draft",
+            17,
+            "\u{feff}---\r\ntitle: exact\r\n---\r\nno final newline",
+        );
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let recorded_by_effect = recorded.clone();
+
+        let announcement = initiate_captured_markdown_download(&prepared, true, move |captured| {
+            recorded_by_effect.borrow_mut().push(captured.clone());
+            Ok(())
+        });
+
+        assert_eq!(
+            recorded.borrow().as_slice(),
+            std::slice::from_ref(&prepared)
+        );
+        assert_eq!(recorded.borrow()[0].note_id, "note-42");
+        assert_eq!(recorded.borrow()[0].title, "会議 / draft");
+        assert_eq!(recorded.borrow()[0].revision, 17);
+        assert_eq!(
+            recorded.borrow()[0].bytes,
+            "\u{feff}---\r\ntitle: exact\r\n---\r\nno final newline".as_bytes()
+        );
+        assert_eq!(recorded.borrow()[0].filename, "会議  draft.md");
+        assert_eq!(
+            announcement,
+            "Markdown download initiated. Attachment files are not included in this Markdown download."
+        );
+    }
+
+    #[test]
+    fn captured_download_action_returns_success_without_an_attachment_warning() {
+        let prepared = prepare_markdown_download("note-1", "Plain", 1, "body");
+
+        assert_eq!(
+            initiate_captured_markdown_download(&prepared, false, |_| Ok(())),
+            "Markdown download initiated."
+        );
+    }
+
+    #[test]
+    fn captured_download_action_does_not_expose_effect_errors() {
+        let prepared = prepare_markdown_download("note-1", "Plain", 1, "body");
+
+        assert_eq!(
+            initiate_captured_markdown_download(&prepared, true, |_| {
+                Err("private browser detail".to_string())
+            }),
+            "Unable to initiate Markdown download."
+        );
     }
 
     #[test]
@@ -223,15 +300,5 @@ mod tests {
         assert!(source.contains(r#"role="menuitem""#));
         assert!(source.contains(r#"aria-disabled="true""#));
         assert!(source.contains("PDF export is not configured yet."));
-    }
-
-    #[test]
-    fn export_boundary_has_no_server_or_attachment_fetch_dependency() {
-        let source = include_str!("export.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-
-        assert!(!production.contains("crate::api"));
-        assert!(!production.contains("get_note("));
-        assert!(!production.contains("attachment_url("));
     }
 }

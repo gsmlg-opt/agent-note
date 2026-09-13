@@ -9,8 +9,8 @@ use yew_router::prelude::*;
 use crate::api;
 use crate::components::Modal;
 use crate::export::{
-    export_menu_decision, initiate_browser_download, prepare_markdown_download, ExportMenuDecision,
-    ExportMenuKey,
+    export_menu_decision, initiate_browser_download, initiate_captured_markdown_download,
+    prepare_markdown_download, ExportMenuDecision, ExportMenuKey,
 };
 use crate::routes::{NotesQueryParams, Route};
 use crate::state::{stale_retry_blocked, AttachmentContent, NoteSummary};
@@ -77,14 +77,6 @@ fn copy_generation_is_current(current: u64, completed: u64) -> bool {
 
 fn note_load_is_current(started_generation: u64, current_generation: u64) -> bool {
     started_generation == current_generation
-}
-
-fn markdown_download_announcement(has_attachments: bool) -> &'static str {
-    if has_attachments {
-        "Markdown download initiated. Attachment files are not included in this Markdown download."
-    } else {
-        "Markdown download initiated."
-    }
 }
 
 fn delete_confirmation_message(title: &str) -> String {
@@ -542,14 +534,13 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                                                         }
                                                     }
                                                     ExportMenuDecision::DownloadMarkdownAndRestoreFocus => {
-                                                        match initiate_browser_download(&prepared) {
-                                                            Ok(()) => export_announcement.set(
-                                                                markdown_download_announcement(has_attachments).to_string()
-                                                            ),
-                                                            Err(message) => export_announcement.set(
-                                                                format!("Unable to initiate Markdown download: {message}")
-                                                            ),
-                                                        }
+                                                        export_announcement.set(
+                                                            initiate_captured_markdown_download(
+                                                                &prepared,
+                                                                has_attachments,
+                                                                initiate_browser_download,
+                                                            )
+                                                        );
                                                         export_open.set(false);
                                                         if let Some(trigger) = export_trigger_ref.cast::<web_sys::HtmlElement>() {
                                                             let _ = trigger.focus();
@@ -578,14 +569,13 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                                                 );
                                                 let has_attachments = !n.attachments.is_empty();
                                                 Callback::from(move |_| {
-                                                    match initiate_browser_download(&prepared) {
-                                                        Ok(()) => export_announcement.set(
-                                                            markdown_download_announcement(has_attachments).to_string()
-                                                        ),
-                                                        Err(message) => export_announcement.set(
-                                                            format!("Unable to initiate Markdown download: {message}")
-                                                        ),
-                                                    }
+                                                    export_announcement.set(
+                                                        initiate_captured_markdown_download(
+                                                            &prepared,
+                                                            has_attachments,
+                                                            initiate_browser_download,
+                                                        )
+                                                    );
                                                     export_open.set(false);
                                                     if let Some(trigger) = export_trigger_ref.cast::<web_sys::HtmlElement>() {
                                                         let _ = trigger.focus();
@@ -811,8 +801,8 @@ mod tests {
     use super::{
         content_copy_announcement, content_copy_chip_text, content_copy_payload, copy_announcement,
         copy_chip_text, copy_generation_is_current, delete_confirmation_message,
-        markdown_download_announcement, next_copy_generation, note_load_is_current,
-        rewrite_attachment_urls, try_start_delete, CopyStatus,
+        next_copy_generation, note_load_is_current, rewrite_attachment_urls, try_start_delete,
+        CopyStatus,
     };
     use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
@@ -929,18 +919,6 @@ mod tests {
     fn note_load_generation_rejects_late_initial_and_conflict_reload_completions() {
         assert!(note_load_is_current(7, 7));
         assert!(!note_load_is_current(6, 7));
-    }
-
-    #[test]
-    fn markdown_initiation_message_mentions_omitted_attachments_only_when_present() {
-        assert_eq!(
-            markdown_download_announcement(false),
-            "Markdown download initiated."
-        );
-        assert_eq!(
-            markdown_download_announcement(true),
-            "Markdown download initiated. Attachment files are not included in this Markdown download."
-        );
     }
 
     #[test]
