@@ -4,7 +4,7 @@ use html5ever::tokenizer::{
     BufferQueue, StartTag, TagToken, Token, TokenSink, TokenSinkResult, Tokenizer,
 };
 use note_attachments::BoundedReadError;
-use note_core::{Note, NoteAttachment};
+use note_core::{normalize_attachment_path, Note, NoteAttachment};
 use note_storage::TransactionMode;
 use percent_encoding::percent_decode_str;
 use pulldown_cmark::{Event, Parser, Tag};
@@ -54,13 +54,21 @@ impl NoteExportLimits {
     }
 }
 
+/// A note state captured by [`capture_note_export`] inside a storage snapshot.
+///
+/// Callers cannot manufacture a captured state without the capture workflow.
+///
+/// ```compile_fail
+/// use note_pipelines::CapturedNoteExport;
+/// let _ = CapturedNoteExport::from_note;
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapturedNoteExport {
     note: Note,
 }
 
 impl CapturedNoteExport {
-    pub fn from_note(note: Note) -> Result<Self, NoteExportError> {
+    fn new(note: Note) -> Result<Self, NoteExportError> {
         if note.deleted_at.is_some() {
             return Err(NoteExportError::NoteNotFound);
         }
@@ -107,6 +115,8 @@ impl PlannedAttachmentAsset {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteExportAssetPlan {
+    captured_note_id: String,
+    captured_revision: i64,
     assets: Vec<PlannedAttachmentAsset>,
     omissions: Vec<ExportAssetOmission>,
     data_images: Vec<String>,
@@ -145,6 +155,7 @@ pub struct FrozenNoteExport {
 pub enum NoteExportError {
     InvalidExpectedRevision,
     InvalidInput,
+    MismatchedAssetPlan,
     NoteNotFound,
     StaleRevision { expected: i64, current: i64 },
     MarkdownLimitExceeded,
@@ -164,6 +175,7 @@ impl fmt::Debug for NoteExportError {
         formatter.write_str(match self {
             Self::InvalidExpectedRevision => "InvalidExpectedRevision",
             Self::InvalidInput => "InvalidInput",
+            Self::MismatchedAssetPlan => "MismatchedAssetPlan",
             Self::NoteNotFound => "NoteNotFound",
             Self::StaleRevision { .. } => "StaleRevision",
             Self::MarkdownLimitExceeded => "MarkdownLimitExceeded",
@@ -185,6 +197,7 @@ impl fmt::Display for NoteExportError {
         let message = match self {
             Self::InvalidExpectedRevision => "expected revision must be positive",
             Self::InvalidInput => "invalid note export limits",
+            Self::MismatchedAssetPlan => "note export asset plan does not match captured note",
             Self::NoteNotFound => "note not found",
             Self::StaleRevision { .. } => "note revision is stale",
             Self::MarkdownLimitExceeded => "note Markdown exceeds export limit",
@@ -218,7 +231,13 @@ pub fn plan_note_export_assets(
 
     for destination in destinations {
         let lower = destination.to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") {
+        if lower.starts_with("data:") {
+            if seen_data.insert(destination.clone()) {
+                data_images.push(destination);
+            }
+            continue;
+        }
+        if is_external_destination(&destination) {
             if !omissions
                 .iter()
                 .any(|entry: &ExportAssetOmission| entry.destination == destination)
@@ -227,12 +246,6 @@ pub fn plan_note_export_assets(
                     kind: ExportAssetKind::External,
                     destination,
                 });
-            }
-            continue;
-        }
-        if lower.starts_with("data:") {
-            if seen_data.insert(destination.clone()) {
-                data_images.push(destination);
             }
             continue;
         }
@@ -252,10 +265,12 @@ pub fn plan_note_export_assets(
         }
     }
 
-    if assets.len() > DEFAULT_MAX_ASSET_COUNT {
+    if assets.len().saturating_add(data_images.len()) > DEFAULT_MAX_ASSET_COUNT {
         return Err(NoteExportError::AssetCountLimitExceeded);
     }
     Ok(NoteExportAssetPlan {
+        captured_note_id: captured.note.id.clone(),
+        captured_revision: captured.note.revision,
         assets,
         omissions,
         data_images,
@@ -266,25 +281,34 @@ fn resolve_captured_attachment<'a>(
     attachments: &'a [NoteAttachment],
     destination: &str,
 ) -> Option<&'a NoteAttachment> {
-    let raw = destination.strip_prefix("./").unwrap_or(destination);
-    let decoded = percent_decode_str(raw).decode_utf8().ok();
+    let raw = normalize_attachment_path(destination);
+    let decoded = percent_decode_str(destination)
+        .decode_utf8()
+        .ok()
+        .map(|value| normalize_attachment_path(&value));
     attachments
         .iter()
-        .find(|attachment| {
-            attachment
-                .path
-                .strip_prefix("./")
-                .unwrap_or(&attachment.path)
-                == raw
-        })
+        .find(|attachment| normalize_attachment_path(&attachment.path) == raw)
         .or_else(|| {
             attachments.iter().find(|attachment| {
-                let path = attachment
-                    .path
-                    .strip_prefix("./")
-                    .unwrap_or(&attachment.path);
+                let path = normalize_attachment_path(&attachment.path);
                 decoded.as_deref().is_some_and(|decoded| path == decoded)
             })
+        })
+}
+
+fn is_external_destination(destination: &str) -> bool {
+    if destination.starts_with("//") {
+        return true;
+    }
+    let Some((scheme, _)) = destination.split_once(':') else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' => true,
+            b'0'..=b'9' | b'+' | b'-' | b'.' => index > 0,
+            _ => false,
         })
 }
 
@@ -380,7 +404,7 @@ pub async fn capture_note_export_with_limits(
     if note.content.len() as u64 > limits.max_markdown_bytes {
         return Err(NoteExportError::MarkdownLimitExceeded);
     }
-    Ok(CapturedNoteExport { note })
+    CapturedNoteExport::new(note)
 }
 
 pub async fn hydrate_note_export(
@@ -390,7 +414,11 @@ pub async fn hydrate_note_export(
     limits: NoteExportLimits,
 ) -> Result<FrozenNoteExport, NoteExportError> {
     let limits = limits.validate()?;
-    if plan.assets.len() > limits.max_asset_count {
+    if plan.captured_note_id != captured.note.id || plan.captured_revision != captured.note.revision
+    {
+        return Err(NoteExportError::MismatchedAssetPlan);
+    }
+    if plan.assets.len().saturating_add(plan.data_images.len()) > limits.max_asset_count {
         return Err(NoteExportError::AssetCountLimitExceeded);
     }
     let mut combined = 0_u64;
@@ -440,11 +468,15 @@ pub async fn hydrate_note_export(
                             attachment_id: planned.attachment.id,
                         })
                     }
-                    None => {}
+                    Some(BoundedReadError::Missing) => {
+                        return Err(NoteExportError::AssetMissing {
+                            destination: planned.destination,
+                        })
+                    }
+                    Some(BoundedReadError::StorageFailure) | None => {
+                        return Err(NoteExportError::StorageFailure)
+                    }
                 }
-                return Err(NoteExportError::AssetMissing {
-                    destination: planned.destination,
-                });
             }
         };
         if let Some(storage) = &planned.attachment.storage {

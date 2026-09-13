@@ -196,14 +196,25 @@ impl S3AttachmentStore {
     }
 
     async fn read_key_bounded(&self, key: &str, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
-        let output = self
+        let output = match self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
             .await
-            .map_err(|error| safe_sdk_error("get object", &error))?;
+        {
+            Ok(output) => output,
+            Err(error)
+                if matches!(error.code(), Some("NoSuchKey" | "NotFound" | "404"))
+                    || error
+                        .raw_response()
+                        .is_some_and(|response| response.status().as_u16() == 404) =>
+            {
+                return Err(crate::BoundedReadError::Missing.into())
+            }
+            Err(_) => return Err(crate::BoundedReadError::StorageFailure.into()),
+        };
         if output
             .content_length()
             .and_then(|length| u64::try_from(length).ok())
@@ -299,7 +310,7 @@ where
         .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
         .await
-        .map_err(|_| anyhow::anyhow!("S3 get object body failed (stream)"))?;
+        .map_err(|_| anyhow::Error::from(crate::BoundedReadError::StorageFailure))?;
     if bytes.len() as u64 > max_bytes {
         return Err(crate::BoundedReadError::LimitExceeded.into());
     }
@@ -997,6 +1008,44 @@ mod tests {
         assert!(matches!(
             error.downcast_ref::<crate::BoundedReadError>(),
             Some(crate::BoundedReadError::LimitExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_reads_distinguish_missing_keys_from_service_failures() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("bounded-errors-access", "bounded-errors-secret");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/missing"))
+            .respond_with(ResponseTemplate::new(404).set_body_raw(
+                "<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>",
+                "application/xml",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/failure"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let store = test_store(server.uri()).await;
+
+        let missing = store
+            .read_object_bounded("generations/missing", 8)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<crate::BoundedReadError>(),
+            Some(crate::BoundedReadError::Missing)
+        ));
+        let storage = store
+            .read_object_bounded("generations/failure", 8)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            storage.downcast_ref::<crate::BoundedReadError>(),
+            Some(crate::BoundedReadError::StorageFailure)
         ));
     }
 

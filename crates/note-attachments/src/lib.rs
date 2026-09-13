@@ -42,6 +42,8 @@ pub enum DeleteObjectOutcome {
 pub enum BoundedReadError {
     Unsupported,
     LimitExceeded,
+    Missing,
+    StorageFailure,
 }
 
 impl std::fmt::Display for BoundedReadError {
@@ -49,6 +51,8 @@ impl std::fmt::Display for BoundedReadError {
         formatter.write_str(match self {
             Self::Unsupported => "bounded attachment reads are not supported by this store",
             Self::LimitExceeded => "attachment object exceeds bounded read limit",
+            Self::Missing => "attachment object does not exist",
+            Self::StorageFailure => "attachment bounded read failed",
         })
     }
 }

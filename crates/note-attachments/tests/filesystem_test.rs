@@ -84,6 +84,32 @@ async fn bounded_reads_accept_exact_limit_and_reject_oversized_objects() {
 }
 
 #[tokio::test]
+async fn bounded_reads_distinguish_missing_objects_from_storage_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    std::fs::create_dir_all(root.join("objects/directory")).unwrap();
+    let store = FilesystemAttachmentStore::new(root);
+
+    let missing = store
+        .read_object_bounded("objects/missing", 8)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing.downcast_ref::<BoundedReadError>(),
+        Some(BoundedReadError::Missing)
+    ));
+
+    let storage = store
+        .read_object_bounded("objects/directory", 1024 * 1024)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        storage.downcast_ref::<BoundedReadError>(),
+        Some(BoundedReadError::StorageFailure)
+    ));
+}
+
+#[tokio::test]
 async fn legacy_read_and_delete_are_exact_contained_and_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("attachments");

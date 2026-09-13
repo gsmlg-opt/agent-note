@@ -51,7 +51,7 @@ impl AttachmentStore for FilesystemAttachmentStore {
     ) -> anyhow::Result<Vec<u8>> {
         let object_key = canonical_object_key(object_key)?;
         if !existing_safe_directory(&self.root).await? {
-            anyhow::bail!("attachment object root does not exist");
+            return Err(crate::BoundedReadError::Missing.into());
         }
         reject_symlink_components(&self.root, &object_key).await?;
         read_file_bounded(attachment_path_on_disk(&self.root, &object_key), max_bytes).await
@@ -108,7 +108,7 @@ impl AttachmentStore for FilesystemAttachmentStore {
     ) -> anyhow::Result<Vec<u8>> {
         let note_dir = note_directory(&self.root, note_id)?;
         if !existing_safe_directory(&note_dir).await? {
-            anyhow::bail!("attachment note directory does not exist");
+            return Err(crate::BoundedReadError::Missing.into());
         }
         let relative_path = canonical_relative_path(path)?;
         reject_symlink_components(&note_dir, &relative_path).await?;
@@ -128,18 +128,29 @@ impl AttachmentStore for FilesystemAttachmentStore {
 }
 
 async fn read_file_bounded(path: PathBuf, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
-    let file = fs::File::open(path).await?;
-    if file.metadata().await?.len() > max_bytes {
+    let file = fs::File::open(path).await.map_err(bounded_io_error)?;
+    if file.metadata().await.map_err(bounded_io_error)?.len() > max_bytes {
         return Err(crate::BoundedReadError::LimitExceeded.into());
     }
     let ceiling = max_bytes.saturating_add(1);
     let initial_capacity = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(64 * 1024);
     let mut bytes = Vec::with_capacity(initial_capacity);
-    file.take(ceiling).read_to_end(&mut bytes).await?;
+    file.take(ceiling)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(bounded_io_error)?;
     if bytes.len() as u64 > max_bytes {
         return Err(crate::BoundedReadError::LimitExceeded.into());
     }
     Ok(bytes)
+}
+
+fn bounded_io_error(error: std::io::Error) -> anyhow::Error {
+    if error.kind() == ErrorKind::NotFound {
+        crate::BoundedReadError::Missing.into()
+    } else {
+        crate::BoundedReadError::StorageFailure.into()
+    }
 }
 
 async fn delete_file(path: &Path) -> anyhow::Result<DeleteObjectOutcome> {
