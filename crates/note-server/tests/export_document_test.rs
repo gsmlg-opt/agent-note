@@ -597,46 +597,209 @@ pie showData
 }
 
 #[test]
-fn print_css_covers_every_supported_mermaid_shape_family() {
-    let package =
-        build_export_document(&frozen("body", vec![]), ExportDocumentLimits::default()).unwrap();
+fn every_supported_mermaid_family_survives_rendering_and_export_sanitization() {
+    // These minimal valid sources follow yew-duskmoon 0.9.0's own renderer fixtures.
+    let fixtures = [
+        (
+            "flowchart LR\n  A --> B",
+            "dm-mermaid-node",
+            ".dm-mermaid-node rect",
+        ),
+        (
+            "swimlane-beta LR\n  subgraph Customer\n    request[Request]\n  end",
+            "dm-swimlane-lane",
+            ".dm-swimlane-lane rect",
+        ),
+        (
+            "sequenceDiagram\n  Author->>Renderer: Render",
+            "dm-sequence-lane",
+            ".dm-sequence-lane rect",
+        ),
+        (
+            "classDiagram\n  class Note {\n    +render()\n  }",
+            "dm-class-node",
+            ".dm-class-node rect",
+        ),
+        (
+            "stateDiagram-v2\n  [*] --> Ready",
+            "dm-state-start",
+            ".dm-state-start",
+        ),
+        (
+            "erDiagram\n  NOTE ||--o{ ASSET : contains",
+            "dm-er-entity",
+            ".dm-er-entity rect",
+        ),
+        (
+            "journey\n  section Export\n    Render: 5: User",
+            "dm-journey-task",
+            ".dm-journey-task",
+        ),
+        (
+            "gantt\n  title Export\n  Task :2026-01-01, 1d",
+            "dm-gantt-bar",
+            ".dm-gantt-bar",
+        ),
+        (
+            "pie showData\n  \"Rendered\" : 100",
+            "dm-mermaid-pie-graphic",
+            ".dm-mermaid-pie-graphic",
+        ),
+        (
+            "quadrantChart\n  Note: [0.4, 0.7]",
+            "dm-mermaid-quadrant-plane",
+            ".dm-mermaid-quadrant-plane",
+        ),
+        (
+            "requirementDiagram\n  requirement safe_render {\n    id: EXP-1\n  }",
+            "dm-requirement-node",
+            ".dm-requirement-node rect",
+        ),
+        (
+            "gitGraph\n  commit id: \"export\"",
+            "dm-git-commit",
+            ".dm-git-commit circle",
+        ),
+        (
+            "C4Context\n  Person(user, \"User\")",
+            "dm-c4-node",
+            ".dm-c4-node rect",
+        ),
+        (
+            "mindmap\n  root((Export))\n    PDF",
+            "dm-mindmap-node",
+            ".dm-mindmap-node rect",
+        ),
+        (
+            "timeline\n  Source : Markdown",
+            "dm-timeline-event",
+            ".dm-timeline-event",
+        ),
+        (
+            "zenuml\n  Author->Renderer: Render",
+            "dm-zenuml-participant",
+            ".dm-zenuml-participant rect",
+        ),
+        (
+            "sankey-beta\n  Markdown,PDF,10",
+            "dm-sankey-node",
+            ".dm-sankey-node rect",
+        ),
+        ("xychart-beta\n  bar [1, 2]", "dm-xy-bar", ".dm-xy-bar"),
+        (
+            "block-beta\n  Source --> PDF",
+            "dm-block-node",
+            ".dm-block-node rect",
+        ),
+        (
+            "packet-beta\n  0-7: \"type\"",
+            "dm-packet-field",
+            ".dm-packet-field rect",
+        ),
+        (
+            "kanban\n  Todo\n    Export",
+            "dm-kanban-column",
+            ".dm-kanban-column > rect",
+        ),
+        (
+            "architecture-beta\n  service api(server)[API]",
+            "dm-architecture-service",
+            ".dm-architecture-service rect",
+        ),
+        (
+            "radar-beta\n  axis Safety, Speed\n  curve Export{4,3}",
+            "dm-radar-area",
+            ".dm-radar-area",
+        ),
+        (
+            "eventModeling\n  event ExportRequested",
+            "dm-event-modeling-node",
+            ".dm-event-modeling-node rect",
+        ),
+        (
+            "treemap-beta\n  \"Export\"\n    \"PDF\": 40",
+            "dm-treemap-leaf",
+            ".dm-treemap-leaf rect",
+        ),
+        (
+            "venn\n  Markdown: 40\n  PDF: 35\n  Markdown & PDF: 15",
+            "dm-venn-left",
+            ".dm-venn-left",
+        ),
+        (
+            "ishikawa\n  root((Quality))\n    Export",
+            "dm-ishikawa-head",
+            ".dm-ishikawa-head",
+        ),
+        (
+            "wardley\n  component Export [0.6, 0.5]",
+            "dm-wardley-plane",
+            ".dm-wardley-plane",
+        ),
+        (
+            "cynefin\n  Simple: Export",
+            "dm-cynefin-domain",
+            ".dm-cynefin-domain rect",
+        ),
+        (
+            "treeview\n  root\n    export",
+            "dm-treeview-glyph",
+            ".dm-treeview-glyph",
+        ),
+    ];
+    assert_eq!(fixtures.len(), 30, "update the full Mermaid family matrix");
 
-    for css_selector in [
-        ".dm-mermaid-node rect",
-        ".dm-swimlane-lane rect",
-        ".dm-sequence-lane rect",
-        ".dm-class-node rect",
-        ".dm-state-start",
-        ".dm-er-entity rect",
-        ".dm-journey-task",
-        ".dm-gantt-bar",
-        ".dm-mermaid-pie-graphic",
-        ".dm-git-commit circle",
-        ".dm-c4-node rect",
-        ".dm-mindmap-node rect",
-        ".dm-timeline-event",
-        ".dm-zenuml-participant rect",
-        ".dm-sankey-node rect",
-        ".dm-xy-bar",
-        ".dm-block-node rect",
-        ".dm-packet-field rect",
-        ".dm-kanban-column > rect",
-        ".dm-architecture-service rect",
-        ".dm-radar-area",
-        ".dm-event-modeling-node rect",
-        ".dm-treemap-leaf rect",
-        ".dm-venn-left",
-        ".dm-ishikawa-head",
-        ".dm-wardley-plane",
-        ".dm-cynefin-domain rect",
-        ".dm-treeview-glyph",
-        ".dm-mermaid-quadrant-plane",
-        ".dm-requirement-node rect",
-        ".dm-mermaid-summary-grid span",
-    ] {
+    for (source, rendered_class, css_selector) in fixtures {
+        let markdown = format!("```mermaid\n{source}\n```");
+        let package =
+            build_export_document(&frozen(&markdown, vec![]), ExportDocumentLimits::default())
+                .unwrap();
+
+        assert!(
+            package.index_html.contains(rendered_class),
+            "renderer or sanitizer dropped {rendered_class} for:\n{source}"
+        );
         assert!(
             package.index_html.contains(css_selector),
-            "missing export-owned styling for {css_selector}"
+            "missing export-owned styling for emitted {rendered_class}"
+        );
+        assert!(
+            !package.index_html.contains("Diagram could not be rendered"),
+            "valid renderer fixture unexpectedly fell back for:\n{source}"
+        );
+    }
+}
+
+fn simple_selector_specificity(selector: &str) -> (usize, usize, usize) {
+    let ids = selector.matches('#').count();
+    let classes = selector.matches('.').count();
+    let elements = selector
+        .split_ascii_whitespace()
+        .filter(|part| part.chars().next().is_some_and(char::is_alphabetic))
+        .count();
+    (ids, classes, elements)
+}
+
+#[test]
+fn light_mermaid_text_overrides_win_the_css_cascade() {
+    let package =
+        build_export_document(&frozen("body", vec![]), ExportDocumentLimits::default()).unwrap();
+    let shared = ".dm-mermaid-chart text";
+
+    assert_eq!(simple_selector_specificity(shared), (0, 1, 1));
+    for semantic_override in [
+        ".dm-mermaid-chart .dm-journey-score-text",
+        ".dm-mermaid-chart .dm-gantt-task",
+    ] {
+        assert!(
+            package
+                .index_html
+                .contains(&format!("{semantic_override} {{ fill: #ffffff")),
+            "missing scoped light-text rule {semantic_override}"
+        );
+        assert!(
+            simple_selector_specificity(semantic_override) > simple_selector_specificity(shared),
+            "{semantic_override} must outrank {shared}"
         );
     }
 }

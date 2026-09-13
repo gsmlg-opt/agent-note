@@ -152,7 +152,7 @@ pre {
 /* Journey retains separate tasks, scores, actors, and guide lines. */
 .dm-journey-task { fill: #eaddff; stroke: #6750a4; }
 .dm-journey-score { fill: #6750a4; stroke: #ffffff; }
-.dm-journey-score-text { fill: #ffffff; }
+.dm-mermaid-chart .dm-journey-score-text { fill: #ffffff; }
 .dm-journey-axis,
 .dm-journey-drop { stroke: #79747e; }
 .dm-journey-axis-arrow { fill: #79747e; }
@@ -200,7 +200,7 @@ pre {
 .dm-git-commit-merge circle { fill: #006a6a; }
 .dm-gantt-bar-done,
 .dm-xy-bar-3 { fill: #8c5000; }
-.dm-gantt-task { fill: #ffffff; }
+.dm-mermaid-chart .dm-gantt-task { fill: #ffffff; }
 .dm-timeline-event { fill: #e8def8; stroke: #6750a4; }
 .dm-radar-area { fill: #6750a4; fill-opacity: 0.2; stroke: #6750a4; }
 .dm-radar-area-2 { fill: #006a6a; stroke: #006a6a; }
