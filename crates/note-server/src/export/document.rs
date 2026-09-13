@@ -1,6 +1,9 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use html5ever::{local_name, ns, parse_fragment, tendril::TendrilSink, QualName};
-use image::{guess_format, ImageFormat, ImageReader};
+use image::{
+    codecs::png::PngEncoder, guess_format, ImageEncoder, ImageFormat, ImageReader,
+    Limits as ImageLimits,
+};
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use note_pipelines::{ExportAssetKind, FrozenNoteExport};
 use percent_encoding::percent_decode_str;
@@ -8,9 +11,9 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use roxmltree::{Document, Node};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
-    io::Cursor,
+    io::{Cursor, Write},
     ops::Range,
 };
 
@@ -25,6 +28,8 @@ const DEFAULT_MAX_DIAGRAM_COUNT: usize = 32;
 const DEFAULT_MAX_DIAGRAM_BYTES: usize = 256 * 1024;
 const DEFAULT_MAX_COMBINED_DIAGRAM_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_DIAGRAM_LINES: usize = 4_096;
+const DEFAULT_MAX_PACKAGED_ASSET_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_COMBINED_PACKAGED_ASSET_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportDocumentLimits {
@@ -38,6 +43,8 @@ pub struct ExportDocumentLimits {
     pub max_diagram_bytes: usize,
     pub max_combined_diagram_bytes: usize,
     pub max_diagram_lines: usize,
+    pub max_packaged_asset_bytes: usize,
+    pub max_combined_packaged_asset_bytes: usize,
 }
 
 impl Default for ExportDocumentLimits {
@@ -53,6 +60,8 @@ impl Default for ExportDocumentLimits {
             max_diagram_bytes: DEFAULT_MAX_DIAGRAM_BYTES,
             max_combined_diagram_bytes: DEFAULT_MAX_COMBINED_DIAGRAM_BYTES,
             max_diagram_lines: DEFAULT_MAX_DIAGRAM_LINES,
+            max_packaged_asset_bytes: DEFAULT_MAX_PACKAGED_ASSET_BYTES,
+            max_combined_packaged_asset_bytes: DEFAULT_MAX_COMBINED_PACKAGED_ASSET_BYTES,
         }
     }
 }
@@ -90,6 +99,8 @@ pub enum ExportDocumentError {
     DiagramInputLimitExceeded,
     CombinedDiagramInputLimitExceeded,
     DiagramComplexityExceeded,
+    PackagedAssetLimitExceeded { destination: String },
+    CombinedPackagedAssetLimitExceeded,
 }
 
 impl fmt::Display for ExportDocumentError {
@@ -120,6 +131,12 @@ impl fmt::Display for ExportDocumentError {
                 "combined export diagram input exceeds the limit"
             }
             Self::DiagramComplexityExceeded => "export diagram complexity exceeds the limit",
+            Self::PackagedAssetLimitExceeded { .. } => {
+                "packaged export image exceeds the byte limit"
+            }
+            Self::CombinedPackagedAssetLimitExceeded => {
+                "combined packaged export images exceed the byte limit"
+            }
         };
         formatter.write_str(message)
     }
@@ -134,10 +151,12 @@ pub fn build_export_document(
     validate_limits(limits)?;
     validate_export_diagrams(&frozen.note.content, limits)?;
     let prepared = prepare_footnotes(&frozen.note.content);
+    preflight_generated_html(&prepared, &frozen.note.title, limits)?;
 
     let mut assets = Vec::new();
-    let mut rewrites = HashMap::new();
+    let mut rewrites = RewriteManifest::default();
     let mut combined_pixels = 0_u64;
+    let mut combined_packaged_bytes = 0_usize;
     for hydrated in &frozen.assets {
         if let Some(storage) = &hydrated.attachment.storage {
             if storage.size_bytes != hydrated.bytes.len() as u64 {
@@ -158,9 +177,14 @@ pub fn build_export_document(
             limits,
             &mut combined_pixels,
         )?;
+        add_packaged_bytes(
+            &hydrated.destination,
+            validated.bytes.len(),
+            limits,
+            &mut combined_packaged_bytes,
+        )?;
         let filename = asset_filename(assets.len() + 1, validated.extension);
-        rewrites.insert(hydrated.destination.clone(), filename.clone());
-        rewrites.insert(normalize_relative(&hydrated.destination), filename.clone());
+        rewrites.insert(&hydrated.destination, &filename);
         assets.push(PackagedExportAsset {
             filename,
             mime: validated.mime.into(),
@@ -177,8 +201,14 @@ pub fn build_export_document(
             limits,
             &mut combined_pixels,
         )?;
+        add_packaged_bytes(
+            "embedded data image",
+            validated.bytes.len(),
+            limits,
+            &mut combined_packaged_bytes,
+        )?;
         let filename = asset_filename(assets.len() + 1, validated.extension);
-        rewrites.insert(data_url.clone(), filename.clone());
+        rewrites.insert(data_url, &filename);
         assets.push(PackagedExportAsset {
             filename,
             mime: validated.mime.into(),
@@ -186,11 +216,10 @@ pub fn build_export_document(
         });
     }
 
-    let mut rendered = render_with_existing_contract(&prepared.body_markdown);
-    rendered.push_str(&render_footnote_definitions(&prepared.footnotes));
-    if rendered.len() > limits.max_generated_html_bytes {
-        return Err(ExportDocumentError::GeneratedHtmlLimitExceeded);
-    }
+    let mut rendered = CappedString::new(limits.max_generated_html_bytes);
+    rendered.push_str(&render_with_existing_contract(&prepared.body_markdown));
+    render_footnote_definitions(&prepared, &mut rendered);
+    let rendered = rendered.finish()?;
 
     let external_omissions = frozen
         .omissions
@@ -198,32 +227,55 @@ pub fn build_export_document(
         .filter(|omission| omission.kind == ExportAssetKind::External)
         .map(|omission| omission.destination.as_str())
         .collect::<Vec<_>>();
-    let mut original_image_sources = collect_original_image_sources(&prepared.body_markdown);
+    let mut original_image_sources =
+        collect_original_image_sources(markdown_body_after_front_matter(&prepared.body_markdown));
     for footnote in &prepared.footnotes {
-        original_image_sources.extend(collect_original_image_sources(&footnote.markdown));
+        original_image_sources.extend(collect_original_image_sources(
+            markdown_body_after_front_matter(&footnote.markdown),
+        ));
     }
     let policy = HtmlPolicy {
         rewrites: &rewrites,
         external_omissions: &external_omissions,
         original_image_sources: &original_image_sources,
+        footnote_marker: &prepared.marker_token,
     };
     let SanitizedHtml {
         html: body,
         removed,
     } = sanitize_html(&rendered, &policy, limits, &mut combined_pixels)?;
-    let title = escape_text(&frozen.note.title);
     let notices = export_notices(!external_omissions.is_empty(), removed);
-    let index_html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"color-scheme\" content=\"light\"><title>{title}</title><style>{PRINT_CSS}</style></head><body><main class=\"export-document markdown-body\"><h1 class=\"export-title\">{title}</h1>{notices}{body}</main></body></html>"
-    );
-    if index_html.len() > limits.max_generated_html_bytes {
-        return Err(ExportDocumentError::GeneratedHtmlLimitExceeded);
-    }
+    let index_html = assemble_index_html(
+        &frozen.note.title,
+        &notices,
+        &body,
+        limits.max_generated_html_bytes,
+    )?;
     Ok(ExportDocumentPackage {
         index_html,
         footer_html: "<!doctype html><html><head><style>body{width:100%;margin:0;color:#5f6368;font:8pt \"Noto Sans\",\"DejaVu Sans\",sans-serif}div{text-align:center}</style></head><body><div><span class=\"pageNumber\"></span> / <span class=\"totalPages\"></span></div></body></html>".into(),
         assets,
     })
+}
+
+fn assemble_index_html(
+    title: &str,
+    notices: &str,
+    body: &str,
+    max_bytes: usize,
+) -> Result<String, ExportDocumentError> {
+    let mut index_html = CappedString::new(max_bytes);
+    index_html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"color-scheme\" content=\"light\"><title>");
+    index_html.push_escaped_text(title);
+    index_html.push_str("</title><style>");
+    index_html.push_str(PRINT_CSS);
+    index_html.push_str("</style></head><body><main class=\"export-document markdown-body\"><h1 class=\"export-title\">");
+    index_html.push_escaped_text(title);
+    index_html.push_str("</h1>");
+    index_html.push_str(notices);
+    index_html.push_str(body);
+    index_html.push_str("</main></body></html>");
+    index_html.finish()
 }
 
 fn validate_limits(limits: ExportDocumentLimits) -> Result<(), ExportDocumentError> {
@@ -236,6 +288,8 @@ fn validate_limits(limits: ExportDocumentLimits) -> Result<(), ExportDocumentErr
         || limits.max_diagram_bytes == 0
         || limits.max_combined_diagram_bytes < limits.max_diagram_bytes
         || limits.max_diagram_lines == 0
+        || limits.max_packaged_asset_bytes == 0
+        || limits.max_combined_packaged_asset_bytes == 0
     {
         return Err(ExportDocumentError::InvalidLimits);
     }
@@ -256,13 +310,7 @@ pub fn validate_export_diagrams(
     for event in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES) {
         match event {
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
-                if info
-                    .split_ascii_whitespace()
-                    .next()
-                    .is_some_and(|language| {
-                        language.eq_ignore_ascii_case("mermaid")
-                            || language.eq_ignore_ascii_case("mmd")
-                    }) =>
+                if is_mermaid_language(&info) =>
             {
                 diagram_count += 1;
                 if diagram_count > limits.max_diagram_count {
@@ -315,10 +363,186 @@ pub fn validate_export_diagrams(
     Ok(())
 }
 
+fn is_mermaid_language(info: &str) -> bool {
+    info.split_whitespace().next().is_some_and(|language| {
+        let language = language.trim().to_ascii_lowercase();
+        matches!(language.as_str(), "mermaid" | "mmd")
+    })
+}
+
+fn preflight_generated_html(
+    prepared: &PreparedFootnotes,
+    title: &str,
+    limits: ExportDocumentLimits,
+) -> Result<(), ExportDocumentError> {
+    let mut markdown_bytes = 0_usize;
+    let mut diagram_count = 0_usize;
+    let mut diagram_bytes = 0_usize;
+    let mut diagram_lines = 0_usize;
+    for markdown in std::iter::once(prepared.body_markdown.as_str()).chain(
+        prepared
+            .footnotes
+            .iter()
+            .map(|footnote| footnote.markdown.as_str()),
+    ) {
+        markdown_bytes = markdown_bytes
+            .checked_add(markdown.len())
+            .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+        let mut in_diagram = false;
+        for event in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES) {
+            match event {
+                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                    if is_mermaid_language(&info) =>
+                {
+                    diagram_count = diagram_count
+                        .checked_add(1)
+                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+                    in_diagram = true;
+                }
+                Event::Text(text) if in_diagram => {
+                    diagram_bytes = diagram_bytes
+                        .checked_add(text.len())
+                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+                    diagram_lines = diagram_lines
+                        .checked_add(text.lines().count().max(1))
+                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+                }
+                Event::SoftBreak | Event::HardBreak if in_diagram => {
+                    diagram_bytes = diagram_bytes
+                        .checked_add(1)
+                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+                    diagram_lines = diagram_lines
+                        .checked_add(1)
+                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+                }
+                Event::End(TagEnd::CodeBlock) if in_diagram => in_diagram = false,
+                _ => {}
+            }
+        }
+    }
+
+    // The renderer necessarily returns a String. Reject work before invoking it using a
+    // conservative ceiling for escaping, syntax spans, diagram DOM, and the fixed wrapper.
+    let footnote_references = prepared
+        .footnotes
+        .iter()
+        .try_fold(0_usize, |total, footnote| {
+            total.checked_add(footnote.reference_ids.len())
+        })
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+    let estimated = PRINT_CSS
+        .len()
+        .checked_add(512)
+        .and_then(|value| value.checked_add(title.len().checked_mul(10)?))
+        .and_then(|value| value.checked_add(markdown_bytes.checked_mul(6)?))
+        .and_then(|value| value.checked_add(prepared.footnotes.len().checked_mul(512)?))
+        .and_then(|value| value.checked_add(footnote_references.checked_mul(256)?))
+        .and_then(|value| value.checked_add(diagram_count.checked_mul(64 * 1024)?))
+        .and_then(|value| value.checked_add(diagram_bytes.checked_mul(32)?))
+        .and_then(|value| value.checked_add(diagram_lines.checked_mul(256)?))
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+    if estimated > limits.max_generated_html_bytes {
+        return Err(ExportDocumentError::GeneratedHtmlLimitExceeded);
+    }
+    Ok(())
+}
+
+struct CappedString {
+    value: String,
+    max: usize,
+    exceeded: bool,
+}
+
+impl CappedString {
+    fn new(max: usize) -> Self {
+        Self {
+            value: String::new(),
+            max,
+            exceeded: false,
+        }
+    }
+
+    fn push_str(&mut self, value: &str) {
+        let fits = self
+            .value
+            .len()
+            .checked_add(value.len())
+            .is_some_and(|length| length <= self.max);
+        if fits {
+            self.value.push_str(value);
+        } else {
+            self.exceeded = true;
+        }
+    }
+
+    fn push(&mut self, value: char) {
+        let mut buffer = [0_u8; 4];
+        self.push_str(value.encode_utf8(&mut buffer));
+    }
+
+    fn push_escaped_text(&mut self, value: &str) {
+        for character in value.chars() {
+            self.push_str(match character {
+                '&' => "&amp;",
+                '<' => "&lt;",
+                '>' => "&gt;",
+                _ => {
+                    self.push(character);
+                    continue;
+                }
+            });
+        }
+    }
+
+    fn push_escaped_attribute(&mut self, value: &str) {
+        for character in value.chars() {
+            self.push_str(match character {
+                '&' => "&amp;",
+                '<' => "&lt;",
+                '>' => "&gt;",
+                '"' => "&quot;",
+                '\'' => "&#39;",
+                _ => {
+                    self.push(character);
+                    continue;
+                }
+            });
+        }
+    }
+
+    fn finish(self) -> Result<String, ExportDocumentError> {
+        if self.exceeded {
+            Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+        } else {
+            Ok(self.value)
+        }
+    }
+}
+
 struct ValidatedImage {
     extension: &'static str,
     mime: &'static str,
     bytes: Vec<u8>,
+}
+
+fn add_packaged_bytes(
+    destination: &str,
+    bytes: usize,
+    limits: ExportDocumentLimits,
+    combined: &mut usize,
+) -> Result<(), ExportDocumentError> {
+    if bytes > limits.max_packaged_asset_bytes {
+        return Err(ExportDocumentError::PackagedAssetLimitExceeded {
+            destination: destination.into(),
+        });
+    }
+    *combined = combined
+        .checked_add(bytes)
+        .ok_or(ExportDocumentError::CombinedPackagedAssetLimitExceeded)?;
+    if *combined > limits.max_combined_packaged_asset_bytes {
+        return Err(ExportDocumentError::CombinedPackagedAssetLimitExceeded);
+    }
+    Ok(())
 }
 
 fn validate_image(
@@ -369,22 +593,43 @@ fn validate_image(
             destination: destination.into(),
         })?;
     add_pixels(destination, pixels, limits, combined_pixels)?;
-    let decoded = ImageReader::with_format(Cursor::new(bytes), actual)
+    let max_alloc =
+        pixels
+            .checked_mul(16)
+            .ok_or_else(|| ExportDocumentError::ImageDimensionsExceeded {
+                destination: destination.into(),
+            })?;
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), actual);
+    let mut image_limits = ImageLimits::default();
+    image_limits.max_image_width = Some(width);
+    image_limits.max_image_height = Some(height);
+    image_limits.max_alloc = Some(max_alloc);
+    reader.limits(image_limits);
+    let decoded = reader
         .decode()
         .map_err(|_| ExportDocumentError::InvalidImage {
             destination: destination.into(),
         })?;
     if actual == ImageFormat::Gif {
-        let mut flattened = Cursor::new(Vec::new());
-        decoded
-            .write_to(&mut flattened, ImageFormat::Png)
-            .map_err(|_| ExportDocumentError::InvalidImage {
+        let mut flattened = BoundedVecWriter::new(limits.max_packaged_asset_bytes);
+        let encoded = PngEncoder::new(&mut flattened).write_image(
+            decoded.as_bytes(),
+            decoded.width(),
+            decoded.height(),
+            decoded.color().into(),
+        );
+        if flattened.exceeded {
+            return Err(ExportDocumentError::PackagedAssetLimitExceeded {
                 destination: destination.into(),
-            })?;
+            });
+        }
+        encoded.map_err(|_| ExportDocumentError::InvalidImage {
+            destination: destination.into(),
+        })?;
         return Ok(ValidatedImage {
             extension: "png",
             mime: "image/png",
-            bytes: flattened.into_inner(),
+            bytes: flattened.bytes,
         });
     }
     let (extension, canonical_mime) = match actual {
@@ -399,6 +644,41 @@ fn validate_image(
         mime: canonical_mime,
         bytes: bytes.to_vec(),
     })
+}
+
+struct BoundedVecWriter {
+    bytes: Vec<u8>,
+    max: usize,
+    exceeded: bool,
+}
+
+impl BoundedVecWriter {
+    fn new(max: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedVecWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(next) = self.bytes.len().checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("packaged image limit exceeded"));
+        };
+        if next > self.max {
+            self.exceeded = true;
+            return Err(std::io::Error::other("packaged image limit exceeded"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn add_pixels(
@@ -648,6 +928,101 @@ fn normalize_relative(value: &str) -> String {
     value.strip_prefix("./").unwrap_or(value).to_owned()
 }
 
+#[derive(Default)]
+struct RewriteManifest {
+    exact: HashMap<String, String>,
+    aliases: HashMap<String, Option<String>>,
+}
+
+impl RewriteManifest {
+    fn insert(&mut self, source: &str, filename: &str) {
+        self.exact.insert(source.to_owned(), filename.to_owned());
+        self.exact
+            .insert(normalize_relative(source), filename.to_owned());
+        for alias in source_aliases(source) {
+            match self.aliases.entry(alias) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(filename.to_owned()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry)
+                    if entry.get().as_deref() != Some(filename) =>
+                {
+                    entry.insert(None);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn resolve(&self, original: Option<&str>, rendered: &str) -> Option<&str> {
+        if let Some(original) = original {
+            if let Some(filename) = self
+                .exact
+                .get(original)
+                .or_else(|| self.exact.get(&normalize_relative(original)))
+            {
+                return Some(filename);
+            }
+            for alias in source_aliases(original) {
+                if let Some(Some(filename)) = self.aliases.get(&alias) {
+                    return Some(filename);
+                }
+            }
+        }
+        // Renderers may URL-encode the DOM src. Only use canonical aliases that identify one
+        // manifest entry; an encoded spelling must never steal a distinct literal destination.
+        for alias in source_aliases(rendered) {
+            if let Some(Some(filename)) = self.aliases.get(&alias) {
+                return Some(filename);
+            }
+        }
+        None
+    }
+}
+
+fn source_aliases(value: &str) -> Vec<String> {
+    let normalized = normalize_relative(value);
+    let mut aliases = vec![normalized.clone()];
+    if let Ok(decoded) = percent_decode_str(&normalized).decode_utf8() {
+        if decoded != normalized {
+            aliases.push(decoded.into_owned());
+        }
+    }
+    aliases
+}
+
+fn markdown_body_after_front_matter(markdown: &str) -> &str {
+    let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
+    let Some((opening, mut cursor, has_line_ending)) = logical_line(markdown, 0) else {
+        return markdown;
+    };
+    if opening != "---" || !has_line_ending {
+        return markdown;
+    }
+    while cursor < markdown.len() {
+        let Some((line, next, _)) = logical_line(markdown, cursor) else {
+            return markdown;
+        };
+        if matches!(line, "---" | "...") {
+            return &markdown[next..];
+        }
+        cursor = next;
+    }
+    markdown
+}
+
+fn logical_line(source: &str, start: usize) -> Option<(&str, usize, bool)> {
+    let rest = source.get(start..)?;
+    if let Some(newline) = rest.find('\n') {
+        let line = rest[..newline]
+            .strip_suffix('\r')
+            .unwrap_or(&rest[..newline]);
+        Some((line, start + newline + 1, true))
+    } else {
+        Some((rest, source.len(), false))
+    }
+}
+
 fn collect_original_image_sources(markdown: &str) -> Vec<Option<String>> {
     let mut sources = Vec::new();
     for event in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES) {
@@ -693,9 +1068,10 @@ fn collect_dom_image_sources(node: &Handle, sources: &mut Vec<Option<String>>) {
 }
 
 struct HtmlPolicy<'a> {
-    rewrites: &'a HashMap<String, String>,
+    rewrites: &'a RewriteManifest,
     external_omissions: &'a [&'a str],
     original_image_sources: &'a [Option<String>],
+    footnote_marker: &'a str,
 }
 
 struct SanitizedHtml {
@@ -717,8 +1093,11 @@ fn sanitize_html(
         true,
     )
     .one(rendered);
+    let mut author_ids = HashSet::new();
+    collect_author_ids(&dom.document, policy.footnote_marker, &mut author_ids);
+    let footnote_namespace = choose_footnote_namespace(&author_ids);
     let mut state = HtmlSanitizer {
-        output: String::new(),
+        output: CappedString::new(limits.max_generated_html_bytes),
         removed: false,
         policy,
         limits,
@@ -727,18 +1106,82 @@ fn sanitize_html(
         svg_attributes: 0,
         code_depth: 0,
         image_sources: policy.original_image_sources.iter().cloned().collect(),
+        footnote_namespace,
     };
     for child in dom.document.children.borrow().iter() {
         state.write_node(child)?;
     }
     Ok(SanitizedHtml {
-        html: state.output,
+        html: state.output.finish()?,
         removed: state.removed,
     })
 }
 
+fn collect_author_ids(node: &Handle, footnote_marker: &str, ids: &mut HashSet<String>) {
+    if let NodeData::Element { attrs, .. } = &node.data {
+        let attrs = attrs.borrow();
+        if generated_footnote_marker(&attrs, footnote_marker).is_none() {
+            if let Some(id) = attrs
+                .iter()
+                .find(|attribute| attribute.name.local.as_ref() == "id")
+            {
+                ids.insert(id.value.to_string());
+            }
+        }
+    }
+    for child in node.children.borrow().iter() {
+        collect_author_ids(child, footnote_marker, ids);
+    }
+}
+
+fn choose_footnote_namespace(author_ids: &HashSet<String>) -> String {
+    for suffix in 0_usize.. {
+        let namespace = if suffix == 0 {
+            "export-footnote".to_owned()
+        } else {
+            format!("export-footnote-{suffix}")
+        };
+        if !author_ids.iter().any(|id| {
+            id.starts_with(&format!("{namespace}-def-"))
+                || id.starts_with(&format!("{namespace}-ref-"))
+        }) {
+            return namespace;
+        }
+    }
+    unreachable!("finite IDs always leave a footnote namespace")
+}
+
+enum GeneratedFootnoteMarker<'a> {
+    Definition(&'a str),
+    Reference(&'a str),
+    Target(&'a str),
+    Backref(&'a str),
+}
+
+fn generated_footnote_marker<'a>(
+    attrs: &'a [html5ever::Attribute],
+    expected_marker: &str,
+) -> Option<GeneratedFootnoteMarker<'a>> {
+    if !attrs.iter().any(|attribute| {
+        attribute.name.local.as_ref() == "data-export-footnote-marker"
+            && attribute.value.as_ref() == expected_marker
+    }) {
+        return None;
+    }
+    attrs.iter().find_map(|attribute| {
+        let value = attribute.value.as_ref();
+        match attribute.name.local.as_ref() {
+            "data-export-footnote-definition" => Some(GeneratedFootnoteMarker::Definition(value)),
+            "data-export-footnote-reference" => Some(GeneratedFootnoteMarker::Reference(value)),
+            "data-export-footnote-target" => Some(GeneratedFootnoteMarker::Target(value)),
+            "data-export-footnote-backref" => Some(GeneratedFootnoteMarker::Backref(value)),
+            _ => None,
+        }
+    })
+}
+
 struct HtmlSanitizer<'a> {
-    output: String,
+    output: CappedString,
     removed: bool,
     policy: &'a HtmlPolicy<'a>,
     limits: ExportDocumentLimits,
@@ -747,6 +1190,7 @@ struct HtmlSanitizer<'a> {
     svg_attributes: usize,
     code_depth: usize,
     image_sources: VecDeque<Option<String>>,
+    footnote_namespace: String,
 }
 
 impl HtmlSanitizer<'_> {
@@ -764,7 +1208,7 @@ impl HtmlSanitizer<'_> {
                     self.removed = true;
                     return Ok(());
                 }
-                self.output.push_str(&escape_text(&contents));
+                self.output.push_escaped_text(&contents);
                 Ok(())
             }
             NodeData::Element { name, attrs, .. } => {
@@ -839,12 +1283,20 @@ impl HtmlSanitizer<'_> {
                 }
                 self.output.push('<');
                 self.output.push_str(tag);
-                for attribute in attrs.borrow().iter() {
-                    self.write_attribute(
-                        tag,
-                        attribute.name.local.as_ref(),
-                        attribute.value.as_ref(),
-                    )?;
+                let attrs = attrs.borrow();
+                let generated_marker =
+                    generated_footnote_marker(&attrs, self.policy.footnote_marker);
+                for attribute in attrs.iter() {
+                    let attribute_name = attribute.name.local.as_ref();
+                    if attribute_name.starts_with("data-export-footnote-")
+                        || (generated_marker.is_some() && matches!(attribute_name, "id" | "href"))
+                    {
+                        continue;
+                    }
+                    self.write_attribute(tag, attribute_name, attribute.value.as_ref())?;
+                }
+                if let Some(marker) = generated_marker {
+                    self.write_generated_footnote_attribute(marker);
                 }
                 self.output.push('>');
                 let entering_code = tag == "code";
@@ -887,9 +1339,9 @@ impl HtmlSanitizer<'_> {
             .unwrap_or_default();
         let original_src = self.image_sources.pop_front().flatten();
         let src = if rendered_src.is_empty() {
-            original_src.unwrap_or_default()
+            original_src.clone().unwrap_or_default()
         } else {
-            rendered_src
+            rendered_src.clone()
         };
         let alt = attrs
             .iter()
@@ -899,13 +1351,12 @@ impl HtmlSanitizer<'_> {
         if let Some(filename) = self
             .policy
             .rewrites
-            .get(&src)
-            .or_else(|| self.policy.rewrites.get(&normalize_relative(&src)))
+            .resolve(original_src.as_deref(), &rendered_src)
         {
             self.output.push_str("<img src=\"");
             self.output.push_str(filename);
             self.output.push_str("\" alt=\"");
-            self.output.push_str(&escape_attribute(alt));
+            self.output.push_escaped_attribute(alt);
             self.output.push_str("\">");
             return Ok(());
         }
@@ -920,7 +1371,7 @@ impl HtmlSanitizer<'_> {
                 .push_str("<span class=\"export-omission\" role=\"note\">External image omitted");
             if !alt.is_empty() {
                 self.output.push_str(": ");
-                self.output.push_str(&escape_text(alt));
+                self.output.push_escaped_text(alt);
             }
             self.output.push_str("</span>");
             return Ok(());
@@ -930,7 +1381,9 @@ impl HtmlSanitizer<'_> {
             self.output.push_str("<span class=\"export-omission\" role=\"note\">Image omitted by export safety policy</span>");
             return Ok(());
         }
-        Err(ExportDocumentError::AssetNotInManifest { destination: src })
+        Err(ExportDocumentError::AssetNotInManifest {
+            destination: original_src.unwrap_or(src),
+        })
     }
 
     fn write_task_checkbox(
@@ -971,6 +1424,24 @@ impl HtmlSanitizer<'_> {
         node: &Handle,
     ) -> Result<(), ExportDocumentError> {
         let attrs = attrs.borrow();
+        if let Some(
+            marker @ (GeneratedFootnoteMarker::Target(_) | GeneratedFootnoteMarker::Backref(_)),
+        ) = generated_footnote_marker(&attrs, self.policy.footnote_marker)
+        {
+            self.output.push_str("<a");
+            for attribute in attrs.iter() {
+                let name = attribute.name.local.as_ref();
+                if name.starts_with("data-export-footnote-") || name == "href" {
+                    continue;
+                }
+                self.write_attribute("a", name, attribute.value.as_ref())?;
+            }
+            self.write_generated_footnote_attribute(marker);
+            self.output.push('>');
+            self.write_children(node)?;
+            self.output.push_str("</a>");
+            return Ok(());
+        }
         let href = attrs
             .iter()
             .find(|attribute| attribute.name.local.as_ref() == "href")
@@ -979,11 +1450,11 @@ impl HtmlSanitizer<'_> {
         if is_app_relative(&href) && !href.starts_with('#') {
             self.output
                 .push_str("<span class=\"attachment-link\" data-app-path=\"");
-            self.output.push_str(&escape_attribute(&href));
+            self.output.push_escaped_attribute(&href);
             self.output.push_str("\">");
             self.write_children(node)?;
             self.output.push_str(" <span class=\"attachment-path\">(");
-            self.output.push_str(&escape_text(&href));
+            self.output.push_escaped_text(&href);
             self.output.push_str(")</span></span>");
             return Ok(());
         }
@@ -1050,8 +1521,27 @@ impl HtmlSanitizer<'_> {
         self.output.push(' ');
         self.output.push_str(name);
         self.output.push_str("=\"");
-        self.output.push_str(&escape_attribute(value));
+        self.output.push_escaped_attribute(value);
         self.output.push('"');
+    }
+
+    fn write_generated_footnote_attribute(&mut self, marker: GeneratedFootnoteMarker<'_>) {
+        match marker {
+            GeneratedFootnoteMarker::Definition(index) => {
+                self.push_attribute("id", &format!("{}-def-{index}", self.footnote_namespace))
+            }
+            GeneratedFootnoteMarker::Reference(reference) => self.push_attribute(
+                "id",
+                &format!("{}-ref-{reference}", self.footnote_namespace),
+            ),
+            GeneratedFootnoteMarker::Target(index) => {
+                self.push_attribute("href", &format!("#{}-def-{index}", self.footnote_namespace))
+            }
+            GeneratedFootnoteMarker::Backref(reference) => self.push_attribute(
+                "href",
+                &format!("#{}-ref-{reference}", self.footnote_namespace),
+            ),
+        }
     }
 }
 
@@ -1336,6 +1826,7 @@ fn export_notices(external_omitted: bool, removed: bool) -> String {
 struct PreparedFootnotes {
     body_markdown: String,
     footnotes: Vec<PreparedFootnote>,
+    marker_token: String,
 }
 
 struct PreparedFootnote {
@@ -1344,6 +1835,7 @@ struct PreparedFootnote {
 }
 
 fn prepare_footnotes(markdown: &str) -> PreparedFootnotes {
+    let marker_token = collision_free_marker(markdown);
     let mut definitions = HashMap::<String, (Range<usize>, String)>::new();
     let mut references = Vec::<(String, Range<usize>)>::new();
     for (event, range) in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES).into_offset_iter() {
@@ -1391,7 +1883,7 @@ fn prepare_footnotes(markdown: &str) -> PreparedFootnotes {
             index
         });
         let reference_id = format!(
-            "fnref-{:04}-{}",
+            "{:04}-{}",
             index + 1,
             footnotes[index].reference_ids.len() + 1
         );
@@ -1399,13 +1891,13 @@ fn prepare_footnotes(markdown: &str) -> PreparedFootnotes {
         edits.push((
             range,
             format!(
-                "<sup class=\"footnote-reference\" id=\"{reference_id}\"><a href=\"#fn-{:04}\">[{}]</a></sup>",
+                "<sup class=\"footnote-reference\" data-export-footnote-marker=\"{marker_token}\" data-export-footnote-reference=\"{reference_id}\"><a data-export-footnote-marker=\"{marker_token}\" data-export-footnote-target=\"{:04}\">[{}]</a></sup>",
                 index + 1,
                 index + 1
             ),
         ));
     }
-    edits.sort_by(|left, right| right.0.start.cmp(&left.0.start));
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.0.start));
     let mut body_markdown = markdown.to_owned();
     for (range, replacement) in edits {
         body_markdown.replace_range(range, &replacement);
@@ -1413,7 +1905,18 @@ fn prepare_footnotes(markdown: &str) -> PreparedFootnotes {
     PreparedFootnotes {
         body_markdown,
         footnotes,
+        marker_token,
     }
+}
+
+fn collision_free_marker(markdown: &str) -> String {
+    for suffix in 0_usize.. {
+        let marker = format!("note-export-generated-footnote-{suffix}");
+        if !markdown.contains(&marker) {
+            return marker;
+        }
+    }
+    unreachable!("finite Markdown always leaves a marker token")
 }
 
 fn footnote_definition_markdown(source: &str) -> String {
@@ -1442,32 +1945,35 @@ fn render_with_existing_contract(markdown: &str) -> String {
     )
 }
 
-fn render_footnote_definitions(footnotes: &[PreparedFootnote]) -> String {
-    if footnotes.is_empty() {
-        return String::new();
+fn render_footnote_definitions(prepared: &PreparedFootnotes, html: &mut CappedString) {
+    if prepared.footnotes.is_empty() {
+        return;
     }
-    let mut html = String::from("<section class=\"footnotes\"><ol>");
-    for (index, footnote) in footnotes.iter().enumerate() {
-        html.push_str(&format!(
-            "<li class=\"footnote-definition\" id=\"fn-{:04}\">{}<span class=\"footnote-backrefs\">",
-            index + 1,
-            render_with_existing_contract(&footnote.markdown)
-        ));
+    html.push_str("<section class=\"footnotes\"><ol>");
+    for (index, footnote) in prepared.footnotes.iter().enumerate() {
+        html.push_str("<li class=\"footnote-definition\" data-export-footnote-marker=\"");
+        html.push_str(&prepared.marker_token);
+        html.push_str("\" data-export-footnote-definition=\"");
+        html.push_str(&format!("{:04}", index + 1));
+        html.push_str("\">");
+        html.push_str(&render_with_existing_contract(&footnote.markdown));
+        html.push_str("<span class=\"footnote-backrefs\">");
         for (usage, reference_id) in footnote.reference_ids.iter().enumerate() {
-            html.push_str(&format!(
-                " <a href=\"#{reference_id}\" aria-label=\"Back to reference {}\">↩{}</a>",
-                usage + 1,
-                if usage == 0 {
-                    String::new()
-                } else {
-                    (usage + 1).to_string()
-                }
-            ));
+            html.push_str(" <a data-export-footnote-marker=\"");
+            html.push_str(&prepared.marker_token);
+            html.push_str("\" data-export-footnote-backref=\"");
+            html.push_str(reference_id);
+            html.push_str("\" aria-label=\"Back to reference ");
+            html.push_str(&(usage + 1).to_string());
+            html.push_str("\">↩");
+            if usage != 0 {
+                html.push_str(&(usage + 1).to_string());
+            }
+            html.push_str("</a>");
         }
         html.push_str("</span></li>");
     }
     html.push_str("</ol></section>");
-    html
 }
 
 fn escape_text(value: &str) -> String {
@@ -1481,4 +1987,42 @@ fn escape_attribute(value: &str) -> String {
     escape_text(value)
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizer_stops_growing_when_escaped_output_exceeds_cap() {
+        let rewrites = RewriteManifest::default();
+        let policy = HtmlPolicy {
+            rewrites: &rewrites,
+            external_omissions: &[],
+            original_image_sources: &[],
+            footnote_marker: "unused",
+        };
+        let limits = ExportDocumentLimits {
+            max_generated_html_bytes: 8,
+            ..ExportDocumentLimits::default()
+        };
+        let mut combined_pixels = 0;
+
+        assert!(matches!(
+            sanitize_html("&amp;&amp;", &policy, limits, &mut combined_pixels),
+            Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn final_wrapper_stops_before_appending_over_limit_title_or_body() {
+        assert!(matches!(
+            assemble_index_html("&".repeat(32).as_str(), "", "body", PRINT_CSS.len() + 128),
+            Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+        ));
+        assert!(matches!(
+            assemble_index_html("title", "", &"x".repeat(256), PRINT_CSS.len() + 128),
+            Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+        ));
+    }
 }

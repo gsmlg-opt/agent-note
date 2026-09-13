@@ -58,6 +58,34 @@ fn encoded_raster(format: image::ImageFormat) -> Vec<u8> {
     bytes.into_inner()
 }
 
+fn solid_animated_gif(width: u32, height: u32, color: image::Rgba<u8>) -> Vec<u8> {
+    use image::{codecs::gif::GifEncoder, Delay, Frame, RgbaImage};
+    let mut bytes = Vec::new();
+    let mut encoder = GifEncoder::new(&mut bytes);
+    let frame = Frame::from_parts(
+        RgbaImage::from_pixel(width, height, color),
+        0,
+        0,
+        Delay::from_numer_denom_ms(10, 1),
+    );
+    encoder.encode_frame(frame).unwrap();
+    drop(encoder);
+    bytes
+}
+
+fn html_attribute_values(html: &str, attribute: &str) -> Vec<String> {
+    let prefix = format!("{attribute}=\"");
+    let mut rest = html;
+    let mut values = Vec::new();
+    while let Some(start) = rest.find(&prefix) {
+        rest = &rest[start + prefix.len()..];
+        let Some(end) = rest.find('"') else { break };
+        values.push(rest[..end].to_owned());
+        rest = &rest[end + 1..];
+    }
+    values
+}
+
 #[test]
 fn renders_title_and_renderer_features_without_deduplicating_headings() {
     let export = frozen(
@@ -92,10 +120,22 @@ fn renders_multiline_formatted_footnotes_with_unique_repeated_backlinks() {
     let package =
         build_export_document(&frozen(markdown, vec![]), ExportDocumentLimits::default()).unwrap();
 
-    assert!(package.index_html.contains("id=\"fnref-0001-1\""));
-    assert!(package.index_html.contains("id=\"fnref-0001-2\""));
-    assert_eq!(package.index_html.matches("href=\"#fn-0001\"").count(), 2);
-    assert!(package.index_html.contains("id=\"fn-0001\""));
+    assert!(package
+        .index_html
+        .contains("id=\"export-footnote-ref-0001-1\""));
+    assert!(package
+        .index_html
+        .contains("id=\"export-footnote-ref-0001-2\""));
+    assert_eq!(
+        package
+            .index_html
+            .matches("href=\"#export-footnote-def-0001\"")
+            .count(),
+        2
+    );
+    assert!(package
+        .index_html
+        .contains("id=\"export-footnote-def-0001\""));
     assert!(package
         .index_html
         .contains("<strong>bold</strong> first line"));
@@ -103,8 +143,45 @@ fn renders_multiline_formatted_footnotes_with_unique_repeated_backlinks() {
         .index_html
         .contains("continued with <code>code</code>"));
     assert!(package.index_html.contains("Second <em>paragraph</em>."));
-    assert!(package.index_html.contains("href=\"#fnref-0001-1\""));
-    assert!(package.index_html.contains("href=\"#fnref-0001-2\""));
+    assert!(package
+        .index_html
+        .contains("href=\"#export-footnote-ref-0001-1\""));
+    assert!(package
+        .index_html
+        .contains("href=\"#export-footnote-ref-0001-2\""));
+}
+
+#[test]
+fn footnote_ids_avoid_author_and_heading_collisions_and_keep_repeated_targets_valid() {
+    let markdown = r#"<div id="fn-0001"></div>
+<div id="export-footnote-def-0001"></div>
+<h2 id="export-footnote-ref-0001-1">Heading collision</h2>
+
+First[^detail], repeated[^detail].
+
+[^detail]: body"#;
+
+    let package =
+        build_export_document(&frozen(markdown, vec![]), ExportDocumentLimits::default()).unwrap();
+    let ids = html_attribute_values(&package.index_html, "id");
+    let hrefs = html_attribute_values(&package.index_html, "href");
+    let unique = ids.iter().collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(ids.len(), unique.len(), "all exported IDs must be unique");
+    for href in hrefs.iter().filter_map(|href| href.strip_prefix('#')) {
+        assert!(
+            ids.iter().any(|id| id == href),
+            "missing target for #{href}"
+        );
+    }
+    assert_eq!(
+        hrefs
+            .iter()
+            .filter(|href| ids.iter().any(|id| href == &&format!("#{id}")))
+            .count(),
+        4,
+        "two references and two backlinks must target generated unique IDs"
+    );
 }
 
 #[test]
@@ -142,6 +219,47 @@ fn packages_validated_images_with_flat_names_and_omits_external_fetches() {
     assert!(package.index_html.contains("href=\"#part\""));
     assert!(!package.index_html.contains("tracker.png\""));
     assert!(!package.index_html.contains("javascript:"));
+}
+
+#[test]
+fn rewrites_unicode_spaces_reserved_percent_forms_and_front_matter_images_by_source_order() {
+    let markdown = r#"---
+cover: ![not rendered](front.png)
+---
+![unicode](<图 片.png>)
+![encoded](图%20片.png)
+![hash](<hash#mark.png>)
+![question](<query?mark.png>)
+![percent](<literal%mark.png>)
+![body](body.png)
+![repeat](<图 片.png>)"#;
+    let export = frozen(
+        markdown,
+        vec![
+            asset("图 片.png", "image/png", one_pixel_png()),
+            asset("图%20片.png", "image/png", one_pixel_png()),
+            asset("hash#mark.png", "image/png", one_pixel_png()),
+            asset("query?mark.png", "image/png", one_pixel_png()),
+            asset("literal%mark.png", "image/png", one_pixel_png()),
+            asset("body.png", "image/png", one_pixel_png()),
+        ],
+    );
+
+    let package = build_export_document(&export, ExportDocumentLimits::default()).unwrap();
+
+    assert_eq!(
+        package.index_html.matches("src=\"asset-0001.png\"").count(),
+        2
+    );
+    for index in 2..=6 {
+        assert!(
+            package
+                .index_html
+                .contains(&format!("src=\"asset-{index:04}.png\"")),
+            "missing rewrite for asset {index}"
+        );
+    }
+    assert!(!package.index_html.contains("src=\"front.png\""));
 }
 
 #[test]
@@ -318,6 +436,52 @@ fn animated_gif_is_flattened_to_one_png_frame() {
 }
 
 #[test]
+fn rejects_transcoded_gif_that_exceeds_per_asset_packaging_limit() {
+    let gif = solid_animated_gif(64, 64, image::Rgba([255, 0, 0, 255]));
+    let limits = ExportDocumentLimits {
+        max_packaged_asset_bytes: 100,
+        max_combined_packaged_asset_bytes: 1_000,
+        ..ExportDocumentLimits::default()
+    };
+
+    assert!(matches!(
+        build_export_document(
+            &frozen(
+                "![gif](tiny.gif)",
+                vec![asset("tiny.gif", "image/gif", gif)]
+            ),
+            limits
+        ),
+        Err(ExportDocumentError::PackagedAssetLimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn rejects_combined_transcoded_package_bytes_with_checked_budget() {
+    let first = solid_animated_gif(32, 32, image::Rgba([255, 0, 0, 255]));
+    let second = solid_animated_gif(32, 32, image::Rgba([0, 0, 255, 255]));
+    let limits = ExportDocumentLimits {
+        max_packaged_asset_bytes: 10_000,
+        max_combined_packaged_asset_bytes: 150,
+        ..ExportDocumentLimits::default()
+    };
+
+    assert!(matches!(
+        build_export_document(
+            &frozen(
+                "![one](one.gif) ![two](two.gif)",
+                vec![
+                    asset("one.gif", "image/gif", first),
+                    asset("two.gif", "image/gif", second),
+                ],
+            ),
+            limits
+        ),
+        Err(ExportDocumentError::CombinedPackagedAssetLimitExceeded)
+    ));
+}
+
+#[test]
 fn rejects_mime_signature_malformed_svg_and_dimension_limits() {
     let mismatch = frozen(
         "![bad](bad.png)",
@@ -446,6 +610,70 @@ fn rejects_diagram_limits_in_pure_pre_render_check() {
     assert!(matches!(
         validate_export_diagrams("```mermaid\na\nb\n```", complexity_limits),
         Err(ExportDocumentError::DiagramComplexityExceeded)
+    ));
+}
+
+#[test]
+fn unicode_whitespace_cannot_bypass_mermaid_pre_render_limits() {
+    let limits = ExportDocumentLimits {
+        max_diagram_bytes: 4,
+        ..ExportDocumentLimits::default()
+    };
+    let markdown = "```mermaid\u{00a0}ignored\nflowchart LR\nA --> B\n```";
+
+    assert!(matches!(
+        validate_export_diagrams(markdown, limits),
+        Err(ExportDocumentError::DiagramInputLimitExceeded)
+    ));
+}
+
+#[test]
+fn generated_html_preflight_accounts_for_escaping_and_mermaid_expansion() {
+    let ordinary_limits = ExportDocumentLimits {
+        max_generated_html_bytes: 9_000,
+        ..ExportDocumentLimits::default()
+    };
+    assert!(matches!(
+        build_export_document(&frozen(&"<&".repeat(200), vec![]), ordinary_limits),
+        Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+    ));
+
+    let mermaid_limits = ExportDocumentLimits {
+        max_generated_html_bytes: 12_000,
+        ..ExportDocumentLimits::default()
+    };
+    assert!(matches!(
+        build_export_document(
+            &frozen("```mermaid\nflowchart LR\nA --> B\n```", vec![]),
+            mermaid_limits
+        ),
+        Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+    ));
+}
+
+#[test]
+fn sanitizer_and_final_wrapper_refuse_incremental_output_over_cap() {
+    let sanitizer_limits = ExportDocumentLimits {
+        max_generated_html_bytes: 9_000,
+        ..ExportDocumentLimits::default()
+    };
+    assert!(matches!(
+        build_export_document(
+            &frozen(&format!("<div>{}</div>", "&".repeat(300)), vec![]),
+            sanitizer_limits
+        ),
+        Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+    ));
+
+    let mut final_wrapper = frozen("body", vec![]);
+    final_wrapper.note.title = "&".repeat(300);
+    let wrapper_limits = ExportDocumentLimits {
+        max_generated_html_bytes: 9_000,
+        ..ExportDocumentLimits::default()
+    };
+    assert!(matches!(
+        build_export_document(&final_wrapper, wrapper_limits),
+        Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
     ));
 }
 
