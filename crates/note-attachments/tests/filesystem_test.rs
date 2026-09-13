@@ -1,5 +1,6 @@
 use note_attachments::{
-    AttachmentStore, DeleteObjectOutcome, FilesystemAttachmentStore, PutObjectRequest,
+    AttachmentStore, BoundedReadError, DeleteObjectOutcome, FilesystemAttachmentStore,
+    PutObjectRequest,
 };
 
 fn object_request(object_key: &str, bytes: &[u8], checksum_sha256: &str) -> PutObjectRequest {
@@ -45,6 +46,41 @@ async fn immutable_object_lifecycle_reports_metadata_and_replays_delete() {
         store.delete_object("objects/01/file.bin").await.unwrap(),
         DeleteObjectOutcome::AlreadyAbsent
     );
+}
+
+#[tokio::test]
+async fn bounded_reads_accept_exact_limit_and_reject_oversized_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("attachments");
+    std::fs::create_dir_all(root.join("objects")).unwrap();
+    std::fs::create_dir_all(root.join("note-1")).unwrap();
+    std::fs::write(root.join("objects/exact.bin"), b"12345678").unwrap();
+    std::fs::write(root.join("objects/large.bin"), b"123456789").unwrap();
+    std::fs::write(root.join("note-1/legacy.bin"), b"123456789").unwrap();
+    let store = FilesystemAttachmentStore::new(root);
+
+    assert_eq!(
+        store
+            .read_object_bounded("objects/exact.bin", 8)
+            .await
+            .unwrap(),
+        b"12345678"
+    );
+    for error in [
+        store
+            .read_object_bounded("objects/large.bin", 8)
+            .await
+            .unwrap_err(),
+        store
+            .read_legacy_bounded("note-1", "legacy.bin", 8)
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(matches!(
+            error.downcast_ref::<BoundedReadError>(),
+            Some(BoundedReadError::LimitExceeded)
+        ));
+    }
 }
 
 #[tokio::test]

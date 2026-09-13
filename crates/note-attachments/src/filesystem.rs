@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 
 /// Filesystem-backed attachment storage.
 ///
@@ -41,6 +42,19 @@ impl AttachmentStore for FilesystemAttachmentStore {
         }
         reject_symlink_components(&self.root, &object_key).await?;
         Ok(fs::read(attachment_path_on_disk(&self.root, &object_key)).await?)
+    }
+
+    async fn read_object_bounded(
+        &self,
+        object_key: &str,
+        max_bytes: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let object_key = canonical_object_key(object_key)?;
+        if !existing_safe_directory(&self.root).await? {
+            anyhow::bail!("attachment object root does not exist");
+        }
+        reject_symlink_components(&self.root, &object_key).await?;
+        read_file_bounded(attachment_path_on_disk(&self.root, &object_key), max_bytes).await
     }
 
     async fn head_object(&self, object_key: &str) -> anyhow::Result<ObjectMetadata> {
@@ -86,12 +100,46 @@ impl AttachmentStore for FilesystemAttachmentStore {
         Ok(fs::read(attachment_path_on_disk(&note_dir, &relative_path)).await?)
     }
 
+    async fn read_legacy_bounded(
+        &self,
+        note_id: &str,
+        path: &str,
+        max_bytes: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let note_dir = note_directory(&self.root, note_id)?;
+        if !existing_safe_directory(&note_dir).await? {
+            anyhow::bail!("attachment note directory does not exist");
+        }
+        let relative_path = canonical_relative_path(path)?;
+        reject_symlink_components(&note_dir, &relative_path).await?;
+        read_file_bounded(
+            attachment_path_on_disk(&note_dir, &relative_path),
+            max_bytes,
+        )
+        .await
+    }
+
     fn info(&self) -> AttachmentStoreInfo {
         AttachmentStoreInfo {
             engine: "filesystem".to_string(),
             location: Some(self.root.to_string_lossy().into_owned()),
         }
     }
+}
+
+async fn read_file_bounded(path: PathBuf, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+    let file = fs::File::open(path).await?;
+    if file.metadata().await?.len() > max_bytes {
+        return Err(crate::BoundedReadError::LimitExceeded.into());
+    }
+    let ceiling = max_bytes.saturating_add(1);
+    let initial_capacity = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    file.take(ceiling).read_to_end(&mut bytes).await?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(crate::BoundedReadError::LimitExceeded.into());
+    }
+    Ok(bytes)
 }
 
 async fn delete_file(path: &Path) -> anyhow::Result<DeleteObjectOutcome> {

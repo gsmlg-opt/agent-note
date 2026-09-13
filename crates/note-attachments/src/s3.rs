@@ -6,6 +6,7 @@ use aws_sdk_s3::{
 };
 use sha2::{Digest, Sha256};
 use std::fmt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 const S3_MAX_ATTEMPTS: u32 = 4;
 
@@ -194,6 +195,26 @@ impl S3AttachmentStore {
         Ok(bytes.into_bytes().to_vec())
     }
 
+    async fn read_key_bounded(&self, key: &str, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| safe_sdk_error("get object", &error))?;
+        if output
+            .content_length()
+            .and_then(|length| u64::try_from(length).ok())
+            .is_some_and(|length| length > max_bytes)
+        {
+            return Err(crate::BoundedReadError::LimitExceeded.into());
+        }
+
+        read_stream_bounded(output.body.into_async_read(), max_bytes).await
+    }
+
     async fn head_key(&self, key: &str) -> anyhow::Result<Option<crate::ObjectMetadata>> {
         let output = match self
             .client
@@ -268,6 +289,23 @@ impl S3AttachmentStore {
     }
 }
 
+async fn read_stream_bounded<R>(reader: R, max_bytes: u64) -> anyhow::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let initial_capacity = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| anyhow::anyhow!("S3 get object body failed (stream)"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(crate::BoundedReadError::LimitExceeded.into());
+    }
+    Ok(bytes)
+}
+
 #[async_trait::async_trait]
 impl crate::AttachmentStore for S3AttachmentStore {
     async fn put_immutable(
@@ -283,6 +321,18 @@ impl crate::AttachmentStore for S3AttachmentStore {
     async fn read_object(&self, object_key: &str) -> anyhow::Result<Vec<u8>> {
         self.read_key(&object_key_with_prefix(&self.prefix, object_key)?)
             .await
+    }
+
+    async fn read_object_bounded(
+        &self,
+        object_key: &str,
+        max_bytes: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.read_key_bounded(
+            &object_key_with_prefix(&self.prefix, object_key)?,
+            max_bytes,
+        )
+        .await
     }
 
     async fn head_object(&self, object_key: &str) -> anyhow::Result<crate::ObjectMetadata> {
@@ -315,6 +365,16 @@ impl crate::AttachmentStore for S3AttachmentStore {
 
     async fn read_legacy(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
         self.read_key(&final_key(&self.prefix, note_id, path)?)
+            .await
+    }
+
+    async fn read_legacy_bounded(
+        &self,
+        note_id: &str,
+        path: &str,
+        max_bytes: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        self.read_key_bounded(&final_key(&self.prefix, note_id, path)?, max_bytes)
             .await
     }
 
@@ -875,6 +935,82 @@ mod tests {
             store.delete_object("generations/missing").await.unwrap(),
             crate::DeleteObjectOutcome::AlreadyAbsent
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_immutable_reads_accept_exact_limit_and_reject_advertised_oversize() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("bounded-access", "bounded-secret");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/exact"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"12345678".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/large"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"123456789".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = test_store(server.uri()).await;
+
+        assert_eq!(
+            store
+                .read_object_bounded("generations/exact", 8)
+                .await
+                .unwrap(),
+            b"12345678"
+        );
+        assert_eq!(
+            store
+                .read_object_bounded("generations/large", 8)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "attachment object exceeds bounded read limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_reads_reject_chunked_oversize_bodies_without_content_length() {
+        let _lock = AWS_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = test_env("bounded-stream-access", "bounded-stream-secret");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/agent-note/generations/chunked"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("transfer-encoding", "chunked")
+                    .set_body_bytes(b"123456789".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let store = test_store(server.uri()).await;
+
+        let error = store
+            .read_object_bounded("generations/chunked", 8)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<crate::BoundedReadError>(),
+            Some(crate::BoundedReadError::LimitExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_ceiling_rejects_a_body_larger_than_advertised() {
+        let advertised_length = 1_u64;
+        let hard_limit = 8_u64;
+        let body = std::io::Cursor::new(b"123456789".to_vec());
+        assert!(body.get_ref().len() as u64 > advertised_length);
+        let error = read_stream_bounded(body, hard_limit).await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<crate::BoundedReadError>(),
+            Some(crate::BoundedReadError::LimitExceeded)
+        ));
     }
 
     #[tokio::test]
