@@ -4,8 +4,9 @@ use note_pipelines::{
     ExportAssetKind, ExportAssetOmission, FrozenNoteExport, HydratedNoteExportAsset,
 };
 use note_server::export::document::{
-    build_export_document, ExportDocumentError, ExportDocumentLimits,
+    build_export_document, validate_export_diagrams, ExportDocumentError, ExportDocumentLimits,
 };
+use sha2::Digest;
 use std::io::Cursor;
 
 fn frozen(markdown: &str, assets: Vec<HydratedNoteExportAsset>) -> FrozenNoteExport {
@@ -82,6 +83,28 @@ fn renders_title_and_renderer_features_without_deduplicating_headings() {
     assert!(package.index_html.contains("dm-mermaid-chart"));
     assert!(package.index_html.contains("footnote-reference"));
     assert!(package.index_html.contains("footnote-definition"));
+}
+
+#[test]
+fn renders_multiline_formatted_footnotes_with_unique_repeated_backlinks() {
+    let markdown = "First[^detail], repeated[^detail].\n\n[^detail]: **bold** first line\n    continued with `code`\n\n    Second *paragraph*.\n";
+
+    let package =
+        build_export_document(&frozen(markdown, vec![]), ExportDocumentLimits::default()).unwrap();
+
+    assert!(package.index_html.contains("id=\"fnref-0001-1\""));
+    assert!(package.index_html.contains("id=\"fnref-0001-2\""));
+    assert_eq!(package.index_html.matches("href=\"#fn-0001\"").count(), 2);
+    assert!(package.index_html.contains("id=\"fn-0001\""));
+    assert!(package
+        .index_html
+        .contains("<strong>bold</strong> first line"));
+    assert!(package
+        .index_html
+        .contains("continued with <code>code</code>"));
+    assert!(package.index_html.contains("Second <em>paragraph</em>."));
+    assert!(package.index_html.contains("href=\"#fnref-0001-1\""));
+    assert!(package.index_html.contains("href=\"#fnref-0001-2\""));
 }
 
 #[test]
@@ -178,6 +201,28 @@ fn validates_raster_svg_and_embedded_data_images() {
 }
 
 #[test]
+fn data_image_rewrite_is_structural_and_cannot_collide_with_attachment_or_code() {
+    let data = format!("data:image/png;base64,{}", STANDARD.encode(one_pixel_png()));
+    let markdown = format!(
+        "The literal export-data-image-2 and `{data}` stay readable.\n\n```text\n{data}\nexport-data-image-2\n```\n\n![attachment](export-data-image-2)\n\n![embedded]({data})"
+    );
+    let mut export = frozen(
+        &markdown,
+        vec![asset("export-data-image-2", "image/png", one_pixel_png())],
+    );
+    export.data_images.push(data);
+
+    let package = build_export_document(&export, ExportDocumentLimits::default()).unwrap();
+
+    assert!(package
+        .index_html
+        .contains("The literal export-data-image-2"));
+    assert!(package.index_html.matches("data:image/png;base64,").count() >= 2);
+    assert!(package.index_html.contains("src=\"asset-0001.png\""));
+    assert!(package.index_html.contains("src=\"asset-0002.png\""));
+}
+
+#[test]
 fn validates_png_jpeg_webp_and_gif_first_frame_with_collision_free_names() {
     let export = frozen(
         "![png](same/a) ![jpeg](same/b) ![webp](same/c) ![gif](same/d)",
@@ -217,10 +262,53 @@ fn validates_png_jpeg_webp_and_gif_first_frame_with_collision_free_names() {
             "asset-0001.png",
             "asset-0002.jpg",
             "asset-0003.webp",
-            "asset-0004.gif"
+            "asset-0004.png"
         ]
     );
     assert_eq!(package.index_html.matches("<img src=\"asset-").count(), 4);
+}
+
+fn animated_gif() -> Vec<u8> {
+    use image::{codecs::gif::GifEncoder, Delay, Frame, RgbaImage};
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = GifEncoder::new(&mut bytes);
+        let first = Frame::from_parts(
+            RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255])),
+            0,
+            0,
+            Delay::from_numer_denom_ms(10, 1),
+        );
+        let second = Frame::from_parts(
+            RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 255, 255])),
+            0,
+            0,
+            Delay::from_numer_denom_ms(10, 1),
+        );
+        encoder.encode_frames([first, second]).unwrap();
+    }
+    bytes
+}
+
+#[test]
+fn animated_gif_is_flattened_to_one_png_frame() {
+    let original = animated_gif();
+    let package = build_export_document(
+        &frozen(
+            "![animated](animation.gif)",
+            vec![asset("animation.gif", "image/gif", original.clone())],
+        ),
+        ExportDocumentLimits::default(),
+    )
+    .unwrap();
+
+    assert_eq!(package.assets[0].filename, "asset-0001.png");
+    assert_eq!(package.assets[0].mime, "image/png");
+    assert_eq!(
+        image::guess_format(&package.assets[0].bytes).unwrap(),
+        image::ImageFormat::Png
+    );
+    assert_ne!(package.assets[0].bytes, original);
 }
 
 #[test]
@@ -258,6 +346,100 @@ fn rejects_mime_signature_malformed_svg_and_dimension_limits() {
     assert!(matches!(
         build_export_document(&too_large, limits),
         Err(ExportDocumentError::ImageDimensionsExceeded { .. })
+    ));
+}
+
+#[test]
+fn rejects_size_mismatch_unsupported_mime_and_malformed_raster() {
+    let mut wrong_size = asset("a.png", "image/png", one_pixel_png());
+    wrong_size.attachment.storage = Some(AttachmentStorageMetadata {
+        object_key: "immutable/a".into(),
+        storage_generation: "1".into(),
+        size_bytes: wrong_size.bytes.len() as u64 + 1,
+        checksum_sha256: format!("{:x}", sha2::Sha256::digest(&wrong_size.bytes)),
+    });
+    assert!(matches!(
+        build_export_document(
+            &frozen("![a](a.png)", vec![wrong_size]),
+            ExportDocumentLimits::default()
+        ),
+        Err(ExportDocumentError::AssetSizeMismatch { .. })
+    ));
+    assert!(matches!(
+        build_export_document(
+            &frozen(
+                "![bmp](a.bmp)",
+                vec![asset("a.bmp", "image/bmp", b"BMbad".to_vec())]
+            ),
+            ExportDocumentLimits::default()
+        ),
+        Err(ExportDocumentError::UnsupportedImage { .. })
+    ));
+    assert!(matches!(
+        build_export_document(
+            &frozen(
+                "![png](a.png)",
+                vec![asset("a.png", "image/png", b"not a png".to_vec())]
+            ),
+            ExportDocumentLimits::default()
+        ),
+        Err(ExportDocumentError::InvalidImage { .. })
+    ));
+}
+
+#[test]
+fn rejects_diagram_limits_in_pure_pre_render_check() {
+    let limits = ExportDocumentLimits {
+        max_diagram_bytes: 8,
+        ..ExportDocumentLimits::default()
+    };
+    let markdown = "```mermaid\nflowchart LR\nA --> B\n```";
+
+    assert!(matches!(
+        validate_export_diagrams(markdown, limits),
+        Err(ExportDocumentError::DiagramInputLimitExceeded)
+    ));
+    assert!(matches!(
+        build_export_document(&frozen(markdown, vec![]), limits),
+        Err(ExportDocumentError::DiagramInputLimitExceeded)
+    ));
+
+    let count_limits = ExportDocumentLimits {
+        max_diagram_count: 1,
+        ..ExportDocumentLimits::default()
+    };
+    assert!(matches!(
+        validate_export_diagrams(
+            "```Mermaid\nA --> B\n```\n\n```mmd\nB --> C\n```",
+            count_limits
+        ),
+        Err(ExportDocumentError::DiagramCountLimitExceeded)
+    ));
+
+    let combined_limits = ExportDocumentLimits {
+        max_diagram_bytes: 6,
+        max_combined_diagram_bytes: 9,
+        ..ExportDocumentLimits::default()
+    };
+    let combined_result = validate_export_diagrams(
+        "```mermaid\nabcde\n```\n\n```mermaid\nfghij\n```",
+        combined_limits,
+    );
+    assert!(
+        matches!(
+            combined_result,
+            Err(ExportDocumentError::CombinedDiagramInputLimitExceeded)
+        ),
+        "unexpected result: {combined_result:?}"
+    );
+
+    let complexity_limits = ExportDocumentLimits {
+        max_diagram_lines: 1,
+        ..ExportDocumentLimits::default()
+    };
+    assert!(matches!(
+        validate_export_diagrams("```mermaid\na\nb\n```", complexity_limits),
+        Err(ExportDocumentError::DiagramComplexityExceeded)
     ));
 }
 
@@ -327,6 +509,18 @@ fn print_css_has_bounded_a4_contract_without_tall_block_avoidance() {
         .contains("thead { display: table-header-group"));
     assert!(package.index_html.contains("white-space: pre-wrap"));
     assert!(package.index_html.contains("max-width: 100%"));
+    assert!(package.index_html.contains("--dm-syntax-keyword: #ffb454"));
+    assert!(package.index_html.contains("background: #101720"));
+    assert!(package
+        .index_html
+        .contains(".dm-token-keyword { color: var(--dm-syntax-keyword); font-weight: 700"));
+    assert!(package.index_html.contains(".dm-mermaid-edge"));
+    assert!(package.index_html.contains("stroke: #6750a4"));
+    assert!(package.index_html.contains(".dm-mermaid-node rect"));
+    assert!(package.index_html.contains("fill: #faf8ff"));
+    assert!(package
+        .index_html
+        .contains(".dm-mermaid-chart text { fill: #1b1b1f"));
     assert!(!package.index_html.contains("pre { break-inside: avoid"));
     assert!(package.footer_html.contains("pageNumber"));
     assert!(package.footer_html.contains("totalPages"));
