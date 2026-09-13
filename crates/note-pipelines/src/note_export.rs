@@ -4,7 +4,7 @@ use html5ever::tokenizer::{
     BufferQueue, StartTag, TagToken, Token, TokenSink, TokenSinkResult, Tokenizer,
 };
 use note_attachments::BoundedReadError;
-use note_core::{normalize_attachment_path, Note, NoteAttachment};
+use note_core::{normalize_attachment_path, Label, Note, NoteAttachment};
 use note_storage::TransactionMode;
 use percent_encoding::percent_decode_str;
 use pulldown_cmark::{Event, Parser, Tag};
@@ -117,6 +117,7 @@ impl PlannedAttachmentAsset {
 pub struct NoteExportAssetPlan {
     captured_note_id: String,
     captured_revision: i64,
+    referenced_image_count: usize,
     assets: Vec<PlannedAttachmentAsset>,
     omissions: Vec<ExportAssetOmission>,
     data_images: Vec<String>,
@@ -223,30 +224,29 @@ pub fn plan_note_export_assets(
     captured: &CapturedNoteExport,
 ) -> Result<NoteExportAssetPlan, NoteExportError> {
     let destinations = image_destinations(&captured.note.content);
+    let mut seen_destinations = HashSet::new();
     let mut seen_attachments = HashSet::new();
-    let mut seen_data = HashSet::new();
     let mut assets = Vec::new();
     let mut omissions = Vec::new();
     let mut data_images = Vec::new();
 
     for destination in destinations {
+        if !seen_destinations.insert(destination.clone()) {
+            continue;
+        }
+        if seen_destinations.len() > DEFAULT_MAX_ASSET_COUNT {
+            return Err(NoteExportError::AssetCountLimitExceeded);
+        }
         let lower = destination.to_ascii_lowercase();
         if lower.starts_with("data:") {
-            if seen_data.insert(destination.clone()) {
-                data_images.push(destination);
-            }
+            data_images.push(destination);
             continue;
         }
         if is_external_destination(&destination) {
-            if !omissions
-                .iter()
-                .any(|entry: &ExportAssetOmission| entry.destination == destination)
-            {
-                omissions.push(ExportAssetOmission {
-                    kind: ExportAssetKind::External,
-                    destination,
-                });
-            }
+            omissions.push(ExportAssetOmission {
+                kind: ExportAssetKind::External,
+                destination,
+            });
             continue;
         }
 
@@ -265,12 +265,10 @@ pub fn plan_note_export_assets(
         }
     }
 
-    if assets.len().saturating_add(data_images.len()) > DEFAULT_MAX_ASSET_COUNT {
-        return Err(NoteExportError::AssetCountLimitExceeded);
-    }
     Ok(NoteExportAssetPlan {
         captured_note_id: captured.note.id.clone(),
         captured_revision: captured.note.revision,
+        referenced_image_count: seen_destinations.len(),
         assets,
         omissions,
         data_images,
@@ -418,7 +416,10 @@ pub async fn hydrate_note_export(
     {
         return Err(NoteExportError::MismatchedAssetPlan);
     }
-    if plan.assets.len().saturating_add(plan.data_images.len()) > limits.max_asset_count {
+    if captured.note.content.len() as u64 > limits.max_markdown_bytes {
+        return Err(NoteExportError::MarkdownLimitExceeded);
+    }
+    if plan.referenced_image_count > limits.max_asset_count {
         return Err(NoteExportError::AssetCountLimitExceeded);
     }
     let mut combined = 0_u64;
@@ -543,10 +544,83 @@ async fn confirm_snapshot(ctx: &Context, captured: &Note) -> Result<(), NoteExpo
         .map_err(|_| NoteExportError::StorageFailure)?;
     match current {
         None => Err(NoteExportError::NoteNotFound),
-        Some(current) if current != *captured => Err(NoteExportError::StaleRevision {
-            expected: captured.revision,
-            current: current.revision,
-        }),
+        Some(current) if !note_snapshots_equal(captured, &current) => {
+            Err(NoteExportError::StaleRevision {
+                expected: captured.revision,
+                current: current.revision,
+            })
+        }
         Some(_) => Ok(()),
+    }
+}
+
+fn note_snapshots_equal(captured: &Note, current: &Note) -> bool {
+    captured.id == current.id
+        && captured.title == current.title
+        && captured.content == current.content
+        && captured.attachments == current.attachments
+        && labels_semantically_equal(&captured.labels, &current.labels)
+        && captured.created_at == current.created_at
+        && captured.updated_at == current.updated_at
+        && captured.revision == current.revision
+        && captured.deleted_at == current.deleted_at
+}
+
+fn labels_semantically_equal(captured: &[Label], current: &[Label]) -> bool {
+    fn canonical(labels: &[Label]) -> Vec<(&str, &str, &str, &str)> {
+        let mut labels = labels
+            .iter()
+            .map(|label| {
+                (
+                    label.key.as_str(),
+                    label.value.as_str(),
+                    label.description.as_str(),
+                    label.value_type.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        labels
+    }
+
+    canonical(captured) == canonical(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use note_core::{Label, LabelValueType};
+
+    fn note_with_labels(labels: Vec<Label>) -> Note {
+        Note {
+            id: "note".into(),
+            title: "title".into(),
+            content: "body".into(),
+            attachments: vec![],
+            labels,
+            created_at: 1,
+            updated_at: 2,
+            revision: 3,
+            deleted_at: None,
+        }
+    }
+
+    fn label(key: &str, value: &str) -> Label {
+        Label {
+            key: key.into(),
+            value: value.into(),
+            description: format!("{key} label"),
+            value_type: LabelValueType::Text,
+        }
+    }
+
+    #[test]
+    fn snapshot_comparison_accepts_label_reordering_but_rejects_label_changes() {
+        let captured = note_with_labels(vec![label("status", "ready"), label("team", "core")]);
+        let reordered = note_with_labels(vec![label("team", "core"), label("status", "ready")]);
+        let changed = note_with_labels(vec![label("team", "other"), label("status", "ready")]);
+
+        assert!(note_snapshots_equal(&captured, &reordered));
+        assert!(!note_snapshots_equal(&captured, &changed));
     }
 }

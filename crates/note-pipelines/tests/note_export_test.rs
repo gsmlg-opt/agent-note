@@ -378,6 +378,39 @@ async fn unique_data_and_local_images_share_the_asset_count_limit() {
 }
 
 #[tokio::test]
+async fn unique_external_images_are_deduplicated_and_count_toward_the_asset_limit() {
+    let duplicate_external = (0..100)
+        .map(|_| "![remote](https://example.test/same.png)")
+        .collect::<Vec<_>>()
+        .join("\n");
+    let duplicate_captured = captured(&duplicate_external, vec![]).await;
+    let plan = plan_note_export_assets(&duplicate_captured).unwrap();
+    assert_eq!(plan.omissions().len(), 1);
+
+    let external_only = (0..65)
+        .map(|index| format!("![remote](https://example.test/{index}.png)"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let external_captured = captured(&external_only, vec![]).await;
+    assert_eq!(
+        plan_note_export_assets(&external_captured).unwrap_err(),
+        NoteExportError::AssetCountLimitExceeded
+    );
+
+    let mut mixed = (0..63)
+        .map(|index| format!("![data](<data:image/png;base64,YQ{index}=>)"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    mixed.push_str("\n![local](local.png)\n![remote](https://example.test/remote.png)");
+    let mixed_captured =
+        captured(&mixed, vec![attachment("local", "local.png", "image/png")]).await;
+    assert_eq!(
+        plan_note_export_assets(&mixed_captured).unwrap_err(),
+        NoteExportError::AssetCountLimitExceeded
+    );
+}
+
+#[tokio::test]
 async fn hydration_rejects_a_plan_captured_for_another_note_before_asset_io() {
     let (ctx, backend, store, _dir) = recording_context().await;
     seed_named_note(
@@ -563,6 +596,33 @@ async fn limits_reject_captured_metadata_before_reading_any_object() {
             .await
             .unwrap_err(),
         NoteExportError::CombinedAssetLimitExceeded
+    );
+    assert!(store.reads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn hydration_rechecks_its_markdown_limit_before_asset_io() {
+    let (ctx, backend, store, _dir) = recording_context().await;
+    seed_note(&backend, "markdown longer than five bytes", &[]).await;
+    let capture_limits = NoteExportLimits {
+        max_markdown_bytes: 64,
+        ..NoteExportLimits::default()
+    };
+    let captured =
+        note_pipelines::capture_note_export_with_limits(&ctx, "export-note", 7, capture_limits)
+            .await
+            .unwrap();
+    let plan = plan_note_export_assets(&captured).unwrap();
+    let hydration_limits = NoteExportLimits {
+        max_markdown_bytes: 5,
+        ..NoteExportLimits::default()
+    };
+
+    assert_eq!(
+        hydrate_note_export(&ctx, captured, plan, hydration_limits)
+            .await
+            .unwrap_err(),
+        NoteExportError::MarkdownLimitExceeded
     );
     assert!(store.reads.lock().unwrap().is_empty());
 }

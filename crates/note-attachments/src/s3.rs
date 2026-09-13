@@ -1050,11 +1050,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_ceiling_rejects_a_body_larger_than_advertised() {
-        let advertised_length = 1_u64;
+    async fn streaming_ceiling_independently_rejects_oversize_body() {
         let hard_limit = 8_u64;
         let body = std::io::Cursor::new(b"123456789".to_vec());
-        assert!(body.get_ref().len() as u64 > advertised_length);
         let error = read_stream_bounded(body, hard_limit).await.unwrap_err();
         assert!(matches!(
             error.downcast_ref::<crate::BoundedReadError>(),
