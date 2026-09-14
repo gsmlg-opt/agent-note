@@ -28,4 +28,10 @@ nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (ps: [
   --command python browser-tests/test_note_export.py --browser firefox
 ```
 
-The macOS Safari smoke workflow is separate because Safari/WebDriver is not available on Linux. A skipped or unavailable Safari job is not a passing Safari result.
+The macOS Safari smoke workflow is separate because Safari/WebDriver is not available on Linux. It enables PDF in a local mock, verifies the exact revision request, observes accessible busy and success states, and confirms that the application initiates the Blob download. Safari WebDriver does not provide a portable downloaded-file inspection API, so the smoke does not claim to inspect a saved file. A skipped or unavailable Safari job is not a passing Safari result.
+
+The Safari API fixture itself is portable and can be checked without Selenium:
+
+```sh
+python browser-tests/test_safari_smoke_fixture.py
+```
