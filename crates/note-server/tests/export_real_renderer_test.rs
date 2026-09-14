@@ -87,7 +87,9 @@ async fn qualifies_a_real_renderer_and_writes_review_artifacts() {
     let destinations =
         String::from_utf8(destinations.stdout).expect("pdfinfo destinations output is UTF-8");
     assert!(
-        destinations.lines().any(|line| line.ends_with("details")),
+        destinations
+            .lines()
+            .any(|line| line.ends_with("\"details\"")),
         "document-anchor destination must be reported by pdfinfo:\n{destinations}"
     );
 
