@@ -1,6 +1,6 @@
 Agent Note PDF release qualification
-date_utc=2026-09-14T04:38:31Z
-functional_commit=279303d840f543bf347366cd5adb9c3981c16dfc
+date_utc=2026-09-14T05:08:38Z
+functional_commit=e4a1b00618bfdd77868d28582aeccbe8b825fa6a
 renderer_image=gotenberg/gotenberg:8.37.0-chromium@sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c
 renderer_manifest_digest=sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c
 renderer_image_id=sha256:3db63074ad73de5b1daa9b0e174f9b073b905a06ade9c7e0025763b052bf1c9d
@@ -12,9 +12,7 @@ qpdf=qpdf version 12.3.2
 pdfinfo=pdfinfo version 26.06.0
 pdftoppm=pdftoppm version 26.06.0
 imagemagick=Version: ImageMagick 7.1.2-29 Q16-HDRI x86_64 b919b37fd:20260727 https://imagemagick.org
-browser_chromium=147.0.7727.15; scenarios=7/7 passed
-browser_firefox=148.0.2; scenarios=7/7 passed
-browser_safari=not run on Linux; real macOS Safari workflow pending
+browser_coverage=not executed by this PDF-only qualification; use the separate browser gate
 postgres_live_contract=not part of this renderer qualification
 s3_minio_contract=not part of this renderer qualification
 visual_review=completed at full resolution for all 11 pages; see visual-review.md
@@ -26,16 +24,16 @@ fonts:
   DejaVu Sans => DejaVu Sans | /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 security_checks:
   renderer public egress probe blocked
-  blocked-css_import fetch blocked; conversion HTTP 200; recorder requests 0
-  blocked-css_url fetch blocked; conversion HTTP 200; recorder requests 0
-  blocked-http fetch blocked; conversion HTTP 200; recorder requests 0
-  blocked-https fetch blocked; conversion HTTP 200; recorder requests 0
-  blocked-iframe fetch blocked; conversion HTTP 200; recorder requests 0
-  blocked-loopback fetch blocked; conversion HTTP 200; recorder requests 0
-  blocked-private fetch blocked; conversion HTTP 200; recorder requests 0
-  blocked-public_ip fetch blocked; conversion HTTP 200; recorder requests 0
-  blocked-redirect fetch blocked; conversion HTTP 200; recorder requests 0
-  blocked-svg fetch blocked; conversion HTTP 200; recorder requests 0
+  blocked-css_import fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-css_url fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-http fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-https fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-iframe fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-loopback fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-private fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-public_dns fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-public_ip fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-redirect fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-svg fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
   script and event handlers did not execute
-  request-b asset access blocked with HTTP 409
-  path traversal exposed no prior-request marker; conversion HTTP 200
+  concurrent request B could not read request A's known live renderer path; conversion HTTP 200
