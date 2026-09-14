@@ -4,15 +4,18 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="$repo_root/deployment/pdf-export/compose.yaml"
 artifact_dir="${NOTE_TEST_PDF_ARTIFACT_DIR:-$repo_root/target/pdf-export-validation}"
-project_name="agent-note-pdf-validation"
 renderer_image="gotenberg/gotenberg:8.37.0-chromium@sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c"
 renderer_digest="sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c"
 recorder_image="python:3.13-alpine@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a"
-public_probe_network="${project_name}-public-probe"
 work_dir="$(mktemp -d)"
+run_id="$(basename "$work_dir" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+project_name="agent-note-pdf-validation-${run_id}"
+qualification_network="${project_name}-internal"
+public_probe_network="${project_name}-public-probe"
 
 compose() {
-  docker compose --project-name "$project_name" -f "$compose_file" "$@"
+  AGENT_NOTE_PDF_NETWORK="$qualification_network" \
+    docker compose --project-name "$project_name" -f "$compose_file" "$@"
 }
 
 cleanup() {
@@ -43,13 +46,15 @@ rm -f "$artifact_dir"/agent-note-export.pdf \
   "$artifact_dir"/qualification-record.txt \
   "$artifact_dir"/security-checks.log
 
-docker compose -f "$compose_file" config --format json >"$work_dir/production-compose.json"
-python3 - "$work_dir/production-compose.json" "$renderer_image" <<'PY'
+AGENT_NOTE_PDF_NETWORK="$qualification_network" \
+  docker compose -f "$compose_file" config --format json >"$work_dir/production-compose.json"
+python3 - "$work_dir/production-compose.json" "$renderer_image" "$qualification_network" <<'PY'
 import json
 import sys
 
 config = json.load(open(sys.argv[1], encoding="utf-8"))
 expected_image = sys.argv[2]
+expected_network = sys.argv[3]
 service = config["services"]["gotenberg"]
 assert service["image"] == expected_image, service["image"]
 assert not service.get("ports"), "production renderer must not publish ports"
@@ -81,7 +86,10 @@ for flag in required:
 for forbidden in ("proxy-server", "host-resolver-rules", "user-agent", "--chromium-cookies"):
     assert forbidden not in command, f"forbidden renderer option: {forbidden}"
 networks = config.get("networks", {})
-assert any(value.get("internal") is True for value in networks.values())
+assert any(
+    value.get("internal") is True and value.get("name") == expected_network
+    for value in networks.values()
+), f"qualification renderer must use its unique internal network: {expected_network}"
 PY
 
 compose pull gotenberg
@@ -226,7 +234,7 @@ set -e
 docker network create --internal --subnet 203.0.113.0/24 "$public_probe_network" >/dev/null
 docker run --detach --rm \
   --name "${project_name}-recorder" \
-  --network "${AGENT_NOTE_PDF_NETWORK:-agent-note-pdf}" \
+  --network "$qualification_network" \
   --network-alias recorder \
   --mount "type=bind,src=${work_dir},dst=/work" \
   "$recorder_image" python /work/recorder.py >/dev/null
@@ -374,6 +382,10 @@ kill -0 "$request_a_pid" 2>/dev/null || {
   exit 1
 }
 pdftotext "$work_dir/request-b.response" "$work_dir/request-b.txt"
+grep -F "REQUEST B CONTROL" "$work_dir/request-b.txt" >/dev/null || {
+  echo "request B control text is missing from the isolation probe" >&2
+  exit 1
+}
 if grep -F "IN-FLIGHT REQUEST A SECRET 9f4ca771" "$work_dir/request-b.txt" >/dev/null; then
   echo "request B accessed request A's in-flight packaged file" >&2
   exit 1
@@ -389,6 +401,31 @@ set -e
 pdftotext "$work_dir/request-a.pdf" "$work_dir/request-a.txt"
 grep -F "IN-FLIGHT REQUEST A SECRET 9f4ca771" "$work_dir/request-a.txt" >/dev/null
 echo "concurrent request B could not read request A's known live renderer path; conversion HTTP $status" \
+  | tee -a "$security_log"
+
+container_hostname="$(docker exec "$container_id" cat /etc/hostname | tr -d '\r\n')"
+[[ -n "$container_hostname" ]] || {
+  echo "could not read the renderer traversal probe target" >&2
+  exit 1
+}
+cat >"$work_dir/traversal.html" <<'HTML'
+<!doctype html><body><p>TRAVERSAL CONTROL</p><iframe src="file:///tmp/../../etc/hostname"></iframe></body>
+HTML
+status="$(post_isolation_probe "$work_dir/traversal.html" "$work_dir/traversal.response")"
+[[ "$status" =~ ^2 ]] || {
+  echo "file traversal probe failed to render its control document: HTTP $status" >&2
+  exit 1
+}
+pdftotext "$work_dir/traversal.response" "$work_dir/traversal.txt"
+grep -F "TRAVERSAL CONTROL" "$work_dir/traversal.txt" >/dev/null || {
+  echo "file traversal control text is missing" >&2
+  exit 1
+}
+if grep -F "$container_hostname" "$work_dir/traversal.txt" >/dev/null; then
+  echo "renderer file traversal exposed /etc/hostname" >&2
+  exit 1
+fi
+echo "file traversal to a known renderer-local target was blocked; conversion HTTP $status" \
   | tee -a "$security_log"
 
 NOTE_TEST_REAL_PDF=1 \

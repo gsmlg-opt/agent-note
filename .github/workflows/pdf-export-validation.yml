@@ -3,13 +3,6 @@ name: PDF export qualification
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - "crates/note-pipelines/src/note_export.rs"
-      - "crates/note-server/src/export/**"
-      - "crates/note-server/tests/export_*"
-      - "deployment/pdf-export/**"
-      - "pdf-tests/**"
-      - ".github/workflows/pdf-export-validation.yml"
 
 permissions:
   contents: read

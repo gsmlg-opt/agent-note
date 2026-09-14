@@ -20,7 +20,7 @@ nix shell \
   --command ./pdf-tests/run-release-validation.sh
 ```
 
-The script fails if a required tool, renderer, security control, font, or artifact is missing. It does not contain a skip-success path. It checks the pinned manifest digest, container runtime controls, locally resolved CJK/Japanese/Latin fonts, blocked network/resource vectors, disabled JavaScript and event handlers, path traversal, and cross-request asset isolation.
+The script fails if a required tool, renderer, security control, font, or artifact is missing. It does not contain a skip-success path. Each run forces a qualification-unique internal Docker network, so it cannot join or tear down the production `agent-note-pdf` network. It checks the pinned manifest digest, container runtime controls, locally resolved CJK/Japanese/Latin fonts, blocked network/resource vectors, disabled JavaScript and event handlers, a real renderer-local file-traversal probe, and cross-request asset isolation.
 
 It then builds a representative document through the production `FrozenNoteExport` → document package → `GotenbergRenderer` path. The fixture contains Chinese, Japanese, and English text; searchable code and long lines; footnotes and anchors; a multi-page table; PNG, JPEG, WebP, animated-GIF-first-frame, sanitized SVG, and data images; Mermaid; print colors; A4 sizing; and page numbers.
 
@@ -55,6 +55,9 @@ as passed external coverage in that case:
 TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/postgres \
   cargo test -p note-storage-pg
 
+AWS_ACCESS_KEY_ID=minioadmin \
+AWS_SECRET_ACCESS_KEY=minioadmin \
+AWS_EC2_METADATA_DISABLED=true \
 NOTE_TEST_MINIO_ENDPOINT=http://127.0.0.1:9000 \
 NOTE_TEST_MINIO_BUCKET=agent-note-tests \
   cargo test -p note-attachments --test s3_minio_test
