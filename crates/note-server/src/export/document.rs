@@ -5,6 +5,7 @@ use image::{
     Limits as ImageLimits,
 };
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
+use note_core::{is_relative_attachment_path, normalize_attachment_path};
 use note_pipelines::{ExportAssetKind, FrozenNoteExport};
 use percent_encoding::percent_decode_str;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -1308,11 +1309,26 @@ impl RewriteManifest {
 fn source_aliases(value: &str) -> Vec<String> {
     let normalized = normalize_relative(value);
     let mut aliases = vec![normalized.clone()];
-    if let Ok(decoded) = percent_decode_str(&normalized).decode_utf8() {
-        if decoded != normalized {
-            aliases.push(decoded.into_owned());
+    if is_relative_attachment_path(&normalized) {
+        let canonical = normalize_attachment_path(&normalized);
+        if canonical != normalized {
+            aliases.push(canonical);
         }
     }
+    if let Ok(decoded) = percent_decode_str(&normalized).decode_utf8() {
+        if decoded != normalized {
+            let decoded = decoded.into_owned();
+            aliases.push(decoded.clone());
+            if is_relative_attachment_path(&decoded) {
+                let canonical_decoded = normalize_attachment_path(&decoded);
+                if canonical_decoded != decoded {
+                    aliases.push(canonical_decoded);
+                }
+            }
+        }
+    }
+    aliases.sort();
+    aliases.dedup();
     aliases
 }
 

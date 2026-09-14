@@ -53,14 +53,16 @@ as passed external coverage in that case:
 
 ```sh
 TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/postgres \
-  cargo test -p note-storage-pg
+  cargo test -p note-pipelines --test note_export_test \
+    live_postgres_hydration_and_confirmation_contract_or_exact_environment_skip \
+    -- --exact --nocapture
 
 AWS_ACCESS_KEY_ID=minioadmin \
 AWS_SECRET_ACCESS_KEY=minioadmin \
 AWS_EC2_METADATA_DISABLED=true \
 NOTE_TEST_MINIO_ENDPOINT=http://127.0.0.1:9000 \
 NOTE_TEST_MINIO_BUCKET=agent-note-tests \
-  cargo test -p note-attachments --test s3_minio_test
+  cargo test -p note-attachments --test s3_minio_test -- --nocapture
 ```
 
 ## Evidence and visual review

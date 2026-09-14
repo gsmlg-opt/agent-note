@@ -333,6 +333,21 @@ cover: ![not rendered](front.png)
 }
 
 #[test]
+fn rewrites_every_canonical_spelling_of_one_frozen_attachment() {
+    let export = frozen(
+        "![first](images/a.png) ![alias](images//./a.png)",
+        vec![asset("images/a.png", "image/png", one_pixel_png())],
+    );
+
+    let package = build_export_document(&export, ExportDocumentLimits::default()).unwrap();
+
+    assert_eq!(
+        package.index_html.matches("src=\"asset-0001.png\"").count(),
+        2
+    );
+}
+
+#[test]
 fn removes_executable_and_fetch_capable_author_html_but_preserves_text() {
     let export = frozen(
         r#"<script>alert('x')</script><iframe src="https://example.com">frame text</iframe><form action="/steal"><label>Name<input autofocus onfocus="alert(1)"></label></form><div onclick="go()" style="background:url(https://example.com/x);color:red">kept text</div><img srcset="https://example.com/a 2x" src="https://example.com/b"><style>@import url(https://example.com/x)</style>

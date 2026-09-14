@@ -284,14 +284,25 @@ fn map_pipeline_error(error: NoteExportError) -> ExportApiError {
             "The note changed after it was read",
             false,
         ),
-        NoteExportError::MarkdownLimitExceeded
-        | NoteExportError::AssetCountLimitExceeded
-        | NoteExportError::AssetLimitExceeded { .. }
-        | NoteExportError::CombinedAssetLimitExceeded => ExportApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "export_limit_exceeded",
-            "Note export exceeds a configured limit",
-            false,
+        NoteExportError::MarkdownLimitExceeded => limit_error(
+            "Markdown input exceeds the configured byte limit",
+            "markdown_input",
+            None,
+        ),
+        NoteExportError::AssetCountLimitExceeded => limit_error(
+            "Referenced image count exceeds the configured limit",
+            "referenced_image_count",
+            None,
+        ),
+        NoteExportError::AssetLimitExceeded { destination } => limit_error(
+            "A referenced image exceeds the configured byte limit",
+            "asset_bytes",
+            Some(destination),
+        ),
+        NoteExportError::CombinedAssetLimitExceeded => limit_error(
+            "Combined referenced images exceed the configured byte limit",
+            "combined_asset_bytes",
+            None,
         ),
         NoteExportError::AssetInvalid { destination }
         | NoteExportError::AssetMissing { destination } => ExportApiError {
@@ -303,13 +314,16 @@ fn map_pipeline_error(error: NoteExportError) -> ExportApiError {
                 false,
             )
         },
-        NoteExportError::AssetChecksumMismatch { .. }
-        | NoteExportError::AssetSizeMismatch { .. } => ExportApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "export_asset_invalid",
-            "A referenced export image failed integrity validation",
-            false,
-        ),
+        NoteExportError::AssetChecksumMismatch { destination }
+        | NoteExportError::AssetSizeMismatch { destination } => ExportApiError {
+            details: serde_json::json!({"path": destination}),
+            ..ExportApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "export_asset_invalid",
+                "A referenced export image failed integrity validation",
+                false,
+            )
+        },
         NoteExportError::MismatchedAssetPlan
         | NoteExportError::StorageFailure
         | NoteExportError::UnsupportedBoundedRead => storage_error(),
@@ -339,22 +353,71 @@ fn map_document_error(error: ExportDocumentError) -> ExportApiError {
             "An embedded export image is invalid",
             false,
         ),
-        ExportDocumentError::ImageDimensionsExceeded { .. }
-        | ExportDocumentError::SvgComplexityExceeded { .. }
-        | ExportDocumentError::PackagedAssetLimitExceeded { .. }
-        | ExportDocumentError::CombinedImageDimensionsExceeded
-        | ExportDocumentError::CombinedPackagedAssetLimitExceeded => ExportApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "export_limit_exceeded",
-            "Export document exceeds a configured limit",
-            false,
+        ExportDocumentError::ImageDimensionsExceeded { destination } => limit_error(
+            "A referenced image exceeds the configured pixel limit",
+            "image_dimensions",
+            Some(destination),
+        ),
+        ExportDocumentError::SvgComplexityExceeded { destination } => limit_error(
+            "A referenced SVG exceeds the configured complexity limit",
+            "svg_complexity",
+            Some(destination),
+        ),
+        ExportDocumentError::PackagedAssetLimitExceeded { destination } => limit_error(
+            "A packaged image exceeds the configured byte limit",
+            "packaged_asset_bytes",
+            Some(destination),
+        ),
+        ExportDocumentError::CombinedImageDimensionsExceeded => limit_error(
+            "Combined images exceed the configured pixel limit",
+            "combined_image_dimensions",
+            None,
+        ),
+        ExportDocumentError::CombinedPackagedAssetLimitExceeded => limit_error(
+            "Combined packaged images exceed the configured byte limit",
+            "combined_packaged_asset_bytes",
+            None,
         ),
         ExportDocumentError::InvalidLimits => storage_error(),
-        _ => ExportApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "export_limit_exceeded",
-            "Export document exceeds a configured limit",
-            false,
+        ExportDocumentError::GeneratedHtmlLimitExceeded => limit_error(
+            "Generated HTML exceeds the configured byte limit",
+            "generated_html",
+            None,
+        ),
+        ExportDocumentError::DiagramCountLimitExceeded => limit_error(
+            "Diagram count exceeds the configured limit",
+            "diagram_count",
+            None,
+        ),
+        ExportDocumentError::DiagramInputLimitExceeded => limit_error(
+            "A diagram exceeds the configured input limit",
+            "diagram_input",
+            None,
+        ),
+        ExportDocumentError::CombinedDiagramInputLimitExceeded => limit_error(
+            "Combined diagrams exceed the configured input limit",
+            "combined_diagram_input",
+            None,
+        ),
+        ExportDocumentError::DiagramComplexityExceeded => limit_error(
+            "A diagram exceeds the configured complexity limit",
+            "diagram_complexity",
+            None,
+        ),
+        ExportDocumentError::MarkupDepthLimitExceeded => limit_error(
+            "Document markup exceeds the configured nesting limit",
+            "markup_depth",
+            None,
+        ),
+        ExportDocumentError::MarkupNodeLimitExceeded => limit_error(
+            "Document markup exceeds the configured node limit",
+            "markup_nodes",
+            None,
+        ),
+        ExportDocumentError::FootnoteMarkerUnavailable => limit_error(
+            "Document footnotes exceed the supported marker space",
+            "footnote_markers",
+            None,
         ),
     }
 }
@@ -368,14 +431,16 @@ fn map_renderer_error(error: PdfRendererError) -> ExportApiError {
             "PDF renderer is temporarily unavailable",
             true,
         ),
-        PdfRendererError::PackageLimitExceeded | PdfRendererError::ResponseLimitExceeded => {
-            ExportApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "export_limit_exceeded",
-                "PDF export exceeds a configured limit",
-                false,
-            )
-        }
+        PdfRendererError::PackageLimitExceeded => limit_error(
+            "PDF renderer input exceeds the configured byte limit",
+            "renderer_input",
+            None,
+        ),
+        PdfRendererError::ResponseLimitExceeded => limit_error(
+            "PDF output exceeds the configured byte limit",
+            "pdf_output",
+            None,
+        ),
         PdfRendererError::InvalidConfiguration => storage_error(),
         PdfRendererError::InvalidPackage
         | PdfRendererError::ConversionFailed
@@ -395,6 +460,22 @@ fn storage_error() -> ExportApiError {
         "Note export storage operation failed",
         true,
     )
+}
+
+fn limit_error(message: &str, limit: &str, path: Option<String>) -> ExportApiError {
+    let details = match path {
+        Some(path) => serde_json::json!({"limit": limit, "path": path}),
+        None => serde_json::json!({"limit": limit}),
+    };
+    ExportApiError {
+        details,
+        ..ExportApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "export_limit_exceeded",
+            message,
+            false,
+        )
+    }
 }
 
 fn pdf_response(
@@ -439,7 +520,15 @@ fn ascii_filename_fallback(filename: &str, note_id: &str) -> String {
         .collect::<String>();
     let ascii = ascii.trim();
     if ascii.is_empty() || ascii == ".pdf" {
-        format!("note-{note_id}.pdf")
+        let safe_id = note_id
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            .collect::<String>();
+        if safe_id.is_empty() {
+            "note.pdf".to_owned()
+        } else {
+            format!("note-{safe_id}.pdf")
+        }
     } else {
         ascii.to_owned()
     }
@@ -536,6 +625,39 @@ mod tests {
     fn header_fallback_is_ascii_and_cannot_inject_fields() {
         assert_eq!(ascii_filename_fallback("会議 notes.pdf", "n1"), "notes.pdf");
         assert_eq!(ascii_filename_fallback("\r\n\"\\.pdf", "n1"), "note-n1.pdf");
+        assert_eq!(
+            ascii_filename_fallback("会議.pdf", "bad\"\\\r\nid"),
+            "note-badid.pdf"
+        );
+        assert_eq!(ascii_filename_fallback("会議.pdf", "注释"), "note.pdf");
+    }
+
+    #[test]
+    fn limit_and_integrity_errors_explain_the_failed_boundary() {
+        let markdown = map_pipeline_error(NoteExportError::MarkdownLimitExceeded);
+        assert_eq!(
+            markdown.details,
+            serde_json::json!({"limit": "markdown_input"})
+        );
+
+        let asset = map_pipeline_error(NoteExportError::AssetLimitExceeded {
+            destination: "images/large.png".into(),
+        });
+        assert_eq!(
+            asset.details,
+            serde_json::json!({"limit": "asset_bytes", "path": "images/large.png"})
+        );
+
+        let checksum = map_pipeline_error(NoteExportError::AssetChecksumMismatch {
+            destination: "images/corrupt.png".into(),
+        });
+        assert_eq!(
+            checksum.details,
+            serde_json::json!({"path": "images/corrupt.png"})
+        );
+
+        let output = map_renderer_error(PdfRendererError::ResponseLimitExceeded);
+        assert_eq!(output.details, serde_json::json!({"limit": "pdf_output"}));
     }
 
     #[test]

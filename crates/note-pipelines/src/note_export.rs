@@ -161,12 +161,12 @@ pub enum NoteExportError {
     StaleRevision { expected: i64, current: i64 },
     MarkdownLimitExceeded,
     AssetCountLimitExceeded,
-    AssetLimitExceeded { attachment_id: String },
+    AssetLimitExceeded { destination: String },
     CombinedAssetLimitExceeded,
     AssetInvalid { destination: String },
     AssetMissing { destination: String },
-    AssetChecksumMismatch { attachment_id: String },
-    AssetSizeMismatch { attachment_id: String },
+    AssetChecksumMismatch { destination: String },
+    AssetSizeMismatch { destination: String },
     StorageFailure,
     UnsupportedBoundedRead,
 }
@@ -312,7 +312,7 @@ fn is_external_destination(destination: &str) -> bool {
 
 fn image_destinations(markdown: &str) -> Vec<String> {
     let mut destinations = Vec::new();
-    for event in Parser::new(markdown) {
+    for event in Parser::new(markdown_body_after_front_matter(markdown)) {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => destinations.push(dest_url.into_string()),
             Event::Html(html) | Event::InlineHtml(html) => {
@@ -322,6 +322,38 @@ fn image_destinations(markdown: &str) -> Vec<String> {
         }
     }
     destinations
+}
+
+fn markdown_body_after_front_matter(markdown: &str) -> &str {
+    let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
+    let Some((opening, mut cursor, has_line_ending)) = logical_line(markdown, 0) else {
+        return markdown;
+    };
+    if opening != "---" || !has_line_ending {
+        return markdown;
+    }
+    while cursor < markdown.len() {
+        let Some((line, next, _)) = logical_line(markdown, cursor) else {
+            return markdown;
+        };
+        if matches!(line, "---" | "...") {
+            return &markdown[next..];
+        }
+        cursor = next;
+    }
+    markdown
+}
+
+fn logical_line(source: &str, start: usize) -> Option<(&str, usize, bool)> {
+    let rest = source.get(start..)?;
+    if let Some(newline) = rest.find('\n') {
+        let line = rest[..newline]
+            .strip_suffix('\r')
+            .unwrap_or(&rest[..newline]);
+        Some((line, start + newline + 1, true))
+    } else {
+        Some((rest, source.len(), false))
+    }
 }
 
 fn html_image_sources(fragment: &str) -> Vec<String> {
@@ -427,7 +459,7 @@ pub async fn hydrate_note_export(
         if let Some(storage) = &planned.attachment.storage {
             if storage.size_bytes > limits.max_asset_bytes {
                 return Err(NoteExportError::AssetLimitExceeded {
-                    attachment_id: planned.attachment.id.clone(),
+                    destination: planned.destination.clone(),
                 });
             }
             combined = combined
@@ -439,20 +471,22 @@ pub async fn hydrate_note_export(
         }
     }
     let mut assets = Vec::with_capacity(plan.assets.len());
+    let mut hydrated_combined = 0_u64;
     for planned in plan.assets {
+        let remaining_combined = limits
+            .max_combined_asset_bytes
+            .saturating_sub(hydrated_combined);
+        let read_limit = limits.max_asset_bytes.min(remaining_combined);
+        let limited_by_combined_budget = read_limit < limits.max_asset_bytes;
         let read = match &planned.attachment.storage {
             Some(storage) => {
                 ctx.attachments()
-                    .read_object_bounded(&storage.object_key, limits.max_asset_bytes)
+                    .read_object_bounded(&storage.object_key, read_limit)
                     .await
             }
             None => {
                 ctx.attachments()
-                    .read_legacy_bounded(
-                        &captured.note.id,
-                        &planned.attachment.path,
-                        limits.max_asset_bytes,
-                    )
+                    .read_legacy_bounded(&captured.note.id, &planned.attachment.path, read_limit)
                     .await
             }
         };
@@ -465,9 +499,12 @@ pub async fn hydrate_note_export(
                         return Err(NoteExportError::UnsupportedBoundedRead)
                     }
                     Some(BoundedReadError::LimitExceeded) => {
+                        if limited_by_combined_budget {
+                            return Err(NoteExportError::CombinedAssetLimitExceeded);
+                        }
                         return Err(NoteExportError::AssetLimitExceeded {
-                            attachment_id: planned.attachment.id,
-                        })
+                            destination: planned.destination,
+                        });
                     }
                     Some(BoundedReadError::Missing) => {
                         return Err(NoteExportError::AssetMissing {
@@ -484,23 +521,21 @@ pub async fn hydrate_note_export(
             if bytes.len() as u64 != storage.size_bytes {
                 confirm_snapshot(ctx, &captured.note).await?;
                 return Err(NoteExportError::AssetSizeMismatch {
-                    attachment_id: planned.attachment.id.clone(),
+                    destination: planned.destination.clone(),
                 });
             }
             if format!("{:x}", Sha256::digest(&bytes)) != storage.checksum_sha256 {
                 confirm_snapshot(ctx, &captured.note).await?;
                 return Err(NoteExportError::AssetChecksumMismatch {
-                    attachment_id: planned.attachment.id.clone(),
+                    destination: planned.destination.clone(),
                 });
             }
         }
-        if planned.attachment.storage.is_none() {
-            combined = combined
-                .checked_add(bytes.len() as u64)
-                .ok_or(NoteExportError::CombinedAssetLimitExceeded)?;
-            if combined > limits.max_combined_asset_bytes {
-                return Err(NoteExportError::CombinedAssetLimitExceeded);
-            }
+        hydrated_combined = hydrated_combined
+            .checked_add(bytes.len() as u64)
+            .ok_or(NoteExportError::CombinedAssetLimitExceeded)?;
+        if hydrated_combined > limits.max_combined_asset_bytes {
+            return Err(NoteExportError::CombinedAssetLimitExceeded);
         }
         assets.push(HydratedNoteExportAsset {
             destination: planned.destination,

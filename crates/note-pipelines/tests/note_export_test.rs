@@ -299,6 +299,17 @@ async fn planning_reports_missing_and_non_image_local_destinations() {
 }
 
 #[tokio::test]
+async fn planning_ignores_images_in_unrendered_front_matter() {
+    let snapshot = captured("---\ncover: ![not rendered](front.png)\n---\nbody", vec![]).await;
+
+    let plan = plan_note_export_assets(&snapshot).unwrap();
+
+    assert!(plan.assets().is_empty());
+    assert!(plan.omissions().is_empty());
+    assert!(plan.data_images().is_empty());
+}
+
+#[tokio::test]
 async fn planning_decodes_once_and_prefers_an_exact_literal_percent_path() {
     let snapshot = captured(
         "![exact](images/raw%20.png) ![encoded](images/encoded%2Fsegment.png) ![percent](images/literal%2520.png)",
@@ -573,6 +584,82 @@ async fn legacy_images_use_bounded_legacy_reads_without_fabricating_metadata() {
 }
 
 #[tokio::test]
+async fn legacy_reads_are_bounded_by_the_remaining_combined_budget() {
+    struct LegacyLimitStore {
+        limits: Mutex<Vec<u64>>,
+    }
+
+    #[async_trait]
+    impl AttachmentStore for LegacyLimitStore {
+        async fn read_legacy(&self, _note_id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("unbounded reads must not be used")
+        }
+
+        async fn read_legacy_bounded(
+            &self,
+            _note_id: &str,
+            path: &str,
+            max_bytes: u64,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.limits.lock().unwrap().push(max_bytes);
+            let bytes = if path == "one.png" {
+                vec![1; 6]
+            } else {
+                vec![2; 5]
+            };
+            if bytes.len() as u64 > max_bytes {
+                return Err(BoundedReadError::LimitExceeded.into());
+            }
+            Ok(bytes)
+        }
+
+        fn info(&self) -> AttachmentStoreInfo {
+            AttachmentStoreInfo {
+                engine: "legacy-limit-test".into(),
+                location: None,
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("legacy-limit.db"))
+            .await
+            .unwrap(),
+    );
+    let attachments = [
+        NoteAttachment {
+            storage: None,
+            content: vec![],
+            ..attachment("one", "one.png", "image/png")
+        },
+        NoteAttachment {
+            storage: None,
+            content: vec![],
+            ..attachment("two", "two.png", "image/png")
+        },
+    ];
+    seed_note(&backend, "![one](one.png) ![two](two.png)", &attachments).await;
+    let store = Arc::new(LegacyLimitStore {
+        limits: Mutex::new(Vec::new()),
+    });
+    let ctx = Context::new(backend, Arc::new(StubEmbedder), store.clone());
+    let limits = NoteExportLimits {
+        max_asset_bytes: 8,
+        max_combined_asset_bytes: 10,
+        ..NoteExportLimits::default()
+    };
+
+    assert_eq!(
+        freeze_note_export(&ctx, "export-note", 7, limits)
+            .await
+            .unwrap_err(),
+        NoteExportError::CombinedAssetLimitExceeded
+    );
+    assert_eq!(*store.limits.lock().unwrap(), [8, 4]);
+}
+
+#[tokio::test]
 async fn limits_reject_captured_metadata_before_reading_any_object() {
     let (ctx, backend, store, _dir) = recording_context().await;
     seed_note(
@@ -633,13 +720,13 @@ async fn generated_asset_size_checksum_missing_and_unsupported_are_typed() {
         (
             Some(b"longer".as_slice()),
             NoteExportError::AssetSizeMismatch {
-                attachment_id: "image".into(),
+                destination: "image.png".into(),
             },
         ),
         (
             Some(b"other".as_slice()),
             NoteExportError::AssetChecksumMismatch {
-                attachment_id: "image".into(),
+                destination: "image.png".into(),
             },
         ),
         (
