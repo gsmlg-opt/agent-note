@@ -35,6 +35,31 @@ cargo test -p note-server --test export_real_renderer_test -- --nocapture
 
 When `NOTE_TEST_REAL_PDF=1`, the URL, artifact directory, renderer, and PDF inspection tools are mandatory. Missing dependencies fail the test. Without that flag the single integration test reports that real qualification was skipped; do not report that default-mode result as a renderer pass.
 
+## Focused non-renderer gates
+
+Run the snapshot, document-policy, renderer-transport, and API contracts without Gotenberg:
+
+```sh
+cargo test -p note-pipelines --test note_export_test
+cargo test -p note-server --test export_document_test
+cargo test -p note-server --test export_renderer_test
+cargo test -p note-server --test export_api_test
+```
+
+The snapshot suite uses the embedded adapter and deterministic attachment-store doubles. When
+validating the repository's external adapter environment too, run the existing live suites
+explicitly; both visibly skip when their environment variable is absent and must not be reported
+as passed external coverage in that case:
+
+```sh
+TEST_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/postgres \
+  cargo test -p note-storage-pg
+
+NOTE_TEST_MINIO_ENDPOINT=http://127.0.0.1:9000 \
+NOTE_TEST_MINIO_BUCKET=agent-note-tests \
+  cargo test -p note-attachments --test s3_minio_test
+```
+
 ## Evidence and visual review
 
 The gate writes these files under `target/pdf-export-validation/`:
