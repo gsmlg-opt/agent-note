@@ -174,7 +174,8 @@ vectors = {
 }
 for name, body in vectors.items():
     (root / f"blocked-{name}.html").write_text(
-        f"<!doctype html><html><body>{body}</body></html>", encoding="utf-8"
+        f"<!doctype html><html><body><p>BLOCKED VECTOR CONTROL {name}</p>{body}</body></html>",
+        encoding="utf-8",
     )
 (root / "javascript.html").write_text(
     "<!doctype html><body onload=\"document.body.textContent='EXECUTED EVENT'\">"
@@ -309,6 +310,19 @@ for fixture in "$work_dir"/blocked-*.html; do
   : >"$work_dir/requests.log"
   : >"$work_dir/connections.log"
   status="$(post_html "$fixture" "$work_dir/$name.response")"
+  [[ "$status" =~ ^2 ]] || {
+    echo "$name failed to render while testing blocked fetches: HTTP $status" >&2
+    exit 1
+  }
+  qpdf --check "$work_dir/$name.response" >/dev/null || {
+    echo "$name returned a non-PDF response while testing blocked fetches" >&2
+    exit 1
+  }
+  pdftotext "$work_dir/$name.response" "$work_dir/$name.txt"
+  grep -F "BLOCKED VECTOR CONTROL ${name#blocked-}" "$work_dir/$name.txt" >/dev/null || {
+    echo "$name PDF omitted its static rendering control" >&2
+    exit 1
+  }
   sleep 0.25
   if [[ -s "$work_dir/requests.log" ]]; then
     echo "$name reached the forbidden recorder: $(tr '\n' ' ' <"$work_dir/requests.log")" >&2
