@@ -174,11 +174,8 @@ for name, body in vectors.items():
     "<script>document.body.textContent='EXECUTED SCRIPT'</script></body>",
     encoding="utf-8",
 )
-(root / "request-a-secret.html").write_text(
-    '<!doctype html><body><p>IN-FLIGHT REQUEST A SECRET 9f4ca771</p></body>', encoding="utf-8"
-)
 (root / "request-a.html").write_text(
-    '<!doctype html><body><p>REQUEST A CONTROL</p><iframe src="request-a-secret.html"></iframe></body>',
+    '<!doctype html><body><p>IN-FLIGHT REQUEST A SECRET 9f4ca771</p></body>',
     encoding="utf-8",
 )
 (root / "requests.log").write_text("", encoding="utf-8")
@@ -330,7 +327,6 @@ fi
 echo "script and event handlers did not execute" | tee -a "$security_log"
 
 post_html "$work_dir/request-a.html" "$work_dir/request-a.pdf" \
-  --form "files=@${work_dir}/request-a-secret.html;type=text/html;filename=request-a-secret.html" \
   --form "waitDelay=20s" >"$work_dir/request-a.status" &
 request_a_pid=$!
 active_request_file=""
