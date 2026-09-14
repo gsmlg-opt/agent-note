@@ -319,7 +319,7 @@ echo "script and event handlers did not execute" | tee -a "$security_log"
 
 post_html "$work_dir/request-a.html" "$work_dir/request-a.pdf" \
   --form "files=@${work_dir}/request-a-secret.html;type=text/html;filename=request-a-secret.html" \
-  --form "waitDelay=8s" >"$work_dir/request-a.status" &
+  --form "waitDelay=20s" >"$work_dir/request-a.status" &
 request_a_pid=$!
 active_request_file=""
 for _ in $(seq 1 60); do
