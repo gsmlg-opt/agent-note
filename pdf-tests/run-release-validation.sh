@@ -279,6 +279,18 @@ post_html() {
     "$@" "$renderer_url/forms/chromium/convert/html"
 }
 
+post_isolation_probe() {
+  local html="$1"
+  local output="$2"
+  curl --silent --show-error --output "$output" --write-out '%{http_code}' \
+    --form "files=@${html};type=text/html;filename=index.html" \
+    --form "preferCssPageSize=true" \
+    --form "printBackground=true" \
+    --form "skipNetworkIdleEvent=true" \
+    --form "failOnResourceLoadingFailed=false" \
+    "$renderer_url/forms/chromium/convert/html"
+}
+
 security_log="$artifact_dir/security-checks.log"
 : >"$security_log"
 if docker exec "$container_id" curl --fail --silent --show-error --max-time 5 \
@@ -356,17 +368,19 @@ target = html.escape(f"file://{request_file}", quote=True)
     encoding="utf-8",
 )
 PY
-status="$(post_html "$work_dir/request-b.html" "$work_dir/request-b.response")"
+status="$(post_isolation_probe "$work_dir/request-b.html" "$work_dir/request-b.response")"
 kill -0 "$request_a_pid" 2>/dev/null || {
   echo "request A was not live throughout the concurrent isolation probe" >&2
   exit 1
 }
-if [[ "$status" =~ ^2 ]]; then
-  pdftotext "$work_dir/request-b.response" "$work_dir/request-b.txt"
-  if grep -F "IN-FLIGHT REQUEST A SECRET 9f4ca771" "$work_dir/request-b.txt" >/dev/null; then
-    echo "request B accessed request A's in-flight packaged file" >&2
-    exit 1
-  fi
+[[ "$status" =~ ^2 ]] || {
+  echo "request B isolation probe failed to render: HTTP $status" >&2
+  exit 1
+}
+pdftotext "$work_dir/request-b.response" "$work_dir/request-b.txt"
+if grep -F "IN-FLIGHT REQUEST A SECRET 9f4ca771" "$work_dir/request-b.txt" >/dev/null; then
+  echo "request B accessed request A's in-flight packaged file" >&2
+  exit 1
 fi
 set +e
 wait "$request_a_pid"
