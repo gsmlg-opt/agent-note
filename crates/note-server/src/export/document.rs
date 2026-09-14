@@ -16,6 +16,7 @@ use std::{
     io::{Cursor, Write},
     ops::Range,
 };
+use uuid::Uuid;
 
 const PRINT_CSS: &str = include_str!("print.css");
 const DEFAULT_MAX_PIXELS_PER_IMAGE: u64 = 20_000_000;
@@ -101,6 +102,7 @@ pub enum ExportDocumentError {
     DiagramComplexityExceeded,
     PackagedAssetLimitExceeded { destination: String },
     CombinedPackagedAssetLimitExceeded,
+    FootnoteMarkerUnavailable,
 }
 
 impl fmt::Display for ExportDocumentError {
@@ -137,6 +139,7 @@ impl fmt::Display for ExportDocumentError {
             Self::CombinedPackagedAssetLimitExceeded => {
                 "combined packaged export images exceed the byte limit"
             }
+            Self::FootnoteMarkerUnavailable => "could not reserve an export footnote marker",
         };
         formatter.write_str(message)
     }
@@ -150,7 +153,8 @@ pub fn build_export_document(
 ) -> Result<ExportDocumentPackage, ExportDocumentError> {
     validate_limits(limits)?;
     validate_export_diagrams(&frozen.note.content, limits)?;
-    let prepared = prepare_footnotes(&frozen.note.content);
+    let prepared = prepare_footnotes(&frozen.note.content)?;
+    // WORKAROUND(upstream): duskmoon-dev/yew-duskmoon-ui#12
     preflight_generated_html(&prepared, &frozen.note.title, limits)?;
 
     let mut assets = Vec::new();
@@ -225,8 +229,8 @@ pub fn build_export_document(
         .omissions
         .iter()
         .filter(|omission| omission.kind == ExportAssetKind::External)
-        .map(|omission| omission.destination.as_str())
-        .collect::<Vec<_>>();
+        .flat_map(|omission| source_aliases(&omission.destination))
+        .collect::<HashSet<_>>();
     let mut original_image_sources =
         collect_original_image_sources(markdown_body_after_front_matter(&prepared.body_markdown));
     for footnote in &prepared.footnotes {
@@ -375,54 +379,22 @@ fn preflight_generated_html(
     title: &str,
     limits: ExportDocumentLimits,
 ) -> Result<(), ExportDocumentError> {
-    let mut markdown_bytes = 0_usize;
-    let mut diagram_count = 0_usize;
-    let mut diagram_bytes = 0_usize;
-    let mut diagram_lines = 0_usize;
+    let escaped_title = escaped_text_len(title)?;
+    let mut estimated = PRINT_CSS
+        .len()
+        .checked_add(512)
+        .and_then(|value| value.checked_add(escaped_title.checked_mul(2)?))
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
     for markdown in std::iter::once(prepared.body_markdown.as_str()).chain(
         prepared
             .footnotes
             .iter()
             .map(|footnote| footnote.markdown.as_str()),
     ) {
-        markdown_bytes = markdown_bytes
-            .checked_add(markdown.len())
+        estimated = estimated
+            .checked_add(estimate_renderer_html(markdown)?)
             .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
-        let mut in_diagram = false;
-        for event in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES) {
-            match event {
-                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
-                    if is_mermaid_language(&info) =>
-                {
-                    diagram_count = diagram_count
-                        .checked_add(1)
-                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
-                    in_diagram = true;
-                }
-                Event::Text(text) if in_diagram => {
-                    diagram_bytes = diagram_bytes
-                        .checked_add(text.len())
-                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
-                    diagram_lines = diagram_lines
-                        .checked_add(text.lines().count().max(1))
-                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
-                }
-                Event::SoftBreak | Event::HardBreak if in_diagram => {
-                    diagram_bytes = diagram_bytes
-                        .checked_add(1)
-                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
-                    diagram_lines = diagram_lines
-                        .checked_add(1)
-                        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
-                }
-                Event::End(TagEnd::CodeBlock) if in_diagram => in_diagram = false,
-                _ => {}
-            }
-        }
     }
-
-    // The renderer necessarily returns a String. Reject work before invoking it using a
-    // conservative ceiling for escaping, syntax spans, diagram DOM, and the fixed wrapper.
     let footnote_references = prepared
         .footnotes
         .iter()
@@ -430,21 +402,118 @@ fn preflight_generated_html(
             total.checked_add(footnote.reference_ids.len())
         })
         .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
-    let estimated = PRINT_CSS
-        .len()
-        .checked_add(512)
-        .and_then(|value| value.checked_add(title.len().checked_mul(10)?))
-        .and_then(|value| value.checked_add(markdown_bytes.checked_mul(6)?))
-        .and_then(|value| value.checked_add(prepared.footnotes.len().checked_mul(512)?))
+    estimated = estimated
+        .checked_add(
+            prepared
+                .footnotes
+                .len()
+                .checked_mul(512)
+                .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?,
+        )
         .and_then(|value| value.checked_add(footnote_references.checked_mul(256)?))
-        .and_then(|value| value.checked_add(diagram_count.checked_mul(64 * 1024)?))
-        .and_then(|value| value.checked_add(diagram_bytes.checked_mul(32)?))
-        .and_then(|value| value.checked_add(diagram_lines.checked_mul(256)?))
         .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
     if estimated > limits.max_generated_html_bytes {
         return Err(ExportDocumentError::GeneratedHtmlLimitExceeded);
     }
     Ok(())
+}
+
+fn estimate_renderer_html(markdown: &str) -> Result<usize, ExportDocumentError> {
+    let (front_matter, body) = split_front_matter(markdown)
+        .map(|(source, body)| (Some(source), body))
+        .unwrap_or((None, markdown));
+    let mut estimate = front_matter
+        .map(|source| highlighted_code_bound(source.len(), source.lines().count().max(1)))
+        .transpose()?
+        .unwrap_or(0);
+    let mut code_kind = None;
+    for event in Parser::new_ext(body, renderer_markdown_options()) {
+        let addition =
+            match event {
+                Event::Start(Tag::CodeBlock(kind)) => {
+                    code_kind = Some(match kind {
+                        CodeBlockKind::Fenced(info) if is_mermaid_language(&info) => {
+                            PreflightCodeKind::Mermaid
+                        }
+                        _ => PreflightCodeKind::Highlighted,
+                    });
+                    512
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    code_kind = None;
+                    64
+                }
+                Event::Text(text) => match code_kind {
+                    Some(PreflightCodeKind::Highlighted) => {
+                        highlighted_code_bound(text.len(), text.lines().count().max(1))?
+                    }
+                    Some(PreflightCodeKind::Mermaid) => mermaid_html_bound(&text)?,
+                    None => escaped_text_len(&text)?,
+                },
+                Event::Code(code) => escaped_text_len(&code)?
+                    .checked_add(512)
+                    .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?,
+                Event::Html(html) | Event::InlineHtml(html) => html
+                    .len()
+                    .checked_mul(6)
+                    .and_then(|value| value.checked_add(512))
+                    .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?,
+                Event::Start(_) | Event::End(_) => 512,
+                Event::SoftBreak | Event::HardBreak => 16,
+                Event::Rule | Event::TaskListMarker(_) => 128,
+                Event::FootnoteReference(reference) => escaped_text_len(&reference)?
+                    .checked_add(256)
+                    .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?,
+                _ => 64,
+            };
+        estimate = estimate
+            .checked_add(addition)
+            .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+    }
+    Ok(estimate)
+}
+
+#[derive(Clone, Copy)]
+enum PreflightCodeKind {
+    Highlighted,
+    Mermaid,
+}
+
+fn renderer_markdown_options() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_GFM
+}
+
+fn escaped_text_len(value: &str) -> Result<usize, ExportDocumentError> {
+    value
+        .chars()
+        .try_fold(0_usize, |total, character| {
+            total.checked_add(match character {
+                '&' => 5,
+                '<' | '>' => 4,
+                _ => character.len_utf8(),
+            })
+        })
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)
+}
+
+fn highlighted_code_bound(bytes: usize, lines: usize) -> Result<usize, ExportDocumentError> {
+    bytes
+        .checked_mul(64)
+        .and_then(|value| value.checked_add(lines.checked_mul(128)?))
+        .and_then(|value| value.checked_add(512))
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)
+}
+
+fn mermaid_html_bound(source: &str) -> Result<usize, ExportDocumentError> {
+    source
+        .len()
+        .checked_mul(128)
+        .and_then(|value| value.checked_add(source.lines().count().max(1).checked_mul(1_024)?))
+        .and_then(|value| value.checked_add(64 * 1024))
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)
 }
 
 struct CappedString {
@@ -992,23 +1061,27 @@ fn source_aliases(value: &str) -> Vec<String> {
 }
 
 fn markdown_body_after_front_matter(markdown: &str) -> &str {
+    split_front_matter(markdown)
+        .map(|(_, body)| body)
+        .unwrap_or(markdown)
+}
+
+fn split_front_matter(markdown: &str) -> Option<(&str, &str)> {
     let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
-    let Some((opening, mut cursor, has_line_ending)) = logical_line(markdown, 0) else {
-        return markdown;
-    };
+    let (opening, mut cursor, has_line_ending) = logical_line(markdown, 0)?;
     if opening != "---" || !has_line_ending {
-        return markdown;
+        return None;
     }
+    let source_start = cursor;
     while cursor < markdown.len() {
-        let Some((line, next, _)) = logical_line(markdown, cursor) else {
-            return markdown;
-        };
+        let line_start = cursor;
+        let (line, next, _) = logical_line(markdown, cursor)?;
         if matches!(line, "---" | "...") {
-            return &markdown[next..];
+            return Some((&markdown[source_start..line_start], &markdown[next..]));
         }
         cursor = next;
     }
-    markdown
+    None
 }
 
 fn logical_line(source: &str, start: usize) -> Option<(&str, usize, bool)> {
@@ -1069,7 +1142,7 @@ fn collect_dom_image_sources(node: &Handle, sources: &mut Vec<Option<String>>) {
 
 struct HtmlPolicy<'a> {
     rewrites: &'a RewriteManifest,
-    external_omissions: &'a [&'a str],
+    external_omissions: &'a HashSet<String>,
     original_image_sources: &'a [Option<String>],
     footnote_marker: &'a str,
 }
@@ -1135,20 +1208,32 @@ fn collect_author_ids(node: &Handle, footnote_marker: &str, ids: &mut HashSet<St
 }
 
 fn choose_footnote_namespace(author_ids: &HashSet<String>) -> String {
-    for suffix in 0_usize.. {
+    let blocked = author_ids
+        .iter()
+        .filter_map(|id| footnote_namespace_from_generated_shape(id))
+        .collect::<HashSet<_>>();
+    for suffix in 0..=blocked.len() {
         let namespace = if suffix == 0 {
             "export-footnote".to_owned()
         } else {
             format!("export-footnote-{suffix}")
         };
-        if !author_ids.iter().any(|id| {
-            id.starts_with(&format!("{namespace}-def-"))
-                || id.starts_with(&format!("{namespace}-ref-"))
-        }) {
+        if !blocked.contains(&namespace) {
             return namespace;
         }
     }
-    unreachable!("finite IDs always leave a footnote namespace")
+    unreachable!("n blocked namespaces cannot occupy n plus one candidates")
+}
+
+fn footnote_namespace_from_generated_shape(id: &str) -> Option<String> {
+    let (namespace, suffix) = id.split_once("-def-").or_else(|| id.split_once("-ref-"))?;
+    let valid_namespace = namespace == "export-footnote"
+        || namespace
+            .strip_prefix("export-footnote-")
+            .is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+            });
+    (valid_namespace && !suffix.is_empty()).then(|| namespace.to_owned())
 }
 
 enum GeneratedFootnoteMarker<'a> {
@@ -1360,13 +1445,13 @@ impl HtmlSanitizer<'_> {
             self.output.push_str("\">");
             return Ok(());
         }
-        if is_external_url(&src)
-            || self
-                .policy
-                .external_omissions
-                .iter()
-                .any(|omitted| **omitted == src)
-        {
+        let omitted = original_src
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(rendered_src.as_str()))
+            .flat_map(source_aliases)
+            .any(|source| self.policy.external_omissions.contains(&source));
+        if is_external_url(&src) || omitted {
             self.output
                 .push_str("<span class=\"export-omission\" role=\"note\">External image omitted");
             if !alt.is_empty() {
@@ -1834,8 +1919,15 @@ struct PreparedFootnote {
     reference_ids: Vec<String>,
 }
 
-fn prepare_footnotes(markdown: &str) -> PreparedFootnotes {
-    let marker_token = collision_free_marker(markdown);
+fn prepare_footnotes(markdown: &str) -> Result<PreparedFootnotes, ExportDocumentError> {
+    prepare_footnotes_with_nonce_source(markdown, || Uuid::new_v4().simple().to_string())
+}
+
+fn prepare_footnotes_with_nonce_source(
+    markdown: &str,
+    mut nonce_source: impl FnMut() -> String,
+) -> Result<PreparedFootnotes, ExportDocumentError> {
+    let marker_token = reserve_footnote_marker(markdown, &mut nonce_source)?;
     let mut definitions = HashMap::<String, (Range<usize>, String)>::new();
     let mut references = Vec::<(String, Range<usize>)>::new();
     for (event, range) in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES).into_offset_iter() {
@@ -1856,19 +1948,22 @@ fn prepare_footnotes(markdown: &str) -> PreparedFootnotes {
 
     let mut label_indexes = HashMap::<String, usize>::new();
     let mut footnotes = Vec::<PreparedFootnote>::new();
-    let definition_ranges = definitions
+    let mut definition_ranges = definitions
         .values()
         .map(|(range, _)| range.clone())
         .collect::<Vec<_>>();
+    definition_ranges.sort_by_key(|range| range.start);
     let mut edits = definitions
         .values()
         .map(|(range, _)| (range.clone(), String::new()))
         .collect::<Vec<_>>();
     for (label, range) in references {
-        if definition_ranges
-            .iter()
-            .any(|definition| definition.start <= range.start && range.end <= definition.end)
-        {
+        let enclosing_definition = definition_ranges
+            .partition_point(|definition| definition.start <= range.start)
+            .checked_sub(1)
+            .and_then(|index| definition_ranges.get(index))
+            .is_some_and(|definition| range.end <= definition.end);
+        if enclosing_definition {
             continue;
         }
         let Some((_, definition)) = definitions.get(&label) else {
@@ -1902,21 +1997,64 @@ fn prepare_footnotes(markdown: &str) -> PreparedFootnotes {
     for (range, replacement) in edits {
         body_markdown.replace_range(range, &replacement);
     }
-    PreparedFootnotes {
+    Ok(PreparedFootnotes {
         body_markdown,
         footnotes,
         marker_token,
-    }
+    })
 }
 
-fn collision_free_marker(markdown: &str) -> String {
-    for suffix in 0_usize.. {
-        let marker = format!("note-export-generated-footnote-{suffix}");
-        if !markdown.contains(&marker) {
-            return marker;
+fn reserve_footnote_marker(
+    markdown: &str,
+    nonce_source: &mut impl FnMut() -> String,
+) -> Result<String, ExportDocumentError> {
+    const MAX_ATTEMPTS: usize = 8;
+    let forbidden = author_html_attribute_values(markdown);
+    for _ in 0..MAX_ATTEMPTS {
+        let nonce = nonce_source();
+        if !nonce.is_empty()
+            && nonce.len() <= 64
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && !forbidden.contains(&nonce)
+        {
+            return Ok(nonce);
         }
     }
-    unreachable!("finite Markdown always leaves a marker token")
+    Err(ExportDocumentError::FootnoteMarkerUnavailable)
+}
+
+fn author_html_attribute_values(markdown: &str) -> HashSet<String> {
+    let mut values = HashSet::new();
+    for event in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES) {
+        if let Event::Html(fragment) | Event::InlineHtml(fragment) = event {
+            let dom = parse_fragment(
+                RcDom::default(),
+                Default::default(),
+                QualName::new(None, ns!(html), local_name!("div")),
+                vec![],
+                true,
+            )
+            .one(fragment.as_ref());
+            collect_dom_attribute_values(&dom.document, &mut values);
+        }
+    }
+    values
+}
+
+fn collect_dom_attribute_values(node: &Handle, values: &mut HashSet<String>) {
+    if let NodeData::Element { attrs, .. } = &node.data {
+        values.extend(
+            attrs
+                .borrow()
+                .iter()
+                .map(|attribute| attribute.value.to_string()),
+        );
+    }
+    for child in node.children.borrow().iter() {
+        collect_dom_attribute_values(child, values);
+    }
 }
 
 fn footnote_definition_markdown(source: &str) -> String {
@@ -1996,9 +2134,10 @@ mod tests {
     #[test]
     fn sanitizer_stops_growing_when_escaped_output_exceeds_cap() {
         let rewrites = RewriteManifest::default();
+        let external_omissions = HashSet::new();
         let policy = HtmlPolicy {
             rewrites: &rewrites,
-            external_omissions: &[],
+            external_omissions: &external_omissions,
             original_image_sources: &[],
             footnote_marker: "unused",
         };
@@ -2024,5 +2163,43 @@ mod tests {
             assemble_index_html("title", "", &"x".repeat(256), PRINT_CSS.len() + 128),
             Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
         ));
+    }
+
+    #[test]
+    fn syntax_aware_preflight_accepts_large_plain_text_within_final_html_limit() {
+        let markdown = "a".repeat(1_500 * 1024);
+        let prepared = prepare_footnotes(&markdown).unwrap();
+
+        assert!(
+            preflight_generated_html(&prepared, "title", ExportDocumentLimits::default()).is_ok()
+        );
+    }
+
+    #[test]
+    fn syntax_aware_preflight_rejects_high_expansion_highlighted_code() {
+        let markdown = format!("```rust\n{}\n```", "fn ".repeat(220_000));
+        assert!((600 * 1024..=700 * 1024).contains(&markdown.len()));
+        let prepared = prepare_footnotes(&markdown).unwrap();
+
+        assert!(matches!(
+            preflight_generated_html(&prepared, "title", ExportDocumentLimits::default()),
+            Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn nonce_reservation_rejects_html_entity_decoded_author_marker() {
+        let markdown = r#"<div data-export-footnote-marker="nonce-&#48;"></div>
+
+reference[^one]
+
+[^one]: body"#;
+        let mut candidates = ["nonce-0".to_owned(), "safe-nonce-1".to_owned()].into_iter();
+        let prepared = prepare_footnotes_with_nonce_source(markdown, || {
+            candidates.next().expect("bounded nonce candidate")
+        })
+        .unwrap();
+
+        assert_eq!(prepared.marker_token, "safe-nonce-1");
     }
 }

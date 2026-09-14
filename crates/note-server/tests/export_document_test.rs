@@ -185,6 +185,36 @@ First[^detail], repeated[^detail].
 }
 
 #[test]
+fn encoded_marker_spoof_and_sequential_adversarial_ids_cannot_collide_with_footnotes() {
+    let adversarial_ids = (1..=256)
+        .map(|index| {
+            format!(
+                "<div id=\"export-footnote-{index}-def-0001\"></div><div id=\"export-footnote-{index}-ref-0001-1\"></div>"
+            )
+        })
+        .collect::<String>();
+    let markdown = format!(
+        "<div data-export-footnote-marker=\"note-export-generated-footnote-&#48;\" data-export-footnote-definition=\"0001\" id=\"author-marker\"></div><div id=\"export-footnote-def-0001\"></div><div id=\"export-footnote-ref-0001-1\"></div>{adversarial_ids}\n\nOne[^note], two[^note].\n\n[^note]: body"
+    );
+
+    let package =
+        build_export_document(&frozen(&markdown, vec![]), ExportDocumentLimits::default()).unwrap();
+    let ids = html_attribute_values(&package.index_html, "id");
+    let hrefs = html_attribute_values(&package.index_html, "href");
+    let unique = ids.iter().collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(ids.len(), unique.len());
+    assert!(ids.iter().any(|id| id == "author-marker"));
+    assert!(ids.iter().any(|id| id == "export-footnote-257-def-0001"));
+    for target in hrefs.iter().filter_map(|href| href.strip_prefix('#')) {
+        assert!(
+            ids.iter().any(|id| id == target),
+            "missing target for #{target}"
+        );
+    }
+}
+
+#[test]
 fn packages_validated_images_with_flat_names_and_omits_external_fetches() {
     let mut export = frozen(
         "![local](images/a.png)\n\n![external](https://example.com/tracker.png)\n\n[site](https://example.com) [mail](mailto:a@example.com) [app](/notes/2) [manual](manual.pdf) [jump](#part)\n\n<a href=\"javascript:alert(1)\">bad</a>\n\n<h2 id=\"part\">Part</h2>",
@@ -219,6 +249,26 @@ fn packages_validated_images_with_flat_names_and_omits_external_fetches() {
     assert!(package.index_html.contains("href=\"#part\""));
     assert!(!package.index_html.contains("tracker.png\""));
     assert!(!package.index_html.contains("javascript:"));
+}
+
+#[test]
+fn percent_encoded_unicode_non_http_image_matches_external_omission() {
+    let destination = "ssh://example.invalid/图 片.png";
+    let mut export = frozen(
+        "![remote](ssh://example.invalid/%E5%9B%BE%20%E7%89%87.png)",
+        vec![],
+    );
+    export.omissions.push(ExportAssetOmission {
+        kind: ExportAssetKind::External,
+        destination: destination.into(),
+    });
+
+    let package = build_export_document(&export, ExportDocumentLimits::default()).unwrap();
+
+    assert!(package
+        .index_html
+        .contains("External image omitted: remote"));
+    assert!(!package.index_html.contains("ssh://"));
 }
 
 #[test]
