@@ -44,6 +44,8 @@ async fn qualifies_a_real_renderer_and_writes_review_artifacts() {
         "all fixture image kinds must be packaged"
     );
     assert!(package.index_html.contains("dm-mermaid-chart"));
+    assert!(package.index_html.contains("href=\"#details\""));
+    assert!(package.index_html.contains("id=\"details\""));
     assert!(!package.index_html.contains("Unsafe content removed"));
     assert!(!package.index_html.contains("https://"));
     assert!(!package.index_html.contains("http://"));
@@ -58,6 +60,17 @@ async fn qualifies_a_real_renderer_and_writes_review_artifacts() {
     fs::write(&pdf_path, pdf).expect("write representative PDF");
 
     run_checked(&qpdf, [OsStr::new("--check"), pdf_path.as_os_str()]);
+    let qpdf_json = run_checked(&qpdf, [OsStr::new("--json"), pdf_path.as_os_str()]);
+    let qpdf_json: serde_json::Value =
+        serde_json::from_slice(&qpdf_json.stdout).expect("qpdf JSON output is valid JSON");
+    assert!(
+        json_has_string_property(&qpdf_json, "/Dest", "/details"),
+        "document-anchor link annotation must target the details destination"
+    );
+    assert!(
+        json_has_object_key(&qpdf_json, "/details"),
+        "document-anchor destination must be present in the PDF name tree"
+    );
     let info = run_checked(&pdfinfo, [&pdf_path.as_os_str()]);
     let info = String::from_utf8(info.stdout).expect("pdfinfo output is UTF-8");
     let pages = pdf_page_count(&info);
@@ -69,6 +82,13 @@ async fn qualifies_a_real_renderer_and_writes_review_artifacts() {
         info.lines()
             .any(|line| line.starts_with("Page size:") && line.contains("A4")),
         "CSS page size must resolve to A4; pdfinfo:\n{info}"
+    );
+    let destinations = run_checked(&pdfinfo, [OsStr::new("-dests"), pdf_path.as_os_str()]);
+    let destinations =
+        String::from_utf8(destinations.stdout).expect("pdfinfo destinations output is UTF-8");
+    assert!(
+        destinations.lines().any(|line| line.ends_with("details")),
+        "document-anchor destination must be reported by pdfinfo:\n{destinations}"
     );
 
     let text_path = artifact_dir.join(TEXT_NAME);
@@ -196,6 +216,33 @@ fn pdf_page_count(info: &str) -> usize {
         .expect("pdfinfo output includes a numeric page count")
 }
 
+fn json_has_string_property(value: &serde_json::Value, key: &str, expected: &str) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.get(key).and_then(serde_json::Value::as_str) == Some(expected)
+                || object
+                    .values()
+                    .any(|value| json_has_string_property(value, key, expected))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_has_string_property(value, key, expected)),
+        _ => false,
+    }
+}
+
+fn json_has_object_key(value: &serde_json::Value, key: &str) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.contains_key(key) || object.values().any(|value| json_has_object_key(value, key))
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| json_has_object_key(value, key))
+        }
+        _ => false,
+    }
+}
+
 fn preview_paths(directory: &Path) -> Vec<PathBuf> {
     let mut paths = fs::read_dir(directory)
         .expect("read preview directory")
@@ -244,7 +291,7 @@ flowchart LR
     Render --> Validate
 ```
 
-## Details
+<h2 id="details">Details</h2>
 
 | Sequence | Chinese | Japanese |
 | --- | --- | --- |

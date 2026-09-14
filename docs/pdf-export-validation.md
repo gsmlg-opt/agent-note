@@ -43,7 +43,7 @@ The gate writes these files under `target/pdf-export-validation/`:
 - `agent-note-export.txt` — Poppler text extraction used for multilingual/searchability assertions;
 - `agent-note-export-page-*.png` — every page, rendered at 120 DPI;
 - `security-checks.log` — blocked vectors and isolation assertions;
-- `qualification-record.txt` — commit, exact image/digest/platform, fonts, tool versions, browser coverage, and skips.
+- `qualification-record.txt` — commit, exact image/digest/platform, fonts, tool versions, and renderer-suite skips. Browser coverage comes only from the separate browser gate.
 
 Before enabling PDF in a trusted environment, inspect every page preview. Record whether pagination, CJK/Japanese glyphs, Mermaid, code wrapping, table headers/page breaks, images, light print colors, footnotes/backlinks, page numbers, and blank pages are acceptable. Do not compare PDF bytes, and do not review only the first page.
 

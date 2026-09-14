@@ -135,8 +135,12 @@ PY
 
 fonts_log="$work_dir/fonts.log"
 for family in "Noto Sans CJK SC" "Noto Sans CJK JP" "Noto Sans Mono CJK SC" "Noto Sans" "DejaVu Sans"; do
-  printf '%s => ' "$family" | tee -a "$fonts_log"
-  compose exec -T gotenberg fc-match --format '%{family} | %{file}\n' "$family" | tee -a "$fonts_log"
+  match="$(compose exec -T gotenberg fc-match --format '%{family} | %{file}\n' "$family")"
+  [[ "$match" == "$family | "* ]] || {
+    echo "required renderer font family resolved to a fallback: $family => $match" >&2
+    exit 1
+  }
+  printf '%s => %s\n' "$family" "$match" | tee -a "$fonts_log"
 done
 
 python3 - "$work_dir" <<'PY'
@@ -170,14 +174,11 @@ for name, body in vectors.items():
     "<script>document.body.textContent='EXECUTED SCRIPT'</script></body>",
     encoding="utf-8",
 )
+(root / "request-a-secret.html").write_text(
+    '<!doctype html><body><p>IN-FLIGHT REQUEST A SECRET 9f4ca771</p></body>', encoding="utf-8"
+)
 (root / "request-a.html").write_text(
-    '<!doctype html><body><p>REQUEST A</p><img src="request-a.png"></body>', encoding="utf-8"
-)
-(root / "request-b.html").write_text(
-    '<!doctype html><body><p>REQUEST B</p><img src="request-a.png"></body>', encoding="utf-8"
-)
-(root / "traversal.html").write_text(
-    '<!doctype html><body><p>TRAVERSAL CONTROL</p><iframe src="../request-a.html"></iframe></body>',
+    '<!doctype html><body><p>REQUEST A CONTROL</p><iframe src="request-a-secret.html"></iframe></body>',
     encoding="utf-8",
 )
 (root / "requests.log").write_text("", encoding="utf-8")
@@ -315,28 +316,72 @@ if grep -E "EXECUTED (SCRIPT|EVENT)" "$work_dir/javascript.txt" >/dev/null; then
 fi
 echo "script and event handlers did not execute" | tee -a "$security_log"
 
-status="$(post_html "$work_dir/request-a.html" "$work_dir/request-a.pdf" \
-  --form "files=@${work_dir}/request-a.png;type=image/png;filename=request-a.png")"
-[[ "$status" =~ ^2 ]] || {
-  echo "request A packaged asset control failed: HTTP $status" >&2
+docker exec "$container_id" sh -c \
+  'for directory in /tmp/*; do [ -d "$directory" ] && basename "$directory"; done' \
+  | sort >"$work_dir/tmp-before"
+post_html "$work_dir/request-a.html" "$work_dir/request-a.pdf" \
+  --form "files=@${work_dir}/request-a-secret.html;type=text/html;filename=request-a-secret.html" \
+  --form "waitDelay=8s" >"$work_dir/request-a.status" &
+request_a_pid=$!
+active_request_dir=""
+for _ in $(seq 1 60); do
+  if ! kill -0 "$request_a_pid" 2>/dev/null; then
+    break
+  fi
+  docker exec "$container_id" sh -c \
+    'for directory in /tmp/*; do [ -d "$directory" ] && basename "$directory"; done' \
+    | sort >"$work_dir/tmp-during"
+  active_request_dir="$(comm -13 "$work_dir/tmp-before" "$work_dir/tmp-during" | sed -n '1p')"
+  if [[ -n "$active_request_dir" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+[[ -n "$active_request_dir" ]] || {
+  echo "could not identify request A's live renderer directory" >&2
   exit 1
 }
-status="$(post_html "$work_dir/request-b.html" "$work_dir/request-b.response")"
-if [[ "$status" =~ ^2 ]]; then
-  echo "request B unexpectedly accessed request A's packaged asset" >&2
+kill -0 "$request_a_pid" 2>/dev/null || {
+  echo "request A completed before the concurrent isolation probe" >&2
   exit 1
-fi
-echo "request-b asset access blocked with HTTP $status" | tee -a "$security_log"
+}
+python3 - "$work_dir" "$active_request_dir" <<'PY'
+from pathlib import Path
+import html
+import sys
 
-status="$(post_html "$work_dir/traversal.html" "$work_dir/traversal.response")"
+root = Path(sys.argv[1])
+request_dir = sys.argv[2]
+target = html.escape(f"file:///tmp/{request_dir}/request-a-secret.html", quote=True)
+(root / "request-b.html").write_text(
+    f'<!doctype html><body><p>REQUEST B CONTROL</p><iframe src="{target}"></iframe></body>',
+    encoding="utf-8",
+)
+PY
+status="$(post_html "$work_dir/request-b.html" "$work_dir/request-b.response")"
+kill -0 "$request_a_pid" 2>/dev/null || {
+  echo "request A was not live throughout the concurrent isolation probe" >&2
+  exit 1
+}
 if [[ "$status" =~ ^2 ]]; then
-  pdftotext "$work_dir/traversal.response" "$work_dir/traversal.txt"
-  if grep -F "REQUEST A" "$work_dir/traversal.txt" >/dev/null; then
-    echo "path traversal exposed prior-request content" >&2
+  pdftotext "$work_dir/request-b.response" "$work_dir/request-b.txt"
+  if grep -F "IN-FLIGHT REQUEST A SECRET 9f4ca771" "$work_dir/request-b.txt" >/dev/null; then
+    echo "request B accessed request A's in-flight packaged file" >&2
     exit 1
   fi
 fi
-echo "path traversal exposed no prior-request marker; conversion HTTP $status" | tee -a "$security_log"
+set +e
+wait "$request_a_pid"
+request_a_exit=$?
+set -e
+[[ "$request_a_exit" -eq 0 && "$(<"$work_dir/request-a.status")" =~ ^2 ]] || {
+  echo "request A packaged asset control failed" >&2
+  exit 1
+}
+pdftotext "$work_dir/request-a.pdf" "$work_dir/request-a.txt"
+grep -F "IN-FLIGHT REQUEST A SECRET 9f4ca771" "$work_dir/request-a.txt" >/dev/null
+echo "concurrent request B could not read request A's known live renderer path; conversion HTTP $status" \
+  | tee -a "$security_log"
 
 NOTE_TEST_REAL_PDF=1 \
 NOTE_TEST_GOTENBERG_URL="$renderer_url" \
@@ -362,9 +407,7 @@ platform="$(docker image inspect "$renderer_image" --format '{{.Os}}/{{.Architec
   echo "pdfinfo=$(pdfinfo -v 2>&1 | head -1)"
   echo "pdftoppm=$(pdftoppm -v 2>&1 | head -1)"
   echo "imagemagick=$(identify --version | head -1)"
-  echo "browser_chromium=147.0.7727.15; scenarios=7/7 passed"
-  echo "browser_firefox=148.0.2; scenarios=7/7 passed"
-  echo "browser_safari=not run on Linux; real macOS Safari workflow pending"
+  echo "browser_coverage=not executed by this PDF-only qualification; use the separate browser gate"
   echo "postgres_live_contract=not part of this renderer qualification"
   echo "s3_minio_contract=not part of this renderer qualification"
   echo "visual_review=automated every-page nonblank check complete; human review required before release sign-off"

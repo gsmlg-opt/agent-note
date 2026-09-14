@@ -252,6 +252,26 @@ fn packages_validated_images_with_flat_names_and_omits_external_fetches() {
 }
 
 #[test]
+fn preserves_explicit_document_fragment_links_and_targets() {
+    let package = build_export_document(
+        &frozen(
+            "[Jump to details](#details)\n\n<h2 id=\"details\">Details</h2>",
+            vec![],
+        ),
+        ExportDocumentLimits::default(),
+    )
+    .unwrap();
+
+    assert!(package
+        .index_html
+        .contains("<a href=\"#details\">Jump to details</a>"));
+    assert!(package
+        .index_html
+        .contains("<h2 id=\"details\">Details</h2>"));
+    assert!(!package.index_html.contains("Unsafe content removed"));
+}
+
+#[test]
 fn percent_encoded_unicode_non_http_image_matches_external_omission() {
     let destination = "ssh://example.invalid/图 片.png";
     let mut export = frozen(
