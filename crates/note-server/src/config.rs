@@ -30,6 +30,30 @@ struct FileConfig {
     database: Option<FileDatabaseConfig>,
     embedding: Option<FileEmbeddingConfig>,
     attachments: Option<FileAttachmentConfig>,
+    export: Option<FileExportConfig>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileExportConfig {
+    pdf: Option<FilePdfExportConfig>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePdfExportConfig {
+    enabled: Option<bool>,
+    renderer_url: Option<String>,
+    total_deadline_secs: Option<u64>,
+    renderer_timeout_secs: Option<u64>,
+    max_in_flight: Option<usize>,
+    max_markdown_bytes: Option<u64>,
+    max_asset_count: Option<usize>,
+    max_asset_bytes: Option<u64>,
+    max_combined_asset_bytes: Option<u64>,
+    max_pixels_per_image: Option<u64>,
+    max_combined_pixels: Option<u64>,
+    max_pdf_bytes: Option<usize>,
 }
 
 #[derive(Default, Deserialize)]
@@ -174,6 +198,53 @@ pub struct RuntimeConfig {
     pub database: DatabaseConfig,
     pub embedding: EmbeddingConfig,
     pub attachments: AttachmentConfig,
+    pub pdf_export: PdfExportConfig,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PdfExportConfig {
+    pub enabled: bool,
+    pub renderer_url: Option<String>,
+    pub total_deadline_secs: u64,
+    pub renderer_timeout_secs: u64,
+    pub max_in_flight: usize,
+    pub max_markdown_bytes: u64,
+    pub max_asset_count: usize,
+    pub max_asset_bytes: u64,
+    pub max_combined_asset_bytes: u64,
+    pub max_pixels_per_image: u64,
+    pub max_combined_pixels: u64,
+    pub max_pdf_bytes: usize,
+}
+
+impl Default for PdfExportConfig {
+    fn default() -> Self {
+        resolve_pdf_export(FilePdfExportConfig::default())
+            .expect("built-in PDF export defaults must be valid")
+    }
+}
+
+impl std::fmt::Debug for PdfExportConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PdfExportConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "renderer_url",
+                &self.renderer_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("total_deadline_secs", &self.total_deadline_secs)
+            .field("renderer_timeout_secs", &self.renderer_timeout_secs)
+            .field("max_in_flight", &self.max_in_flight)
+            .field("max_markdown_bytes", &self.max_markdown_bytes)
+            .field("max_asset_count", &self.max_asset_count)
+            .field("max_asset_bytes", &self.max_asset_bytes)
+            .field("max_combined_asset_bytes", &self.max_combined_asset_bytes)
+            .field("max_pixels_per_image", &self.max_pixels_per_image)
+            .field("max_combined_pixels", &self.max_combined_pixels)
+            .field("max_pdf_bytes", &self.max_pdf_bytes)
+            .finish()
+    }
 }
 
 #[derive(Default)]
@@ -256,6 +327,7 @@ fn resolve_runtime_config(
     let file_database = file.database.unwrap_or_default();
     let file_embedding = file.embedding.unwrap_or_default();
     let file_attachments = file.attachments.unwrap_or_default();
+    let file_pdf_export = file.export.unwrap_or_default().pdf.unwrap_or_default();
 
     let bind_addr = file_server
         .bind_addr
@@ -264,6 +336,7 @@ fn resolve_runtime_config(
     let database = resolve_database(file_database, &env, config_base)?;
     let embedding = resolve_embedding(file_embedding, &env, config_base)?;
     let attachments = resolve_attachments(file_attachments, &env, config_base)?;
+    let pdf_export = resolve_pdf_export(file_pdf_export)?;
     persist_missing_bind_addr(&config_path, &bind_addr)?;
 
     Ok(RuntimeConfig {
@@ -272,7 +345,62 @@ fn resolve_runtime_config(
         database,
         embedding,
         attachments,
+        pdf_export,
     })
+}
+
+fn resolve_pdf_export(file: FilePdfExportConfig) -> anyhow::Result<PdfExportConfig> {
+    const MIB: u64 = 1024 * 1024;
+    let config = PdfExportConfig {
+        enabled: file.enabled.unwrap_or(false),
+        renderer_url: file.renderer_url.map(|value| value.trim().to_owned()),
+        total_deadline_secs: file.total_deadline_secs.unwrap_or(35),
+        renderer_timeout_secs: file.renderer_timeout_secs.unwrap_or(30),
+        max_in_flight: file.max_in_flight.unwrap_or(2),
+        max_markdown_bytes: file.max_markdown_bytes.unwrap_or(2 * MIB),
+        max_asset_count: file.max_asset_count.unwrap_or(64),
+        max_asset_bytes: file.max_asset_bytes.unwrap_or(8 * MIB),
+        max_combined_asset_bytes: file.max_combined_asset_bytes.unwrap_or(32 * MIB),
+        max_pixels_per_image: file.max_pixels_per_image.unwrap_or(20_000_000),
+        max_combined_pixels: file.max_combined_pixels.unwrap_or(80_000_000),
+        max_pdf_bytes: file.max_pdf_bytes.unwrap_or(32 * MIB as usize),
+    };
+    if !config.enabled {
+        return Ok(config);
+    }
+    let renderer_url = config
+        .renderer_url
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("config field export.pdf.renderer_url is required"))?;
+    if crate::export::renderer::GotenbergRenderer::new(renderer_url, config.max_pdf_bytes).is_err()
+    {
+        anyhow::bail!("config field export.pdf.renderer_url is invalid");
+    }
+    let valid = config.total_deadline_secs > 0
+        && config.renderer_timeout_secs > 0
+        && config.renderer_timeout_secs <= 30
+        && config.renderer_timeout_secs <= config.total_deadline_secs
+        && config.max_in_flight > 0
+        && config.max_in_flight <= 64
+        && config.max_markdown_bytes > 0
+        && config.max_markdown_bytes <= 2 * MIB
+        && config.max_asset_count > 0
+        && config.max_asset_count <= 64
+        && config.max_asset_bytes > 0
+        && config.max_asset_bytes <= 8 * MIB
+        && config.max_combined_asset_bytes > 0
+        && config.max_combined_asset_bytes <= 32 * MIB
+        && config.max_pixels_per_image > 0
+        && config.max_pixels_per_image <= 20_000_000
+        && config.max_combined_pixels > 0
+        && config.max_combined_pixels <= 80_000_000
+        && config.max_pdf_bytes > 0
+        && config.max_pdf_bytes <= 32 * MIB as usize;
+    if !valid {
+        anyhow::bail!("config fields under export.pdf contain invalid safety limits");
+    }
+    Ok(config)
 }
 
 fn load_file_config(
@@ -815,6 +943,18 @@ path = "winner-attachments"
             "region",
             "endpoint",
             "force_path_style",
+            "enabled",
+            "renderer_url",
+            "total_deadline_secs",
+            "renderer_timeout_secs",
+            "max_in_flight",
+            "max_markdown_bytes",
+            "max_asset_count",
+            "max_asset_bytes",
+            "max_combined_asset_bytes",
+            "max_pixels_per_image",
+            "max_combined_pixels",
+            "max_pdf_bytes",
         ] {
             assert!(
                 contents.lines().any(|line| {
@@ -1249,6 +1389,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
             attachments: AttachmentConfig::Filesystem {
                 path: "/tmp/attachments".into(),
             },
+            pdf_export: PdfExportConfig::default(),
         };
 
         for rendered in [format!("{:?}", config.database), format!("{config:?}")] {
@@ -1277,6 +1418,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
             attachments: AttachmentConfig::Filesystem {
                 path: "/tmp/attachments".into(),
             },
+            pdf_export: PdfExportConfig::default(),
         };
 
         let rendered = format!("{config:?}");
@@ -1307,6 +1449,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
                 endpoint: Some(format!("https://{ENDPOINT_SENTINEL}")),
                 force_path_style: true,
             },
+            pdf_export: PdfExportConfig::default(),
         };
 
         for rendered in [format!("{:?}", config.attachments), format!("{config:?}")] {
@@ -1586,6 +1729,99 @@ max_retries = 5
             decode_string_env("NOTE_DB_ENGINE", Err(std::env::VarError::NotPresent)).unwrap();
 
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn missing_pdf_export_configuration_is_backward_compatible_and_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "config.toml", "");
+
+        let config = resolve_explicit(dir.path(), "config.toml").unwrap();
+
+        assert!(!config.pdf_export.enabled);
+        assert_eq!(config.pdf_export.renderer_url, None);
+        assert_eq!(config.pdf_export.total_deadline_secs, 35);
+        assert_eq!(config.pdf_export.renderer_timeout_secs, 30);
+        assert_eq!(config.pdf_export.max_in_flight, 2);
+        assert_eq!(config.pdf_export.max_pdf_bytes, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn enabled_pdf_export_configuration_loads_typed_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "config.toml",
+            r#"[export.pdf]
+enabled = true
+renderer_url = "http://renderer.internal:3000"
+total_deadline_secs = 20
+renderer_timeout_secs = 15
+max_in_flight = 1
+max_markdown_bytes = 1024
+max_asset_count = 4
+max_asset_bytes = 2048
+max_combined_asset_bytes = 4096
+max_pixels_per_image = 1000000
+max_combined_pixels = 2000000
+max_pdf_bytes = 8192
+"#,
+        );
+
+        let config = resolve_explicit(dir.path(), "config.toml").unwrap();
+
+        assert!(config.pdf_export.enabled);
+        assert_eq!(
+            config.pdf_export.renderer_url.as_deref(),
+            Some("http://renderer.internal:3000")
+        );
+        assert_eq!(config.pdf_export.total_deadline_secs, 20);
+        assert_eq!(config.pdf_export.renderer_timeout_secs, 15);
+        assert_eq!(config.pdf_export.max_in_flight, 1);
+        assert_eq!(config.pdf_export.max_markdown_bytes, 1024);
+    }
+
+    #[test]
+    fn enabled_pdf_export_rejects_missing_or_unsafe_renderer_and_invalid_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("missing.toml", "[export.pdf]\nenabled = true\n"),
+            (
+                "credentials.toml",
+                "[export.pdf]\nenabled = true\nrenderer_url = \"http://user:secret@renderer:3000\"\n",
+            ),
+            (
+                "deadline.toml",
+                "[export.pdf]\nenabled = true\nrenderer_url = \"http://renderer:3000\"\ntotal_deadline_secs = 10\nrenderer_timeout_secs = 11\n",
+            ),
+            (
+                "zero.toml",
+                "[export.pdf]\nenabled = true\nrenderer_url = \"http://renderer:3000\"\nmax_in_flight = 0\n",
+            ),
+            (
+                "long-timeout.toml",
+                "[export.pdf]\nenabled = true\nrenderer_url = \"http://renderer:3000\"\ntotal_deadline_secs = 35\nrenderer_timeout_secs = 31\n",
+            ),
+        ] {
+            write_config(dir.path(), name, body);
+            let rendered = format!("{:#}", resolve_explicit(dir.path(), name).unwrap_err());
+            assert!(rendered.contains("export.pdf"), "{name}: {rendered}");
+            assert!(!rendered.contains("secret"), "{name}: {rendered}");
+        }
+
+        write_config(
+            dir.path(),
+            "unknown.toml",
+            "[export.pdf]\nenabled = true\nrenderer_url = \"http://renderer:3000\"\nbrowser_option = true\n",
+        );
+        let rendered = format!(
+            "{:#}",
+            resolve_explicit(dir.path(), "unknown.toml").unwrap_err()
+        );
+        assert!(
+            rendered.contains("unknown field `browser_option`"),
+            "{rendered}"
+        );
     }
 
     #[cfg(unix)]
