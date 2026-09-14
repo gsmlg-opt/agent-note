@@ -7,6 +7,8 @@ artifact_dir="${NOTE_TEST_PDF_ARTIFACT_DIR:-$repo_root/target/pdf-export-validat
 project_name="agent-note-pdf-validation"
 renderer_image="gotenberg/gotenberg:8.37.0-chromium@sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c"
 renderer_digest="sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c"
+recorder_image="python:3.13-alpine@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a"
+public_probe_network="${project_name}-public-probe"
 work_dir="$(mktemp -d)"
 
 compose() {
@@ -17,6 +19,7 @@ cleanup() {
   set +e
   docker rm --force "${project_name}-recorder" >/dev/null 2>&1
   compose down --volumes --remove-orphans >/dev/null 2>&1
+  docker network rm "$public_probe_network" >/dev/null 2>&1
   rm -rf "$work_dir"
 }
 trap cleanup EXIT
@@ -82,7 +85,7 @@ assert any(value.get("internal") is True for value in networks.values())
 PY
 
 compose pull gotenberg
-docker pull python:3.13-alpine
+docker pull "$recorder_image"
 repo_digests="$(docker image inspect "$renderer_image" --format '{{json .RepoDigests}}')"
 grep -F "$renderer_digest" <<<"$repo_digests" >/dev/null || {
   echo "pulled image does not expose the required manifest digest: $repo_digests" >&2
@@ -146,10 +149,11 @@ png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4
 (root / "request-a.png").write_bytes(png)
 vectors = {
     "http": '<img src="http://recorder:8080/blocked.png">',
-    "https": '<img src="https://example.com/blocked.png">',
+    "https": '<img src="https://public-recorder:8443/blocked.png">',
     "loopback": '<img src="http://127.0.0.1:9/blocked.png">',
     "private": '<img src="http://recorder:8080/private.png">',
-    "public_ip": '<img src="http://93.184.216.34/blocked.png">',
+    "public_dns": '<img src="http://public-recorder:8080/blocked.png">',
+    "public_ip": '<img src="http://203.0.113.10:8080/blocked.png">',
     "redirect": '<img src="http://recorder:8080/redirect">',
     "css_import": '<style>@import url("http://recorder:8080/blocked.css");</style>',
     "css_url": '<style>body{background:url("http://recorder:8080/blocked.png")}</style>',
@@ -177,9 +181,12 @@ for name, body in vectors.items():
     encoding="utf-8",
 )
 (root / "requests.log").write_text("", encoding="utf-8")
+(root / "connections.log").write_text("", encoding="utf-8")
 (root / "recorder.py").write_text(
     '''from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import socketserver
+import threading
 
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010804000000b51c0c020000000b4944415478da6364f80f00010501012718e3660000000049454e44ae426082")
 
@@ -201,6 +208,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+class ConnectionHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        with Path("/work/connections.log").open("a", encoding="utf-8") as log:
+            log.write(f"{self.client_address[0]}\\n")
+
+tcp_server = socketserver.ThreadingTCPServer(("0.0.0.0", 8443), ConnectionHandler)
+threading.Thread(target=tcp_server.serve_forever, daemon=True).start()
 ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
 ''',
     encoding="utf-8",
@@ -209,12 +223,21 @@ PY
 
 set +e
 docker rm --force "${project_name}-recorder" >/dev/null 2>&1
+docker network rm "$public_probe_network" >/dev/null 2>&1
 set -e
+docker network create --internal --subnet 203.0.113.0/24 "$public_probe_network" >/dev/null
 docker run --detach --rm \
   --name "${project_name}-recorder" \
   --network "${AGENT_NOTE_PDF_NETWORK:-agent-note-pdf}" \
   --mount "type=bind,src=${work_dir},dst=/work" \
-  python:3.13-alpine python /work/recorder.py >/dev/null
+  "$recorder_image" python /work/recorder.py >/dev/null
+docker network connect \
+  --alias public-recorder \
+  --ip 203.0.113.10 \
+  "$public_probe_network" \
+  "${project_name}-recorder"
+docker network connect --ip 203.0.113.11 "$public_probe_network" "$container_id"
+[[ "$(docker network inspect "$public_probe_network" --format '{{.Internal}}')" == "true" ]]
 for _ in $(seq 1 30); do
   if docker exec "${project_name}-recorder" python -c \
     "import socket; socket.create_connection(('127.0.0.1', 8080), 1).close()" \
@@ -225,6 +248,21 @@ for _ in $(seq 1 30); do
 done
 docker exec "${project_name}-recorder" python -c \
   "import socket; socket.create_connection(('127.0.0.1', 8080), 1).close()"
+
+# Prove both recorder paths are routable from the renderer container. Conversion requests below
+# must still produce no recorder traffic because Chromium's private/public destination filters
+# reject them before a connection is attempted.
+docker exec "$container_id" curl --fail --silent http://recorder:8080/private-control >/dev/null
+docker exec "$container_id" curl --fail --silent http://203.0.113.10:8080/public-control >/dev/null
+set +e
+docker exec "$container_id" curl --silent --max-time 2 https://public-recorder:8443/https-control \
+  >/dev/null 2>&1
+https_control_status=$?
+set -e
+[[ "$https_control_status" -ne 0 ]]
+grep -F "/private-control" "$work_dir/requests.log" >/dev/null
+grep -F "/public-control" "$work_dir/requests.log" >/dev/null
+[[ -s "$work_dir/connections.log" ]]
 
 post_html() {
   local html="$1"
@@ -250,13 +288,18 @@ echo "renderer public egress probe blocked" | tee -a "$security_log"
 for fixture in "$work_dir"/blocked-*.html; do
   name="$(basename "$fixture" .html)"
   : >"$work_dir/requests.log"
+  : >"$work_dir/connections.log"
   status="$(post_html "$fixture" "$work_dir/$name.response")"
   sleep 0.25
   if [[ -s "$work_dir/requests.log" ]]; then
     echo "$name reached the forbidden recorder: $(tr '\n' ' ' <"$work_dir/requests.log")" >&2
     exit 1
   fi
-  echo "$name fetch blocked; conversion HTTP $status; recorder requests 0" | tee -a "$security_log"
+  if [[ -s "$work_dir/connections.log" ]]; then
+    echo "$name opened a forbidden recorder connection: $(tr '\n' ' ' <"$work_dir/connections.log")" >&2
+    exit 1
+  fi
+  echo "$name fetch blocked; conversion HTTP $status; recorder requests 0; raw connections 0" | tee -a "$security_log"
 done
 
 status="$(post_html "$work_dir/javascript.html" "$work_dir/javascript.pdf")"

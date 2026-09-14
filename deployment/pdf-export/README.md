@@ -22,7 +22,7 @@ Gotenberg is also configured to:
 - deny both public and private Chromium destinations;
 - ignore environment proxies and carry no proxy or browser credentials;
 - clear Chromium cache, cookies, and local storage between conversions;
-- admit at most two Chromium conversions, including active and queued work; and
+- run at most two active Chromium conversions and queue at most two additional conversions; and
 - cap requests at 30 seconds and multipart bodies at 48 MB.
 
 The 48 MB renderer body ceiling accommodates Agent Note's bounded 8 MiB generated HTML, 32 MiB
