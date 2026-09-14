@@ -230,6 +230,7 @@ docker network create --internal --subnet 203.0.113.0/24 "$public_probe_network"
 docker run --detach --rm \
   --name "${project_name}-recorder" \
   --network "${AGENT_NOTE_PDF_NETWORK:-agent-note-pdf}" \
+  --network-alias recorder \
   --mount "type=bind,src=${work_dir},dst=/work" \
   "$recorder_image" python /work/recorder.py >/dev/null
 docker network connect \
