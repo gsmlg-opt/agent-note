@@ -10,7 +10,7 @@ use note_pipelines::{freeze_note_export, NoteExportError, NoteExportLimits};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -23,6 +23,7 @@ struct ExportCapabilities {
 #[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 struct PdfExportQuery {
+    #[param(minimum = 1)]
     expected_revision: i64,
 }
 
@@ -116,7 +117,8 @@ impl IntoResponse for ExportApiError {
     get,
     path = "/api/export/capabilities",
     tag = "export",
-    responses((status = 200, description = "Configured export formats", body = ExportCapabilities))
+    responses((status = 200, description = "Configured export formats", body = ExportCapabilities,
+        headers(("Cache-Control" = String, description = "Always no-store"))))
 )]
 async fn capabilities_handler(State(state): State<AppState>) -> Response {
     let mut response = Json(ExportCapabilities {
@@ -144,17 +146,26 @@ async fn capabilities_handler(State(state): State<AppState>) -> Response {
                 ("Content-Disposition" = String, description = "Safe attachment filename")
             )
         ),
-        (status = 400, description = "Invalid revision", body = ExportApiError),
-        (status = 404, description = "Note not found", body = ExportApiError),
-        (status = 409, description = "Stale revision", body = ExportApiError),
-        (status = 413, description = "Export limit exceeded", body = ExportApiError),
-        (status = 422, description = "Export asset invalid", body = ExportApiError),
+        (status = 400, description = "Invalid revision", body = ExportApiError,
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff"))),
+        (status = 404, description = "Note not found", body = ExportApiError,
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff"))),
+        (status = 409, description = "Stale revision", body = ExportApiError,
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff"))),
+        (status = 413, description = "Export limit exceeded", body = ExportApiError,
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff"))),
+        (status = 422, description = "Export asset invalid", body = ExportApiError,
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff"))),
         (status = 429, description = "Export capacity busy", body = ExportApiError,
-            headers(("Retry-After" = u64, description = "Short manual retry delay in seconds"))),
-        (status = 500, description = "Storage failure", body = ExportApiError),
-        (status = 502, description = "Renderer conversion failure", body = ExportApiError),
-        (status = 503, description = "PDF export unavailable or disabled", body = ExportApiError),
-        (status = 504, description = "PDF export timeout", body = ExportApiError)
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff"), ("Retry-After" = u64, description = "Short manual retry delay in seconds"))),
+        (status = 500, description = "Storage failure", body = ExportApiError,
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff"))),
+        (status = 502, description = "Renderer conversion failure", body = ExportApiError,
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff"))),
+        (status = 503, description = "PDF export unavailable or disabled", body = ExportApiError,
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff"))),
+        (status = 504, description = "PDF export timeout", body = ExportApiError,
+            headers(("Cache-Control" = String, description = "Always no-store"), ("X-Content-Type-Options" = String, description = "Always nosniff")))
     )
 )]
 async fn pdf_export_handler(
@@ -177,16 +188,9 @@ async fn pdf_export_handler(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ExportApiError::busy())?;
-    let total = Duration::from_secs(runtime.config.total_deadline_secs);
-    match tokio::time::timeout(
-        total,
-        execute_export(state, runtime, permit, note_id, expected_revision),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(ExportApiError::timeout()),
-    }
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(runtime.config.total_deadline_secs);
+    execute_export(state, runtime, permit, note_id, expected_revision, deadline).await
 }
 
 async fn execute_export(
@@ -195,20 +199,24 @@ async fn execute_export(
     permit: tokio::sync::OwnedSemaphorePermit,
     note_id: String,
     expected_revision: i64,
+    deadline: tokio::time::Instant,
 ) -> Result<Response, ExportApiError> {
-    let started = Instant::now();
     let pipeline_limits = NoteExportLimits {
         max_markdown_bytes: runtime.config.max_markdown_bytes,
         max_asset_count: runtime.config.max_asset_count,
         max_asset_bytes: runtime.config.max_asset_bytes,
         max_combined_asset_bytes: runtime.config.max_combined_asset_bytes,
     };
-    let frozen = freeze_note_export(&state.note, &note_id, expected_revision, pipeline_limits)
-        .await
-        .map_err(|error| {
-            eprintln!("PDF export snapshot failed: {error:?}");
-            map_pipeline_error(error)
-        })?;
+    let frozen = tokio::time::timeout_at(
+        deadline,
+        freeze_note_export(&state.note, &note_id, expected_revision, pipeline_limits),
+    )
+    .await
+    .map_err(|_| ExportApiError::timeout())?
+    .map_err(|error| {
+        eprintln!("PDF export snapshot failed: {error:?}");
+        map_pipeline_error(error)
+    })?;
     let title = frozen.note.title.clone();
     let revision = frozen.note.revision;
     let document_limits = ExportDocumentLimits {
@@ -218,32 +226,43 @@ async fn execute_export(
         max_combined_packaged_asset_bytes: runtime.config.max_combined_asset_bytes as usize,
         ..ExportDocumentLimits::default()
     };
-    // The permit moves into the bounded blocking task so request cancellation cannot create an
-    // unbounded population of orphaned document conversions.
-    let (package, permit) = tokio::task::spawn_blocking(move || {
-        build_export_document(&frozen, document_limits).map(|package| (package, permit))
-    })
+    // The blocking document task owns admission while it runs. If the handler is cancelled or
+    // the total deadline elapses, dropping its join handle must not admit unbounded orphaned CPU
+    // work; successful preparation returns the same permit for the remote conversion phase.
+    let (package, permit) = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            build_export_document(&frozen, document_limits).map(|package| (package, permit))
+        }),
+    )
     .await
+    .map_err(|_| ExportApiError::timeout())?
     .map_err(|_| storage_error())?
     .map_err(|error| {
         eprintln!("PDF export document preparation failed: {error:?}");
         map_document_error(error)
     })?;
-    let elapsed = started.elapsed();
-    let total = Duration::from_secs(runtime.config.total_deadline_secs);
-    let remaining = total
-        .checked_sub(elapsed)
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
         .ok_or_else(ExportApiError::timeout)?;
     let renderer_timeout = remaining.min(Duration::from_secs(runtime.config.renderer_timeout_secs));
-    let pdf = runtime
-        .renderer
-        .render(&package, renderer_timeout)
+    let renderer = runtime.renderer.clone();
+    // Once remote conversion starts, the detached task owns both admission and the absolute
+    // request deadline. Dropping the client handler cannot admit another remote conversion while
+    // this one is still pending, and the task cannot outlive the configured total deadline.
+    let render_task = tokio::spawn(async move {
+        let _permit = permit;
+        tokio::time::timeout_at(deadline, renderer.render(&package, renderer_timeout))
+            .await
+            .map_err(|_| PdfRendererError::Timeout)?
+    });
+    let pdf = render_task
         .await
+        .map_err(|_| storage_error())?
         .map_err(|error| {
             eprintln!("PDF export renderer request failed: {error:?}");
             map_renderer_error(error)
         })?;
-    drop(permit);
     pdf_response(pdf, &title, &note_id, revision)
 }
 

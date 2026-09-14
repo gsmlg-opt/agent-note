@@ -168,7 +168,11 @@ impl GotenbergRenderer {
             .await
             .map_err(classify_transport)?;
         if !response.status().is_success() {
-            return Err(PdfRendererError::ConversionFailed);
+            return Err(if matches!(response.status().as_u16(), 429 | 503 | 504) {
+                PdfRendererError::Unavailable
+            } else {
+                PdfRendererError::ConversionFailed
+            });
         }
         let content_type = response
             .headers()
@@ -185,24 +189,37 @@ impl GotenbergRenderer {
         {
             return Err(PdfRendererError::ResponseLimitExceeded);
         }
-        let mut output = Vec::new();
+        let initial_capacity = self.max_pdf_bytes.min(64 * 1024).saturating_add(1);
+        let mut output = Vec::with_capacity(initial_capacity);
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(classify_transport)?;
-            let next = output
-                .len()
-                .checked_add(chunk.len())
-                .ok_or(PdfRendererError::ResponseLimitExceeded)?;
-            if next > self.max_pdf_bytes {
-                return Err(PdfRendererError::ResponseLimitExceeded);
-            }
-            output.extend_from_slice(&chunk);
+            append_response_chunk(&mut output, &chunk, self.max_pdf_bytes)?;
         }
         if !output.starts_with(b"%PDF-") {
             return Err(PdfRendererError::InvalidResponse);
         }
         Ok(output)
     }
+}
+
+fn append_response_chunk(
+    output: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> Result<(), PdfRendererError> {
+    let ceiling = max_bytes
+        .checked_add(1)
+        .ok_or(PdfRendererError::ResponseLimitExceeded)?;
+    let remaining = ceiling
+        .checked_sub(output.len())
+        .ok_or(PdfRendererError::ResponseLimitExceeded)?;
+    let take = remaining.min(chunk.len());
+    output.extend_from_slice(&chunk[..take]);
+    if output.len() > max_bytes || take < chunk.len() {
+        return Err(PdfRendererError::ResponseLimitExceeded);
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -235,4 +252,18 @@ fn is_flat_asset_name(name: &str) -> bool {
         && name != "."
         && name != ".."
         && !name.chars().any(char::is_control)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_append_never_grows_output_beyond_limit_plus_one() {
+        let mut output = b"%PDF-".to_vec();
+        let error = append_response_chunk(&mut output, &vec![0; 1024 * 1024], 32).unwrap_err();
+        assert_eq!(error, PdfRendererError::ResponseLimitExceeded);
+        assert_eq!(output.len(), 33);
+        assert!(output.capacity() <= 33);
+    }
 }

@@ -1,5 +1,6 @@
 use note_server::export::document::{ExportDocumentPackage, PackagedExportAsset};
 use note_server::export::renderer::{GotenbergRenderer, PdfRenderer, PdfRendererError};
+use std::convert::Infallible;
 use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -71,29 +72,154 @@ async fn renderer_rejects_non_pdf_and_suppresses_diagnostic_body() {
 
 #[tokio::test]
 async fn renderer_enforces_declared_and_streamed_response_limits() {
-    for response in [
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "application/pdf")
-            .set_body_bytes([b"%PDF-".as_slice(), &[0_u8; 64]].concat()),
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "application/pdf")
-            .set_body_bytes([b"%PDF-".as_slice(), &[0_u8; 64]].concat()),
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/forms/chromium/convert/html"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/pdf")
+                .insert_header("content-length", "33")
+                .set_body_bytes([b"%PDF-".as_slice(), &[0_u8; 28]].concat()),
+        )
+        .mount(&server)
+        .await;
+    let renderer = GotenbergRenderer::new(&server.uri(), 32).unwrap();
+    assert_eq!(
+        renderer
+            .render(&package(), Duration::from_secs(2))
+            .await
+            .unwrap_err(),
+        PdfRendererError::ResponseLimitExceeded
+    );
+}
+
+async fn chunked_server(chunks: Vec<Vec<u8>>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(move || {
+        let chunks = chunks.clone();
+        async move {
+            let stream = futures::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| Ok::<_, Infallible>(axum::body::Bytes::from(chunk))),
+            );
+            (
+                [("content-type", "application/pdf")],
+                axum::body::Body::from_stream(stream),
+            )
+        }
+    });
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{address}"), task)
+}
+
+#[tokio::test]
+async fn renderer_accepts_exact_declared_and_chunked_limits() {
+    let exact = [b"%PDF-".as_slice(), &[0_u8; 27]].concat();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/pdf")
+                .insert_header("content-length", "32")
+                .set_body_bytes(exact.clone()),
+        )
+        .mount(&server)
+        .await;
+    assert_eq!(
+        GotenbergRenderer::new(&server.uri(), 32)
+            .unwrap()
+            .render(&package(), Duration::from_secs(2))
+            .await
+            .unwrap(),
+        exact
+    );
+
+    let (url, task) = chunked_server(vec![b"%PDF-".to_vec(), vec![0; 27]]).await;
+    let pdf = GotenbergRenderer::new(&url, 32)
+        .unwrap()
+        .render(&package(), Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(pdf.len(), 32);
+    task.abort();
+}
+
+#[tokio::test]
+async fn renderer_rejects_chunked_limit_plus_one_and_huge_single_chunk() {
+    for chunks in [
+        vec![b"%PDF-".to_vec(), vec![0; 28]],
+        vec![[b"%PDF-".as_slice(), &vec![0; 1024 * 1024]].concat()],
+    ] {
+        let (url, task) = chunked_server(chunks).await;
+        let result = GotenbergRenderer::new(&url, 32)
+            .unwrap()
+            .render(&package(), Duration::from_secs(2))
+            .await;
+        assert_eq!(result.unwrap_err(), PdfRendererError::ResponseLimitExceeded);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn renderer_validates_success_mime_signature_and_transport_without_body_leaks() {
+    for (content_type, body) in [
+        ("text/plain", b"%PDF-secret".as_slice()),
+        ("application/pdf", b"SECRET not a PDF".as_slice()),
     ] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/forms/chromium/convert/html"))
-            .respond_with(response)
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", content_type)
+                    .set_body_bytes(body),
+            )
             .mount(&server)
             .await;
-        let renderer = GotenbergRenderer::new(&server.uri(), 32).unwrap();
+        let error = GotenbergRenderer::new(&server.uri(), 1024)
+            .unwrap()
+            .render(&package(), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(error, PdfRendererError::InvalidResponse);
+        assert!(!format!("{error:?}").contains("SECRET"));
+    }
 
-        assert_eq!(
-            renderer
-                .render(&package(), Duration::from_secs(2))
-                .await
-                .unwrap_err(),
-            PdfRendererError::ResponseLimitExceeded
-        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    assert_eq!(
+        GotenbergRenderer::new(&url, 1024)
+            .unwrap()
+            .render(&package(), Duration::from_secs(2))
+            .await
+            .unwrap_err(),
+        PdfRendererError::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn temporary_upstream_statuses_are_unavailable_and_other_failures_are_conversion_errors() {
+    for (status, expected) in [
+        (429, PdfRendererError::Unavailable),
+        (503, PdfRendererError::Unavailable),
+        (504, PdfRendererError::Unavailable),
+        (400, PdfRendererError::ConversionFailed),
+        (500, PdfRendererError::ConversionFailed),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("SECRET upstream body"))
+            .mount(&server)
+            .await;
+        let error = GotenbergRenderer::new(&server.uri(), 1024)
+            .unwrap()
+            .render(&package(), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(error, expected);
+        assert!(!error.to_string().contains("SECRET"));
     }
 }
 
