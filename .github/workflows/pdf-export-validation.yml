@@ -1,0 +1,38 @@
+name: PDF export qualification
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  real-renderer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install PDF qualification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes imagemagick poppler-utils qpdf
+      - name: Run pinned real-renderer qualification
+        env:
+          NOTE_TEST_REAL_PDF: "1"
+          NOTE_TEST_PDF_ARTIFACT_DIR: ${{ github.workspace }}/target/pdf-export-validation
+        run: ./pdf-tests/run-release-validation.sh
+      - name: Upload PDF and every rendered page
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf-export-qualification
+          if-no-files-found: error
+          path: |
+            target/pdf-export-validation/agent-note-export.pdf
+            target/pdf-export-validation/agent-note-export.txt
+            target/pdf-export-validation/agent-note-export-page-*.png
+            target/pdf-export-validation/qualification-record.txt
+            target/pdf-export-validation/security-checks.log

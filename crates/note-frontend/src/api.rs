@@ -8,6 +8,78 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
+use crate::export::{PdfExportError, PdfExportRequest};
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct ExportCapabilities {
+    pub markdown: bool,
+    pub pdf: bool,
+}
+
+fn decode_export_capabilities(body: &str) -> Result<ExportCapabilities, serde_json::Error> {
+    serde_json::from_str(body)
+}
+
+pub async fn get_export_capabilities(
+    signal: Option<&web_sys::AbortSignal>,
+) -> Result<ExportCapabilities, String> {
+    let response = Request::get("/api/export/capabilities")
+        .abort_signal(signal)
+        .send()
+        .await
+        .map_err(|_| "PDF availability could not be loaded.".to_string())?;
+    if !response.ok() {
+        return Err("PDF availability could not be loaded.".to_string());
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|_| "PDF availability could not be loaded.".to_string())?;
+    decode_export_capabilities(&body)
+        .map_err(|_| "PDF availability could not be loaded.".to_string())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PdfExportResponse {
+    pub bytes: Vec<u8>,
+    pub revision_header: Option<String>,
+    pub content_type: Option<String>,
+}
+
+fn pdf_export_url(note_id: &str, revision: i64) -> String {
+    format!(
+        "/api/notes/{}/export/pdf?expected_revision={revision}",
+        urlencoding::encode(note_id)
+    )
+}
+
+pub async fn get_pdf_export(
+    request: &PdfExportRequest,
+    signal: Option<&web_sys::AbortSignal>,
+) -> Result<PdfExportResponse, PdfExportError> {
+    let response = Request::get(&pdf_export_url(&request.note_id, request.revision))
+        .abort_signal(signal)
+        .send()
+        .await
+        .map_err(|_| PdfExportError::transport())?;
+    if !response.ok() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(PdfExportError::from_payload(status, &body));
+    }
+    let revision_header = response.headers().get("x-note-revision");
+    let content_type = response.headers().get("content-type");
+    let bytes = response
+        .binary()
+        .await
+        .map_err(|_| PdfExportError::transport())?;
+    Ok(PdfExportResponse {
+        bytes,
+        revision_header,
+        content_type,
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct NoteMutationApiError {
     pub code: String,
@@ -1156,5 +1228,25 @@ mod tests {
         assert_eq!(summary.categories[0].description, "Project");
         assert_eq!(summary.categories[0].values[0].value, "yellow-dog");
         assert_eq!(summary.categories[0].values[0].count, 2);
+    }
+
+    #[test]
+    fn pdf_export_url_captures_exact_note_and_positive_revision() {
+        assert_eq!(
+            pdf_export_url("note/a ?", 7),
+            "/api/notes/note%2Fa%20%3F/export/pdf?expected_revision=7"
+        );
+    }
+
+    #[test]
+    fn export_capabilities_decode_configuration_without_health_claims() {
+        assert_eq!(
+            decode_export_capabilities(r#"{"markdown":true,"pdf":false}"#).unwrap(),
+            ExportCapabilities {
+                markdown: true,
+                pdf: false,
+            }
+        );
+        assert!(decode_export_capabilities("not-json").is_err());
     }
 }

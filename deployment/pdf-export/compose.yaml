@@ -1,0 +1,68 @@
+services:
+  gotenberg:
+    image: gotenberg/gotenberg:8.37.0-chromium@sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c
+    restart: unless-stopped
+    command:
+      - gotenberg
+      - --api-bind-ip=0.0.0.0
+      - --api-port=3000
+      - --api-timeout=30s
+      - --api-body-limit=48MB
+      - --api-disable-download-from=true
+      - --api-download-from-max-entries=0
+      - --api-download-from-max-concurrency=0
+      - --chromium-disable-javascript=true
+      - --chromium-deny-private-ips=true
+      - --chromium-deny-public-ips=true
+      - --chromium-clear-cache=true
+      - --chromium-clear-cookies=true
+      - --chromium-clear-storage=true
+      - --chromium-max-concurrency=2
+      - --chromium-max-queue-size=2
+      - --webhook-disable=true
+      - --pdfengines-disable-routes=true
+    environment:
+      HOME: /tmp/home
+      XDG_CACHE_HOME: /tmp/.cache
+      XDG_CONFIG_HOME: /tmp/.config
+      ALL_PROXY: ""
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      NO_PROXY: ""
+      all_proxy: ""
+      http_proxy: ""
+      https_proxy: ""
+      no_proxy: ""
+    networks:
+      - pdf-export
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    cpus: 2.0
+    mem_limit: 1g
+    mem_reservation: 512m
+    shm_size: 256m
+    tmpfs:
+      - /tmp:size=512m,mode=1777,uid=1001,gid=1001,noexec,nosuid,nodev
+    stop_grace_period: 40s
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:3000/health
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 30s
+
+networks:
+  pdf-export:
+    name: ${AGENT_NOTE_PDF_NETWORK:-agent-note-pdf}
+    internal: true
+    driver: bridge

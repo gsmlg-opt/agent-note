@@ -1,0 +1,249 @@
+@page {
+  size: A4 portrait;
+  margin: 18mm;
+}
+
+:root {
+  color-scheme: light;
+  --ink: #202124;
+  --muted: #5f6368;
+  --line: #dadce0;
+  --surface: #f8f9fa;
+  --link: #0757b2;
+}
+
+* { box-sizing: border-box; }
+html, body { background: #fff; }
+body {
+  margin: 0;
+  color: var(--ink);
+  font: 10.5pt/1.55 "Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans", "DejaVu Sans", sans-serif;
+}
+.export-document { overflow-wrap: anywhere; }
+.export-title { margin: 0 0 1.4rem; font-size: 24pt; line-height: 1.2; }
+h1, h2, h3, h4, h5, h6 { break-after: avoid-page; line-height: 1.3; }
+a { color: var(--link); text-decoration: underline; }
+pre, code { font-family: "Noto Sans Mono CJK SC", "Noto Sans Mono", "DejaVu Sans Mono", monospace; }
+pre {
+  max-width: 100%;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.dm-code-block {
+  --dm-syntax-text: #d7dee9;
+  --dm-syntax-keyword: #ffb454;
+  --dm-syntax-function: #82aaff;
+  --dm-syntax-type: #c792ea;
+  --dm-syntax-builtin: #7dd3fc;
+  --dm-syntax-string: #a5d977;
+  --dm-syntax-number: #f78c6c;
+  --dm-syntax-literal: #ff8fa3;
+  --dm-syntax-comment: #7a869a;
+  max-width: 100%;
+  border: 1px solid var(--line);
+  background: #101720;
+}
+.dm-code-block-header { color: #d7dee9; background: #17202c; font-size: 8pt; }
+.dm-code-block code { color: var(--dm-syntax-text); }
+.dm-token-keyword { color: var(--dm-syntax-keyword); font-weight: 700; }
+.dm-token-function { color: var(--dm-syntax-function); }
+.dm-token-type { color: var(--dm-syntax-type); }
+.dm-token-builtin { color: var(--dm-syntax-builtin); }
+.dm-token-string { color: var(--dm-syntax-string); }
+.dm-token-number { color: var(--dm-syntax-number); }
+.dm-token-literal { color: var(--dm-syntax-literal); }
+.dm-token-comment { color: var(--dm-syntax-comment); font-style: italic; }
+.dm-mermaid-chart {
+  --dm-mermaid-slice-1: #6750a4;
+  --dm-mermaid-slice-2: #006a6a;
+  --dm-mermaid-slice-3: #8c5000;
+  --dm-mermaid-slice-4: #3f6374;
+  --dm-mermaid-slice-5: #7d5260;
+  --dm-mermaid-slice-6: #386a20;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  background: #f3f0f9;
+}
+.dm-mermaid-chart-title { color: #46464f; font-weight: 700; }
+.dm-mermaid-edge,
+.dm-swimlane-edge,
+.dm-class-relation,
+.dm-state-transition,
+.dm-er-relation,
+.dm-sequence-message line { fill: none; stroke: #6750a4; stroke-width: 2; }
+.dm-mermaid-arrow { fill: #6750a4; }
+.dm-mermaid-node rect,
+.dm-swimlane-node rect,
+.dm-class-node rect,
+.dm-state-node rect,
+.dm-er-entity rect,
+.dm-sequence-lane rect { fill: #faf8ff; stroke: #c7c5d0; }
+.dm-mermaid-chart text { fill: #1b1b1f; font-family: inherit; }
+.dm-mermaid-chart svg { width: 100%; }
+.dm-state-start { fill: #6750a4; stroke: #ffffff; }
+.dm-state-end circle:first-child { fill: #faf8ff; stroke: #6750a4; }
+.dm-state-end circle:last-child { fill: #6750a4; stroke: #6750a4; }
+.dm-class-node line,
+.dm-requirement-node line { stroke: #79747e; }
+
+/* Structural diagrams: each shape keeps a light fill and visible outline. */
+.dm-swimlane-lane rect,
+.dm-class-namespace rect,
+.dm-gantt-section-band,
+.dm-architecture-group rect,
+.dm-wardley-plane,
+.dm-treemap-root {
+  fill: #f7f2fa;
+  stroke: #79747e;
+}
+.dm-sequence-lane line,
+.dm-gantt-axis,
+.dm-gantt-tick,
+.dm-timeline-axis,
+.dm-timeline-stem,
+.dm-xy-axis,
+.dm-xy-grid,
+.dm-radar-axis,
+.dm-radar-grid,
+.dm-treeview-connector {
+  fill: none;
+  stroke: #79747e;
+}
+.dm-block-edge,
+.dm-architecture-edge,
+.dm-event-modeling-edge,
+.dm-mindmap-edge,
+.dm-requirement-relation,
+.dm-c4-relation,
+.dm-zenuml-message,
+.dm-wardley-edge,
+.dm-ishikawa-spine,
+.dm-ishikawa-bone,
+.dm-git-branch-edge,
+.dm-git-lane {
+  fill: none;
+  stroke: #6750a4;
+  stroke-width: 2;
+}
+.dm-block-node rect,
+.dm-architecture-service rect,
+.dm-event-modeling-node rect,
+.dm-mindmap-node rect,
+.dm-requirement-node rect,
+.dm-c4-node rect,
+.dm-zenuml-participant rect,
+.dm-packet-field rect,
+.dm-cynefin-domain rect,
+.dm-treeview-glyph {
+  fill: #faf8ff;
+  stroke: #6750a4;
+}
+.dm-mindmap-root rect,
+.dm-cynefin-center,
+.dm-treeview-glyph-dir {
+  fill: #e8def8;
+  stroke: #6750a4;
+}
+
+/* Journey retains separate tasks, scores, actors, and guide lines. */
+.dm-journey-task { fill: #eaddff; stroke: #6750a4; }
+.dm-journey-score { fill: #6750a4; stroke: #ffffff; }
+.dm-mermaid-chart .dm-journey-score-text { fill: #ffffff; }
+.dm-journey-axis,
+.dm-journey-drop { stroke: #79747e; }
+.dm-journey-axis-arrow { fill: #79747e; }
+.dm-journey-actor-1 { fill: #6750a4; }
+.dm-journey-actor-2 { fill: #006a6a; }
+.dm-journey-actor-3 { fill: #8c5000; }
+
+/* Sankey links remain translucent paths while nodes remain solid labels. */
+.dm-sankey-link { fill: none; stroke: #6750a4; stroke-opacity: 0.5; }
+.dm-sankey-link-2 { stroke: #006a6a; }
+.dm-sankey-link-3 { stroke: #8c5000; }
+.dm-sankey-node rect { fill: #e8def8; stroke: #6750a4; }
+
+/* Kanban columns and cards must not collapse into one undifferentiated fill. */
+.dm-kanban-column > rect { fill: #f7f2fa; stroke: #79747e; }
+.dm-kanban-card { fill: #ffffff; stroke: #6750a4; }
+
+/* Pie colors are shared by its graphic and matching legend swatches. */
+.dm-mermaid-pie-layout { display: flex; align-items: center; gap: 1rem; }
+.dm-mermaid-pie-layout ul { margin: 0; padding: 0; list-style: none; }
+.dm-mermaid-pie-layout li { display: grid; grid-template-columns: 0.8rem 1fr auto; gap: 0.4rem; }
+.dm-mermaid-pie-graphic {
+  flex: 0 0 12rem;
+  width: 12rem;
+  height: 12rem;
+  border: 1px solid #79747e;
+  border-radius: 50%;
+}
+.dm-mermaid-swatch { display: inline-block; width: 0.75rem; height: 0.75rem; border: 1px solid #49454f; }
+.dm-mermaid-swatch-1 { background: var(--dm-mermaid-slice-1); }
+.dm-mermaid-swatch-2 { background: var(--dm-mermaid-slice-2); }
+.dm-mermaid-swatch-3 { background: var(--dm-mermaid-slice-3); }
+.dm-mermaid-swatch-4 { background: var(--dm-mermaid-slice-4); }
+.dm-mermaid-swatch-5 { background: var(--dm-mermaid-slice-5); }
+.dm-mermaid-swatch-6 { background: var(--dm-mermaid-slice-6); }
+
+/* Charts retain independent series, bars, regions, and data marks. */
+.dm-gantt-bar,
+.dm-xy-bar,
+.dm-timeline-point,
+.dm-git-commit circle,
+.dm-wardley-point circle { fill: #6750a4; stroke: #ffffff; }
+.dm-gantt-bar-active,
+.dm-xy-bar-2,
+.dm-git-commit-merge circle { fill: #006a6a; }
+.dm-gantt-bar-done,
+.dm-xy-bar-3 { fill: #8c5000; }
+.dm-mermaid-chart .dm-gantt-task { fill: #ffffff; }
+.dm-timeline-event { fill: #e8def8; stroke: #6750a4; }
+.dm-radar-area { fill: #6750a4; fill-opacity: 0.2; stroke: #6750a4; }
+.dm-radar-area-2 { fill: #006a6a; stroke: #006a6a; }
+.dm-radar-line { fill: none; stroke: #6750a4; stroke-width: 2; }
+.dm-radar-line-2 { stroke: #006a6a; }
+
+/* Area diagrams use distinct surfaces without overriding their labels. */
+.dm-treemap-leaf rect { fill: #e8def8; stroke: #6750a4; }
+.dm-treemap-leaf-2 rect { fill: #b2dfdb; stroke: #006a6a; }
+.dm-treemap-leaf-3 rect { fill: #ffddb3; stroke: #8c5000; }
+.dm-venn-left { fill: #6750a4; fill-opacity: 0.32; stroke: #6750a4; }
+.dm-venn-right { fill: #006a6a; fill-opacity: 0.32; stroke: #006a6a; }
+.dm-ishikawa-head { fill: #e8def8; stroke: #6750a4; }
+.dm-quadrant-point,
+.dm-mermaid-quadrant-plane b { color: #ffffff; background: #6750a4; }
+.dm-mermaid-quadrant-plane {
+  position: relative;
+  min-height: 18rem;
+  border: 1px solid #79747e;
+  background: linear-gradient(90deg, #f7f2fa 50%, #f3edf7 50%);
+  color: #1b1b1f;
+}
+.dm-mermaid-quadrant-plane b { position: absolute; padding: 0.2rem 0.35rem; border-radius: 0.25rem; }
+
+/* Renderer fallback summaries remain readable instead of unstyled blocks. */
+.dm-mermaid-summary-grid { display: grid; gap: 0.35rem; }
+.dm-mermaid-summary-grid span {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #c7c5d0;
+  background: #faf8ff;
+  color: #1b1b1f;
+}
+table { width: 100%; border-collapse: collapse; table-layout: auto; }
+thead { display: table-header-group; }
+th, td { padding: 0.35rem 0.5rem; border: 1px solid var(--line); overflow-wrap: anywhere; }
+th { background: var(--surface); }
+img, svg { display: block; max-width: 100%; height: auto; object-fit: contain; }
+.export-notice, .export-omission, .export-removal-notice {
+  margin: 0.8rem 0;
+  padding: 0.55rem 0.75rem;
+  border-left: 3px solid #b06000;
+  background: #fff7e6;
+  color: #5f3700;
+}
+.attachment-path { color: var(--muted); font-family: monospace; }
+.footnote-definition { font-size: 9pt; }

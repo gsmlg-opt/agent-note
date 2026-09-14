@@ -156,6 +156,7 @@ pub fn rest_router() -> (Router<crate::AppState>, OpenApi) {
             tag("trash", "Restore or permanently delete trashed notes"),
             tag("dashboard", "Read dashboard summary data"),
             tag("rendering", "Render Markdown as HTML"),
+            tag("export", "Download notes in portable formats"),
             tag("labels", "Manage the label-key catalog"),
             tag("system", "Read and update system configuration and backups"),
             tag(
@@ -169,6 +170,7 @@ pub fn rest_router() -> (Router<crate::AppState>, OpenApi) {
         .merge(crate::notes_api::notes_router::<crate::AppState>())
         .merge(crate::labels_api::labels_router::<crate::AppState>())
         .merge(crate::system_api::system_router::<crate::AppState>())
+        .merge(crate::export_api::export_router::<crate::AppState>())
         .merge(crate::org_api::router())
         .split_for_parts();
     (

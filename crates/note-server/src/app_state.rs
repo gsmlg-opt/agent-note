@@ -1,17 +1,47 @@
 use std::sync::Arc;
 
+use crate::config::PdfExportConfig;
+use crate::export::renderer::PdfRenderer;
 use axum::extract::FromRef;
 use note_pipelines::{org::OrgContext, Context};
+use tokio::sync::Semaphore;
+
+pub struct PdfExportRuntime {
+    pub config: PdfExportConfig,
+    pub renderer: Arc<dyn PdfRenderer>,
+    pub admission: Arc<Semaphore>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub note: Arc<Context>,
     pub org: Arc<OrgContext>,
+    pub pdf_export: Option<Arc<PdfExportRuntime>>,
 }
 
 impl AppState {
     pub fn new(note: Arc<Context>, org: Arc<OrgContext>) -> Self {
-        Self { note, org }
+        Self {
+            note,
+            org,
+            pdf_export: None,
+        }
+    }
+
+    pub fn with_pdf_export(
+        mut self,
+        config: PdfExportConfig,
+        renderer: Arc<dyn PdfRenderer>,
+    ) -> Self {
+        if config.enabled {
+            let max_in_flight = config.max_in_flight;
+            self.pdf_export = Some(Arc::new(PdfExportRuntime {
+                config,
+                renderer,
+                admission: Arc::new(Semaphore::new(max_in_flight)),
+            }));
+        }
+        self
     }
 }
 

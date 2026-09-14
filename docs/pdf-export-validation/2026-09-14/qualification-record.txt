@@ -1,0 +1,40 @@
+Agent Note PDF release qualification
+date_utc=2026-09-14T05:47:16Z
+functional_commit=0ce48b8714d471aac65c69c36fd06aaf8a90a572
+renderer_image=gotenberg/gotenberg:8.37.0-chromium@sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c
+renderer_manifest_digest=sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c
+renderer_image_id=sha256:3db63074ad73de5b1daa9b0e174f9b073b905a06ade9c7e0025763b052bf1c9d
+renderer_platform=linux/amd64
+docker=Docker version 29.7.2, build v29.7.2
+compose=5.4.0
+cargo=cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+qpdf=qpdf version 12.3.2
+pdfinfo=pdfinfo version 26.06.0
+pdftoppm=pdftoppm version 26.06.0
+imagemagick=Version: ImageMagick 7.1.2-29 Q16-HDRI x86_64 b919b37fd:20260727 https://imagemagick.org
+browser_coverage=not executed by this PDF-only qualification; use the separate browser gate
+postgres_live_contract=not part of this renderer qualification
+s3_minio_contract=not part of this renderer qualification
+visual_review=completed at full resolution for all 11 pages; see visual-review.md
+fonts:
+  Noto Sans CJK SC => Noto Sans CJK SC | /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+  Noto Sans CJK JP => Noto Sans CJK JP | /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+  Noto Sans Mono CJK SC => Noto Sans Mono CJK SC | /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+  Noto Sans => Noto Sans | /usr/share/fonts/truetype/noto/NotoSans-Regular.ttf
+  DejaVu Sans => DejaVu Sans | /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+security_checks:
+  renderer public egress probe blocked
+  blocked-css_import fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-css_url fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-http fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-https fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-iframe fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-loopback fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-private fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-public_dns fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-public_ip fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-redirect fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  blocked-svg fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
+  script and event handlers did not execute
+  concurrent request B could not read request A's known live renderer path; conversion HTTP 200
+  file traversal to a known renderer-local target was blocked; conversion HTTP 200

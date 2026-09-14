@@ -1,5 +1,6 @@
 use note_attachments::{
-    AttachmentStore, DeleteObjectOutcome, PutObjectRequest, S3AttachmentConfig, S3AttachmentStore,
+    AttachmentStore, BoundedReadError, DeleteObjectOutcome, PutObjectRequest, S3AttachmentConfig,
+    S3AttachmentStore,
 };
 
 struct Fixture {
@@ -66,6 +67,23 @@ async fn immutable_object_lifecycle_round_trips_and_deletes_exact_key() {
     assert_eq!(
         fixture
             .store
+            .read_object_bounded(&stored.object_key, 7)
+            .await
+            .unwrap(),
+        b"payload"
+    );
+    let error = fixture
+        .store
+        .read_object_bounded(&stored.object_key, 6)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<BoundedReadError>(),
+        Some(&BoundedReadError::LimitExceeded)
+    );
+    assert_eq!(
+        fixture
+            .store
             .head_object(&stored.object_key)
             .await
             .unwrap()
@@ -114,6 +132,23 @@ async fn legacy_read_and_delete_target_only_the_legacy_key() {
             .await
             .unwrap(),
         b"legacy"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .read_legacy_bounded("note-1", "nested/legacy.txt", 6)
+            .await
+            .unwrap(),
+        b"legacy"
+    );
+    let error = fixture
+        .store
+        .read_legacy_bounded("note-1", "nested/legacy.txt", 5)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<BoundedReadError>(),
+        Some(&BoundedReadError::LimitExceeded)
     );
     assert_eq!(
         fixture

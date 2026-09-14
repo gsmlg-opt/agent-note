@@ -1,0 +1,44 @@
+name: Safari export smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/note-frontend/**"
+      - "browser-tests/**"
+      - ".github/workflows/safari-export-smoke.yml"
+
+jobs:
+  safari-export-smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Trunk and Selenium
+        run: |
+          cargo install --locked trunk
+          python3 -m pip install selenium==4.35.0
+      - name: Enable Safari WebDriver
+        run: sudo safaridriver --enable
+      - name: Test Safari API fixture
+        run: python3 browser-tests/test_safari_smoke_fixture.py
+      - name: Run real Safari smoke
+        run: |
+          (cd crates/note-frontend && trunk serve index.html --address 127.0.0.1 --port 6221) &
+          trunk_pid=$!
+          trap 'kill "$trunk_pid"' EXIT
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:6221 >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            exit 1
+          fi
+          python3 browser-tests/safari_smoke.py

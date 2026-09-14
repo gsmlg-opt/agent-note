@@ -1,0 +1,13 @@
+[export.pdf]
+enabled = true
+renderer_url = "http://gotenberg:3000"
+total_deadline_secs = 35
+renderer_timeout_secs = 30
+max_in_flight = 2
+max_markdown_bytes = 2097152
+max_asset_count = 64
+max_asset_bytes = 8388608
+max_combined_asset_bytes = 33554432
+max_pixels_per_image = 20000000
+max_combined_pixels = 80000000
+max_pdf_bytes = 33554432

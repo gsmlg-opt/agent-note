@@ -1,5 +1,6 @@
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag};
 use pulldown_cmark_to_cmark::cmark;
+use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use yew::prelude::*;
@@ -8,6 +9,13 @@ use yew_router::prelude::*;
 
 use crate::api;
 use crate::components::Modal;
+use crate::export::{
+    classify_pdf_error, export_menu_decision, export_menu_should_prevent_default,
+    initiate_browser_download, initiate_browser_pdf_download, initiate_captured_markdown_download,
+    invalidate_pdf_export, pdf_completion_is_current, pdf_response_is_downloadable,
+    prepare_markdown_download, try_start_pdf_export, ClassifiedPdfError, ExportCapabilitiesState,
+    ExportMenuDecision, ExportMenuKey, PdfErrorAction, PdfExportError, PdfExportRequest,
+};
 use crate::routes::{NotesQueryParams, Route};
 use crate::state::{stale_retry_blocked, AttachmentContent, NoteSummary};
 
@@ -71,6 +79,15 @@ fn copy_generation_is_current(current: u64, completed: u64) -> bool {
     current == completed
 }
 
+fn note_load_is_current(started_generation: u64, current_generation: u64) -> bool {
+    started_generation == current_generation
+}
+
+fn next_note_load_generation(generation: &mut u64) -> u64 {
+    *generation = generation.saturating_add(1);
+    *generation
+}
+
 fn delete_confirmation_message(title: &str) -> String {
     format!("Move the note \u{201c}{title}\u{201d} to Trash? You can restore it later.")
 }
@@ -99,6 +116,49 @@ fn browser_clipboard() -> Option<web_sys::Clipboard> {
     }
 }
 
+fn start_capabilities_fetch(
+    state: UseStateHandle<ExportCapabilitiesState>,
+    generation: Rc<RefCell<u64>>,
+    abort_controller: Rc<RefCell<Option<web_sys::AbortController>>>,
+) {
+    if let Some(previous) = abort_controller.borrow_mut().take() {
+        previous.abort();
+    }
+    let started_generation = {
+        let mut current = generation.borrow_mut();
+        *current = current.saturating_add(1);
+        *current
+    };
+    state.set(ExportCapabilitiesState::Loading);
+    let controller = web_sys::AbortController::new().ok();
+    *abort_controller.borrow_mut() = controller.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let signal = controller.as_ref().map(|value| value.signal());
+        let result = api::get_export_capabilities(signal.as_ref()).await;
+        if *generation.borrow() == started_generation {
+            state.set(match result {
+                Ok(capabilities) => ExportCapabilitiesState::Available {
+                    pdf: capabilities.pdf,
+                },
+                Err(_) => ExportCapabilitiesState::Failed,
+            });
+            abort_controller.borrow_mut().take();
+        }
+    });
+}
+
+fn invalidate_active_pdf(
+    generation: &Rc<RefCell<u64>>,
+    active: &Rc<RefCell<Option<PdfExportRequest>>>,
+    abort_controller: &Rc<RefCell<Option<web_sys::AbortController>>>,
+) {
+    if invalidate_pdf_export(&mut generation.borrow_mut(), &mut active.borrow_mut()) {
+        if let Some(controller) = abort_controller.borrow_mut().take() {
+            controller.abort();
+        }
+    }
+}
+
 /// Read-only view of a single note.
 #[function_component(NoteShowPage)]
 pub fn note_show_page(props: &NoteShowProps) -> Html {
@@ -112,10 +172,45 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
     let copy_status = use_state(CopyStatus::default);
     let content_copy_status = use_state(CopyStatus::default);
     let content_copy_generation = use_mut_ref(|| 0_u64);
+    let load_generation = use_mut_ref(|| 0_u64);
+    let export_open = use_state(|| false);
+    let export_focused_item = use_state(|| 0_usize);
+    let export_announcement = use_state(String::new);
+    let export_capabilities = use_state(ExportCapabilitiesState::default);
+    let capabilities_generation = use_mut_ref(|| 0_u64);
+    let capabilities_abort = use_mut_ref(|| None::<web_sys::AbortController>);
+    let pdf_generation = use_mut_ref(|| 0_u64);
+    let active_pdf = use_mut_ref(|| None::<PdfExportRequest>);
+    let pdf_abort = use_mut_ref(|| None::<web_sys::AbortController>);
+    let pdf_pending = use_state(|| false);
+    let pdf_error = use_state(|| None::<ClassifiedPdfError>);
+    let export_trigger_ref = use_node_ref();
+    let markdown_export_ref = use_node_ref();
+    let pdf_export_ref = use_node_ref();
     let delete_open = use_state(|| false);
     let delete_pending = use_state(|| false);
     let delete_conflict = use_state(|| None::<api::NoteMutationApiError>);
     let delete_in_flight = use_mut_ref(|| false);
+
+    {
+        let export_capabilities = export_capabilities.clone();
+        let capabilities_generation = capabilities_generation.clone();
+        let capabilities_abort = capabilities_abort.clone();
+        use_effect_with((), move |_| {
+            start_capabilities_fetch(
+                export_capabilities,
+                capabilities_generation.clone(),
+                capabilities_abort.clone(),
+            );
+            move || {
+                let mut generation = capabilities_generation.borrow_mut();
+                *generation = generation.saturating_add(1);
+                if let Some(controller) = capabilities_abort.borrow_mut().take() {
+                    controller.abort();
+                }
+            }
+        });
+    }
 
     {
         let note = note.clone();
@@ -124,31 +219,74 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
         let copy_status = copy_status.clone();
         let content_copy_status = content_copy_status.clone();
         let content_copy_generation = content_copy_generation.clone();
+        let load_generation = load_generation.clone();
+        let export_open = export_open.clone();
+        let export_announcement = export_announcement.clone();
+        let pdf_generation = pdf_generation.clone();
+        let active_pdf = active_pdf.clone();
+        let pdf_abort = pdf_abort.clone();
+        let pdf_pending = pdf_pending.clone();
+        let pdf_error = pdf_error.clone();
         let delete_open = delete_open.clone();
         let delete_pending = delete_pending.clone();
         let delete_in_flight = delete_in_flight.clone();
         let delete_conflict = delete_conflict.clone();
         let id = props.id.clone();
         use_effect_with(props.id.clone(), move |_| {
+            let started_generation = {
+                let mut generation = load_generation.borrow_mut();
+                next_note_load_generation(&mut generation)
+            };
             loading.set(true);
             note.set(None);
             error.set(None);
             copy_status.set(CopyStatus::Ready);
             next_copy_generation(&mut content_copy_generation.borrow_mut());
             content_copy_status.set(CopyStatus::Ready);
+            export_open.set(false);
+            export_announcement.set(String::new());
+            invalidate_active_pdf(&pdf_generation, &active_pdf, &pdf_abort);
+            pdf_pending.set(false);
+            pdf_error.set(None);
             delete_open.set(false);
             delete_pending.set(false);
             *delete_in_flight.borrow_mut() = false;
             delete_conflict.set(None);
             wasm_bindgen_futures::spawn_local(async move {
-                match api::get_note(&id).await {
-                    Ok(n) => note.set(Some(n)),
-                    Err(e) => error.set(Some(e)),
+                let result = api::get_note(&id).await;
+                if note_load_is_current(started_generation, *load_generation.borrow()) {
+                    match result {
+                        Ok(n) => note.set(Some(n)),
+                        Err(e) => error.set(Some(e)),
+                    }
+                    loading.set(false);
                 }
-                loading.set(false);
             });
-            || ()
+            move || {
+                invalidate_active_pdf(&pdf_generation, &active_pdf, &pdf_abort);
+            }
         });
+    }
+
+    {
+        let markdown_export_ref = markdown_export_ref.clone();
+        let pdf_export_ref = pdf_export_ref.clone();
+        use_effect_with(
+            (*export_open, *export_focused_item),
+            move |(open, focused_item)| {
+                if *open {
+                    let item_ref = if *focused_item == 0 {
+                        &markdown_export_ref
+                    } else {
+                        &pdf_export_ref
+                    };
+                    if let Some(item) = item_ref.cast::<web_sys::HtmlElement>() {
+                        let _ = item.focus();
+                    }
+                }
+                || ()
+            },
+        );
     }
 
     let copy_id = (*note)
@@ -200,6 +338,153 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                     } else {
                         CopyStatus::Failed
                     });
+                }
+            });
+        })
+    };
+
+    let on_pdf_export = {
+        let note = note.clone();
+        let export_open = export_open.clone();
+        let export_announcement = export_announcement.clone();
+        let pdf_generation = pdf_generation.clone();
+        let active_pdf = active_pdf.clone();
+        let pdf_abort = pdf_abort.clone();
+        let pdf_pending = pdf_pending.clone();
+        let pdf_error = pdf_error.clone();
+        Callback::from(move |_: ()| {
+            let Some(loaded_note) = (*note).clone() else {
+                return;
+            };
+            let request = {
+                let mut active = active_pdf.borrow_mut();
+                try_start_pdf_export(
+                    &mut active,
+                    &loaded_note.id,
+                    &loaded_note.title,
+                    loaded_note.revision,
+                    *pdf_generation.borrow(),
+                )
+            };
+            let Some(request) = request else {
+                return;
+            };
+            let Ok(controller) = web_sys::AbortController::new() else {
+                active_pdf.borrow_mut().take();
+                pdf_error.set(Some(classify_pdf_error(PdfExportError::transport())));
+                return;
+            };
+            *pdf_abort.borrow_mut() = Some(controller.clone());
+            pdf_pending.set(true);
+            pdf_error.set(None);
+            export_announcement.set("Preparing PDF download…".into());
+            export_open.set(false);
+
+            let note = note.clone();
+            let export_announcement = export_announcement.clone();
+            let pdf_generation = pdf_generation.clone();
+            let active_pdf = active_pdf.clone();
+            let pdf_abort = pdf_abort.clone();
+            let pdf_pending = pdf_pending.clone();
+            let pdf_error = pdf_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let signal = controller.signal();
+                let result = api::get_pdf_export(&request, Some(&signal)).await;
+                let is_current = (*note).as_ref().is_some_and(|current_note| {
+                    pdf_completion_is_current(
+                        &request,
+                        *pdf_generation.borrow(),
+                        &current_note.id,
+                        current_note.revision,
+                    )
+                });
+                if !is_current {
+                    return;
+                }
+
+                match result {
+                    Ok(response)
+                        if pdf_response_is_downloadable(
+                            &request,
+                            response.revision_header.as_deref(),
+                            response.content_type.as_deref(),
+                        ) =>
+                    {
+                        match initiate_browser_pdf_download(&request, &response.bytes) {
+                            Ok(()) => {
+                                export_announcement.set("PDF download initiated.".into());
+                                pdf_error.set(None);
+                            }
+                            Err(_) => {
+                                export_announcement.set(String::new());
+                                pdf_error
+                                    .set(Some(classify_pdf_error(PdfExportError::transport())));
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        export_announcement.set(String::new());
+                        pdf_error.set(Some(classify_pdf_error(PdfExportError::from_payload(
+                            502, "",
+                        ))));
+                    }
+                    Err(error) => {
+                        export_announcement.set(String::new());
+                        pdf_error.set(Some(classify_pdf_error(error)));
+                    }
+                }
+                active_pdf.borrow_mut().take();
+                pdf_abort.borrow_mut().take();
+                pdf_pending.set(false);
+            });
+        })
+    };
+
+    let on_retry_capabilities = {
+        let export_capabilities = export_capabilities.clone();
+        let capabilities_generation = capabilities_generation.clone();
+        let capabilities_abort = capabilities_abort.clone();
+        Callback::from(move |_| {
+            start_capabilities_fetch(
+                export_capabilities.clone(),
+                capabilities_generation.clone(),
+                capabilities_abort.clone(),
+            );
+        })
+    };
+
+    let on_reload_pdf_note = {
+        let note = note.clone();
+        let error = error.clone();
+        let load_generation = load_generation.clone();
+        let pdf_generation = pdf_generation.clone();
+        let active_pdf = active_pdf.clone();
+        let pdf_abort = pdf_abort.clone();
+        let pdf_pending = pdf_pending.clone();
+        let pdf_error = pdf_error.clone();
+        let id = props.id.clone();
+        Callback::from(move |_| {
+            invalidate_active_pdf(&pdf_generation, &active_pdf, &pdf_abort);
+            pdf_pending.set(false);
+            pdf_error.set(None);
+            let started_generation = {
+                let mut generation = load_generation.borrow_mut();
+                next_note_load_generation(&mut generation)
+            };
+            let note = note.clone();
+            let error = error.clone();
+            let load_generation = load_generation.clone();
+            let id = id.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = api::get_note(&id).await;
+                if note_load_is_current(started_generation, *load_generation.borrow()) {
+                    match result {
+                        Ok(latest) => {
+                            note.set(Some(latest));
+                            error.set(None);
+                        }
+                        Err(message) => error.set(Some(message)),
+                    }
                 }
             });
         })
@@ -284,20 +569,39 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                 let note_state = loaded_note_state.clone();
                 let delete_conflict = delete_conflict.clone();
                 let error = error.clone();
+                let load_generation = load_generation.clone();
+                let pdf_generation = pdf_generation.clone();
+                let active_pdf = active_pdf.clone();
+                let pdf_abort = pdf_abort.clone();
+                let pdf_pending = pdf_pending.clone();
+                let pdf_error = pdf_error.clone();
+                let export_announcement = export_announcement.clone();
                 let id = note.id.clone();
                 Callback::from(move |_| {
+                    invalidate_active_pdf(&pdf_generation, &active_pdf, &pdf_abort);
+                    pdf_pending.set(false);
+                    pdf_error.set(None);
+                    export_announcement.set(String::new());
                     let note_state = note_state.clone();
                     let delete_conflict = delete_conflict.clone();
                     let error = error.clone();
+                    let load_generation = load_generation.clone();
                     let id = id.clone();
+                    let started_generation = {
+                        let mut generation = load_generation.borrow_mut();
+                        next_note_load_generation(&mut generation)
+                    };
                     wasm_bindgen_futures::spawn_local(async move {
-                        match api::get_note(&id).await {
-                            Ok(latest) => {
-                                note_state.set(Some(latest));
-                                delete_conflict.set(None);
-                                error.set(None);
+                        let result = api::get_note(&id).await;
+                        if note_load_is_current(started_generation, *load_generation.borrow()) {
+                            match result {
+                                Ok(latest) => {
+                                    note_state.set(Some(latest));
+                                    delete_conflict.set(None);
+                                    error.set(None);
+                                }
+                                Err(message) => error.set(Some(message)),
                             }
-                            Err(message) => error.set(Some(message)),
                         }
                     });
                 })
@@ -343,7 +647,7 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
             }
             if *loading {
                 <p class="loading">{ "Loading…" }</p>
-            } else if let Some(n) = &*note {
+            } else if let Some(n) = (*note).as_ref().filter(|n| n.id == props.id) {
                 <Card title={Some(html! { <span>{ n.title.clone() }</span> })}>
                     <div class="note-copy-actions">
                         <button
@@ -393,14 +697,246 @@ pub fn note_show_page(props: &NoteShowProps) -> Html {
                         >
                             { "Delete note" }
                         </button>
-                        <Link<Route, NotesQueryParams>
-                            to={Route::NoteEdit { id: n.id.clone() }}
-                            query={notes_query.clone()}
-                            classes={classes!("btn","btn-primary")}
-                        >
-                            { "Edit note" }
-                        </Link<Route, NotesQueryParams>>
+                        <div class="note-edit-export-actions">
+                            <Link<Route, NotesQueryParams>
+                                to={Route::NoteEdit { id: n.id.clone() }}
+                                query={notes_query.clone()}
+                                classes={classes!("btn","btn-primary")}
+                            >
+                                { "Edit note" }
+                            </Link<Route, NotesQueryParams>>
+                            <div class="note-export-menu">
+                                <button
+                                    ref={export_trigger_ref.clone()}
+                                    type="button"
+                                    class="btn btn-outline"
+                                    aria-label="Export note"
+                                    aria-haspopup="menu"
+                                    aria-expanded={export_open.to_string()}
+                                    aria-controls="note-export-menu"
+                                    aria-busy={pdf_pending.to_string()}
+                                    onclick={{
+                                        let export_open = export_open.clone();
+                                        let export_focused_item = export_focused_item.clone();
+                                        Callback::from(move |_| {
+                                            if *export_open {
+                                                export_open.set(false);
+                                            } else {
+                                                export_focused_item.set(0);
+                                                export_open.set(true);
+                                            }
+                                        })
+                                    }}
+                                    onkeydown={{
+                                        let export_open = export_open.clone();
+                                        let export_focused_item = export_focused_item.clone();
+                                        Callback::from(move |event: KeyboardEvent| {
+                                            let key = ExportMenuKey::from_key(&event.key());
+                                            if let ExportMenuDecision::OpenAt(item) =
+                                                export_menu_decision(false, 0, key)
+                                            {
+                                                event.prevent_default();
+                                                export_focused_item.set(item);
+                                                export_open.set(true);
+                                            }
+                                        })
+                                    }}
+                                >
+                                    { "Export" }
+                                    <span aria-hidden="true">{ " ▾" }</span>
+                                </button>
+                                if *export_open {
+                                    <div
+                                        id="note-export-menu"
+                                        class="note-export-menu-panel"
+                                        role="menu"
+                                        aria-label="Export note formats"
+                                        onkeydown={{
+                                            let export_open = export_open.clone();
+                                            let export_focused_item = export_focused_item.clone();
+                                            let export_trigger_ref = export_trigger_ref.clone();
+                                            let export_announcement = export_announcement.clone();
+                                            let on_pdf_export = on_pdf_export.clone();
+                                            let pdf_available = export_capabilities.pdf_available();
+                                            let pdf_pending = *pdf_pending;
+                                            let prepared = prepare_markdown_download(
+                                                &n.id,
+                                                &n.title,
+                                                n.revision,
+                                                &n.content,
+                                            );
+                                            let has_attachments = !n.attachments.is_empty();
+                                            Callback::from(move |event: KeyboardEvent| {
+                                                let key = ExportMenuKey::from_key(&event.key());
+                                                if *export_focused_item == 1
+                                                    && matches!(key, ExportMenuKey::Enter | ExportMenuKey::Space)
+                                                {
+                                                    event.prevent_default();
+                                                    if pdf_available && !pdf_pending {
+                                                        on_pdf_export.emit(());
+                                                        export_open.set(false);
+                                                        if let Some(trigger) = export_trigger_ref.cast::<web_sys::HtmlElement>() {
+                                                            let _ = trigger.focus();
+                                                        }
+                                                    }
+                                                    return;
+                                                }
+                                                let decision = export_menu_decision(
+                                                    true,
+                                                    *export_focused_item,
+                                                    key,
+                                                );
+                                                if export_menu_should_prevent_default(decision) {
+                                                    event.prevent_default();
+                                                }
+                                                match decision {
+                                                    ExportMenuDecision::Focus(item) => {
+                                                        export_focused_item.set(item);
+                                                    }
+                                                    ExportMenuDecision::CloseWithoutRestoreFocus => {
+                                                        export_open.set(false);
+                                                    }
+                                                    ExportMenuDecision::CloseAndRestoreFocus => {
+                                                        export_open.set(false);
+                                                        if let Some(trigger) = export_trigger_ref.cast::<web_sys::HtmlElement>() {
+                                                            let _ = trigger.focus();
+                                                        }
+                                                    }
+                                                    ExportMenuDecision::DownloadMarkdownAndRestoreFocus => {
+                                                        export_announcement.set(
+                                                            initiate_captured_markdown_download(
+                                                                &prepared,
+                                                                has_attachments,
+                                                                initiate_browser_download,
+                                                            )
+                                                        );
+                                                        export_open.set(false);
+                                                        if let Some(trigger) = export_trigger_ref.cast::<web_sys::HtmlElement>() {
+                                                            let _ = trigger.focus();
+                                                        }
+                                                    }
+                                                    ExportMenuDecision::OpenAt(_) | ExportMenuDecision::Stay => {}
+                                                }
+                                            })
+                                        }}
+                                    >
+                                        <button
+                                            ref={markdown_export_ref.clone()}
+                                            type="button"
+                                            class="note-export-menu-item"
+                                            role="menuitem"
+                                            tabindex="-1"
+                                            aria-disabled={(!export_capabilities.markdown_available()).to_string()}
+                                            onclick={{
+                                                let export_open = export_open.clone();
+                                                let export_trigger_ref = export_trigger_ref.clone();
+                                                let export_announcement = export_announcement.clone();
+                                                let prepared = prepare_markdown_download(
+                                                    &n.id,
+                                                    &n.title,
+                                                    n.revision,
+                                                    &n.content,
+                                                );
+                                                let has_attachments = !n.attachments.is_empty();
+                                                Callback::from(move |_| {
+                                                    export_announcement.set(
+                                                        initiate_captured_markdown_download(
+                                                            &prepared,
+                                                            has_attachments,
+                                                            initiate_browser_download,
+                                                        )
+                                                    );
+                                                    export_open.set(false);
+                                                    if let Some(trigger) = export_trigger_ref.cast::<web_sys::HtmlElement>() {
+                                                        let _ = trigger.focus();
+                                                    }
+                                                })
+                                            }}
+                                        >
+                                            <span>{ "Markdown (.md)" }</span>
+                                            <small>{ "Original source" }</small>
+                                        </button>
+                                        <button
+                                            ref={pdf_export_ref.clone()}
+                                            type="button"
+                                            class={classes!(
+                                                "note-export-menu-item",
+                                                (!export_capabilities.pdf_available() || *pdf_pending)
+                                                    .then_some("note-export-menu-item-disabled"),
+                                            )}
+                                            role="menuitem"
+                                            tabindex="-1"
+                                            aria-disabled={(!export_capabilities.pdf_available() || *pdf_pending).to_string()}
+                                            aria-busy={pdf_pending.to_string()}
+                                            aria-describedby="note-export-pdf-description"
+                                            onclick={{
+                                                let on_pdf_export = on_pdf_export.clone();
+                                                let export_trigger_ref = export_trigger_ref.clone();
+                                                let actionable = export_capabilities.pdf_available() && !*pdf_pending;
+                                                Callback::from(move |_| {
+                                                    if actionable {
+                                                        on_pdf_export.emit(());
+                                                        if let Some(trigger) = export_trigger_ref.cast::<web_sys::HtmlElement>() {
+                                                            let _ = trigger.focus();
+                                                        }
+                                                    }
+                                                })
+                                            }}
+                                        >
+                                            <span>{ "PDF (.pdf)" }</span>
+                                            <small id="note-export-pdf-description">
+                                                {
+                                                    if *pdf_pending {
+                                                        "Preparing PDF…"
+                                                    } else {
+                                                        export_capabilities.pdf_description()
+                                                    }
+                                                }
+                                            </small>
+                                        </button>
+                                    </div>
+                                }
+                            </div>
+                        </div>
                     </div>
+                    if !export_announcement.is_empty() {
+                        <p class="note-export-status" role="status" aria-live="polite" aria-atomic="true">
+                            { (*export_announcement).clone() }
+                        </p>
+                    }
+                    if matches!(*export_capabilities, ExportCapabilitiesState::Failed) {
+                        <div class="note-export-feedback" role="status">
+                            <span>{ "PDF availability could not be loaded. Markdown export remains available." }</span>
+                            <button type="button" class="btn btn-ghost btn-sm" onclick={on_retry_capabilities}>
+                                { "Retry availability" }
+                            </button>
+                        </div>
+                    }
+                    if let Some(pdf_failure) = &*pdf_error {
+                        <div class="note-export-feedback note-export-feedback-error" role="alert">
+                            <span>{ pdf_failure.message.clone() }</span>
+                            { match pdf_failure.action {
+                                PdfErrorAction::ReloadNote => html! {
+                                    <button type="button" class="btn btn-outline btn-sm" onclick={on_reload_pdf_note.clone()}>
+                                        { "Reload note" }
+                                    </button>
+                                },
+                                PdfErrorAction::Retry => html! {
+                                    <button
+                                        type="button"
+                                        class="btn btn-outline btn-sm"
+                                        onclick={{
+                                            let on_pdf_export = on_pdf_export.clone();
+                                            Callback::from(move |_| on_pdf_export.emit(()))
+                                        }}
+                                    >
+                                        { "Retry PDF export" }
+                                    </button>
+                                },
+                                PdfErrorAction::None => html! {},
+                            }}
+                        </div>
+                    }
                     if !n.labels.is_empty() {
                         <div class="applied-labels">
                             { for n.labels.iter().map(|(k, v)| html! {
@@ -592,7 +1128,8 @@ mod tests {
     use super::{
         content_copy_announcement, content_copy_chip_text, content_copy_payload, copy_announcement,
         copy_chip_text, copy_generation_is_current, delete_confirmation_message,
-        next_copy_generation, rewrite_attachment_urls, try_start_delete, CopyStatus,
+        next_copy_generation, next_note_load_generation, note_load_is_current,
+        rewrite_attachment_urls, try_start_delete, CopyStatus,
     };
     use yew_duskmoon::{render_markdown_to_html_with_options, DmMarkdownOptions};
 
@@ -703,6 +1240,20 @@ mod tests {
         let navigation = next_copy_generation(&mut generation);
         assert_eq!(navigation, 3);
         assert!(!copy_generation_is_current(generation, second));
+    }
+
+    #[test]
+    fn note_load_generation_rejects_late_initial_and_conflict_reload_completions() {
+        let mut generation = 6;
+        let initial = next_note_load_generation(&mut generation);
+        assert!(note_load_is_current(initial, generation));
+
+        let older_reload = next_note_load_generation(&mut generation);
+        let newer_reload = next_note_load_generation(&mut generation);
+
+        assert!(!note_load_is_current(initial, generation));
+        assert!(!note_load_is_current(older_reload, generation));
+        assert!(note_load_is_current(newer_reload, generation));
     }
 
     #[test]

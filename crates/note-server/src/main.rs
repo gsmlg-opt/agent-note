@@ -591,7 +591,25 @@ async fn main() -> anyhow::Result<()> {
         ));
 
         let mcp_contexts = compose_mcp_contexts(ctx.clone(), &org_runtime);
-        let app_state = AppState::new(ctx.clone(), mcp_contexts.org.clone());
+        let mut app_state = AppState::new(ctx.clone(), mcp_contexts.org.clone());
+        if config.pdf_export.enabled {
+            let renderer_url = config
+                .pdf_export
+                .renderer_url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("PDF renderer configuration is invalid"))?;
+            let renderer = note_server::export::renderer::GotenbergRenderer::with_limits(
+                renderer_url,
+                config.pdf_export.max_pdf_bytes,
+                note_server::export::renderer::GotenbergRenderer::max_package_bytes_for_export(
+                    config.pdf_export.max_combined_asset_bytes as usize,
+                    config.pdf_export.max_asset_count,
+                )
+                .map_err(|_| anyhow::anyhow!("PDF renderer configuration is invalid"))?,
+            )
+            .map_err(|_| anyhow::anyhow!("PDF renderer configuration is invalid"))?;
+            app_state = app_state.with_pdf_export(config.pdf_export.clone(), Arc::new(renderer));
+        }
         assert!(
             Arc::ptr_eq(&app_state.org, &mcp_contexts.org),
             "REST and MCP must share the same Org context"
@@ -765,8 +783,8 @@ mod tests {
             })
             .sum::<usize>();
 
-        assert_eq!(paths.len(), 55);
-        assert_eq!(operation_count, 66);
+        assert_eq!(paths.len(), 57);
+        assert_eq!(operation_count, 68);
         assert!(!paths.keys().any(|path| path.starts_with("/mcp")));
         assert!(document["tags"]
             .as_array()
@@ -1101,6 +1119,7 @@ mod tests {
             attachments: AttachmentConfig::Filesystem {
                 path: attachments_dir.clone(),
             },
+            pdf_export: note_server::config::PdfExportConfig::default(),
         };
 
         ensure_data_directories(&local).unwrap();
@@ -1131,6 +1150,7 @@ mod tests {
                 endpoint: None,
                 force_path_style: false,
             },
+            pdf_export: note_server::config::PdfExportConfig::default(),
         };
 
         ensure_data_directories(&external).unwrap();
@@ -1152,6 +1172,7 @@ mod tests {
             attachments: AttachmentConfig::Filesystem {
                 path: temp.path().join("attachments"),
             },
+            pdf_export: note_server::config::PdfExportConfig::default(),
         };
 
         ensure_data_directories(&config).unwrap();

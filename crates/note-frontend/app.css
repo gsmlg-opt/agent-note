@@ -827,9 +827,125 @@ a.dashboard-metric-detail:hover {
 
 .note-page-actions {
     display: flex;
+    align-items: center;
     justify-content: flex-end;
+    flex-wrap: wrap;
     gap: 0.5rem;
     margin-bottom: 0.9rem;
+}
+
+.note-edit-export-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-left: 0.25rem;
+    padding-left: 0.75rem;
+    border-left: 1px solid var(--color-outline-variant, #c7c5d0);
+}
+
+.note-export-menu {
+    position: relative;
+}
+
+.note-export-menu-panel {
+    position: absolute;
+    z-index: 20;
+    top: calc(100% + 0.4rem);
+    right: 0;
+    display: grid;
+    width: max-content;
+    min-width: 15rem;
+    padding: 0.35rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.65rem;
+    background: var(--color-surface, #faf8ff);
+    box-shadow: 0 12px 32px rgb(0 0 0 / 18%);
+}
+
+.note-export-menu-item {
+    display: grid;
+    gap: 0.15rem;
+    width: 100%;
+    padding: 0.65rem 0.75rem;
+    border: 0;
+    border-radius: 0.45rem;
+    color: var(--color-on-surface, #1d1b20);
+    background: transparent;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.note-export-menu-item:hover,
+.note-export-menu-item:focus-visible {
+    background: var(--color-surface-variant, #e7e0ec);
+    outline: none;
+}
+
+.note-export-menu-item:focus-visible {
+    box-shadow: inset 0 0 0 2px var(--color-primary, #6750a4);
+}
+
+.note-export-menu-item small {
+    color: var(--color-on-surface-variant, #49454f);
+    font-size: 0.78rem;
+}
+
+.note-export-menu-item-disabled {
+    color: var(--color-on-surface-variant, #49454f);
+    cursor: not-allowed;
+    opacity: 0.72;
+}
+
+.note-export-status {
+    margin: -0.25rem 0 0.9rem;
+    color: var(--color-on-surface-variant, #49454f);
+    font-size: 0.9rem;
+}
+
+.note-export-feedback {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin: -0.25rem 0 0.9rem;
+    padding: 0.65rem 0.75rem;
+    border-left: 3px solid var(--color-outline, #79747e);
+    border-radius: 0.35rem;
+    background: var(--color-surface-variant, #e7e0ec);
+    color: var(--color-on-surface-variant, #49454f);
+    font-size: 0.9rem;
+}
+
+.note-export-feedback-error {
+    border-left-color: var(--color-error, #ba1a1a);
+    color: var(--color-on-error-container, #410002);
+    background: var(--color-error-container, #ffdad6);
+}
+
+.note-export-feedback .btn {
+    flex: none;
+}
+
+@media (max-width: 620px) {
+    .note-edit-export-actions {
+        width: 100%;
+        justify-content: flex-end;
+        margin-left: 0;
+        padding-top: 0.5rem;
+        padding-left: 0;
+        border-top: 1px solid var(--color-outline-variant, #c7c5d0);
+        border-left: 0;
+    }
+
+    .note-export-menu-panel {
+        max-width: min(15rem, calc(100vw - 2rem));
+    }
+
+    .note-export-feedback {
+        align-items: flex-start;
+        flex-direction: column;
+    }
 }
 
 /* Icon buttons (view/edit/remove). */
