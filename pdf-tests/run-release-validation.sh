@@ -317,43 +317,40 @@ if grep -E "EXECUTED (SCRIPT|EVENT)" "$work_dir/javascript.txt" >/dev/null; then
 fi
 echo "script and event handlers did not execute" | tee -a "$security_log"
 
-docker exec "$container_id" sh -c \
-  'for directory in /tmp/*; do [ -d "$directory" ] && basename "$directory"; done' \
-  | sort >"$work_dir/tmp-before"
 post_html "$work_dir/request-a.html" "$work_dir/request-a.pdf" \
   --form "files=@${work_dir}/request-a-secret.html;type=text/html;filename=request-a-secret.html" \
   --form "waitDelay=8s" >"$work_dir/request-a.status" &
 request_a_pid=$!
-active_request_dir=""
+active_request_file=""
 for _ in $(seq 1 60); do
   if ! kill -0 "$request_a_pid" 2>/dev/null; then
     break
   fi
-  docker exec "$container_id" sh -c \
-    'for directory in /tmp/*; do [ -d "$directory" ] && basename "$directory"; done' \
-    | sort >"$work_dir/tmp-during"
-  active_request_dir="$(comm -13 "$work_dir/tmp-before" "$work_dir/tmp-during" | sed -n '1p')"
-  if [[ -n "$active_request_dir" ]]; then
+  set +e
+  active_request_file="$(docker exec "$container_id" grep -rl \
+    'IN-FLIGHT REQUEST A SECRET 9f4ca771' /tmp 2>/dev/null | sed -n '1p')"
+  set -e
+  if [[ -n "$active_request_file" ]]; then
     break
   fi
   sleep 0.1
 done
-[[ -n "$active_request_dir" ]] || {
-  echo "could not identify request A's live renderer directory" >&2
+[[ "$active_request_file" == /tmp/* ]] || {
+  echo "could not identify request A's live packaged file" >&2
   exit 1
 }
 kill -0 "$request_a_pid" 2>/dev/null || {
   echo "request A completed before the concurrent isolation probe" >&2
   exit 1
 }
-python3 - "$work_dir" "$active_request_dir" <<'PY'
+python3 - "$work_dir" "$active_request_file" <<'PY'
 from pathlib import Path
 import html
 import sys
 
 root = Path(sys.argv[1])
-request_dir = sys.argv[2]
-target = html.escape(f"file:///tmp/{request_dir}/request-a-secret.html", quote=True)
+request_file = sys.argv[2]
+target = html.escape(f"file://{request_file}", quote=True)
 (root / "request-b.html").write_text(
     f'<!doctype html><body><p>REQUEST B CONTROL</p><iframe src="{target}"></iframe></body>',
     encoding="utf-8",
