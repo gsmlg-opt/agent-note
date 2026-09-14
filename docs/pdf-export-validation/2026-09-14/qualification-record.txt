@@ -1,6 +1,6 @@
 Agent Note PDF release qualification
-date_utc=2026-09-14T05:08:38Z
-functional_commit=e4a1b00618bfdd77868d28582aeccbe8b825fa6a
+date_utc=2026-09-14T05:37:38Z
+functional_commit=30062db16123797fa64be9d30897d2166cafecc3
 renderer_image=gotenberg/gotenberg:8.37.0-chromium@sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c
 renderer_manifest_digest=sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c
 renderer_image_id=sha256:3db63074ad73de5b1daa9b0e174f9b073b905a06ade9c7e0025763b052bf1c9d
@@ -37,3 +37,4 @@ security_checks:
   blocked-svg fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
   script and event handlers did not execute
   concurrent request B could not read request A's known live renderer path; conversion HTTP 200
+  file traversal to a known renderer-local target was blocked; conversion HTTP 200

@@ -12,3 +12,4 @@ blocked-redirect fetch blocked; conversion HTTP 200; recorder requests 0; raw co
 blocked-svg fetch blocked; conversion HTTP 200; recorder requests 0; raw connections 0
 script and event handlers did not execute
 concurrent request B could not read request A's known live renderer path; conversion HTTP 200
+file traversal to a known renderer-local target was blocked; conversion HTTP 200

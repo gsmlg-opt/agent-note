@@ -1,6 +1,6 @@
 # Visual review — 2026-09-14
 
-Reviewer inspected all 11 PNG previews at their original 992 × 1404 resolution after the automated release qualification passed at functional commit `e4a1b00618bfdd77868d28582aeccbe8b825fa6a`.
+Reviewer inspected all 11 PNG previews at their original 992 × 1404 resolution. The qualification rerun passed at functional commit `30062db16123797fa64be9d30897d2166cafecc3`; every rerun page raster was byte-identical to the reviewed preview for the same page.
 
 | Page | Observations | Result |
 | ---: | --- | --- |
