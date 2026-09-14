@@ -112,11 +112,11 @@ async fn qualifies_a_real_renderer_and_writes_review_artifacts() {
         let output = run_checked(
             &identify,
             [
-                preview.as_os_str(),
                 OsStr::new("-colorspace"),
                 OsStr::new("Gray"),
                 OsStr::new("-format"),
                 OsStr::new("%[fx:standard_deviation]"),
+                preview.as_os_str(),
             ],
         );
         let deviation: f64 = String::from_utf8(output.stdout)
@@ -238,7 +238,9 @@ fn render_export(note_revision: i64) -> &'static str {{ "searchable code" }}
 
 ```mermaid
 flowchart LR
-    Snapshot --> Sanitize --> Render --> Validate
+    Snapshot --> Sanitize
+    Sanitize --> Render
+    Render --> Validate
 ```
 
 ## Details

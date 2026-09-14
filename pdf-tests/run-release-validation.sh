@@ -15,6 +15,7 @@ compose() {
 
 cleanup() {
   set +e
+  docker rm --force "${project_name}-recorder" >/dev/null 2>&1
   compose down --volumes --remove-orphans >/dev/null 2>&1
   rm -rf "$work_dir"
 }
@@ -81,6 +82,7 @@ assert any(value.get("internal") is True for value in networks.values())
 PY
 
 compose pull gotenberg
+docker pull python:3.13-alpine
 repo_digests="$(docker image inspect "$renderer_image" --format '{{json .RepoDigests}}')"
 grep -F "$renderer_digest" <<<"$repo_digests" >/dev/null || {
   echo "pulled image does not expose the required manifest digest: $repo_digests" >&2
@@ -143,25 +145,25 @@ root = Path(sys.argv[1])
 png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
 (root / "request-a.png").write_bytes(png)
 vectors = {
-    "http": '<img src="http://example.com/blocked.png">',
+    "http": '<img src="http://recorder:8080/blocked.png">',
     "https": '<img src="https://example.com/blocked.png">',
     "loopback": '<img src="http://127.0.0.1:9/blocked.png">',
-    "private": '<img src="http://10.255.255.1/blocked.png">',
+    "private": '<img src="http://recorder:8080/private.png">',
     "public_ip": '<img src="http://93.184.216.34/blocked.png">',
-    "redirect": '<img src="http://example.com/redirect-to-private">',
-    "css_import": '<style>@import url("https://example.com/blocked.css");</style>',
-    "css_url": '<style>body{background:url("http://example.com/blocked.png")}</style>',
-    "svg": '<svg><image href="https://example.com/blocked.png"/></svg>',
-    "iframe": '<iframe src="https://example.com/blocked"></iframe>',
+    "redirect": '<img src="http://recorder:8080/redirect">',
+    "css_import": '<style>@import url("http://recorder:8080/blocked.css");</style>',
+    "css_url": '<style>body{background:url("http://recorder:8080/blocked.png")}</style>',
+    "svg": '<svg><image href="http://recorder:8080/blocked.png"/></svg>',
+    "iframe": '<iframe src="http://recorder:8080/blocked"></iframe>',
 }
 for name, body in vectors.items():
     (root / f"blocked-{name}.html").write_text(
         f"<!doctype html><html><body>{body}</body></html>", encoding="utf-8"
     )
 (root / "javascript.html").write_text(
-    "<!doctype html><body><p>SAFE STATIC TEXT</p>"
-    "<script>document.body.textContent='EXECUTED SCRIPT'</script>"
-    "<img src=x onerror=\"document.body.textContent='EXECUTED EVENT'\">",
+    "<!doctype html><body onload=\"document.body.textContent='EXECUTED EVENT'\">"
+    "<p>SAFE STATIC TEXT</p>"
+    "<script>document.body.textContent='EXECUTED SCRIPT'</script></body>",
     encoding="utf-8",
 )
 (root / "request-a.html").write_text(
@@ -171,9 +173,58 @@ for name, body in vectors.items():
     '<!doctype html><body><p>REQUEST B</p><img src="request-a.png"></body>', encoding="utf-8"
 )
 (root / "traversal.html").write_text(
-    '<!doctype html><body><img src="../request-a.png"></body>', encoding="utf-8"
+    '<!doctype html><body><p>TRAVERSAL CONTROL</p><iframe src="../request-a.html"></iframe></body>',
+    encoding="utf-8",
+)
+(root / "requests.log").write_text("", encoding="utf-8")
+(root / "recorder.py").write_text(
+    '''from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010804000000b51c0c020000000b4944415478da6364f80f00010501012718e3660000000049454e44ae426082")
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        with Path("/work/requests.log").open("a", encoding="utf-8") as log:
+            log.write(self.path + "\\n")
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "http://recorder:8080/redirect-target")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(PNG)))
+        self.end_headers()
+        self.wfile.write(PNG)
+
+    def log_message(self, *_args):
+        pass
+
+ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+''',
+    encoding="utf-8",
 )
 PY
+
+set +e
+docker rm --force "${project_name}-recorder" >/dev/null 2>&1
+set -e
+docker run --detach --rm \
+  --name "${project_name}-recorder" \
+  --network "${AGENT_NOTE_PDF_NETWORK:-agent-note-pdf}" \
+  --mount "type=bind,src=${work_dir},dst=/work" \
+  python:3.13-alpine python /work/recorder.py >/dev/null
+for _ in $(seq 1 30); do
+  if docker exec "${project_name}-recorder" python -c \
+    "import socket; socket.create_connection(('127.0.0.1', 8080), 1).close()" \
+    >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+docker exec "${project_name}-recorder" python -c \
+  "import socket; socket.create_connection(('127.0.0.1', 8080), 1).close()"
 
 post_html() {
   local html="$1"
@@ -190,14 +241,22 @@ post_html() {
 
 security_log="$artifact_dir/security-checks.log"
 : >"$security_log"
+if docker exec "$container_id" curl --fail --silent --show-error --max-time 5 \
+  http://example.com/agent-note-egress-probe >/dev/null 2>&1; then
+  echo "renderer unexpectedly reached public egress" >&2
+  exit 1
+fi
+echo "renderer public egress probe blocked" | tee -a "$security_log"
 for fixture in "$work_dir"/blocked-*.html; do
   name="$(basename "$fixture" .html)"
+  : >"$work_dir/requests.log"
   status="$(post_html "$fixture" "$work_dir/$name.response")"
-  if [[ "$status" =~ ^2 ]]; then
-    echo "$name unexpectedly rendered with HTTP $status" >&2
+  sleep 0.25
+  if [[ -s "$work_dir/requests.log" ]]; then
+    echo "$name reached the forbidden recorder: $(tr '\n' ' ' <"$work_dir/requests.log")" >&2
     exit 1
   fi
-  echo "$name blocked with HTTP $status" | tee -a "$security_log"
+  echo "$name fetch blocked; conversion HTTP $status; recorder requests 0" | tee -a "$security_log"
 done
 
 status="$(post_html "$work_dir/javascript.html" "$work_dir/javascript.pdf")"
@@ -219,14 +278,22 @@ status="$(post_html "$work_dir/request-a.html" "$work_dir/request-a.pdf" \
   echo "request A packaged asset control failed: HTTP $status" >&2
   exit 1
 }
-for fixture in request-b traversal; do
-  status="$(post_html "$work_dir/$fixture.html" "$work_dir/$fixture.response")"
-  if [[ "$status" =~ ^2 ]]; then
-    echo "$fixture unexpectedly accessed a sibling/traversal asset" >&2
+status="$(post_html "$work_dir/request-b.html" "$work_dir/request-b.response")"
+if [[ "$status" =~ ^2 ]]; then
+  echo "request B unexpectedly accessed request A's packaged asset" >&2
+  exit 1
+fi
+echo "request-b asset access blocked with HTTP $status" | tee -a "$security_log"
+
+status="$(post_html "$work_dir/traversal.html" "$work_dir/traversal.response")"
+if [[ "$status" =~ ^2 ]]; then
+  pdftotext "$work_dir/traversal.response" "$work_dir/traversal.txt"
+  if grep -F "REQUEST A" "$work_dir/traversal.txt" >/dev/null; then
+    echo "path traversal exposed prior-request content" >&2
     exit 1
   fi
-  echo "$fixture asset access blocked with HTTP $status" | tee -a "$security_log"
-done
+fi
+echo "path traversal exposed no prior-request marker; conversion HTTP $status" | tee -a "$security_log"
 
 NOTE_TEST_REAL_PDF=1 \
 NOTE_TEST_GOTENBERG_URL="$renderer_url" \
