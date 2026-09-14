@@ -1,0 +1,14 @@
+renderer public egress probe blocked
+blocked-css_import fetch blocked; conversion HTTP 200; recorder requests 0
+blocked-css_url fetch blocked; conversion HTTP 200; recorder requests 0
+blocked-http fetch blocked; conversion HTTP 200; recorder requests 0
+blocked-https fetch blocked; conversion HTTP 200; recorder requests 0
+blocked-iframe fetch blocked; conversion HTTP 200; recorder requests 0
+blocked-loopback fetch blocked; conversion HTTP 200; recorder requests 0
+blocked-private fetch blocked; conversion HTTP 200; recorder requests 0
+blocked-public_ip fetch blocked; conversion HTTP 200; recorder requests 0
+blocked-redirect fetch blocked; conversion HTTP 200; recorder requests 0
+blocked-svg fetch blocked; conversion HTTP 200; recorder requests 0
+script and event handlers did not execute
+request-b asset access blocked with HTTP 409
+path traversal exposed no prior-request marker; conversion HTTP 200
