@@ -608,6 +608,51 @@ fn rejects_size_mismatch_unsupported_mime_and_malformed_raster() {
 }
 
 #[test]
+fn svg_nesting_depth_is_bounded_before_recursive_serialization() {
+    let nested_svg = |groups| {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\">{}<rect width=\"1\" height=\"1\"/>{}</svg>",
+            "<g>".repeat(groups),
+            "</g>".repeat(groups)
+        )
+    };
+    let svg_at_boundary = nested_svg(126);
+    let boundary = frozen(
+        "![svg](boundary.svg)",
+        vec![asset(
+            "boundary.svg",
+            "image/svg+xml",
+            svg_at_boundary.into_bytes(),
+        )],
+    );
+    assert!(build_export_document(&boundary, ExportDocumentLimits::default()).is_ok());
+
+    let too_deep_svg = nested_svg(256);
+    let too_deep = frozen(
+        "![svg](deep.svg)",
+        vec![asset(
+            "deep.svg",
+            "image/svg+xml",
+            too_deep_svg.into_bytes(),
+        )],
+    );
+    assert!(matches!(
+        build_export_document(&too_deep, ExportDocumentLimits::default()),
+        Err(ExportDocumentError::MarkupDepthLimitExceeded)
+    ));
+}
+
+#[test]
+fn generated_renderer_markup_is_depth_checked_before_sanitizer_recursion() {
+    let markdown = format!("{}content", "> ".repeat(129));
+
+    assert!(matches!(
+        build_export_document(&frozen(&markdown, vec![]), ExportDocumentLimits::default()),
+        Err(ExportDocumentError::MarkupDepthLimitExceeded)
+    ));
+}
+
+#[test]
 fn rejects_diagram_limits_in_pure_pre_render_check() {
     let limits = ExportDocumentLimits {
         max_diagram_bytes: 8,

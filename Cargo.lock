@@ -3791,7 +3791,7 @@ dependencies = [
  "note-storage-pg",
  "note-storage-turso",
  "percent-encoding",
- "pulldown-cmark 0.13.4",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3832,7 +3832,7 @@ dependencies = [
  "note-storage-pg",
  "note-storage-turso",
  "percent-encoding",
- "pulldown-cmark 0.12.2",
+ "pulldown-cmark",
  "roxmltree 0.21.1",
  "rustix 1.1.4",
  "serde",
@@ -4542,18 +4542,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "pulldown-cmark"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
-dependencies = [
- "bitflags",
- "memchr",
- "pulldown-cmark-escape",
- "unicase",
 ]
 
 [[package]]
@@ -6307,7 +6295,7 @@ dependencies = [
  "icu_segmenter",
  "itertools 0.14.0",
  "memchr",
- "pulldown-cmark 0.13.4",
+ "pulldown-cmark",
  "strum 0.28.0",
  "thiserror 2.0.20",
 ]
@@ -7854,7 +7842,7 @@ dependencies = [
  "code-engine",
  "htmlize",
  "log",
- "pulldown-cmark 0.13.4",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "strum 0.28.0",

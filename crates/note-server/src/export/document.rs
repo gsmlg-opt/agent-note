@@ -31,6 +31,10 @@ const DEFAULT_MAX_COMBINED_DIAGRAM_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_DIAGRAM_LINES: usize = 4_096;
 const DEFAULT_MAX_PACKAGED_ASSET_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_COMBINED_PACKAGED_ASSET_BYTES: usize = 32 * 1024 * 1024;
+/// Recursive serializers only receive trees at or below this element nesting depth.
+const MAX_MARKUP_NESTING_DEPTH: usize = 128;
+/// Bounds parser-produced non-element nodes before any recursive tree consumer runs.
+const MAX_MARKUP_NODES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExportDocumentLimits {
@@ -102,6 +106,8 @@ pub enum ExportDocumentError {
     DiagramComplexityExceeded,
     PackagedAssetLimitExceeded { destination: String },
     CombinedPackagedAssetLimitExceeded,
+    MarkupDepthLimitExceeded,
+    MarkupNodeLimitExceeded,
     FootnoteMarkerUnavailable,
 }
 
@@ -139,6 +145,8 @@ impl fmt::Display for ExportDocumentError {
             Self::CombinedPackagedAssetLimitExceeded => {
                 "combined packaged export images exceed the byte limit"
             }
+            Self::MarkupDepthLimitExceeded => "export markup nesting exceeds the limit",
+            Self::MarkupNodeLimitExceeded => "export markup node count exceeds the limit",
             Self::FootnoteMarkerUnavailable => "could not reserve an export footnote marker",
         };
         formatter.write_str(message)
@@ -232,11 +240,11 @@ pub fn build_export_document(
         .flat_map(|omission| source_aliases(&omission.destination))
         .collect::<HashSet<_>>();
     let mut original_image_sources =
-        collect_original_image_sources(markdown_body_after_front_matter(&prepared.body_markdown));
+        collect_original_image_sources(markdown_body_after_front_matter(&prepared.body_markdown))?;
     for footnote in &prepared.footnotes {
         original_image_sources.extend(collect_original_image_sources(
             markdown_body_after_front_matter(&footnote.markdown),
-        ));
+        )?);
     }
     let policy = HtmlPolicy {
         rewrites: &rewrites,
@@ -430,18 +438,23 @@ fn estimate_renderer_html(markdown: &str) -> Result<usize, ExportDocumentError> 
     for event in Parser::new_ext(body, renderer_markdown_options()) {
         let addition =
             match event {
-                Event::Start(Tag::CodeBlock(kind)) => {
-                    code_kind = Some(match kind {
-                        CodeBlockKind::Fenced(info) if is_mermaid_language(&info) => {
-                            PreflightCodeKind::Mermaid
-                        }
-                        _ => PreflightCodeKind::Highlighted,
-                    });
-                    512
+                Event::Start(tag) => {
+                    let addition = estimate_start_tag(&tag)?;
+                    if let Tag::CodeBlock(kind) = tag {
+                        code_kind = Some(match kind {
+                            CodeBlockKind::Fenced(info) if is_mermaid_language(&info) => {
+                                PreflightCodeKind::Mermaid
+                            }
+                            _ => PreflightCodeKind::Highlighted,
+                        });
+                    }
+                    addition
                 }
-                Event::End(TagEnd::CodeBlock) => {
-                    code_kind = None;
-                    64
+                Event::End(tag) => {
+                    if tag == TagEnd::CodeBlock {
+                        code_kind = None;
+                    }
+                    estimate_end_tag(tag)
                 }
                 Event::Text(text) => match code_kind {
                     Some(PreflightCodeKind::Highlighted) => {
@@ -450,27 +463,136 @@ fn estimate_renderer_html(markdown: &str) -> Result<usize, ExportDocumentError> 
                     Some(PreflightCodeKind::Mermaid) => mermaid_html_bound(&text)?,
                     None => escaped_text_len(&text)?,
                 },
-                Event::Code(code) => escaped_text_len(&code)?
-                    .checked_add(512)
+                Event::Code(code) => inline_code_bound(&code)?,
+                Event::InlineMath(math) | Event::DisplayMath(math) => escaped_text_len(&math)?
+                    .checked_add(128)
                     .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?,
                 Event::Html(html) | Event::InlineHtml(html) => html
                     .len()
                     .checked_mul(6)
                     .and_then(|value| value.checked_add(512))
                     .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?,
-                Event::Start(_) | Event::End(_) => 512,
                 Event::SoftBreak | Event::HardBreak => 16,
                 Event::Rule | Event::TaskListMarker(_) => 128,
                 Event::FootnoteReference(reference) => escaped_text_len(&reference)?
                     .checked_add(256)
                     .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?,
-                _ => 64,
             };
         estimate = estimate
             .checked_add(addition)
             .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
     }
     Ok(estimate)
+}
+
+fn estimate_start_tag(tag: &Tag<'_>) -> Result<usize, ExportDocumentError> {
+    let payload = match tag {
+        Tag::Paragraph
+        | Tag::HtmlBlock
+        | Tag::Item
+        | Tag::TableHead
+        | Tag::TableRow
+        | Tag::TableCell
+        | Tag::DefinitionList
+        | Tag::DefinitionListTitle
+        | Tag::DefinitionListDefinition
+        | Tag::Emphasis
+        | Tag::Strong
+        | Tag::Strikethrough
+        | Tag::Superscript
+        | Tag::Subscript
+        | Tag::MetadataBlock(_) => 0,
+        Tag::BlockQuote(_) | Tag::List(_) => 64,
+        Tag::Table(alignments) => alignments
+            .len()
+            .checked_mul(32)
+            .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?,
+        Tag::FootnoteDefinition(label) => escaped_attribute_len(label)?,
+        Tag::CodeBlock(CodeBlockKind::Indented) => 0,
+        Tag::CodeBlock(CodeBlockKind::Fenced(info)) => escaped_attribute_len(info)?,
+        Tag::Heading {
+            id, classes, attrs, ..
+        } => {
+            let mut payload = id
+                .as_deref()
+                .map(escaped_attribute_len)
+                .transpose()?
+                .unwrap_or(0);
+            for class in classes {
+                payload = checked_add_html(payload, escaped_attribute_len(class)?)?;
+            }
+            for (name, value) in attrs {
+                payload = checked_add_html(payload, escaped_attribute_len(name)?)?;
+                if let Some(value) = value {
+                    payload = checked_add_html(payload, escaped_attribute_len(value)?)?;
+                }
+            }
+            payload
+        }
+        Tag::Link {
+            dest_url,
+            title,
+            id,
+            ..
+        }
+        | Tag::Image {
+            dest_url,
+            title,
+            id,
+            ..
+        } => checked_add_html(
+            checked_add_html(
+                escaped_attribute_len(dest_url)?,
+                escaped_attribute_len(title)?,
+            )?,
+            escaped_attribute_len(id)?,
+        )?,
+    };
+    checked_add_html(payload, 512)
+}
+
+fn estimate_end_tag(tag: TagEnd) -> usize {
+    match tag {
+        TagEnd::Paragraph
+        | TagEnd::Heading(_)
+        | TagEnd::BlockQuote(_)
+        | TagEnd::CodeBlock
+        | TagEnd::HtmlBlock
+        | TagEnd::List(_)
+        | TagEnd::Item
+        | TagEnd::FootnoteDefinition
+        | TagEnd::DefinitionList
+        | TagEnd::DefinitionListTitle
+        | TagEnd::DefinitionListDefinition
+        | TagEnd::Table
+        | TagEnd::TableHead
+        | TagEnd::TableRow
+        | TagEnd::TableCell
+        | TagEnd::Emphasis
+        | TagEnd::Strong
+        | TagEnd::Strikethrough
+        | TagEnd::Superscript
+        | TagEnd::Subscript
+        | TagEnd::Link
+        | TagEnd::Image
+        | TagEnd::MetadataBlock(_) => 64,
+    }
+}
+
+fn checked_add_html(left: usize, right: usize) -> Result<usize, ExportDocumentError> {
+    left.checked_add(right)
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)
+}
+
+fn inline_code_bound(code: &str) -> Result<usize, ExportDocumentError> {
+    // yew-duskmoon 0.9 turns any accepted CSS color into a fixed color-chip template
+    // containing the text once and the escaped attribute twice. Conservatively charge
+    // that template for every inline code event so preflight need not duplicate its parser.
+    let text = escaped_text_len(code)?;
+    let attributes = escaped_attribute_len(code)?
+        .checked_mul(2)
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)?;
+    checked_add_html(checked_add_html(text, attributes)?, 2_048)
 }
 
 #[derive(Clone, Copy)]
@@ -493,6 +615,21 @@ fn escaped_text_len(value: &str) -> Result<usize, ExportDocumentError> {
             total.checked_add(match character {
                 '&' => 5,
                 '<' | '>' => 4,
+                _ => character.len_utf8(),
+            })
+        })
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)
+}
+
+fn escaped_attribute_len(value: &str) -> Result<usize, ExportDocumentError> {
+    value
+        .chars()
+        .try_fold(0_usize, |total, character| {
+            total.checked_add(match character {
+                '&' => 5,
+                '<' | '>' => 4,
+                '"' => 6,
+                '\'' => 6,
                 _ => character.len_utf8(),
             })
         })
@@ -784,6 +921,7 @@ fn validate_svg(
     let source = std::str::from_utf8(bytes).map_err(|_| ExportDocumentError::InvalidImage {
         destination: destination.into(),
     })?;
+    preflight_xml_nesting(source)?;
     let document = Document::parse(source).map_err(|_| ExportDocumentError::InvalidImage {
         destination: destination.into(),
     })?;
@@ -793,11 +931,7 @@ fn validate_svg(
             destination: destination.into(),
         });
     }
-    let element_count = document.descendants().filter(Node::is_element).count();
-    let attribute_count = document
-        .descendants()
-        .map(|node| node.attributes().len())
-        .sum::<usize>();
+    let (element_count, attribute_count) = validate_svg_tree(root)?;
     if element_count > limits.max_svg_elements || attribute_count > limits.max_svg_attributes {
         return Err(ExportDocumentError::SvgComplexityExceeded {
             destination: destination.into(),
@@ -822,6 +956,108 @@ fn validate_svg(
         mime: "image/svg+xml",
         bytes: sanitized.into_bytes(),
     })
+}
+
+fn preflight_xml_nesting(source: &str) -> Result<(), ExportDocumentError> {
+    let bytes = source.as_bytes();
+    let mut cursor = 0_usize;
+    let mut depth = 0_usize;
+    while cursor < bytes.len() {
+        let Some(relative_open) = bytes[cursor..].iter().position(|byte| *byte == b'<') else {
+            break;
+        };
+        cursor += relative_open;
+        if bytes[cursor..].starts_with(b"<!--") {
+            let Some(end) = source[cursor + 4..].find("-->") else {
+                break;
+            };
+            cursor += 4 + end + 3;
+            continue;
+        }
+        if bytes[cursor..].starts_with(b"<![CDATA[") {
+            let Some(end) = source[cursor + 9..].find("]]>") else {
+                break;
+            };
+            cursor += 9 + end + 3;
+            continue;
+        }
+        if bytes[cursor..].starts_with(b"<?") {
+            let Some(end) = source[cursor + 2..].find("?>") else {
+                break;
+            };
+            cursor += 2 + end + 2;
+            continue;
+        }
+
+        let closing = bytes.get(cursor + 1) == Some(&b'/');
+        let declaration = bytes.get(cursor + 1) == Some(&b'!');
+        let mut scan = cursor + 1;
+        let mut quote = None;
+        let mut last_non_whitespace = None;
+        while let Some(&byte) = bytes.get(scan) {
+            if let Some(expected) = quote {
+                if byte == expected {
+                    quote = None;
+                }
+            } else if matches!(byte, b'\'' | b'"') {
+                quote = Some(byte);
+            } else if byte == b'>' {
+                break;
+            } else if !byte.is_ascii_whitespace() {
+                last_non_whitespace = Some(byte);
+            }
+            scan += 1;
+        }
+        if scan >= bytes.len() {
+            break;
+        }
+        if closing {
+            depth = depth.saturating_sub(1);
+        } else if !declaration && last_non_whitespace != Some(b'/') {
+            depth = depth
+                .checked_add(1)
+                .ok_or(ExportDocumentError::MarkupDepthLimitExceeded)?;
+            if depth > MAX_MARKUP_NESTING_DEPTH {
+                return Err(ExportDocumentError::MarkupDepthLimitExceeded);
+            }
+        }
+        cursor = scan + 1;
+    }
+    Ok(())
+}
+
+fn validate_svg_tree(root: Node<'_, '_>) -> Result<(usize, usize), ExportDocumentError> {
+    let mut stack = vec![(root, 0_usize)];
+    let mut node_count = 0_usize;
+    let mut element_count = 0_usize;
+    let mut attribute_count = 0_usize;
+    while let Some((node, parent_element_depth)) = stack.pop() {
+        node_count = node_count
+            .checked_add(1)
+            .ok_or(ExportDocumentError::MarkupNodeLimitExceeded)?;
+        if node_count > MAX_MARKUP_NODES {
+            return Err(ExportDocumentError::MarkupNodeLimitExceeded);
+        }
+        let element_depth = if node.is_element() {
+            let depth = parent_element_depth
+                .checked_add(1)
+                .ok_or(ExportDocumentError::MarkupDepthLimitExceeded)?;
+            if depth > MAX_MARKUP_NESTING_DEPTH {
+                return Err(ExportDocumentError::MarkupDepthLimitExceeded);
+            }
+            element_count = element_count
+                .checked_add(1)
+                .ok_or(ExportDocumentError::MarkupNodeLimitExceeded)?;
+            attribute_count = attribute_count
+                .checked_add(node.attributes().len())
+                .ok_or(ExportDocumentError::MarkupNodeLimitExceeded)?;
+            depth
+        } else {
+            parent_element_depth
+        };
+        stack.extend(node.children().map(|child| (child, element_depth)));
+    }
+    Ok((element_count, attribute_count))
 }
 
 fn svg_dimensions(root: Node<'_, '_>) -> Option<(u64, u64)> {
@@ -1096,48 +1332,96 @@ fn logical_line(source: &str, start: usize) -> Option<(&str, usize, bool)> {
     }
 }
 
-fn collect_original_image_sources(markdown: &str) -> Vec<Option<String>> {
+fn collect_original_image_sources(
+    markdown: &str,
+) -> Result<Vec<Option<String>>, ExportDocumentError> {
     let mut sources = Vec::new();
     for event in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES) {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => sources.push(Some(dest_url.into_string())),
             Event::Html(fragment) | Event::InlineHtml(fragment) => {
-                let dom = parse_fragment(
-                    RcDom::default(),
-                    Default::default(),
-                    QualName::new(None, ns!(html), local_name!("div")),
-                    vec![],
-                    true,
-                )
-                .one(fragment.as_ref());
+                let dom = parse_checked_html_fragment(fragment.as_ref())?;
                 collect_dom_image_sources(&dom.document, &mut sources);
             }
             _ => {}
         }
     }
-    sources
+    Ok(sources)
 }
 
 fn collect_dom_image_sources(node: &Handle, sources: &mut Vec<Option<String>>) {
-    if let NodeData::Element { name, attrs, .. } = &node.data {
-        if matches!(
-            name.local.as_ref(),
-            "script" | "style" | "template" | "noscript" | "object"
-        ) {
-            return;
+    let mut stack = vec![node.clone()];
+    while let Some(node) = stack.pop() {
+        if let NodeData::Element { name, attrs, .. } = &node.data {
+            if matches!(
+                name.local.as_ref(),
+                "script" | "style" | "template" | "noscript" | "object"
+            ) {
+                continue;
+            }
+            if name.local.as_ref() == "img" {
+                let source = attrs
+                    .borrow()
+                    .iter()
+                    .find(|attribute| attribute.name.local.as_ref() == "src")
+                    .map(|source| source.value.to_string());
+                sources.push(source);
+            }
         }
-        if name.local.as_ref() == "img" {
-            let source = attrs
+        stack.extend(node.children.borrow().iter().rev().cloned());
+    }
+}
+
+fn parse_checked_html_fragment(fragment: &str) -> Result<RcDom, ExportDocumentError> {
+    let dom = parse_fragment(
+        RcDom::default(),
+        Default::default(),
+        QualName::new(None, ns!(html), local_name!("div")),
+        vec![],
+        true,
+    )
+    .one(fragment);
+    validate_html_tree(&dom.document)?;
+    Ok(dom)
+}
+
+fn validate_html_tree(root: &Handle) -> Result<(), ExportDocumentError> {
+    let mut stack = vec![(root.clone(), 0_usize)];
+    let mut node_count = 0_usize;
+    while let Some((node, parent_element_depth)) = stack.pop() {
+        node_count = node_count
+            .checked_add(1)
+            .ok_or(ExportDocumentError::MarkupNodeLimitExceeded)?;
+        if node_count > MAX_MARKUP_NODES {
+            return Err(ExportDocumentError::MarkupNodeLimitExceeded);
+        }
+        let element_depth = if let NodeData::Element { name, .. } = &node.data {
+            // html5ever inserts one synthetic `html` container for fragments. It is not
+            // author-controlled nesting and is excluded from the documented depth limit.
+            if parent_element_depth == 0 && name.local.as_ref() == "html" {
+                0
+            } else {
+                let depth = parent_element_depth
+                    .checked_add(1)
+                    .ok_or(ExportDocumentError::MarkupDepthLimitExceeded)?;
+                if depth > MAX_MARKUP_NESTING_DEPTH {
+                    return Err(ExportDocumentError::MarkupDepthLimitExceeded);
+                }
+                depth
+            }
+        } else {
+            parent_element_depth
+        };
+        stack.extend(
+            node.children
                 .borrow()
                 .iter()
-                .find(|attribute| attribute.name.local.as_ref() == "src")
-                .map(|source| source.value.to_string());
-            sources.push(source);
-        }
+                .rev()
+                .cloned()
+                .map(|child| (child, element_depth)),
+        );
     }
-    for child in node.children.borrow().iter() {
-        collect_dom_image_sources(child, sources);
-    }
+    Ok(())
 }
 
 struct HtmlPolicy<'a> {
@@ -1158,14 +1442,7 @@ fn sanitize_html(
     limits: ExportDocumentLimits,
     combined_pixels: &mut u64,
 ) -> Result<SanitizedHtml, ExportDocumentError> {
-    let dom = parse_fragment(
-        RcDom::default(),
-        Default::default(),
-        QualName::new(None, ns!(html), local_name!("div")),
-        vec![],
-        true,
-    )
-    .one(rendered);
+    let dom = parse_checked_html_fragment(rendered)?;
     let mut author_ids = HashSet::new();
     collect_author_ids(&dom.document, policy.footnote_marker, &mut author_ids);
     let footnote_namespace = choose_footnote_namespace(&author_ids);
@@ -1191,19 +1468,20 @@ fn sanitize_html(
 }
 
 fn collect_author_ids(node: &Handle, footnote_marker: &str, ids: &mut HashSet<String>) {
-    if let NodeData::Element { attrs, .. } = &node.data {
-        let attrs = attrs.borrow();
-        if generated_footnote_marker(&attrs, footnote_marker).is_none() {
-            if let Some(id) = attrs
-                .iter()
-                .find(|attribute| attribute.name.local.as_ref() == "id")
-            {
-                ids.insert(id.value.to_string());
+    let mut stack = vec![node.clone()];
+    while let Some(node) = stack.pop() {
+        if let NodeData::Element { attrs, .. } = &node.data {
+            let attrs = attrs.borrow();
+            if generated_footnote_marker(&attrs, footnote_marker).is_none() {
+                if let Some(id) = attrs
+                    .iter()
+                    .find(|attribute| attribute.name.local.as_ref() == "id")
+                {
+                    ids.insert(id.value.to_string());
+                }
             }
         }
-    }
-    for child in node.children.borrow().iter() {
-        collect_author_ids(child, footnote_marker, ids);
+        stack.extend(node.children.borrow().iter().rev().cloned());
     }
 }
 
@@ -1927,6 +2205,7 @@ fn prepare_footnotes_with_nonce_source(
     markdown: &str,
     mut nonce_source: impl FnMut() -> String,
 ) -> Result<PreparedFootnotes, ExportDocumentError> {
+    validate_author_html(markdown)?;
     let marker_token = reserve_footnote_marker(markdown, &mut nonce_source)?;
     let mut definitions = HashMap::<String, (Range<usize>, String)>::new();
     let mut references = Vec::<(String, Range<usize>)>::new();
@@ -2009,7 +2288,7 @@ fn reserve_footnote_marker(
     nonce_source: &mut impl FnMut() -> String,
 ) -> Result<String, ExportDocumentError> {
     const MAX_ATTEMPTS: usize = 8;
-    let forbidden = author_html_attribute_values(markdown);
+    let forbidden = author_html_attribute_values(markdown)?;
     for _ in 0..MAX_ATTEMPTS {
         let nonce = nonce_source();
         if !nonce.is_empty()
@@ -2025,35 +2304,38 @@ fn reserve_footnote_marker(
     Err(ExportDocumentError::FootnoteMarkerUnavailable)
 }
 
-fn author_html_attribute_values(markdown: &str) -> HashSet<String> {
+fn validate_author_html(markdown: &str) -> Result<(), ExportDocumentError> {
+    for event in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES) {
+        if let Event::Html(fragment) | Event::InlineHtml(fragment) = event {
+            parse_checked_html_fragment(fragment.as_ref())?;
+        }
+    }
+    Ok(())
+}
+
+fn author_html_attribute_values(markdown: &str) -> Result<HashSet<String>, ExportDocumentError> {
     let mut values = HashSet::new();
     for event in Parser::new_ext(markdown, Options::ENABLE_FOOTNOTES) {
         if let Event::Html(fragment) | Event::InlineHtml(fragment) = event {
-            let dom = parse_fragment(
-                RcDom::default(),
-                Default::default(),
-                QualName::new(None, ns!(html), local_name!("div")),
-                vec![],
-                true,
-            )
-            .one(fragment.as_ref());
+            let dom = parse_checked_html_fragment(fragment.as_ref())?;
             collect_dom_attribute_values(&dom.document, &mut values);
         }
     }
-    values
+    Ok(values)
 }
 
 fn collect_dom_attribute_values(node: &Handle, values: &mut HashSet<String>) {
-    if let NodeData::Element { attrs, .. } = &node.data {
-        values.extend(
-            attrs
-                .borrow()
-                .iter()
-                .map(|attribute| attribute.value.to_string()),
-        );
-    }
-    for child in node.children.borrow().iter() {
-        collect_dom_attribute_values(child, values);
+    let mut stack = vec![node.clone()];
+    while let Some(node) = stack.pop() {
+        if let NodeData::Element { attrs, .. } = &node.data {
+            values.extend(
+                attrs
+                    .borrow()
+                    .iter()
+                    .map(|attribute| attribute.value.to_string()),
+            );
+        }
+        stack.extend(node.children.borrow().iter().rev().cloned());
     }
 }
 
@@ -2184,6 +2466,84 @@ mod tests {
         assert!(matches!(
             preflight_generated_html(&prepared, "title", ExportDocumentLimits::default()),
             Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn renderer_preflight_is_an_upper_bound_for_payload_heavy_markdown() {
+        let ampersands = "&".repeat(16_384);
+        let corpus = [
+            format!("[label](https://example.test/{ampersands} \"{ampersands}\")"),
+            format!("![alt](image.png \"{ampersands}\")"),
+            format!("# heading {{#identifier .class key=\"{ampersands}\"}}"),
+            format!("raw <span title=\"{ampersands}\">&</span> and `#fff`"),
+            format!("---\nkey: {ampersands}\n---\nbody"),
+        ];
+
+        for markdown in corpus {
+            let estimate = estimate_renderer_html(&markdown).unwrap();
+            let rendered = render_with_existing_contract(&markdown);
+            assert!(
+                estimate >= rendered.len(),
+                "estimate {estimate} was smaller than rendered {} bytes for corpus entry",
+                rendered.len()
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_preflight_rejects_repeated_inline_color_chip_expansion() {
+        let markdown = "`#fff` ".repeat(10_000);
+        let rendered = render_with_existing_contract(&markdown);
+        assert!(rendered.len() > DEFAULT_MAX_GENERATED_HTML_BYTES);
+        let prepared = prepare_footnotes(&markdown).unwrap();
+
+        assert!(matches!(
+            preflight_generated_html(&prepared, "title", ExportDocumentLimits::default()),
+            Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn renderer_preflight_rejects_sub_two_mib_ampersand_link_title() {
+        let markdown = format!("[label](destination \"{}\")", "&".repeat(1_700_000));
+        assert!(markdown.len() < 2 * 1024 * 1024);
+        let prepared = prepare_footnotes(&markdown).unwrap();
+
+        assert!(matches!(
+            preflight_generated_html(&prepared, "title", ExportDocumentLimits::default()),
+            Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn deeply_nested_author_html_is_rejected_before_recursive_processing() {
+        let boundary = format!("{}content{}", "<div>".repeat(128), "</div>".repeat(128));
+        let markdown = format!("{}content{}", "<div>".repeat(256), "</div>".repeat(256));
+
+        assert!(prepare_footnotes(&boundary).is_ok());
+        assert!(matches!(
+            prepare_footnotes(&markdown),
+            Err(ExportDocumentError::MarkupDepthLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn parsed_markup_node_count_is_bounded_by_iterative_validation() {
+        let source = "<i></i>".repeat(MAX_MARKUP_NODES + 1);
+        assert!(source.len() < 2 * 1024 * 1024);
+        let dom = parse_fragment(
+            RcDom::default(),
+            Default::default(),
+            QualName::new(None, ns!(html), local_name!("div")),
+            vec![],
+            true,
+        )
+        .one(source);
+
+        assert!(matches!(
+            validate_html_tree(&dom.document),
+            Err(ExportDocumentError::MarkupNodeLimitExceeded)
         ));
     }
 
