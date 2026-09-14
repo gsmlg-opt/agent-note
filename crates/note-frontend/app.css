@@ -888,6 +888,30 @@ a.dashboard-metric-detail:hover {
     font-size: 0.9rem;
 }
 
+.note-export-feedback {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin: -0.25rem 0 0.9rem;
+    padding: 0.65rem 0.75rem;
+    border-left: 3px solid var(--color-outline, #79747e);
+    border-radius: 0.35rem;
+    background: var(--color-surface-variant, #e7e0ec);
+    color: var(--color-on-surface-variant, #49454f);
+    font-size: 0.9rem;
+}
+
+.note-export-feedback-error {
+    border-left-color: var(--color-error, #ba1a1a);
+    color: var(--color-on-error-container, #410002);
+    background: var(--color-error-container, #ffdad6);
+}
+
+.note-export-feedback .btn {
+    flex: none;
+}
+
 @media (max-width: 620px) {
     .note-edit-export-actions {
         width: 100%;
@@ -901,6 +925,11 @@ a.dashboard-metric-detail:hover {
 
     .note-export-menu-panel {
         max-width: min(15rem, calc(100vw - 2rem));
+    }
+
+    .note-export-feedback {
+        align-items: flex-start;
+        flex-direction: column;
     }
 }
 
