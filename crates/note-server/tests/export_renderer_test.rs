@@ -96,6 +96,63 @@ async fn renderer_posts_once_to_the_fixed_html_conversion_endpoint() {
 }
 
 #[tokio::test]
+async fn renderer_sends_only_packaged_files_and_fixed_conversion_fields() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/forms/chromium/convert/html"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/pdf")
+                .set_body_bytes(b"%PDF-1.7\nfixture"),
+        )
+        .mount(&server)
+        .await;
+
+    GotenbergRenderer::new(&server.uri(), 1024)
+        .unwrap()
+        .render(&package(), Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&requests[0].body);
+    let dispositions = body
+        .lines()
+        .filter(|line| line.starts_with("Content-Disposition:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        dispositions,
+        vec![
+            "Content-Disposition: form-data; name=\"files\"; filename=\"index.html\"",
+            "Content-Disposition: form-data; name=\"files\"; filename=\"footer.html\"",
+            "Content-Disposition: form-data; name=\"files\"; filename=\"asset-0001.png\"",
+            "Content-Disposition: form-data; name=\"preferCssPageSize\"",
+            "Content-Disposition: form-data; name=\"printBackground\"",
+            "Content-Disposition: form-data; name=\"skipNetworkIdleEvent\"",
+            "Content-Disposition: form-data; name=\"failOnResourceLoadingFailed\"",
+        ]
+    );
+    for (field, value) in [
+        ("preferCssPageSize", "true"),
+        ("printBackground", "true"),
+        ("skipNetworkIdleEvent", "false"),
+        ("failOnResourceLoadingFailed", "true"),
+    ] {
+        assert!(body.contains(&format!("name=\"{field}\"\r\n\r\n{value}\r\n")));
+    }
+    for forbidden in [
+        "waitDelay",
+        "waitForExpression",
+        "webhookUrl",
+        "webhookErrorUrl",
+        "downloadFrom",
+        "cookies",
+    ] {
+        assert!(!body.contains(forbidden));
+    }
+}
+
+#[tokio::test]
 async fn renderer_rejects_non_pdf_and_suppresses_diagnostic_body() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

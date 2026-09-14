@@ -1,0 +1,8 @@
+services:
+  gotenberg:
+    ports:
+      - 127.0.0.1:${GOTENBERG_VALIDATION_PORT:-33000}:3000
+
+networks:
+  pdf-export:
+    internal: false

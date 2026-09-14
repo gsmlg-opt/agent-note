@@ -14,6 +14,12 @@ const MAX_MULTIPART_FILENAME_BYTES: usize = 180;
 const MAX_MULTIPART_MIME_BYTES: usize = 128;
 const MAX_MULTIPART_BOUNDARY_BYTES: usize = 128;
 const MULTIPART_FIELD_NAME: &str = "files";
+const CONVERSION_FIELDS: [(&str, &str); 4] = [
+    ("preferCssPageSize", "true"),
+    ("printBackground", "true"),
+    ("skipNetworkIdleEvent", "false"),
+    ("failOnResourceLoadingFailed", "true"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PdfRendererError {
@@ -187,6 +193,9 @@ impl GotenbergRenderer {
                     .map_err(|_| PdfRendererError::InvalidPackage)?,
             );
         }
+        for (field, value) in CONVERSION_FIELDS {
+            form = form.text(field, value);
+        }
         let response = self
             .client
             .post(self.endpoint.clone())
@@ -321,8 +330,45 @@ fn multipart_body_bytes(
             )?)
             .ok_or(PdfRendererError::PackageLimitExceeded)?;
     }
+    for (field, value) in CONVERSION_FIELDS {
+        bytes = bytes
+            .checked_add(multipart_text_part_bytes(boundary_len, field, value.len())?)
+            .ok_or(PdfRendererError::PackageLimitExceeded)?;
+    }
     bytes
-        .checked_add(2 + boundary_len + 4) // --boundary--\r\n
+        .checked_add(closing_boundary_bytes(boundary_len)?)
+        .ok_or(PdfRendererError::PackageLimitExceeded)
+}
+
+fn opening_boundary_bytes(boundary_len: usize) -> Result<usize, PdfRendererError> {
+    2_usize
+        .checked_add(boundary_len)
+        .and_then(|size| size.checked_add(2)) // --boundary\r\n
+        .ok_or(PdfRendererError::PackageLimitExceeded)
+}
+
+fn closing_boundary_bytes(boundary_len: usize) -> Result<usize, PdfRendererError> {
+    2_usize
+        .checked_add(boundary_len)
+        .and_then(|size| size.checked_add(4)) // --boundary--\r\n
+        .ok_or(PdfRendererError::PackageLimitExceeded)
+}
+
+fn multipart_text_part_bytes(
+    boundary_len: usize,
+    field_name: &str,
+    payload_len: usize,
+) -> Result<usize, PdfRendererError> {
+    let header_len = b"Content-Disposition: form-data; name=\""
+        .len()
+        .checked_add(field_name.len())
+        .and_then(|size| size.checked_add(b"\"\r\n".len()))
+        .ok_or(PdfRendererError::PackageLimitExceeded)?;
+    opening_boundary_bytes(boundary_len)?
+        .checked_add(header_len)
+        .and_then(|size| size.checked_add(2)) // blank \r\n
+        .and_then(|size| size.checked_add(payload_len))
+        .and_then(|size| size.checked_add(2)) // trailing \r\n
         .ok_or(PdfRendererError::PackageLimitExceeded)
 }
 
@@ -341,7 +387,7 @@ fn multipart_part_bytes(
         .and_then(|size| size.checked_add(b"\"\r\nContent-Type: ".len()))
         .and_then(|size| size.checked_add(mime.len()))
         .ok_or(PdfRendererError::PackageLimitExceeded)?;
-    (2 + boundary_len + 2) // --boundary\r\n
+    opening_boundary_bytes(boundary_len)?
         .checked_add(header_len)
         .and_then(|size| size.checked_add(4)) // \r\n\r\n
         .and_then(|size| size.checked_add(payload_len))
@@ -377,6 +423,19 @@ pub fn max_renderer_package_bytes(
         &"i".repeat(MAX_MULTIPART_MIME_BYTES),
         0,
     )?;
+    let fixed = CONVERSION_FIELDS.iter().try_fold(
+        fixed,
+        |size, (field, value)| -> Result<usize, PdfRendererError> {
+            size.checked_add(multipart_text_part_bytes(
+                MAX_MULTIPART_BOUNDARY_BYTES,
+                field,
+                value.len(),
+            )?)
+            .ok_or(PdfRendererError::InvalidConfiguration)
+        },
+    )?;
+    let closing = closing_boundary_bytes(MAX_MULTIPART_BOUNDARY_BYTES)
+        .map_err(|_| PdfRendererError::InvalidConfiguration)?;
     fixed
         .checked_add(
             per_asset_overhead
@@ -384,7 +443,7 @@ pub fn max_renderer_package_bytes(
                 .ok_or(PdfRendererError::InvalidConfiguration)?,
         )
         .and_then(|size| size.checked_add(max_combined_asset_bytes))
-        .and_then(|size| size.checked_add(2 + MAX_MULTIPART_BOUNDARY_BYTES + 4))
+        .and_then(|size| size.checked_add(closing))
         .ok_or(PdfRendererError::InvalidConfiguration)
 }
 
@@ -427,9 +486,33 @@ mod tests {
             "Content-Disposition: form-data; name=\"files\"; filename=\"a.png\"\r\n",
             "Content-Type: image/png\r\n\r\n",
             "\x07\r\n",
+            "--1234567\r\n",
+            "Content-Disposition: form-data; name=\"preferCssPageSize\"\r\n\r\n",
+            "true\r\n",
+            "--1234567\r\n",
+            "Content-Disposition: form-data; name=\"printBackground\"\r\n\r\n",
+            "true\r\n",
+            "--1234567\r\n",
+            "Content-Disposition: form-data; name=\"skipNetworkIdleEvent\"\r\n\r\n",
+            "false\r\n",
+            "--1234567\r\n",
+            "Content-Disposition: form-data; name=\"failOnResourceLoadingFailed\"\r\n\r\n",
+            "true\r\n",
             "--1234567--\r\n"
         );
 
         assert_eq!(multipart_body_bytes(&package, 7).unwrap(), expected.len());
+    }
+
+    #[test]
+    fn multipart_framing_accounting_rejects_arithmetic_overflow() {
+        assert_eq!(
+            multipart_part_bytes(usize::MAX, "a.png", "image/png", 1),
+            Err(PdfRendererError::PackageLimitExceeded)
+        );
+        assert_eq!(
+            multipart_text_part_bytes(usize::MAX, "printBackground", 4),
+            Err(PdfRendererError::PackageLimitExceeded)
+        );
     }
 }
