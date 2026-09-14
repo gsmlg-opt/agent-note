@@ -44,6 +44,7 @@ async fn qualifies_a_real_renderer_and_writes_review_artifacts() {
         "all fixture image kinds must be packaged"
     );
     assert!(package.index_html.contains("dm-mermaid-chart"));
+    assert!(!package.index_html.contains("Unsafe content removed"));
     assert!(!package.index_html.contains("https://"));
     assert!(!package.index_html.contains("http://"));
 
@@ -246,7 +247,7 @@ flowchart LR
 ## Details
 
 | Sequence | Chinese | Japanese |
-| ---: | --- | --- |
+| --- | --- | --- |
 {table}
 
 [^quality]: Qualification footnote text with a backlink.
