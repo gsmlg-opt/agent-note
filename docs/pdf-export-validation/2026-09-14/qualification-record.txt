@@ -1,6 +1,6 @@
 Agent Note PDF release qualification
-date_utc=2026-09-14T05:37:38Z
-functional_commit=30062db16123797fa64be9d30897d2166cafecc3
+date_utc=2026-09-14T05:47:16Z
+functional_commit=0ce48b8714d471aac65c69c36fd06aaf8a90a572
 renderer_image=gotenberg/gotenberg:8.37.0-chromium@sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c
 renderer_manifest_digest=sha256:0d28ae9a96441588ef739623726bd500ad0720b77266c6f1351a13e333fbd61c
 renderer_image_id=sha256:3db63074ad73de5b1daa9b0e174f9b073b905a06ade9c7e0025763b052bf1c9d
