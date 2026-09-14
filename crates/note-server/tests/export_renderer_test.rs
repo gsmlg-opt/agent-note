@@ -1,5 +1,7 @@
 use note_server::export::document::{ExportDocumentPackage, PackagedExportAsset};
-use note_server::export::renderer::{GotenbergRenderer, PdfRenderer, PdfRendererError};
+use note_server::export::renderer::{
+    max_renderer_package_bytes, GotenbergRenderer, PdfRenderer, PdfRendererError,
+};
 use std::convert::Infallible;
 use std::time::Duration;
 use wiremock::matchers::{method, path};
@@ -15,6 +17,53 @@ fn package() -> ExportDocumentPackage {
             bytes: vec![1, 2, 3],
         }],
     }
+}
+
+#[test]
+fn renderer_package_budget_keeps_asset_and_html_limits_independent() {
+    let max_html = 32;
+    let max_footer = 16;
+    let max_assets = 48;
+    let max_package = max_renderer_package_bytes(max_html, max_footer, max_assets, 2).unwrap();
+    let package = ExportDocumentPackage {
+        index_html: "h".repeat(max_html),
+        footer_html: "f".repeat(max_footer),
+        assets: vec![
+            PackagedExportAsset {
+                filename: "a".repeat(180),
+                mime: format!("image/{}", "a".repeat(122)),
+                bytes: vec![1; 24],
+            },
+            PackagedExportAsset {
+                filename: "b".repeat(180),
+                mime: format!("image/{}", "b".repeat(122)),
+                bytes: vec![2; 24],
+            },
+        ],
+    };
+
+    assert!(GotenbergRenderer::validate_package(&package, max_package).is_ok());
+    assert_eq!(
+        GotenbergRenderer::validate_package(&package, max_package - 1),
+        Err(PdfRendererError::PackageLimitExceeded)
+    );
+}
+
+#[test]
+fn renderer_rejects_oversized_multipart_metadata_before_submission() {
+    let mut oversized_filename = package();
+    oversized_filename.assets[0].filename = format!("{}.png", "a".repeat(512));
+    assert_eq!(
+        GotenbergRenderer::validate_package(&oversized_filename, usize::MAX),
+        Err(PdfRendererError::PackageLimitExceeded)
+    );
+
+    let mut oversized_mime = package();
+    oversized_mime.assets[0].mime = format!("image/png; x={}", "a".repeat(512));
+    assert_eq!(
+        GotenbergRenderer::validate_package(&oversized_mime, usize::MAX),
+        Err(PdfRendererError::PackageLimitExceeded)
+    );
 }
 
 #[tokio::test]

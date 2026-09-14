@@ -188,8 +188,9 @@ async fn pdf_export_handler(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ExportApiError::busy())?;
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(runtime.config.total_deadline_secs);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(runtime.config.total_deadline_secs))
+        .ok_or_else(ExportApiError::timeout)?;
     execute_export(state, runtime, permit, note_id, expected_revision, deadline).await
 }
 
@@ -535,5 +536,12 @@ mod tests {
     fn header_fallback_is_ascii_and_cannot_inject_fields() {
         assert_eq!(ascii_filename_fallback("会議 notes.pdf", "n1"), "notes.pdf");
         assert_eq!(ascii_filename_fallback("\r\n\"\\.pdf", "n1"), "note-n1.pdf");
+    }
+
+    #[test]
+    fn deadline_overflow_is_a_typed_timeout_instead_of_a_panic() {
+        assert!(tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(u64::MAX))
+            .is_none());
     }
 }

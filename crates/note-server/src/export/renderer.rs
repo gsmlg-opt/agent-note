@@ -8,6 +8,12 @@ use std::time::Duration;
 
 const CONVERT_PATH: &str = "forms/chromium/convert/html";
 const DEFAULT_MAX_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_INDEX_HTML_BYTES: usize = 8 * 1024 * 1024;
+const MAX_FOOTER_HTML_BYTES: usize = 1024;
+const MAX_MULTIPART_FILENAME_BYTES: usize = 180;
+const MAX_MULTIPART_MIME_BYTES: usize = 128;
+const MAX_MULTIPART_BOUNDARY_BYTES: usize = 128;
+const MULTIPART_FIELD_NAME: &str = "files";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PdfRendererError {
@@ -96,6 +102,20 @@ impl GotenbergRenderer {
         })
     }
 
+    /// Returns the renderer request cap needed for independently valid document and asset
+    /// limits. The reserve covers multipart boundaries and validated per-part metadata.
+    pub fn max_package_bytes_for_export(
+        max_combined_asset_bytes: usize,
+        max_asset_count: usize,
+    ) -> Result<usize, PdfRendererError> {
+        max_renderer_package_bytes(
+            MAX_INDEX_HTML_BYTES,
+            MAX_FOOTER_HTML_BYTES,
+            max_combined_asset_bytes,
+            max_asset_count,
+        )
+    }
+
     pub fn validate_package(
         package: &ExportDocumentPackage,
         max_bytes: usize,
@@ -103,7 +123,7 @@ impl GotenbergRenderer {
         if max_bytes == 0 {
             return Err(PdfRendererError::InvalidPackage);
         }
-        let mut total = package
+        let mut payload_bytes = package
             .index_html
             .len()
             .checked_add(package.footer_html.len())
@@ -113,20 +133,28 @@ impl GotenbergRenderer {
         }
         let mut filenames = HashSet::with_capacity(package.assets.len());
         for asset in &package.assets {
+            if asset.filename.len() > MAX_MULTIPART_FILENAME_BYTES
+                || asset.mime.len() > MAX_MULTIPART_MIME_BYTES
+            {
+                return Err(PdfRendererError::PackageLimitExceeded);
+            }
             if !is_flat_asset_name(&asset.filename)
                 || !filenames.insert(asset.filename.as_str())
                 || !asset.mime.starts_with("image/")
+                || !is_safe_multipart_metadata(&asset.filename, MAX_MULTIPART_FILENAME_BYTES)
+                || !is_safe_multipart_metadata(&asset.mime, MAX_MULTIPART_MIME_BYTES)
             {
                 return Err(PdfRendererError::InvalidPackage);
             }
-            total = total
+            payload_bytes = payload_bytes
                 .checked_add(asset.bytes.len())
                 .ok_or(PdfRendererError::PackageLimitExceeded)?;
         }
-        if total > max_bytes {
+        let multipart_bytes = multipart_body_bytes(package, MAX_MULTIPART_BOUNDARY_BYTES)?;
+        if payload_bytes > max_bytes || multipart_bytes > max_bytes {
             return Err(PdfRendererError::PackageLimitExceeded);
         }
-        Ok(total)
+        Ok(multipart_bytes)
     }
 
     async fn render_inner(
@@ -254,9 +282,116 @@ fn is_flat_asset_name(name: &str) -> bool {
         && !name.chars().any(char::is_control)
 }
 
+fn is_safe_multipart_metadata(value: &str, max_bytes: usize) -> bool {
+    value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| (0x20..=0x7e).contains(&byte) && !matches!(byte, b'"' | b'\\'))
+}
+
+/// Calculates the exact size emitted by reqwest's default multipart layout for a supplied
+/// boundary length. Callers use the maximum supported boundary length as a conservative bound.
+fn multipart_body_bytes(
+    package: &ExportDocumentPackage,
+    boundary_len: usize,
+) -> Result<usize, PdfRendererError> {
+    if boundary_len > MAX_MULTIPART_BOUNDARY_BYTES {
+        return Err(PdfRendererError::PackageLimitExceeded);
+    }
+    let mut bytes = multipart_part_bytes(
+        boundary_len,
+        "index.html",
+        "text/html; charset=utf-8",
+        package.index_html.len(),
+    )?
+    .checked_add(multipart_part_bytes(
+        boundary_len,
+        "footer.html",
+        "text/html; charset=utf-8",
+        package.footer_html.len(),
+    )?)
+    .ok_or(PdfRendererError::PackageLimitExceeded)?;
+    for asset in &package.assets {
+        bytes = bytes
+            .checked_add(multipart_part_bytes(
+                boundary_len,
+                &asset.filename,
+                &asset.mime,
+                asset.bytes.len(),
+            )?)
+            .ok_or(PdfRendererError::PackageLimitExceeded)?;
+    }
+    bytes
+        .checked_add(2 + boundary_len + 4) // --boundary--\r\n
+        .ok_or(PdfRendererError::PackageLimitExceeded)
+}
+
+fn multipart_part_bytes(
+    boundary_len: usize,
+    filename: &str,
+    mime: &str,
+    payload_len: usize,
+) -> Result<usize, PdfRendererError> {
+    // reqwest's default PathSegment encoder leaves the constant field name `files` unchanged.
+    let header_len = b"Content-Disposition: form-data; name=\""
+        .len()
+        .checked_add(MULTIPART_FIELD_NAME.len())
+        .and_then(|size| size.checked_add(b"\"; filename=\"".len()))
+        .and_then(|size| size.checked_add(filename.len()))
+        .and_then(|size| size.checked_add(b"\"\r\nContent-Type: ".len()))
+        .and_then(|size| size.checked_add(mime.len()))
+        .ok_or(PdfRendererError::PackageLimitExceeded)?;
+    (2 + boundary_len + 2) // --boundary\r\n
+        .checked_add(header_len)
+        .and_then(|size| size.checked_add(4)) // \r\n\r\n
+        .and_then(|size| size.checked_add(payload_len))
+        .and_then(|size| size.checked_add(2)) // trailing \r\n
+        .ok_or(PdfRendererError::PackageLimitExceeded)
+}
+
+pub fn max_renderer_package_bytes(
+    max_index_html_bytes: usize,
+    max_footer_html_bytes: usize,
+    max_combined_asset_bytes: usize,
+    max_asset_count: usize,
+) -> Result<usize, PdfRendererError> {
+    if max_asset_count > 64 {
+        return Err(PdfRendererError::InvalidConfiguration);
+    }
+    let fixed = multipart_part_bytes(
+        MAX_MULTIPART_BOUNDARY_BYTES,
+        "index.html",
+        "text/html; charset=utf-8",
+        max_index_html_bytes,
+    )?
+    .checked_add(multipart_part_bytes(
+        MAX_MULTIPART_BOUNDARY_BYTES,
+        "footer.html",
+        "text/html; charset=utf-8",
+        max_footer_html_bytes,
+    )?)
+    .ok_or(PdfRendererError::InvalidConfiguration)?;
+    let per_asset_overhead = multipart_part_bytes(
+        MAX_MULTIPART_BOUNDARY_BYTES,
+        &"a".repeat(MAX_MULTIPART_FILENAME_BYTES),
+        &"i".repeat(MAX_MULTIPART_MIME_BYTES),
+        0,
+    )?;
+    fixed
+        .checked_add(
+            per_asset_overhead
+                .checked_mul(max_asset_count)
+                .ok_or(PdfRendererError::InvalidConfiguration)?,
+        )
+        .and_then(|size| size.checked_add(max_combined_asset_bytes))
+        .and_then(|size| size.checked_add(2 + MAX_MULTIPART_BOUNDARY_BYTES + 4))
+        .ok_or(PdfRendererError::InvalidConfiguration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export::document::PackagedExportAsset;
 
     #[test]
     fn bounded_append_never_grows_output_beyond_limit_plus_one() {
@@ -265,5 +400,36 @@ mod tests {
         assert_eq!(error, PdfRendererError::ResponseLimitExceeded);
         assert_eq!(output.len(), 33);
         assert!(output.capacity() <= 33);
+    }
+
+    #[test]
+    fn multipart_preflight_counts_the_exact_boundary_and_headers() {
+        let package = ExportDocumentPackage {
+            index_html: "i".into(),
+            footer_html: "f".into(),
+            assets: vec![PackagedExportAsset {
+                filename: "a.png".into(),
+                mime: "image/png".into(),
+                bytes: vec![7],
+            }],
+        };
+
+        let expected = concat!(
+            "--1234567\r\n",
+            "Content-Disposition: form-data; name=\"files\"; filename=\"index.html\"\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "i\r\n",
+            "--1234567\r\n",
+            "Content-Disposition: form-data; name=\"files\"; filename=\"footer.html\"\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "f\r\n",
+            "--1234567\r\n",
+            "Content-Disposition: form-data; name=\"files\"; filename=\"a.png\"\r\n",
+            "Content-Type: image/png\r\n\r\n",
+            "\x07\r\n",
+            "--1234567--\r\n"
+        );
+
+        assert_eq!(multipart_body_bytes(&package, 7).unwrap(), expected.len());
     }
 }

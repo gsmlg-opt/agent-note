@@ -8,6 +8,9 @@ const DEFAULT_DATABASE_PATH: &str = "notes.db";
 const DEFAULT_ATTACHMENTS_PATH: &str = "attachments";
 const DEFAULT_EMBEDDING_MODEL: &str = "bge-m3";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:6222";
+/// A finite configured deadline keeps conversion cancellation bounded and is safely representable
+/// by Tokio's monotonic clock on supported platforms.
+const MAX_PDF_EXPORT_TOTAL_DEADLINE_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_DEV_CONFIG: &str = r#"[server]
 bind_addr = "0.0.0.0:6222"
 
@@ -378,6 +381,7 @@ fn resolve_pdf_export(file: FilePdfExportConfig) -> anyhow::Result<PdfExportConf
         anyhow::bail!("config field export.pdf.renderer_url is invalid");
     }
     let valid = config.total_deadline_secs > 0
+        && config.total_deadline_secs <= MAX_PDF_EXPORT_TOTAL_DEADLINE_SECS
         && config.renderer_timeout_secs > 0
         && config.renderer_timeout_secs <= 30
         && config.renderer_timeout_secs <= config.total_deadline_secs
@@ -1821,6 +1825,37 @@ max_pdf_bytes = 8192
         assert!(
             rendered.contains("unknown field `browser_option`"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn enabled_pdf_export_rejects_deadlines_that_cannot_be_safely_added_to_an_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "overflow.toml",
+            "[export.pdf]\nenabled = true\nrenderer_url = \"http://renderer:3000\"\ntotal_deadline_secs = 18446744073709551615\nrenderer_timeout_secs = 30\n",
+        );
+
+        assert!(resolve_explicit(dir.path(), "overflow.toml").is_err());
+    }
+
+    #[test]
+    fn enabled_pdf_export_accepts_the_largest_safe_total_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            "boundary.toml",
+            &format!(
+                "[export.pdf]\nenabled = true\nrenderer_url = \"http://renderer:3000\"\ntotal_deadline_secs = {MAX_PDF_EXPORT_TOTAL_DEADLINE_SECS}\nrenderer_timeout_secs = 30\n"
+            ),
+        );
+
+        let config = resolve_explicit(dir.path(), "boundary.toml").unwrap();
+
+        assert_eq!(
+            config.pdf_export.total_deadline_secs,
+            MAX_PDF_EXPORT_TOTAL_DEADLINE_SECS
         );
     }
 

@@ -601,7 +601,11 @@ async fn main() -> anyhow::Result<()> {
             let renderer = note_server::export::renderer::GotenbergRenderer::with_limits(
                 renderer_url,
                 config.pdf_export.max_pdf_bytes,
-                config.pdf_export.max_combined_asset_bytes as usize,
+                note_server::export::renderer::GotenbergRenderer::max_package_bytes_for_export(
+                    config.pdf_export.max_combined_asset_bytes as usize,
+                    config.pdf_export.max_asset_count,
+                )
+                .map_err(|_| anyhow::anyhow!("PDF renderer configuration is invalid"))?,
             )
             .map_err(|_| anyhow::anyhow!("PDF renderer configuration is invalid"))?;
             app_state = app_state.with_pdf_export(config.pdf_export.clone(), Arc::new(renderer));
