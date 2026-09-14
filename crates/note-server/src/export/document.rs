@@ -541,10 +541,7 @@ fn estimate_start_tag(tag: &Tag<'_>) -> Result<usize, ExportDocumentError> {
             id,
             ..
         } => checked_add_html(
-            checked_add_html(
-                escaped_attribute_len(dest_url)?,
-                escaped_attribute_len(title)?,
-            )?,
+            checked_add_html(escaped_href_len(dest_url)?, escaped_attribute_len(title)?)?,
             escaped_attribute_len(id)?,
         )?,
     };
@@ -634,6 +631,29 @@ fn escaped_attribute_len(value: &str) -> Result<usize, ExportDocumentError> {
             })
         })
         .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)
+}
+
+/// Mirrors pulldown-cmark 0.13's `escape_href` byte-level encoding.
+fn escaped_href_len(value: &str) -> Result<usize, ExportDocumentError> {
+    value
+        .bytes()
+        .try_fold(0_usize, |total, byte| {
+            let escaped = match byte {
+                b'&' => 5,
+                b'\'' => 6,
+                byte if byte < 0x80 && href_byte_is_safe(byte) => 1,
+                _ => 3,
+            };
+            total.checked_add(escaped)
+        })
+        .ok_or(ExportDocumentError::GeneratedHtmlLimitExceeded)
+}
+
+fn href_byte_is_safe(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'..=b'%' | b'('..=b';' | b'=' | b'?'..=b'Z' | b'^' | b'_' | b'a'..=b'z' | b'~'
+    )
 }
 
 fn highlighted_code_bound(bytes: usize, lines: usize) -> Result<usize, ExportDocumentError> {
@@ -2489,6 +2509,79 @@ mod tests {
                 rendered.len()
             );
         }
+    }
+
+    #[test]
+    fn renderer_preflight_accounts_for_percent_encoded_link_and_image_destinations() {
+        let destination = format!("https://example.test/{}", "日".repeat(1_024));
+        let title = "<&\"'".repeat(256);
+
+        for markdown in [
+            format!("[label](<{destination}> \"{title}\")"),
+            format!("![alt](<{destination}> \"{title}\")"),
+        ] {
+            let estimate = estimate_renderer_html(&markdown).unwrap();
+            let rendered = render_with_existing_contract(&markdown);
+            assert!(
+                estimate >= rendered.len(),
+                "estimate {estimate} was smaller than rendered {} bytes for {markdown:?}",
+                rendered.len()
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_href_len_matches_pulldown_for_ascii_and_unicode_bytes() {
+        let mut destinations = (0_u8..=127)
+            .map(|byte| String::from_utf8(vec![byte]).unwrap())
+            .collect::<Vec<_>>();
+        destinations.extend([
+            "日".to_owned(),
+            "é".to_owned(),
+            "💾".to_owned(),
+            "https://example.test/日?x=é&y='".to_owned(),
+        ]);
+
+        for destination in destinations {
+            let rendered = render_pulldown_link(&destination);
+            let href = rendered
+                .strip_prefix("<a href=\"")
+                .and_then(|value| value.split_once('\"'))
+                .map(|(href, _)| href)
+                .expect("pulldown link href");
+            assert_eq!(escaped_href_len(&destination).unwrap(), href.len());
+        }
+    }
+
+    #[test]
+    fn renderer_preflight_rejects_percent_encoded_unicode_destination_before_rendering() {
+        let destination = format!("https://example.test/{}", "日".repeat(290_000));
+        let markdown = format!("[label]({destination} \"{}\")", "&".repeat(1_200_000));
+        let prepared = prepare_footnotes(&markdown).unwrap();
+
+        assert!(matches!(
+            preflight_generated_html(&prepared, "title", ExportDocumentLimits::default()),
+            Err(ExportDocumentError::GeneratedHtmlLimitExceeded)
+        ));
+    }
+
+    fn render_pulldown_link(destination: &str) -> String {
+        let mut output = String::new();
+        pulldown_cmark::html::push_html(
+            &mut output,
+            vec![
+                Event::Start(Tag::Link {
+                    link_type: pulldown_cmark::LinkType::Inline,
+                    dest_url: destination.into(),
+                    title: "".into(),
+                    id: "".into(),
+                }),
+                Event::Text("label".into()),
+                Event::End(TagEnd::Link),
+            ]
+            .into_iter(),
+        );
+        output
     }
 
     #[test]
