@@ -12,20 +12,19 @@ implementation details are left to the builder.
   `embedding.model_path` (or its `NOTE_MODEL_PATH` fallback) is configured, or the deterministic
   stub otherwise. The same file can select a self-hosted OpenAI-compatible BGE-M3 service when
   remote inference is desired.
-- **One core, shared interfaces.** REST/MCP-over-HTTP and MCP-over-stdio call the same pipeline
+- **One core, shared interfaces.** REST and MCP-over-HTTP call the same pipeline
   functions. Storage-only Org commands call the same Org import/export pipelines before attachment
   or embedding startup. No interface duplicates business logic.
 
 ## 2. System Topology
 
 ```
-      ┌─────────────┐        ┌──────────────────────┐
-      │ stdio entry │        │ Axum: /api/notes,      │
-      │ (subprocess)│        │ /api/org, /mcp         │
-      └──────┬──────┘        │ (Streamable HTTP)      │
-             │                └──────────┬────────────┘
-             └───────────┬────────────────┘
-                          ▼
+      ┌──────────────────────────────────┐
+      │ Axum: /api/notes, /api/org,      │
+      │ /mcp, /org/mcp                   │
+      │ (MCP Streamable HTTP)             │
+      └───────────────┬──────────────────┘
+                      ▼
               Functional Pipelines (shared core)
                           │
            ┌──────────────┴──────────────┐
@@ -41,11 +40,9 @@ implementation details are left to the builder.
 The Org offline CLI is a third, storage-only branch into the shared pipelines; it deliberately
 bypasses the embedding and attachment adapters shown below the pipeline boundary.
 
-stdio is the same binary, selected by an entrypoint flag, and calls pipelines directly — never
-proxies through Axum. The composition root resolves configuration once and passes explicit shared
-contexts to the active transport. HTTP and stdio construct storage, embedding, and attachment
-adapters. Legacy note import/export and Org offline modes also load configuration and storage, but
-dispatch before attachment construction or embedding-secret/worker startup.
+The composition root resolves configuration once and passes explicit shared contexts to HTTP
+transports. Legacy note import/export and Org offline modes also load configuration and storage,
+but dispatch before attachment construction or embedding-secret/worker startup.
 
 ## 3. Storage Contract
 
@@ -441,13 +438,13 @@ Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than 
 
 ## 8. MCP Integration
 
-One `NoteMcpServer` registry exposes 52 tools through both transports. The twelve Markdown-note
-tools are `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`, `edit_note`,
+MCP 2026-07-28 is served over Streamable HTTP only. `/mcp` exposes the twelve Markdown-note tools:
+`bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`, `edit_note`,
 `update_note`, `delete_note`, `list_notes`, `semantic_search`, `put_note_attachment`,
 `get_note_attachment_content`, and `delete_note_attachment`. Explicit label-key catalog management
 remains REST/UI-only.
 
-The exact 40 Org tools are:
+`/org/mcp` exposes the exact 40 Org tools:
 
 ```text
 org_list_workspaces       org_create_workspace      org_get_workspace
@@ -468,9 +465,8 @@ org_unlink_note           org_list_note_work_items   org_list_events
 
 Every handler delegates to the corresponding pipeline operation. The composition root constructs
 one Markdown-note `Context` and one `Arc<OrgContext>` over the same storage backend and injects
-those exact contexts into stdio or HTTP. Stdio uses JSON-RPC over process stdin/stdout with logs on
-stderr. Streamable HTTP is stateless JSON POST at the single `/mcp` endpoint; it has no GET/SSE
-transport, MCP sessions, authentication middleware, or legacy two-endpoint HTTP+SSE path.
+those exact contexts into their HTTP endpoint. `/mcp` and `/org/mcp` implement MCP 2026-07-28
+Streamable HTTP. They expose separate tool inventories and have no stdio transport.
 
 Markdown-note detail, summary, and search results expose `revision`. Line reads expose both that
 authoritative note-wide revision and a content tag. MCP update, edit, soft-delete, attachment put,
@@ -489,8 +485,8 @@ so the persisted `search.minimum_score` applies globally to both response sets.
 ### 8.1 Org REST/OpenAPI Interface
 
 The Axum server exposes every Org pipeline operation under `/api/org`. The generated OpenAPI 3.1
-document is available at `/api/openapi.json` and interactive Swagger UI at `/api/docs`; `/mcp` is
-not part of that document. Each REST operation has the exact corresponding MCP tool name as its
+document is available at `/api/openapi.json` and interactive Swagger UI at `/api/docs`; `/mcp` and
+`/org/mcp` are not part of that document. Each REST operation has the exact corresponding MCP tool name as its
 unique `operationId`:
 
 | Method and path | `operationId` |

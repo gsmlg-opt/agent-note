@@ -2,7 +2,8 @@
 target = "index.html"
 
 # Serve the frontend on a different port than note-server (which binds 127.0.0.1:6222), then
-# forward API + MCP calls to it so the frontend's same-origin relative URLs (/api/..., /mcp) work
+# forward API + MCP calls to it so the frontend's same-origin relative URLs (/api/..., /mcp,
+# /org/mcp) work
 # in dev without CORS. Debug `cargo run` starts this server automatically.
 [serve]
 addresses = ["0.0.0.0"]
@@ -15,3 +16,7 @@ backend = "http://127.0.0.1:6222/api/"
 [[proxy]]
 rewrite = "/mcp"
 backend = "http://127.0.0.1:6222/mcp"
+
+[[proxy]]
+rewrite = "/org/mcp"
+backend = "http://127.0.0.1:6222/org/mcp"

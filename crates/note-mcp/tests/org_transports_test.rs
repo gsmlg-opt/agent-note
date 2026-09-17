@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -7,7 +6,6 @@ use std::{
         atomic::{AtomicI64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
 };
 
 use axum::{
@@ -26,11 +24,9 @@ use note_storage::{
 };
 use note_storage_turso::TursoStorage;
 use serde_json::{json, Value};
-use tokio::io::{split, AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tower::ServiceExt as _;
 
 const NOW: i64 = 1_800_000_000;
-const STDIO_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKSPACE_ID: &str = "10000000-0000-4000-8000-000000000051";
 const DOCUMENT_ID: &str = "20000000-0000-4000-8000-000000000051";
 const ITEM_ID: &str = "30000000-0000-4000-8000-000000000051";
@@ -233,144 +229,21 @@ impl Bundle {
     }
 }
 
-struct StdioClient {
-    reader: BufReader<ReadHalf<tokio::io::DuplexStream>>,
-    writer: Option<WriteHalf<tokio::io::DuplexStream>>,
-    next_id: u64,
-    server: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
-}
-
-impl StdioClient {
-    async fn start(bundle: &Bundle) -> Self {
-        let (server_transport, client_transport) = tokio::io::duplex(1024 * 1024);
-        let note = bundle.note.clone();
-        let org = bundle.org.clone();
-        let server = tokio::spawn(async move {
-            note_mcp::serve_stdio_transport(note, org, server_transport).await
-        });
-        let (reader, writer) = split(client_transport);
-        let mut client = Self {
-            reader: BufReader::new(reader),
-            writer: Some(writer),
-            next_id: 1,
-            server: Some(server),
-        };
-        let initialized = client
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "raw-stdio-test", "version": "1"}
-                }),
-            )
-            .await;
-        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
-        client
-            .send(json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-            }))
-            .await;
-        client
-    }
-
-    async fn send(&mut self, message: Value) {
-        let writer = self.writer.as_mut().expect("stdio client is open");
-        writer
-            .write_all(serde_json::to_string(&message).unwrap().as_bytes())
-            .await
-            .unwrap();
-        writer.write_all(b"\n").await.unwrap();
-        writer.flush().await.unwrap();
-    }
-
-    async fn request(&mut self, method: &str, params: Value) -> Value {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send(json!({
-            "jsonrpc": "2.0", "id": id, "method": method, "params": params
-        }))
-        .await;
-        loop {
-            let mut line = String::new();
-            match tokio::time::timeout(STDIO_TIMEOUT, self.reader.read_line(&mut line)).await {
-                Ok(Ok(0)) => {
-                    self.abort_server();
-                    panic!("stdio server closed before response {id}");
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    self.abort_server();
-                    panic!("failed to read stdio response {id}: {error}");
-                }
-                Err(_) => {
-                    self.abort_server();
-                    panic!("timed out waiting for stdio response {id}");
-                }
-            }
-            let response: Value = serde_json::from_str(&line).unwrap();
-            if response["id"] == id {
-                return response;
-            }
-        }
-    }
-
-    async fn call(&mut self, name: &str, arguments: Value) -> Value {
-        self.request("tools/call", json!({"name": name, "arguments": arguments}))
-            .await
-    }
-
-    async fn close(mut self) {
-        let shutdown = tokio::time::timeout(
-            STDIO_TIMEOUT,
-            self.writer
-                .as_mut()
-                .expect("stdio client is open")
-                .shutdown(),
-        )
-        .await;
-        if !matches!(shutdown, Ok(Ok(()))) {
-            self.abort_server();
-            panic!("failed to close stdio client writer: {shutdown:?}");
-        }
-        drop(self.writer.take());
-
-        let mut server = self.server.take().expect("stdio server task is present");
-        match tokio::time::timeout(STDIO_TIMEOUT, &mut server).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => panic!("stdio server returned an error after EOF: {error}"),
-            Ok(Err(error)) => panic!("stdio server task failed after EOF: {error}"),
-            Err(_) => {
-                server.abort();
-                panic!("stdio server did not stop after EOF");
-            }
-        }
-    }
-
-    fn abort_server(&mut self) {
-        if let Some(server) = &self.server {
-            server.abort();
-        }
-    }
-}
-
-impl Drop for StdioClient {
-    fn drop(&mut self) {
-        self.abort_server();
-    }
-}
-
 #[derive(Clone)]
 struct HttpClient {
     router: Router,
     next_id: u64,
+    path: String,
 }
 
 impl HttpClient {
-    async fn start(bundle: &Bundle) -> Self {
+    async fn start(bundle: &Bundle, path: &str) -> Self {
         let router = note_mcp::mcp_router(bundle.note.clone(), bundle.org.clone());
-        let mut client = Self { router, next_id: 1 };
+        let mut client = Self {
+            router,
+            next_id: 1,
+            path: path.to_owned(),
+        };
         let (status, headers, initialized) = client
             .post(json!({
                 "jsonrpc": "2.0",
@@ -406,7 +279,7 @@ impl HttpClient {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/mcp")
+                    .uri(&self.path)
                     .header(header::HOST, "public.example.test")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::ACCEPT, "application/json, text/event-stream")
@@ -446,39 +319,6 @@ impl HttpClient {
         self.request("tools/call", json!({"name": name, "arguments": arguments}))
             .await
     }
-}
-
-enum TransportClient {
-    Stdio(StdioClient),
-    Http(HttpClient),
-}
-
-impl TransportClient {
-    async fn start(bundle: &Bundle, kind: TransportKind) -> Self {
-        match kind {
-            TransportKind::Stdio => Self::Stdio(StdioClient::start(bundle).await),
-            TransportKind::Http => Self::Http(HttpClient::start(bundle).await),
-        }
-    }
-
-    async fn call(&mut self, name: &str, arguments: Value) -> Value {
-        match self {
-            Self::Stdio(client) => client.call(name, arguments).await,
-            Self::Http(client) => client.call(name, arguments).await,
-        }
-    }
-
-    async fn close(self) {
-        if let Self::Stdio(client) = self {
-            client.close().await;
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum TransportKind {
-    Stdio,
-    Http,
 }
 
 fn policy() -> Value {
@@ -539,13 +379,9 @@ fn assert_error(response: &Value, code: &str) {
     assert_eq!(data.as_object().unwrap().len(), 4, "{response}");
 }
 
-async fn run_representative_scenario(kind: TransportKind) -> Vec<Value> {
-    let bundle = Bundle::new(match kind {
-        TransportKind::Stdio => "scenario-stdio",
-        TransportKind::Http => "scenario-http",
-    })
-    .await;
-    let mut client = TransportClient::start(&bundle, kind).await;
+async fn run_representative_scenario() -> Vec<Value> {
+    let bundle = Bundle::new("scenario-http").await;
+    let mut client = HttpClient::start(&bundle, "/org/mcp").await;
     let mut responses = Vec::new();
 
     let create_workspace = client
@@ -788,188 +624,288 @@ async fn run_representative_scenario(kind: TransportKind) -> Vec<Value> {
     assert!(tool_content(&events)["items"].as_array().unwrap().len() >= 8);
     responses.push(events);
 
-    client.close().await;
     responses
 }
 
-struct StableNormalizer {
-    replacements: BTreeMap<String, String>,
-    next_uuid: usize,
-    next_token: usize,
+fn modern_message(id: u64, method: &str, mut params: Value) -> Value {
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "raw-http-test", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 }
 
-impl StableNormalizer {
-    fn new() -> Self {
-        Self {
-            replacements: BTreeMap::new(),
-            next_uuid: 1,
-            next_token: 1,
-        }
+async fn post_modern(
+    router: &Router,
+    path: &str,
+    message: Value,
+    method_header: &str,
+    name_header: Option<&str>,
+    origin: Option<&str>,
+) -> (StatusCode, header::HeaderMap, Value) {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(header::HOST, "public.example.test")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", method_header);
+    if let Some(name) = name_header {
+        request = request.header("Mcp-Name", name);
     }
-
-    fn normalize(&mut self, value: &mut Value) {
-        self.normalize_field(None, value);
+    if let Some(origin) = origin {
+        request = request.header(header::ORIGIN, origin);
     }
-
-    fn normalize_field(&mut self, key: Option<&str>, value: &mut Value) {
-        match value {
-            Value::Array(values) => {
-                for value in values {
-                    self.normalize_field(key, value);
-                }
-            }
-            Value::Object(values) => {
-                for (key, value) in values {
-                    self.normalize_field(Some(key), value);
-                }
-            }
-            Value::String(text) => {
-                if key == Some("text") {
-                    if let Ok(mut embedded) = serde_json::from_str::<Value>(text) {
-                        self.normalize(&mut embedded);
-                        *text = serde_json::to_string(&embedded).unwrap();
-                        return;
-                    }
-                }
-                let replacement = if key == Some("fencing_token") {
-                    let next = self.next_token;
-                    self.next_token += usize::from(!self.replacements.contains_key(text));
-                    Some(format!("<fencing-token-{next}>"))
-                } else if is_dynamic_uuid(text) {
-                    let next = self.next_uuid;
-                    self.next_uuid += usize::from(!self.replacements.contains_key(text));
-                    Some(format!("<uuid-{next}>"))
-                } else {
-                    None
-                };
-                if let Some(replacement) = replacement {
-                    *text = self
-                        .replacements
-                        .entry(text.clone())
-                        .or_insert(replacement)
-                        .clone();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn is_dynamic_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        })
-        && !matches!(value, WORKSPACE_ID | DOCUMENT_ID | ITEM_ID)
-}
-
-fn normalize_scenario(mut responses: Vec<Value>) -> Vec<Value> {
-    let mut normalizer = StableNormalizer::new();
-    for response in &mut responses {
-        normalizer.normalize(response);
-    }
-    responses
-}
-
-fn normalized_inventory(response: &Value) -> Vec<Value> {
-    let mut tools = response["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|tool| {
-            json!({
-                "name": tool["name"],
-                "description": tool["description"],
-                "inputSchema": tool["inputSchema"],
-                "outputSchema": tool["outputSchema"]
-            })
-        })
-        .collect::<Vec<_>>();
-    tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-    tools
+    let response = router
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(serde_json::to_vec(&message).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8(bytes.to_vec()).unwrap()))
+    };
+    (status, headers, body)
 }
 
 #[tokio::test]
-async fn production_transport_factories_share_the_same_52_tool_registry() {
-    let bundle = Bundle::new("inventory").await;
-    let mut stdio = StdioClient::start(&bundle).await;
-    let mut http = HttpClient::start(&bundle).await;
-    let stdio_tools = stdio.request("tools/list", json!({})).await;
-    let http_tools = http.request("tools/list", json!({})).await;
+async fn modern_http_supports_discovery_and_cacheable_tool_lists_without_initialize() {
+    let bundle = Bundle::new("modern-discovery").await;
+    let router = note_mcp::mcp_router(bundle.note, bundle.org);
+    for (path, expected_tools) in [("/mcp", 12), ("/org/mcp", 40)] {
+        let (status, headers, discover) = post_modern(
+            &router,
+            path,
+            modern_message(1, "server/discover", json!({})),
+            "server/discover",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}: {discover}");
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        assert!(headers.get("mcp-session-id").is_none());
+        assert_eq!(
+            discover["result"]["resultType"], "complete",
+            "{path}: {discover}"
+        );
+        assert!(
+            discover["result"]["capabilities"]["tools"].is_object(),
+            "{path}: {discover}"
+        );
+        assert!(
+            discover["result"]["supportedVersions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("2026-07-28")),
+            "{path}: {discover}"
+        );
 
-    assert_eq!(stdio_tools["result"]["tools"].as_array().unwrap().len(), 52);
-    assert_eq!(http_tools["result"]["tools"].as_array().unwrap().len(), 52);
-    let stdio_inventory = normalized_inventory(&stdio_tools);
-    let http_inventory = normalized_inventory(&http_tools);
-    assert_eq!(
-        stdio_inventory
+        let (status, headers, listed) = post_modern(
+            &router,
+            path,
+            modern_message(2, "tools/list", json!({})),
+            "tools/list",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(headers.get("mcp-session-id").is_none());
+        assert_eq!(listed["result"]["resultType"], "complete", "{path}");
+        assert_eq!(
+            listed["result"]["tools"].as_array().unwrap().len(),
+            expected_tools,
+            "{path}"
+        );
+        assert!(listed["result"]["ttlMs"].is_u64(), "{path}");
+        assert!(listed["result"]["cacheScope"].is_string(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn modern_http_validates_routing_headers_and_origin() {
+    let bundle = Bundle::new("modern-validation").await;
+    let router = note_mcp::mcp_router(bundle.note, bundle.org);
+    for path in ["/mcp", "/org/mcp"] {
+        let message = modern_message(1, "tools/list", json!({}));
+        let (status, _, body) =
+            post_modern(&router, path, message.clone(), "tools/call", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {status}");
+        assert_eq!(body["error"]["code"], -32020, "{path}: {body}");
+
+        let mut wrong_version = message.clone();
+        wrong_version["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+            json!("2025-06-18");
+        let (status, _, body) =
+            post_modern(&router, path, wrong_version, "tools/list", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {status}");
+        assert_eq!(body["error"]["code"], -32020, "{path}: {body}");
+
+        let (status, _, _) = post_modern(
+            &router,
+            path,
+            message,
+            "tools/list",
+            None,
+            Some("https://evil.example.test"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+    }
+
+    for (path, tool_name, arguments) in [
+        ("/mcp", "list_notes", json!({})),
+        ("/org/mcp", "org_list_workspaces", json!({})),
+    ] {
+        let message = modern_message(
+            2,
+            "tools/call",
+            json!({"name": tool_name, "arguments": arguments}),
+        );
+        let (status, _, body) = post_modern(
+            &router,
+            path,
+            message.clone(),
+            "tools/call",
+            Some("wrong_tool_name"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(body["error"]["code"], -32020, "{path}: {body}");
+
+        let (status, _, called) =
+            post_modern(&router, path, message, "tools/call", Some(tool_name), None).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(called["result"]["resultType"], "complete", "{path}");
+        assert!(called["result"]["structuredContent"].is_object(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn http_paths_expose_disjoint_note_and_org_tool_registries() {
+    let bundle = Bundle::new("split-inventory").await;
+    let router = note_mcp::mcp_router(bundle.note, bundle.org);
+    for (path, expected_names) in [
+        ("/mcp", note_mcp::org::NOTE_TOOL_NAMES.as_slice()),
+        ("/org/mcp", note_mcp::org::ORG_TOOL_NAMES.as_slice()),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(header::HOST, "public.example.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let tools = body["result"]["tools"].as_array().unwrap();
+        let mut actual_names = tools
             .iter()
-            .filter(|tool| tool["name"].as_str().unwrap().starts_with("org_"))
-            .count(),
-        40
-    );
-    assert_eq!(stdio_inventory, http_inventory);
-
-    stdio.close().await;
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        actual_names.sort_unstable();
+        let mut expected_names = expected_names.to_vec();
+        expected_names.sort_unstable();
+        assert_eq!(actual_names, expected_names, "{path}");
+    }
 }
 
 #[tokio::test]
-async fn real_transports_match_for_reads_mutations_workflow_and_structured_errors() {
-    let stdio = normalize_scenario(run_representative_scenario(TransportKind::Stdio).await);
-    let http = normalize_scenario(run_representative_scenario(TransportKind::Http).await);
-    assert!(serde_json::to_string(&stdio)
-        .unwrap()
-        .contains("<fencing-token-"));
-    assert_eq!(stdio, http);
+async fn org_http_supports_reads_mutations_workflow_and_structured_errors() {
+    let responses = run_representative_scenario().await;
+    assert!(!responses.is_empty());
 }
 
 #[tokio::test]
 async fn streamable_http_is_stateless_json_post_only_without_auth_or_session_headers() {
     let bundle = Bundle::new("http-boundary").await;
     let router = note_mcp::mcp_router(bundle.note, bundle.org);
-    for method in [Method::GET, Method::DELETE] {
-        let response = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri("/mcp")
-                    .header(header::HOST, "public.example.test")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(response.headers()[header::ALLOW], "POST");
-        assert!(response.headers().get("mcp-session-id").is_none());
-        assert!(response.headers().get("www-authenticate").is_none());
+    for path in ["/mcp", "/org/mcp"] {
+        for method in [Method::GET, Method::DELETE] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::HOST, "public.example.test")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{path}");
+            assert_eq!(response.headers()[header::ALLOW], "POST", "{path}");
+            assert!(response.headers().get("mcp-session-id").is_none());
+            assert!(response.headers().get("www-authenticate").is_none());
+        }
     }
 }
 
 #[tokio::test]
-async fn production_transport_factories_serve_note_tools_alongside_org_tools() {
-    let stdio_bundle = Bundle::new("note-tools-stdio").await;
-    let http_bundle = Bundle::new("note-tools-http").await;
-    let mut stdio = StdioClient::start(&stdio_bundle).await;
-    let mut http = HttpClient::start(&http_bundle).await;
-
-    let stdio_notes = stdio.call("list_notes", json!({})).await;
-    let http_notes = http.call("list_notes", json!({})).await;
-    assert_success(&stdio_notes, "list notes over stdio");
-    assert_success(&http_notes, "list notes over HTTP");
-    assert_eq!(tool_content(&stdio_notes), tool_content(&http_notes));
-
-    stdio.close().await;
+async fn note_and_org_http_clients_share_storage_but_reject_cross_path_calls() {
+    let bundle = Bundle::new("separate-http-clients").await;
+    let mut notes = HttpClient::start(&bundle, "/mcp").await;
+    let mut org = HttpClient::start(&bundle, "/org/mcp").await;
+    let listed = notes.call("list_notes", json!({})).await;
+    assert_success(&listed, "list notes");
+    let created = org
+        .call("org_create_workspace", workspace_input("Shared storage"))
+        .await;
+    assert_success(&created, "create workspace");
+    let note_rejected = org.call("list_notes", json!({})).await;
+    let org_rejected = notes
+        .call(
+            "org_query_queue",
+            json!({"workspace_ids": [WORKSPACE_ID], "view": "ready"}),
+        )
+        .await;
+    for rejected in [note_rejected, org_rejected] {
+        assert_eq!(rejected["jsonrpc"], "2.0", "{rejected}");
+        assert_eq!(rejected["id"], 3, "{rejected}");
+        assert_eq!(
+            rejected["error"],
+            json!({"code": -32602, "message": "tool not found"}),
+            "{rejected}"
+        );
+        assert!(rejected.get("result").is_none(), "{rejected}");
+    }
 }
 
 #[tokio::test]
 async fn turso_mcp_workflow_survives_race_expiry_review_export_restart_and_replay() {
     let (bundle, race_gate) = Bundle::new_with_begin_barrier("task7-acceptance").await;
-    let mut client = HttpClient::start(&bundle).await;
+    let mut client = HttpClient::start(&bundle, "/org/mcp").await;
+    let mut note_client = HttpClient::start(&bundle, "/mcp").await;
 
-    let saved_note = client
+    let saved_note = note_client
         .call(
             "save_note",
             json!({
@@ -1014,8 +950,8 @@ async fn turso_mcp_workflow_survives_race_expiry_review_export_restart_and_repla
     assert_success(&ready, "query ready queue");
     assert_eq!(tool_content(&ready)["items"][0]["item"]["id"], ITEM_ID);
 
-    let mut agent_a = HttpClient::start(&bundle).await;
-    let mut agent_b = HttpClient::start(&bundle).await;
+    let mut agent_a = HttpClient::start(&bundle, "/org/mcp").await;
+    let mut agent_b = HttpClient::start(&bundle, "/org/mcp").await;
     let claim_a_input = json!({
         "schema_version": 1, "workspace_id": WORKSPACE_ID, "actor_id": "agent-a",
         "operation_id": "claim-a", "work_item_id": ITEM_ID, "document_id": DOCUMENT_ID,
@@ -1342,13 +1278,17 @@ async fn turso_mcp_workflow_survives_race_expiry_review_export_restart_and_repla
     assert_eq!(tool_content(&replay_before), tool_content(&imported));
 
     drop(client);
+    drop(note_client);
     drop(agent_a);
     drop(agent_b);
     drop(race_gate);
     let bundle = bundle.reopen().await;
-    let mut reopened = HttpClient::start(&bundle).await;
+    let mut reopened = HttpClient::start(&bundle, "/org/mcp").await;
+    let mut reopened_notes = HttpClient::start(&bundle, "/mcp").await;
 
-    let note_after = reopened.call("get_note", json!({"id": note_id})).await;
+    let note_after = reopened_notes
+        .call("get_note", json!({"id": note_id}))
+        .await;
     assert_success(&note_after, "get legacy Markdown note after restart");
     assert_eq!(tool_content(&note_after)["title"], "Legacy Markdown");
     assert_eq!(tool_content(&note_after)["content"], "# Existing\nbody");

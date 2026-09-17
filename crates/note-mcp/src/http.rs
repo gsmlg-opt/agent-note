@@ -1,11 +1,11 @@
 //! MCP server exposing Note and Org tools over rmcp's Streamable HTTP transport.
 //!
-//! This reuses the transport-independent [`NoteMcpServer`] from [`crate::stdio`]
+//! This reuses the transport-independent [`NoteMcpServer`] from [`crate::server`]
 //! verbatim — the tools and server logic live there; here we only wrap that
 //! server in rmcp's [`StreamableHttpService`] and expose it as an Axum
-//! [`Router`] nested at `/mcp`. The endpoint is POST-only, stateless, and always
-//! returns JSON. It creates no MCP sessions, SSE streams, authentication layer,
-//! or Host allowlist; those deployment concerns belong to the front proxy.
+//! [`Router`] nested at `/mcp` and `/org/mcp`. Both endpoints are POST-only,
+//! stateless, and return JSON for simple calls. They create no MCP sessions or
+//! authentication layer; those deployment concerns belong to the front proxy.
 //!
 //! note-server (Task 23) merges the returned router into its Axum app alongside
 //! the REST routes.
@@ -20,20 +20,16 @@ use rmcp::transport::streamable_http_server::{
 
 use crate::NoteMcpServer;
 
-/// Build an Axum [`Router`] serving the MCP protocol over Streamable HTTP at
-/// `/mcp`, backed by a fresh [`NoteMcpServer`] per request built from `ctx`.
+/// Build an Axum [`Router`] serving Note MCP at `/mcp` and Org MCP at
+/// `/org/mcp`, each backed by a fresh [`NoteMcpServer`] per request.
 ///
 /// The service factory clones the shared [`Context`] (cheap — it is an `Arc`)
 /// into a new `NoteMcpServer` for each request, so all requests share the same
 /// underlying storage and embedder without creating transport sessions.
 ///
-/// Runs the transport in **stateless mode** (`with_stateful_mode(false)`): every POST
-/// is a self-contained request/response, so clients can call `tools/list`/`tools/call`
-/// without first performing the `initialize` handshake and carrying an `Mcp-Session-Id`
-/// header on every follow-up. In the default stateful mode, a first POST that isn't an
-/// `initialize` request is rejected with `HTTP 422 "Unexpected message, expect initialize
-/// request"` — which is what non-session-tracking clients hit. Our tools are plain
-/// request/response with no server-initiated streaming, so sessions buy us nothing here.
+/// 2026-07-28 requests are stateless by protocol. Earlier versions also use
+/// stateless mode (`with_legacy_session_mode(false)`) so clients need not carry
+/// an `Mcp-Session-Id` between calls.
 /// `with_json_response(true)` returns `application/json` directly instead of an SSE stream,
 /// dropping the framing overhead (allowed by the MCP Streamable HTTP spec, 2025-06-18).
 ///
@@ -41,18 +37,34 @@ use crate::NoteMcpServer;
 /// (loopback only: `localhost`, `127.0.0.1`, `::1`), which otherwise `403`s any other `Host`.
 /// This app is meant to be served behind a reverse proxy (e.g. Caddy at `notes.web-dev.zdns.cn`)
 /// that forwards a real public `Host` and owns access control / TLS; keeping the allowlist here
-/// would reject every proxied `/mcp` request. Host/origin gating is delegated to the proxy.
+/// would reject proxied requests. Host gating is delegated to the proxy;
+/// any present `Origin` is rejected by the empty Origin allowlist.
 pub fn mcp_router(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> Router {
     let config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(false)
+        .with_legacy_session_mode(false)
         .with_json_response(true)
-        .disable_allowed_hosts();
-    let service = StreamableHttpService::new(
-        move || Ok(NoteMcpServer::new(ctx.clone(), org_ctx.clone())),
+        .disable_allowed_hosts()
+        .enforce_origin_validation();
+    let note_ctx = ctx.clone();
+    let note_org_ctx = org_ctx.clone();
+    let note_service = StreamableHttpService::new(
+        move || {
+            Ok(NoteMcpServer::notes_only(
+                note_ctx.clone(),
+                note_org_ctx.clone(),
+            ))
+        },
+        Arc::new(NeverSessionManager::default()),
+        config.clone(),
+    );
+    let org_service = StreamableHttpService::new(
+        move || Ok(NoteMcpServer::org_only(ctx.clone(), org_ctx.clone())),
         Arc::new(NeverSessionManager::default()),
         config,
     );
-    Router::new().nest_service("/mcp", service)
+    Router::new()
+        .nest_service("/mcp", note_service)
+        .nest_service("/org/mcp", org_service)
 }
 
 #[cfg(test)]
@@ -65,7 +77,7 @@ mod tests {
     use tempfile::TempDir;
 
     // Returns the TempDir guard alongside the Context so the caller keeps it
-    // alive: dropping it deletes the DB directory (mirrors stdio.rs tests).
+    // alive: dropping it deletes the DB directory (mirrors server.rs tests).
     async fn test_context() -> (Context, Arc<dyn StorageBackend>, TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let backend: Arc<dyn StorageBackend> = Arc::new(

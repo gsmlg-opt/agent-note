@@ -809,7 +809,7 @@ fn add_handler<I, O, F, Fut>(
                 let value = serde_json::to_value(output).map_err(|_| {
                     ErrorData::internal_error("failed to serialize Org tool output", None)
                 })?;
-                Ok(CallToolResult::structured(value))
+                Ok(CallToolResult::structured(value).into())
             })
         },
     ));

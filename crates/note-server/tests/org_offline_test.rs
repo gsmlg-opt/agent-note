@@ -289,7 +289,7 @@ async fn call_org_mcp(
     let response = router
         .clone()
         .oneshot(
-            Request::post("/mcp")
+            Request::post("/org/mcp")
                 .header(header::HOST, "offline-acceptance.example.test")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json, text/event-stream")
@@ -471,14 +471,35 @@ fn rejects_missing_duplicate_unknown_and_incompatible_arguments() {
 
 #[test]
 fn preserves_legacy_non_org_modes() {
-    for legacy in [
-        args(&["--import"]),
-        args(&["--export"]),
-        args(&["--stdio"]),
-        args(&[]),
-    ] {
+    for legacy in [args(&["--import"]), args(&["--export"]), args(&[])] {
         assert_eq!(parse_command(&legacy).unwrap(), None);
     }
+}
+
+#[tokio::test]
+async fn stdio_flag_exits_with_an_explicit_http_only_error_before_loading_config() {
+    let dir = TempTestDir::new();
+    let config = dir.path().join("invalid.toml");
+    std::fs::write(&config, "this is not valid TOML = [").unwrap();
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_note-server"))
+        .arg("--stdio")
+        .current_dir(dir.path())
+        .env("NOTE_CONFIG_PATH", &config)
+        .output()
+        .await
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--stdio is no longer supported; use /mcp and /org/mcp over HTTP"),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        !stderr.contains("note-server listening"),
+        "stderr was: {stderr}"
+    );
 }
 
 #[tokio::test]

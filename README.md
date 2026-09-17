@@ -8,7 +8,7 @@ and exact dense retrieval), `note-storage-pg` (external PostgreSQL adapter with 
 pgvector retrieval), `note-embedding` (BGE-M3 via local ONNX or a self-hosted OpenAI-compatible
 service, with a deterministic stub for offline dev), `note-org` (pure Org source projection/editing,
 workflow policy, dependency validation, and readiness), `note-pipelines` (save/search workflows),
-`note-mcp` (MCP over stdio + Streamable HTTP), `note-server` (Axum REST + `/mcp`), and
+`note-mcp` (MCP Streamable HTTP), `note-server` (Axum REST + `/mcp` + `/org/mcp`), and
 `note-frontend` (Yew/Wasm UI built with the
 [`yew-duskmoon`](https://crates.io/crates/yew-duskmoon) component library).
 
@@ -44,8 +44,8 @@ note-pipelines   Context + workflows that compose core/storage/embedding:
                    • org — transport-free, revision-safe workspace/document/item commands,
                      append-only audit reads, and recovery-context assembly
    ▲
-   ├── note-mcp     12 Markdown-note + 40 Org tools over stdio and Streamable HTTP (one registry)
-   └── note-server  Axum REST (/api/notes, /api/labels, /api/org) + /mcp
+   ├── note-mcp     12 Markdown-note tools at /mcp + 40 Org tools at /org/mcp (Streamable HTTP)
+   └── note-server  Axum REST (/api/notes, /api/labels, /api/org) + /mcp + /org/mcp
                         ▲
                    note-frontend   Yew MVU (AppState + pure reducer) → talks to note-server over REST
 ```
@@ -91,7 +91,7 @@ Agent Note implements no inbound authentication, authorization, proxy-identity-h
 ACL behavior. A front proxy owns TLS, authentication, authorization, and network access; direct
 exposure to an untrusted network is unsupported.
 
-**One core, two front doors.** REST and both MCP transports call the exact same `note-pipelines`
+**One core, two front doors.** REST and both MCP HTTP endpoints call the exact same `note-pipelines`
 functions — no business logic is duplicated per transport (design.md §1–2). **Hybrid retrieval**
 runs Turso full-text ranking over note titles and exact dense-vector ranking over body chunks, then
 fuses the two ranked lists with deterministic weighted Reciprocal Rank Fusion. Title FTS has weight
@@ -154,7 +154,7 @@ accessing an external database.
    ```
    cargo run
    ```
-   Then open http://0.0.0.0:6221. Trunk proxies `/api` and `/mcp` to `note-server` on
+   Then open http://0.0.0.0:6221. Trunk proxies `/api`, `/mcp`, and `/org/mcp` to `note-server` on
    `127.0.0.1:6222`. A debug build atomically creates `./dev-data/config.toml` on first start,
    without replacing an existing file. Its generated settings store the embedded Turso database
    at `./dev-data/notes.db` and attachments under `./dev-data/attachments`.
@@ -171,8 +171,8 @@ With the HTTP server running, open the interactive Swagger UI directly at
 `http://127.0.0.1:6222/api/openapi.json`. During frontend development, Trunk proxies the same
 paths on port `6221`, so `/api/docs` and `/api/openapi.json` are also available there.
 
-The OpenAPI document covers the REST API only. `/mcp` remains outside the document and retains its
-own MCP protocol discovery and schemas. Swagger UI has **Try it out** enabled, including for
+The OpenAPI document covers the REST API only. `/mcp` and `/org/mcp` remain outside the document
+and retain their own MCP protocol discovery and schemas. Swagger UI has **Try it out** enabled, including for
 destructive operations, and the HTTP API is unauthenticated. Use it only on a trusted network or
 behind an authenticating reverse proxy.
 
@@ -361,7 +361,7 @@ unsupported.
 
 ## Runtime configuration
 
-Every normal entrypoint—HTTP server, MCP over HTTP, MCP over stdio, legacy `--import`/`--export`,
+Every normal entrypoint—HTTP server, MCP over HTTP, legacy `--import`/`--export`,
 and the four `org` offline modes—loads a configuration file before opening storage.
 `NOTE_CONFIG_PATH` selects it; a relative selector is resolved from the process working directory.
 Without that variable, the path is `./dev-data/config.toml`.
@@ -392,7 +392,7 @@ See [`config.example.toml`](config.example.toml) for every supported option, env
 default, and adapter-specific example.
 
 The HTTP bind address independently uses `server.bind_addr`, then `NOTE_BIND_ADDR`, then
-`0.0.0.0:6222`. The default exposes the REST API and `/mcp` on every network interface; run it only
+`0.0.0.0:6222`. The default exposes the REST API, `/mcp`, and `/org/mcp` on every network interface; run it only
 on a trusted network or protect it with an authenticating reverse proxy.
 
 All relative path values—including values supplied by environment fallbacks—are resolved from the
@@ -653,13 +653,9 @@ retrying.
 
 ## MCP
 
-The same binary also speaks MCP over stdio (for MCP clients that spawn a subprocess):
-
-```
-cargo run -p note-server -- --stdio
-```
-
-This mode loads the same mandatory runtime configuration as HTTP, import, and export modes.
+Agent Note supports MCP 2026-07-28 over Streamable HTTP only. `/mcp` exposes the twelve
+Markdown-note tools; `/org/mcp` exposes the forty Org tools. MCP clients connect to the HTTP
+endpoint that owns the tools they need.
 
 It exposes `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`, `edit_note`,
 `update_note`, `delete_note`, `list_notes`, `semantic_search`, `put_note_attachment`,
@@ -686,8 +682,7 @@ Ordinary-note MCP conflicts use the same `code`, `message`, `details`, and `retr
 REST, including `stale_revision` with the expected and current revision. Missing required inputs
 are protocol caller errors; missing notes are `not_found`; storage failures use safe messages.
 
-The same registry also exposes exactly these 40 Org tools over both transports (52 tools total,
-including the 12 Markdown-note tools):
+`/org/mcp` exposes exactly these 40 Org tools:
 
 ```text
 org_list_workspaces       org_create_workspace      org_get_workspace
@@ -751,9 +746,10 @@ an `Unsupported` publish error; imports remain supported. Every mode writes a ma
 report to stdout, starts only storage, and does not initialize attachments, embeddings, workers,
 HTTP, MCP, or Markdown-note data.
 
-The HTTP server additionally exposes the MCP Streamable HTTP transport at `/mcp`.
+The HTTP server exposes MCP 2026-07-28 Streamable HTTP at `/mcp` for Markdown-note tools and
+`/org/mcp` for Org tools. There is no stdio MCP mode.
 
 `note-server` binds its backend to `0.0.0.0:6222` by default, and the Debug Trunk server binds to
-`0.0.0.0:6221`, so the development UI, REST API, and MCP endpoint are reachable from the local
+`0.0.0.0:6221`, so the development UI, REST API, and MCP endpoints are reachable from the local
 network. Run them only on a trusted network. Packaged builds do not start Trunk and retain their
 configured bind/static-directory behavior.

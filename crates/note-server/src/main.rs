@@ -501,7 +501,10 @@ async fn main() -> anyhow::Result<()> {
         return note_embedding::run_embedding_worker(WorkerConfig::new(ipc_name)?).await;
     }
 
-    let stdio_mode = args.iter().any(|a| a == "--stdio");
+    if args.iter().any(|arg| arg == "--stdio") {
+        anyhow::bail!("--stdio is no longer supported; use /mcp and /org/mcp over HTTP");
+    }
+
     let config = note_server::config::load_runtime_config()?;
     ensure_database_directory(&config)?;
     let storage = build_storage(&config.database).await?;
@@ -533,193 +536,161 @@ async fn main() -> anyhow::Result<()> {
 
     let org_runtime = production_org_runtime(storage.clone());
 
-    if stdio_mode {
-        let mut embedding = start_embedding_runtime(&config.embedding).await?;
-        reconcile_started_embedding(storage.as_ref(), &mut embedding).await?;
-        let notifier = Arc::new(NotifyEmbeddingJobs {
-            notify: embedding.wake.clone(),
-        });
-        let ctx = Arc::new(Context::with_embedding_job_notifier(
+    let mut embedding = start_embedding_runtime(&config.embedding).await?;
+    reconcile_started_embedding(storage.as_ref(), &mut embedding).await?;
+    let notifier = Arc::new(NotifyEmbeddingJobs {
+        notify: embedding.wake.clone(),
+    });
+    let ctx = Arc::new(
+        Context::with_embedding_job_notifier(
             storage.clone(),
             embedding.embedder.clone(),
             embedding.info.clone(),
             notifier,
             attachments.clone(),
-        ));
-        let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
-        let trash_retention = tokio::spawn(run_trash_retention(
-            ctx.clone(),
-            scheduler_shutdown_rx.clone(),
-        ));
-        let scheduler = tokio::spawn(run_embedding_scheduler(
-            ctx.clone(),
-            embedding.wake.clone(),
-            scheduler_shutdown_rx,
-        ));
-        let mcp_contexts = compose_mcp_contexts(ctx, &org_runtime);
-        let run_result = note_mcp::run_stdio(mcp_contexts.note, mcp_contexts.org).await;
-        let _ = scheduler_shutdown_tx.send(true);
-        let _ = scheduler.await;
-        let _ = trash_retention.await;
-        shutdown_embedding(&mut embedding).await;
-        run_result?;
-    } else {
-        let mut embedding = start_embedding_runtime(&config.embedding).await?;
-        reconcile_started_embedding(storage.as_ref(), &mut embedding).await?;
-        let notifier = Arc::new(NotifyEmbeddingJobs {
-            notify: embedding.wake.clone(),
-        });
-        let ctx = Arc::new(
-            Context::with_embedding_job_notifier(
-                storage.clone(),
-                embedding.embedder.clone(),
-                embedding.info.clone(),
-                notifier,
-                attachments.clone(),
+        )
+        .with_note_mutation_notifier(Arc::new(DashboardCacheInvalidator)),
+    );
+    let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
+    let trash_retention = tokio::spawn(run_trash_retention(
+        ctx.clone(),
+        scheduler_shutdown_rx.clone(),
+    ));
+    let scheduler = tokio::spawn(run_embedding_scheduler(
+        ctx.clone(),
+        embedding.wake.clone(),
+        scheduler_shutdown_rx,
+    ));
+
+    let mcp_contexts = compose_mcp_contexts(ctx.clone(), &org_runtime);
+    let mut app_state = AppState::new(ctx.clone(), mcp_contexts.org.clone());
+    if config.pdf_export.enabled {
+        let renderer_url = config
+            .pdf_export
+            .renderer_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("PDF renderer configuration is invalid"))?;
+        let renderer = note_server::export::renderer::GotenbergRenderer::with_limits(
+            renderer_url,
+            config.pdf_export.max_pdf_bytes,
+            note_server::export::renderer::GotenbergRenderer::max_package_bytes_for_export(
+                config.pdf_export.max_combined_asset_bytes as usize,
+                config.pdf_export.max_asset_count,
             )
-            .with_note_mutation_notifier(Arc::new(DashboardCacheInvalidator)),
-        );
-        let (scheduler_shutdown_tx, scheduler_shutdown_rx) = watch::channel(false);
-        let trash_retention = tokio::spawn(run_trash_retention(
-            ctx.clone(),
-            scheduler_shutdown_rx.clone(),
-        ));
-        let scheduler = tokio::spawn(run_embedding_scheduler(
-            ctx.clone(),
-            embedding.wake.clone(),
-            scheduler_shutdown_rx,
-        ));
-
-        let mcp_contexts = compose_mcp_contexts(ctx.clone(), &org_runtime);
-        let mut app_state = AppState::new(ctx.clone(), mcp_contexts.org.clone());
-        if config.pdf_export.enabled {
-            let renderer_url = config
-                .pdf_export
-                .renderer_url
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("PDF renderer configuration is invalid"))?;
-            let renderer = note_server::export::renderer::GotenbergRenderer::with_limits(
-                renderer_url,
-                config.pdf_export.max_pdf_bytes,
-                note_server::export::renderer::GotenbergRenderer::max_package_bytes_for_export(
-                    config.pdf_export.max_combined_asset_bytes as usize,
-                    config.pdf_export.max_asset_count,
-                )
-                .map_err(|_| anyhow::anyhow!("PDF renderer configuration is invalid"))?,
-            )
-            .map_err(|_| anyhow::anyhow!("PDF renderer configuration is invalid"))?;
-            app_state = app_state.with_pdf_export(config.pdf_export.clone(), Arc::new(renderer));
-        }
-        assert!(
-            Arc::ptr_eq(&app_state.org, &mcp_contexts.org),
-            "REST and MCP must share the same Org context"
-        );
-        let (rest, openapi) = rest_openapi::rest_router();
-        let rest = rest.with_state(app_state);
-        let max_request_bytes = env_u64("NOTE_MAX_REQUEST_BYTES", 512 * 1024 * 1024);
-        let mut app = compose_transport_router(
-            rest,
-            note_mcp::mcp_router(mcp_contexts.note, mcp_contexts.org),
-            openapi,
-            max_request_bytes as usize,
-        );
-
-        // NOTE_STATIC_DIR is for packaged builds such as Docker. Local debug HTTP runs use the
-        // Trunk development server instead, unless an explicit static directory is configured.
-        let static_dir = std::env::var("NOTE_STATIC_DIR")
-            .ok()
-            .filter(|static_dir| !static_dir.is_empty());
-        if let Some(static_dir) = &static_dir {
-            // SPA fallback for any path the API/MCP routes don't claim: serve a real static asset
-            // when one exists at that path, otherwise return index.html (200) so client-side routes
-            // like /new and /labels boot on a direct load or refresh. (ServeDir's not_found_service
-            // would serve index.html but with a 404 status, wrong for a valid SPA route.)
-            let static_dir = static_dir.clone();
-            let index_html =
-                std::fs::read_to_string(format!("{static_dir}/index.html")).unwrap_or_default();
-            app = app.fallback(move |uri: axum::http::Uri| {
-                let static_dir = static_dir.clone();
-                let index_html = index_html.clone();
-                async move {
-                    let path = uri.path().trim_start_matches('/');
-                    if !path.is_empty() && !path.contains("..") {
-                        if let Ok(bytes) = tokio::fs::read(format!("{static_dir}/{path}")).await {
-                            let content_type = match path.rsplit('.').next() {
-                                Some("js") => "text/javascript",
-                                Some("wasm") => "application/wasm",
-                                Some("css") => "text/css",
-                                Some("html") => "text/html; charset=utf-8",
-                                Some("json") => "application/json",
-                                Some("svg") => "image/svg+xml",
-                                Some("ico") => "image/x-icon",
-                                Some("png") => "image/png",
-                                _ => "application/octet-stream",
-                            };
-                            return ([(axum::http::header::CONTENT_TYPE, content_type)], bytes)
-                                .into_response();
-                        }
-                    }
-                    axum::response::Html(index_html).into_response()
-                }
-            });
-        }
-
-        // The config loader resolves server.bind_addr, then NOTE_BIND_ADDR, then the public
-        // 0.0.0.0:6222 default. Exposing this unauthenticated personal app must be limited to a
-        // trusted network or protected by a reverse proxy.
-        let bind_addr = &config.bind_addr;
-        let mut dev_frontend = None;
-        let run_result = match tokio::net::TcpListener::bind(&bind_addr).await {
-            Err(error) => Err(anyhow::Error::new(error)),
-            Ok(listener) => match start_dev_frontend(should_start_dev_frontend(
-                cfg!(debug_assertions),
-                true,
-                static_dir.is_some(),
-            )) {
-                Err(error) => Err(error),
-                Ok(child) => {
-                    dev_frontend = child;
-                    eprintln!("note-server listening on http://{bind_addr}");
-                    if dev_frontend.is_some() {
-                        eprintln!("frontend dev server listening on {DEV_FRONTEND_URL}");
-                    } else if let Some(static_dir) = &static_dir {
-                        eprintln!("serving frontend from {static_dir}");
-                    } else {
-                        eprintln!("API only — set NOTE_STATIC_DIR to serve a frontend bundle");
-                    }
-
-                    let server = axum::serve(listener, app);
-                    tokio::select! {
-                        biased;
-                        signal = tokio::signal::ctrl_c() => {
-                            if let Err(error) = signal {
-                                eprintln!("failed to listen for shutdown signal: {error}");
-                            }
-                            eprintln!("shutting down note-server");
-                            Ok(())
-                        }
-                        status = wait_for_dev_frontend(&mut dev_frontend) => {
-                            match status {
-                                Ok(status) => Err(anyhow::anyhow!(
-                                    "trunk serve exited unexpectedly: {status}"
-                                )),
-                                Err(error) => Err(anyhow::anyhow!(
-                                    "wait for trunk serve: {error}"
-                                )),
-                            }
-                        }
-                        result = server => result.map_err(anyhow::Error::new),
-                    }
-                }
-            },
-        };
-        stop_dev_frontend(&mut dev_frontend).await;
-        let _ = scheduler_shutdown_tx.send(true);
-        let _ = scheduler.await;
-        let _ = trash_retention.await;
-        shutdown_embedding(&mut embedding).await;
-        run_result?;
+            .map_err(|_| anyhow::anyhow!("PDF renderer configuration is invalid"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("PDF renderer configuration is invalid"))?;
+        app_state = app_state.with_pdf_export(config.pdf_export.clone(), Arc::new(renderer));
     }
+    assert!(
+        Arc::ptr_eq(&app_state.org, &mcp_contexts.org),
+        "REST and MCP must share the same Org context"
+    );
+    let (rest, openapi) = rest_openapi::rest_router();
+    let rest = rest.with_state(app_state);
+    let max_request_bytes = env_u64("NOTE_MAX_REQUEST_BYTES", 512 * 1024 * 1024);
+    let mut app = compose_transport_router(
+        rest,
+        note_mcp::mcp_router(mcp_contexts.note, mcp_contexts.org),
+        openapi,
+        max_request_bytes as usize,
+    );
+
+    // NOTE_STATIC_DIR is for packaged builds such as Docker. Local debug HTTP runs use the
+    // Trunk development server instead, unless an explicit static directory is configured.
+    let static_dir = std::env::var("NOTE_STATIC_DIR")
+        .ok()
+        .filter(|static_dir| !static_dir.is_empty());
+    if let Some(static_dir) = &static_dir {
+        // SPA fallback for any path the API/MCP routes don't claim: serve a real static asset
+        // when one exists at that path, otherwise return index.html (200) so client-side routes
+        // like /new and /labels boot on a direct load or refresh. (ServeDir's not_found_service
+        // would serve index.html but with a 404 status, wrong for a valid SPA route.)
+        let static_dir = static_dir.clone();
+        let index_html =
+            std::fs::read_to_string(format!("{static_dir}/index.html")).unwrap_or_default();
+        app = app.fallback(move |uri: axum::http::Uri| {
+            let static_dir = static_dir.clone();
+            let index_html = index_html.clone();
+            async move {
+                let path = uri.path().trim_start_matches('/');
+                if !path.is_empty() && !path.contains("..") {
+                    if let Ok(bytes) = tokio::fs::read(format!("{static_dir}/{path}")).await {
+                        let content_type = match path.rsplit('.').next() {
+                            Some("js") => "text/javascript",
+                            Some("wasm") => "application/wasm",
+                            Some("css") => "text/css",
+                            Some("html") => "text/html; charset=utf-8",
+                            Some("json") => "application/json",
+                            Some("svg") => "image/svg+xml",
+                            Some("ico") => "image/x-icon",
+                            Some("png") => "image/png",
+                            _ => "application/octet-stream",
+                        };
+                        return ([(axum::http::header::CONTENT_TYPE, content_type)], bytes)
+                            .into_response();
+                    }
+                }
+                axum::response::Html(index_html).into_response()
+            }
+        });
+    }
+
+    // The config loader resolves server.bind_addr, then NOTE_BIND_ADDR, then the public
+    // 0.0.0.0:6222 default. Exposing this unauthenticated personal app must be limited to a
+    // trusted network or protected by a reverse proxy.
+    let bind_addr = &config.bind_addr;
+    let mut dev_frontend = None;
+    let run_result = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Err(error) => Err(anyhow::Error::new(error)),
+        Ok(listener) => match start_dev_frontend(should_start_dev_frontend(
+            cfg!(debug_assertions),
+            true,
+            static_dir.is_some(),
+        )) {
+            Err(error) => Err(error),
+            Ok(child) => {
+                dev_frontend = child;
+                eprintln!("note-server listening on http://{bind_addr}");
+                if dev_frontend.is_some() {
+                    eprintln!("frontend dev server listening on {DEV_FRONTEND_URL}");
+                } else if let Some(static_dir) = &static_dir {
+                    eprintln!("serving frontend from {static_dir}");
+                } else {
+                    eprintln!("API only — set NOTE_STATIC_DIR to serve a frontend bundle");
+                }
+
+                let server = axum::serve(listener, app);
+                tokio::select! {
+                    biased;
+                    signal = tokio::signal::ctrl_c() => {
+                        if let Err(error) = signal {
+                            eprintln!("failed to listen for shutdown signal: {error}");
+                        }
+                        eprintln!("shutting down note-server");
+                        Ok(())
+                    }
+                    status = wait_for_dev_frontend(&mut dev_frontend) => {
+                        match status {
+                            Ok(status) => Err(anyhow::anyhow!(
+                                "trunk serve exited unexpectedly: {status}"
+                            )),
+                            Err(error) => Err(anyhow::anyhow!(
+                                "wait for trunk serve: {error}"
+                            )),
+                        }
+                    }
+                    result = server => result.map_err(anyhow::Error::new),
+                }
+            }
+        },
+    };
+    stop_dev_frontend(&mut dev_frontend).await;
+    let _ = scheduler_shutdown_tx.send(true);
+    let _ = scheduler.await;
+    let _ = trash_retention.await;
+    shutdown_embedding(&mut embedding).await;
+    run_result?;
     Ok(())
 }
 
@@ -786,6 +757,7 @@ mod tests {
         assert_eq!(paths.len(), 57);
         assert_eq!(operation_count, 68);
         assert!(!paths.keys().any(|path| path.starts_with("/mcp")));
+        assert!(!paths.keys().any(|path| path.starts_with("/org/mcp")));
         assert!(document["tags"]
             .as_array()
             .expect("OpenAPI tags")
@@ -796,10 +768,11 @@ mod tests {
             .expect("OpenAPI schemas")
             .keys()
             .all(|schema| !schema.to_ascii_lowercase().contains("mcp")));
-        assert!(!serde_json::to_string(&document)
+        let serialized = serde_json::to_string(&document)
             .unwrap()
-            .to_ascii_lowercase()
-            .contains("\"/mcp"));
+            .to_ascii_lowercase();
+        assert!(!serialized.contains("\"/mcp"));
+        assert!(!serialized.contains("\"/org/mcp"));
     }
 
     #[test]
@@ -827,7 +800,9 @@ mod tests {
 
     #[tokio::test]
     async fn composed_transport_router_serves_docs_and_preserves_mcp() {
-        let mcp = Router::new().route("/mcp", get(|| async { "mcp-preserved" }));
+        let mcp = Router::new()
+            .route("/mcp", get(|| async { "mcp-preserved" }))
+            .route("/org/mcp", get(|| async { "org-mcp-preserved" }));
         let app = compose_transport_router(Router::new(), mcp, OpenApi::default(), 1024 * 1024);
 
         let response = app
@@ -873,12 +848,26 @@ mod tests {
         assert!(html.contains("Swagger UI"));
 
         let response = app
+            .clone()
             .oneshot(Request::builder().uri("/mcp").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"mcp-preserved");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/org/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"org-mcp-preserved");
     }
 
     #[tokio::test]

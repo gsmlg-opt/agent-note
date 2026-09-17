@@ -1029,6 +1029,7 @@ fn document_lifecycle_openapi_has_closed_bodies_filters_and_archived_fields() {
         .get("archived_at")
         .is_none());
     assert!(document["paths"].get("/mcp").is_none());
+    assert!(document["paths"].get("/org/mcp").is_none());
 }
 
 #[tokio::test]

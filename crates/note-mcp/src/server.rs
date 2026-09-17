@@ -1,4 +1,4 @@
-//! MCP server exposing note tools over stdio and Streamable HTTP transports.
+//! MCP server handlers shared by the Note and Org HTTP endpoints.
 //!
 //! Transport-specific request/response marshalling lives here. The handlers
 //! delegate to transport-independent wrappers in [`crate::tools`].
@@ -11,10 +11,8 @@ use note_pipelines::{
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Json, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router,
-    transport::{io::stdio, IntoTransport},
-    ErrorData, RoleServer, ServerHandler, ServiceExt,
+    model::{ServerCapabilities, ServerConfig},
+    tool, tool_handler, tool_router, ErrorData, ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -654,6 +652,7 @@ pub struct NoteMcpServer {
     ctx: Arc<Context>,
     org_ctx: Arc<OrgContext>,
     tool_router: ToolRouter<Self>,
+    instructions: &'static str,
 }
 
 impl NoteMcpServer {
@@ -663,6 +662,25 @@ impl NoteMcpServer {
             org_ctx,
             tool_router: crate::org::checked_tool_router(Self::tool_router())
                 .expect("static MCP tool names are unique"),
+            instructions: "Agent Note and Org orchestration server. Org actor_id values are caller-asserted audit metadata only; they are not authenticated identities.",
+        }
+    }
+
+    pub fn notes_only(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> Self {
+        Self {
+            ctx,
+            org_ctx,
+            tool_router: Self::tool_router(),
+            instructions: "Agent Note Markdown-note tools.",
+        }
+    }
+
+    pub fn org_only(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> Self {
+        Self {
+            ctx,
+            org_ctx,
+            tool_router: crate::org::org_tool_router(),
+            instructions: "Agent Note Org orchestration tools. Org actor_id values are caller-asserted audit metadata only; they are not authenticated identities.",
         }
     }
 
@@ -896,12 +914,9 @@ impl NoteMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for NoteMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
-        info.instructions = Some(
-            "Agent Note and Org orchestration server. Org actor_id values are caller-asserted audit metadata only; they are not authenticated identities."
-                .to_string(),
-        );
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
+        info.instructions = Some(self.instructions.to_string());
         info
     }
 }
@@ -992,25 +1007,6 @@ fn to_put_error_data(error: anyhow::Error) -> ErrorData {
         return ErrorData::invalid_params(error.to_string(), None);
     }
     to_error_data(error)
-}
-
-pub async fn serve_stdio_transport<T, E, A>(
-    ctx: Arc<Context>,
-    org_ctx: Arc<OrgContext>,
-    transport: T,
-) -> anyhow::Result<()>
-where
-    T: IntoTransport<RoleServer, E, A>,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    let server = NoteMcpServer::new(ctx, org_ctx);
-    let running = server.serve(transport).await?;
-    running.waiting().await?;
-    Ok(())
-}
-
-pub async fn run_stdio(ctx: Arc<Context>, org_ctx: Arc<OrgContext>) -> anyhow::Result<()> {
-    serve_stdio_transport(ctx, org_ctx, stdio()).await
 }
 
 #[cfg(test)]

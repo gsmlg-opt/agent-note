@@ -76,7 +76,7 @@ impl TestApp {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/mcp")
+                    .uri("/org/mcp")
                     .header(header::HOST, "notes.example.test")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::ACCEPT, "application/json, text/event-stream")
