@@ -11,3 +11,5 @@ pub mod fusion;
 pub use fusion::*;
 pub mod line_edit;
 pub use line_edit::*;
+pub mod content_patch;
+pub use content_patch::*;
