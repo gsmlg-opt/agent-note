@@ -140,10 +140,14 @@ pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, Content
         };
         let mut old_line_index = 0;
         let mut new_line_index = 0;
+        let mut output_after = vec![false; prefixes.len()];
+        let mut has_output = false;
+        for (index, prefix) in prefixes.iter().enumerate().rev() {
+            output_after[index] = has_output;
+            has_output |= matches!(prefix, ' ' | '+');
+        }
         for (index, prefix) in prefixes.iter().enumerate() {
-            let has_output_after = prefixes[index + 1..]
-                .iter()
-                .any(|remaining| matches!(remaining, ' ' | '+'));
+            let has_output_after = output_after[index];
             match prefix {
                 ' ' => {
                     let raw = original[start + old_line_index];
