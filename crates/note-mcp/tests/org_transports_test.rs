@@ -679,6 +679,27 @@ async fn post_modern(
     (status, headers, body)
 }
 
+async fn call_modern(router: &Router, id: u64, name: &str, arguments: Value) -> Value {
+    let (status, _, body) = post_modern(
+        router,
+        "/mcp",
+        modern_message(
+            id,
+            "tools/call",
+            json!({"name": name, "arguments": arguments}),
+        ),
+        "tools/call",
+        Some(name),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(status, StatusCode::OK | StatusCode::BAD_REQUEST),
+        "{name}: {status}: {body}"
+    );
+    body
+}
+
 #[tokio::test]
 async fn modern_http_supports_discovery_and_cacheable_tool_lists_without_initialize() {
     let bundle = Bundle::new("modern-discovery").await;
@@ -835,6 +856,126 @@ async fn http_paths_expose_disjoint_note_and_org_tool_registries() {
         expected_names.sort_unstable();
         assert_eq!(actual_names, expected_names, "{path}");
     }
+}
+
+#[tokio::test]
+async fn note_http_exposes_replace_and_patch_structured_results() {
+    let bundle = Bundle::new("replace-patch-http").await;
+    let router = note_mcp::mcp_router(bundle.note, bundle.org);
+    let mut id = 1;
+    let saved = call_modern(
+        &router,
+        id,
+        "save_note",
+        json!({"title": "Original", "content": "before", "labels": []}),
+    )
+    .await;
+    id += 1;
+    assert_success(&saved, "save note");
+    let note_id = tool_content(&saved)["id"].as_str().unwrap().to_owned();
+
+    let replaced = call_modern(
+        &router,
+        id,
+        "replace_note",
+        json!({
+            "id": note_id,
+            "expected_revision": 1,
+            "title": "Replaced",
+            "content": "after",
+            "attachments": [],
+            "labels": []
+        }),
+    )
+    .await;
+    id += 1;
+    assert_success(&replaced, "replace note");
+    assert_eq!(tool_content(&replaced)["changed"], true);
+    assert_eq!(replaced["result"]["resultType"], "complete", "{replaced}");
+
+    let patched = call_modern(
+        &router,
+        id,
+        "patch_note",
+        json!({"id": note_id, "expected_revision": 2, "title": "Patched"}),
+    )
+    .await;
+    id += 1;
+    assert_success(&patched, "patch note");
+    assert_eq!(tool_content(&patched)["changed"], true);
+
+    let noop = call_modern(
+        &router,
+        id,
+        "patch_note",
+        json!({"id": note_id, "expected_revision": 3, "title": "Patched"}),
+    )
+    .await;
+    id += 1;
+    assert_success(&noop, "no-op patch note");
+    assert_eq!(tool_content(&noop)["changed"], false);
+    assert_eq!(tool_content(&noop)["revision"], 3);
+
+    for arguments in [
+        json!({"id": note_id, "title": "Missing revision"}),
+        json!({"id": note_id, "expected_revision": 3, "title": null}),
+        json!({"id": note_id, "expected_revision": 3, "unknown": true}),
+    ] {
+        let malformed = call_modern(&router, id, "patch_note", arguments).await;
+        id += 1;
+        assert_eq!(malformed["error"]["code"], -32602, "{malformed}");
+        assert!(malformed.get("result").is_none(), "{malformed}");
+    }
+
+    for (arguments, code) in [
+        (
+            json!({"id": "missing", "expected_revision": 1, "title": "x"}),
+            "not_found",
+        ),
+        (
+            json!({"id": note_id, "expected_revision": 2, "title": "conflict"}),
+            "revision_conflict",
+        ),
+        (
+            json!({"id": note_id, "expected_revision": 3, "title": ""}),
+            "validation_error",
+        ),
+        (
+            json!({
+                "id": note_id,
+                "expected_revision": 3,
+                "content": {"apply_patch": "@@\n-missing\n+replacement\n"}
+            }),
+            "patch_failed",
+        ),
+    ] {
+        let failure = call_modern(&router, id, "patch_note", arguments).await;
+        id += 1;
+        assert_eq!(failure["result"]["isError"], true, "{failure}");
+        assert_eq!(tool_content(&failure)["code"], code, "{failure}");
+    }
+
+    let invalid = call_modern(
+        &router,
+        id,
+        "patch_note",
+        json!({"id": note_id, "expected_revision": 3}),
+    )
+    .await;
+    assert_eq!(invalid["result"]["isError"], true, "{invalid}");
+    assert_eq!(tool_content(&invalid)["code"], "invalid_request");
+    assert_eq!(
+        tool_content(&invalid)
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["code", "details", "message", "retryable"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
 }
 
 #[tokio::test]

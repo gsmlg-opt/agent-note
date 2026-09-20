@@ -11,21 +11,22 @@ use note_pipelines::{
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Json, wrapper::Parameters},
-    model::{ServerCapabilities, ServerConfig},
+    model::{CallToolResponse, CallToolResult, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router, ErrorData, ServerHandler,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::tools::{
-    bulk_update_note_labels_tool, delete_note_attachment_tool, delete_note_tool, edit_note_tool,
-    get_note_attachment_content_tool, get_note_tool, list_notes_tool, put_note_attachment_tool,
-    read_note_lines_tool, save_note_tool, semantic_search_tool, update_note_tool,
-    AttachmentContentData, AttachmentMetadataData, BulkUpdateNoteLabelsToolInput,
-    BulkUpdateNoteLabelsToolOutput, GetNoteAttachmentContentToolInput, LabelData, NoteDetailData,
-    NoteLine, NoteLinesData, NoteSummaryData, PutNoteAttachmentToolInput,
-    PutNoteAttachmentToolOutput, SaveNoteToolInput, SaveNoteToolOutput, SemanticSearchToolInput,
-    SemanticSearchToolResult, UpdateNoteToolInput,
+    bulk_update_note_labels_tool, delete_note_attachment_tool, delete_note_tool,
+    get_note_attachment_content_tool, get_note_tool, list_notes_tool, patch_note_tool,
+    put_note_attachment_tool, read_note_lines_tool, replace_note_tool, save_note_tool,
+    semantic_search_tool, AttachmentContentData, AttachmentMetadataData,
+    BulkUpdateNoteLabelsToolInput, BulkUpdateNoteLabelsToolOutput,
+    GetNoteAttachmentContentToolInput, LabelData, NoteDetailData, NoteLine, NoteLinesData,
+    NoteMutationData, NoteSummaryData, PatchNoteToolInput, PutNoteAttachmentToolInput,
+    PutNoteAttachmentToolOutput, ReplaceNoteToolInput, SaveNoteToolInput, SaveNoteToolOutput,
+    SemanticSearchToolInput, SemanticSearchToolResult,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -256,9 +257,9 @@ pub struct NoteLineSchema {
 pub struct NoteLinesResponse {
     /// Note id.
     pub id: String,
-    /// Optimistic concurrency revision required by `edit_note`.
+    /// Informational revision at the time these lines were read.
     pub revision: i64,
-    /// Content hash tag used to guard subsequent `edit_note` calls.
+    /// Informational content hash at the time these lines were read.
     pub tag: String,
     /// Numbered note body lines.
     pub lines: Vec<NoteLineSchema>,
@@ -284,79 +285,182 @@ impl From<NoteLinesData> for NoteLinesResponse {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum EditOpSchema {
-    /// Replace an original line range with zero or more lines.
-    Swap {
-        from: usize,
-        to: usize,
-        lines: Vec<String>,
-    },
-    /// Delete an original line range.
-    Delete { from: usize, to: usize },
-    /// Insert lines before an original line.
-    InsertBefore { line: usize, lines: Vec<String> },
-    /// Insert lines after an original line.
-    InsertAfter { line: usize, lines: Vec<String> },
-    /// Insert lines at the start of the note body.
-    InsertHead { lines: Vec<String> },
-    /// Insert lines at the end of the note body.
-    InsertTail { lines: Vec<String> },
-}
-
-impl From<EditOpSchema> for note_pipelines::EditOp {
-    fn from(op: EditOpSchema) -> Self {
-        match op {
-            EditOpSchema::Swap { from, to, lines } => Self::Swap { from, to, lines },
-            EditOpSchema::Delete { from, to } => Self::Delete { from, to },
-            EditOpSchema::InsertBefore { line, lines } => Self::InsertBefore { line, lines },
-            EditOpSchema::InsertAfter { line, lines } => Self::InsertAfter { line, lines },
-            EditOpSchema::InsertHead { lines } => Self::InsertHead { lines },
-            EditOpSchema::InsertTail { lines } => Self::InsertTail { lines },
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct EditNoteRequest {
-    /// Note id.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields, extend(
+    "oneOf" = [
+        {"required": ["content"], "not": {"required": ["content_base64"]}},
+        {"required": ["content_base64"], "not": {"required": ["content"]}}
+    ]
+))]
+pub struct AttachmentRequestSchema {
+    /// Unique attachment id within the note.
     pub id: String,
-    /// Revision returned by `read_note_lines`.
-    pub expected_revision: i64,
-    /// Tag from `read_note_lines`.
-    pub tag: String,
-    /// Operations anchored to the original line numbers.
-    pub edits: Vec<EditOpSchema>,
+    /// Relative path referenced by note Markdown.
+    pub path: String,
+    /// MIME type for the attachment bytes.
+    pub mime: String,
+    /// Optional human-readable description.
+    #[serde(default)]
+    pub description: String,
+    /// UTF-8 bytes. Provide exactly this field or `content_base64`.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Base64-encoded bytes. Provide exactly this field or `content`.
+    #[serde(default)]
+    pub content_base64: Option<String>,
+}
+
+impl TryFrom<AttachmentRequestSchema> for note_core::NoteAttachment {
+    type Error = ErrorData;
+
+    fn try_from(attachment: AttachmentRequestSchema) -> Result<Self, Self::Error> {
+        if attachment.content.is_some() == attachment.content_base64.is_some() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "invalid attachment {} at {}: exactly one of content or content_base64 is required",
+                    attachment.id, attachment.path
+                ),
+                None,
+            ));
+        }
+        let content = note_core::decode_attachment_content(
+            attachment.content.as_deref(),
+            attachment.content_base64.as_deref(),
+        )
+        .map_err(|error| {
+            ErrorData::invalid_params(
+                format!(
+                    "invalid attachment {} at {}: {error}",
+                    attachment.id, attachment.path
+                ),
+                None,
+            )
+        })?;
+        Ok(Self {
+            id: attachment.id,
+            path: attachment.path,
+            mime: attachment.mime,
+            description: attachment.description,
+            content,
+            storage: None,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct UpdateNoteRequest {
-    /// Note id.
+#[schemars(deny_unknown_fields)]
+pub struct ReplaceNoteRequest {
     pub id: String,
-    /// Revision returned by the latest read.
+    /// Revision returned by `get_note`.
+    #[schemars(range(min = 1))]
     pub expected_revision: i64,
-    /// New note title.
     pub title: String,
-    /// New note body, formatted as Markdown.
     pub content: String,
-    /// Label `(key, value)` pairs to attach. Missing keys are auto-created, but keys cannot contain
-    /// selector-reserved characters `&`, `=`, `!`, `<`, `>`, `^`, `$`, or `~`.
-    #[serde(default)]
+    pub attachments: Vec<AttachmentRequestSchema>,
     pub labels: Vec<(String, String)>,
 }
 
-impl From<UpdateNoteRequest> for UpdateNoteToolInput {
-    fn from(request: UpdateNoteRequest) -> Self {
-        Self {
+impl TryFrom<ReplaceNoteRequest> for ReplaceNoteToolInput {
+    type Error = ErrorData;
+
+    fn try_from(request: ReplaceNoteRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: request.id,
             expected_revision: request.expected_revision,
             title: request.title,
             content: request.content,
+            attachments: request
+                .attachments
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             labels: request.labels,
-        }
+        })
     }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ContentUpdateSchema {
+    Replace(String),
+    ApplyPatch(ContentPatchSchema),
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct ContentPatchSchema {
+    pub apply_patch: String,
+}
+
+fn remove_schema_default(schema: &mut schemars::Schema) {
+    schema.remove("default");
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct PatchNoteRequest {
+    pub id: String,
+    /// Revision returned by `get_note`.
+    #[schemars(range(min = 1))]
+    pub expected_revision: i64,
+    #[serde(default, deserialize_with = "note_core::deserialize_present")]
+    #[schemars(with = "String", transform = remove_schema_default)]
+    pub title: Option<String>,
+    #[serde(default, deserialize_with = "note_core::deserialize_present")]
+    #[schemars(with = "ContentUpdateSchema", transform = remove_schema_default)]
+    pub content: Option<ContentUpdateSchema>,
+    #[serde(default, deserialize_with = "note_core::deserialize_present")]
+    #[schemars(with = "Vec<AttachmentRequestSchema>", transform = remove_schema_default)]
+    pub attachments: Option<Vec<AttachmentRequestSchema>>,
+    #[serde(default, deserialize_with = "note_core::deserialize_present")]
+    #[schemars(with = "Vec<(String, String)>", transform = remove_schema_default)]
+    pub labels: Option<Vec<(String, String)>>,
+}
+
+impl TryFrom<PatchNoteRequest> for PatchNoteToolInput {
+    type Error = ErrorData;
+
+    fn try_from(request: PatchNoteRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: request.id,
+            expected_revision: request.expected_revision,
+            patch: note_pipelines::PatchNoteInput {
+                title: request.title,
+                content: request.content.map(|content| match content {
+                    ContentUpdateSchema::Replace(content) => {
+                        note_core::ContentUpdate::Replace(content)
+                    }
+                    ContentUpdateSchema::ApplyPatch(patch) => {
+                        note_core::ContentUpdate::ApplyPatch(note_core::ContentPatch {
+                            apply_patch: patch.apply_patch,
+                        })
+                    }
+                }),
+                attachments: request
+                    .attachments
+                    .map(|attachments| {
+                        attachments
+                            .into_iter()
+                            .map(TryInto::try_into)
+                            .collect::<Result<_, _>>()
+                    })
+                    .transpose()?,
+                labels: request.labels,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct NoteMutationResponse {
+    pub id: String,
+    pub revision: i64,
+    pub changed: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -662,7 +766,7 @@ impl NoteMcpServer {
             org_ctx,
             tool_router: crate::org::checked_tool_router(Self::tool_router())
                 .expect("static MCP tool names are unique"),
-            instructions: "Agent Note and Org orchestration server. Org actor_id values are caller-asserted audit metadata only; they are not authenticated identities.",
+            instructions: "Agent Note and Org orchestration server. For note mutations, read get_note.revision first; use patch_note for partial changes and replace_note only when supplying every writable field. On revision conflict, re-read and recompute the mutation. Org actor_id values are caller-asserted audit metadata only; they are not authenticated identities.",
         }
     }
 
@@ -671,7 +775,7 @@ impl NoteMcpServer {
             ctx,
             org_ctx,
             tool_router: Self::tool_router(),
-            instructions: "Agent Note Markdown-note tools.",
+            instructions: "Agent Note Markdown-note tools. Read get_note.revision before mutations; use patch_note for partial changes and replace_note only when supplying every writable field. On revision conflict, re-read and recompute the mutation.",
         }
     }
 
@@ -741,7 +845,7 @@ impl NoteMcpServer {
 
     #[tool(
         name = "read_note_lines",
-        description = "Read a note's Markdown body as numbered lines with a content tag for editing."
+        description = "Read a note's Markdown body as numbered lines with informational revision and content tag values."
     )]
     pub async fn read_note_lines(
         &self,
@@ -756,43 +860,33 @@ impl NoteMcpServer {
     }
 
     #[tool(
-        name = "edit_note",
-        description = "Edit a note's Markdown body with line-range operations anchored by a content tag."
+        name = "patch_note",
+        description = "Partially update a note using expected_revision from get_note. Omitted fields are preserved; provided labels or attachments replace the complete list and [] clears it. Content is either a full string replacement or a strict contextual {apply_patch} diff. Each attachment requires exactly one of content or content_base64. The mutation is atomic and a semantic no-op keeps the revision unchanged.",
+        output_schema = rmcp::handler::server::common::schema_for_type::<NoteMutationResponse>()
     )]
-    pub async fn edit_note(
+    pub async fn patch_note(
         &self,
-        params: Parameters<EditNoteRequest>,
-    ) -> Result<Json<NoteLinesResponse>, ErrorData> {
-        let request = params.0;
-        let id = request.id;
-        let edits = request.edits.into_iter().map(Into::into).collect();
-        let note = edit_note_tool(
-            &self.ctx,
-            &id,
-            request.expected_revision,
-            &request.tag,
-            edits,
-        )
-        .await
-        .map_err(to_error_data)?
-        .ok_or_else(|| ErrorData::resource_not_found(format!("note not found: {id}"), None))?;
-        Ok(Json(note.into()))
+        params: Parameters<PatchNoteRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let input = params.0.try_into()?;
+        Ok(note_mutation_result(
+            patch_note_tool(&self.ctx, input).await,
+        ))
     }
 
     #[tool(
-        name = "update_note",
-        description = "Update a note's title, Markdown content, and labels while preserving attachments."
+        name = "replace_note",
+        description = "Fully replace a note using expected_revision from get_note. Title, content, attachments, and labels are required; [] clears a collection. Each attachment requires exactly one of content or content_base64. The mutation is atomic and a semantic no-op keeps the revision unchanged.",
+        output_schema = rmcp::handler::server::common::schema_for_type::<NoteMutationResponse>()
     )]
-    pub async fn update_note(
+    pub async fn replace_note(
         &self,
-        params: Parameters<UpdateNoteRequest>,
-    ) -> Result<Json<NoteDetailResponse>, ErrorData> {
-        let id = params.0.id.clone();
-        let note = update_note_tool(&self.ctx, params.0.into())
-            .await
-            .map_err(to_error_data)?
-            .ok_or_else(|| ErrorData::resource_not_found(format!("note not found: {id}"), None))?;
-        Ok(Json(note.into()))
+        params: Parameters<ReplaceNoteRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let input = params.0.try_into()?;
+        Ok(note_mutation_result(
+            replace_note_tool(&self.ctx, input).await,
+        ))
     }
 
     #[tool(name = "delete_note", description = "Delete a note by id.")]
@@ -914,10 +1008,115 @@ impl NoteMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for NoteMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        match request.name.as_ref() {
+            "replace_note" => {
+                let params = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
+                .map_err(|error| {
+                    ErrorData::invalid_params(format!("invalid arguments: {error}"), None)
+                })?;
+                self.replace_note(Parameters(params)).await.map(Into::into)
+            }
+            "patch_note" => {
+                let params = serde_json::from_value(serde_json::Value::Object(
+                    request.arguments.unwrap_or_default(),
+                ))
+                .map_err(|error| {
+                    ErrorData::invalid_params(format!("invalid arguments: {error}"), None)
+                })?;
+                self.patch_note(Parameters(params)).await.map(Into::into)
+            }
+            _ => {
+                let context =
+                    rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+                self.tool_router.call(context).await
+            }
+        }
+    }
+
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
         info.instructions = Some(self.instructions.to_string());
         info
+    }
+}
+
+fn note_mutation_result(result: anyhow::Result<NoteMutationData>) -> CallToolResult {
+    let failure = |code: &str, message: &str, details: serde_json::Value| {
+        CallToolResult::structured_error(serde_json::json!({
+            "code": code,
+            "message": message,
+            "details": details,
+            "retryable": false,
+        }))
+    };
+    match result {
+        Ok(output) => CallToolResult::structured(serde_json::json!({
+            "id": output.id,
+            "revision": output.revision,
+            "changed": output.changed,
+        })),
+        Err(error) => {
+            if let Some(mutation) = error.downcast_ref::<note_pipelines::NoteMutationError>() {
+                return match mutation {
+                    note_pipelines::NoteMutationError::NotFound(note_id) => failure(
+                        "not_found",
+                        "note not found",
+                        serde_json::json!({"note_id": note_id}),
+                    ),
+                    note_pipelines::NoteMutationError::StaleRevision {
+                        note_id,
+                        expected_revision,
+                        current_revision,
+                    } => failure(
+                        "revision_conflict",
+                        "the note changed after it was read",
+                        serde_json::json!({
+                            "note_id": note_id,
+                            "expected_revision": expected_revision,
+                            "current_revision": current_revision,
+                        }),
+                    ),
+                    note_pipelines::NoteMutationError::StaleContentTag { .. } => failure(
+                        "internal_error",
+                        "note mutation failed",
+                        serde_json::json!({}),
+                    ),
+                };
+            }
+            if let Some(replace_patch) = error.downcast_ref::<note_pipelines::ReplacePatchError>() {
+                return match replace_patch {
+                    note_pipelines::ReplacePatchError::PatchFailed(message) => {
+                        failure("patch_failed", message, serde_json::json!({}))
+                    }
+                    note_pipelines::ReplacePatchError::InvalidRequest(message) => {
+                        failure("invalid_request", message, serde_json::json!({}))
+                    }
+                };
+            }
+            if error.downcast_ref::<note_core::ValidationError>().is_some()
+                || error
+                    .downcast_ref::<note_core::LabelKeyValidationError>()
+                    .is_some()
+            {
+                return failure(
+                    "validation_error",
+                    &error.to_string(),
+                    serde_json::json!({}),
+                );
+            }
+            failure(
+                "internal_error",
+                "note mutation failed",
+                serde_json::json!({}),
+            )
+        }
     }
 }
 
@@ -1604,12 +1803,65 @@ mod tests {
 
         let save_input = tool_schema(&server, "save_note", false);
         assert_exact_closed_object(&save_input, &save_input, &["content", "labels", "title"]);
-        let update_input = tool_schema(&server, "update_note", false);
+        let update_input = tool_schema(&server, "replace_note", false);
         assert_exact_closed_object(
             &update_input,
             &update_input,
-            &["content", "expected_revision", "id", "labels", "title"],
+            &[
+                "attachments",
+                "content",
+                "expected_revision",
+                "id",
+                "labels",
+                "title",
+            ],
         );
+        assert_eq!(
+            required_names(&update_input),
+            vec![
+                "attachments",
+                "content",
+                "expected_revision",
+                "id",
+                "labels",
+                "title",
+            ]
+        );
+        assert_eq!(
+            update_input["properties"]["expected_revision"]["minimum"],
+            1
+        );
+
+        let patch_input = tool_schema(&server, "patch_note", false);
+        assert_exact_closed_object(
+            &patch_input,
+            &patch_input,
+            &[
+                "attachments",
+                "content",
+                "expected_revision",
+                "id",
+                "labels",
+                "title",
+            ],
+        );
+        assert_eq!(
+            required_names(&patch_input),
+            vec!["expected_revision", "id"]
+        );
+        for field in ["title", "content", "attachments", "labels"] {
+            assert!(
+                !schema_allows_null(&patch_input["properties"][field]),
+                "{field}: {}",
+                patch_input["properties"][field]
+            );
+        }
+
+        for name in ["replace_note", "patch_note"] {
+            let output = tool_schema(&server, name, true);
+            assert_exact_closed_object(&output, &output, &["changed", "id", "revision"]);
+            assert_eq!(required_names(&output), vec!["changed", "id", "revision"]);
+        }
 
         let bulk_input = tool_schema(&server, "bulk_update_note_labels", false);
         assert_exact_closed_object(&bulk_input, &bulk_input, &["remove", "selector", "set"]);
@@ -1869,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn save_and_update_deserialization_rejects_inline_attachments() {
+    fn save_rejects_inline_attachments_and_mutation_shapes_are_strict() {
         let save = serde_json::from_value::<SaveNoteRequest>(json!({
             "title": "Legacy",
             "content": "Body",
@@ -1877,13 +2129,195 @@ mod tests {
         }));
         assert!(save.is_err());
 
-        let update = serde_json::from_value::<UpdateNoteRequest>(json!({
+        let replacement = json!({
             "id": "note-1",
-            "title": "Legacy",
+            "expected_revision": 1,
+            "title": "Replacement",
             "content": "Body",
-            "attachments": []
+            "attachments": [],
+            "labels": []
+        });
+        serde_json::from_value::<ReplaceNoteRequest>(replacement.clone()).unwrap();
+        for field in [
+            "id",
+            "expected_revision",
+            "title",
+            "content",
+            "attachments",
+            "labels",
+        ] {
+            let mut missing = replacement.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<ReplaceNoteRequest>(missing).is_err(),
+                "accepted omitted {field}"
+            );
+        }
+
+        let patch = json!({"id": "note-1", "expected_revision": 1, "title": "Patched"});
+        serde_json::from_value::<PatchNoteRequest>(patch.clone()).unwrap();
+        for field in ["title", "content", "attachments", "labels"] {
+            let mut null = patch.clone();
+            null[field] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<PatchNoteRequest>(null).is_err(),
+                "accepted null {field}"
+            );
+        }
+        for invalid in [
+            json!({"id": "note-1", "expected_revision": 1, "unknown": true}),
+            json!({"id": "note-1", "expected_revision": 1, "content": {"patch": "@@"}}),
+            json!({"id": "note-1", "expected_revision": 1, "content": {"apply_patch": "@@", "file": "x"}}),
+        ] {
+            assert!(serde_json::from_value::<PatchNoteRequest>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn attachment_request_schema_and_conversion_require_exactly_one_content_form() {
+        let schema = serde_json::to_value(schemars::schema_for!(AttachmentRequestSchema)).unwrap();
+        assert_exact_closed_object(
+            &schema,
+            &schema,
+            &[
+                "content",
+                "content_base64",
+                "description",
+                "id",
+                "mime",
+                "path",
+            ],
+        );
+        assert_eq!(required_names(&schema), vec!["id", "mime", "path"]);
+        let branches = schema["oneOf"].as_array().expect("attachment oneOf");
+        assert_eq!(branches.len(), 2);
+
+        let request = AttachmentRequestSchema {
+            id: "blob".into(),
+            path: "./blob.bin".into(),
+            mime: "application/octet-stream".into(),
+            description: "binary".into(),
+            content: None,
+            content_base64: Some("AP8=".into()),
+        };
+        let attachment = note_core::NoteAttachment::try_from(request).unwrap();
+        assert_eq!(attachment.content, vec![0, 255]);
+        assert!(attachment.storage.is_none());
+
+        for (content, content_base64) in [(None, None), (Some("same"), Some("c2FtZQ=="))] {
+            let request = AttachmentRequestSchema {
+                id: "blob".into(),
+                path: "./blob.bin".into(),
+                mime: "application/octet-stream".into(),
+                description: String::new(),
+                content: content.map(str::to_owned),
+                content_base64: content_base64.map(str::to_owned),
+            };
+            assert_eq!(
+                note_core::NoteAttachment::try_from(request)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::INVALID_PARAMS
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_results_have_stable_four_field_success_and_error_bodies() {
+        let success = note_mutation_result(Ok(NoteMutationData {
+            id: "note-1".into(),
+            revision: 2,
+            changed: true,
         }));
-        assert!(update.is_err());
+        assert_eq!(success.is_error, Some(false));
+        assert_eq!(
+            success.structured_content,
+            Some(json!({"id": "note-1", "revision": 2, "changed": true}))
+        );
+
+        let cases = [
+            (
+                anyhow::Error::new(note_pipelines::NoteMutationError::NotFound("note-1".into())),
+                "not_found",
+            ),
+            (
+                anyhow::Error::new(note_pipelines::NoteMutationError::StaleRevision {
+                    note_id: "note-1".into(),
+                    expected_revision: 1,
+                    current_revision: 2,
+                }),
+                "revision_conflict",
+            ),
+            (
+                anyhow::Error::new(note_pipelines::ReplacePatchError::PatchFailed(
+                    "context did not match".into(),
+                )),
+                "patch_failed",
+            ),
+            (
+                anyhow::Error::new(note_pipelines::ReplacePatchError::InvalidRequest(
+                    "patch must provide at least one field".into(),
+                )),
+                "invalid_request",
+            ),
+            (
+                anyhow::Error::new(note_core::ValidationError::EmptyTitle),
+                "validation_error",
+            ),
+        ];
+        for (error, code) in cases {
+            let result = note_mutation_result(Err(error));
+            assert_eq!(result.is_error, Some(true));
+            let body = result.structured_content.unwrap();
+            assert_eq!(body["code"], code);
+            assert_eq!(
+                body.as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ["code", "details", "message", "retryable"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            );
+            assert_eq!(body["retryable"], false);
+        }
+
+        for error in [
+            anyhow::anyhow!("secret storage object key /private/blob"),
+            anyhow::Error::new(AttachmentMutationError::AttachmentPathCollision {
+                path: "secret/path".into(),
+            }),
+        ] {
+            let body = note_mutation_result(Err(error)).structured_content.unwrap();
+            assert_eq!(body["code"], "internal_error");
+            assert_eq!(body["message"], "note mutation failed");
+            assert_eq!(body["details"], json!({}));
+            assert!(!body.to_string().contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn all_omitted_patch_is_an_operational_invalid_request() {
+        let (ctx, backend, _dir) = test_context().await;
+        let server = test_server(ctx, backend);
+        let result = server
+            .patch_note(Parameters(PatchNoteRequest {
+                id: "missing".into(),
+                expected_revision: 1,
+                title: None,
+                content: None,
+                attachments: None,
+                labels: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["code"],
+            "invalid_request"
+        );
     }
 
     #[test]
@@ -2116,12 +2550,13 @@ mod tests {
         let (ctx, backend, _dir) = test_context().await;
         let server = test_server(ctx, backend);
 
-        for tool_name in ["update_note", "edit_note"] {
+        for tool_name in ["replace_note", "patch_note"] {
             let schema = tool_schema(&server, tool_name, false);
             assert_eq!(
                 schema["properties"]["expected_revision"]["type"], "integer",
                 "{tool_name}: {schema}"
             );
+            assert_eq!(schema["properties"]["expected_revision"]["minimum"], 1);
             assert!(
                 required_names(&schema).contains(&"expected_revision".to_owned()),
                 "{tool_name}: {schema}"
@@ -2339,7 +2774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_note_uses_the_read_revision_and_returns_structured_stale_conflicts() {
+    async fn patch_note_uses_get_revision_and_returns_structured_stale_conflicts() {
         let (ctx, backend, _dir) = test_context().await;
         let server = test_server(ctx, backend);
         let saved = server
@@ -2352,7 +2787,7 @@ mod tests {
             .unwrap()
             .0;
         let read = server
-            .read_note_lines(Parameters(ReadNoteLinesRequest {
+            .get_note(Parameters(GetNoteRequest {
                 id: saved.id.clone(),
             }))
             .await
@@ -2360,42 +2795,42 @@ mod tests {
             .0;
 
         let edited = server
-            .edit_note(Parameters(EditNoteRequest {
+            .patch_note(Parameters(PatchNoteRequest {
                 id: saved.id.clone(),
                 expected_revision: read.revision,
-                tag: read.tag.clone(),
-                edits: vec![EditOpSchema::InsertTail {
-                    lines: vec!["second".into()],
-                }],
+                title: None,
+                content: Some(ContentUpdateSchema::Replace("second".into())),
+                attachments: None,
+                labels: None,
             }))
             .await
-            .unwrap()
-            .0;
-        assert_eq!(edited.revision, read.revision + 1);
-        assert_ne!(edited.tag, read.tag);
-
-        let stale = expect_error(
-            server
-                .edit_note(Parameters(EditNoteRequest {
-                    id: saved.id.clone(),
-                    expected_revision: read.revision,
-                    tag: edited.tag.clone(),
-                    edits: vec![EditOpSchema::InsertTail {
-                        lines: vec!["stale".into()],
-                    }],
-                }))
-                .await,
-        );
-        assert_eq!(stale.code, ErrorCode::INVALID_REQUEST);
+            .unwrap();
         assert_eq!(
-            stale.data,
+            edited.structured_content.as_ref().unwrap()["revision"],
+            read.revision + 1
+        );
+
+        let stale = server
+            .patch_note(Parameters(PatchNoteRequest {
+                id: saved.id.clone(),
+                expected_revision: read.revision,
+                title: Some("stale".into()),
+                content: None,
+                attachments: None,
+                labels: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(stale.is_error, Some(true));
+        assert_eq!(
+            stale.structured_content,
             Some(json!({
-                "code": "stale_revision",
+                "code": "revision_conflict",
                 "message": "the note changed after it was read",
                 "details": {
                     "note_id": saved.id,
                     "expected_revision": read.revision,
-                    "current_revision": edited.revision
+                    "current_revision": read.revision + 1
                 },
                 "retryable": false
             }))
@@ -2555,34 +2990,36 @@ mod tests {
             .await
             .unwrap();
         let updated = server
-            .update_note(Parameters(UpdateNoteRequest {
+            .patch_note(Parameters(PatchNoteRequest {
                 id: saved.id.clone(),
                 expected_revision: 3,
-                title: "Standalone updated".into(),
-                content: "updated searchable body".into(),
-                labels: vec![("topic".into(), "rust".into())],
+                title: Some("Standalone updated".into()),
+                content: Some(ContentUpdateSchema::Replace(
+                    "updated searchable body".into(),
+                )),
+                attachments: None,
+                labels: Some(vec![("topic".into(), "rust".into())]),
             }))
             .await
-            .unwrap()
-            .0;
-        assert_eq!(updated.attachments.len(), 2);
+            .unwrap();
+        assert_eq!(updated.structured_content.unwrap()["revision"], 4);
 
-        let stale = expect_error(
-            server
-                .update_note(Parameters(UpdateNoteRequest {
-                    id: saved.id.clone(),
-                    expected_revision: 3,
-                    title: "Stale".into(),
-                    content: "stale body".into(),
-                    labels: vec![],
-                }))
-                .await,
-        );
-        assert_eq!(stale.code, ErrorCode::INVALID_REQUEST);
+        let stale = server
+            .patch_note(Parameters(PatchNoteRequest {
+                id: saved.id.clone(),
+                expected_revision: 3,
+                title: Some("Stale".into()),
+                content: Some(ContentUpdateSchema::Replace("stale body".into())),
+                attachments: None,
+                labels: Some(vec![]),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(stale.is_error, Some(true));
         assert_eq!(
-            stale.data,
+            stale.structured_content,
             Some(json!({
-                "code": "stale_revision",
+                "code": "revision_conflict",
                 "message": "the note changed after it was read",
                 "details": {
                     "note_id": saved.id.clone(),

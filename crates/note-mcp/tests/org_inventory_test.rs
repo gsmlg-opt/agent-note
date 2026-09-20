@@ -72,17 +72,19 @@ fn note_inventory_is_the_ordered_12_tool_contract() {
             "bulk_update_note_labels",
             "delete_note",
             "delete_note_attachment",
-            "edit_note",
             "get_note",
             "get_note_attachment_content",
             "list_notes",
+            "patch_note",
             "put_note_attachment",
             "read_note_lines",
+            "replace_note",
             "save_note",
             "semantic_search",
-            "update_note",
         ]
     );
+    assert!(!NOTE_TOOL_NAMES.contains(&"edit_note"));
+    assert!(!NOTE_TOOL_NAMES.contains(&"update_note"));
 }
 
 async fn registered_tools() -> (Vec<Tool>, tempfile::TempDir) {

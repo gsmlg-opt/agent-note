@@ -208,59 +208,6 @@ pub async fn read_note_lines_tool(
         }))
 }
 
-pub(crate) async fn edit_note_tool(
-    ctx: &Context,
-    id: &str,
-    expected_revision: i64,
-    tag: &str,
-    ops: Vec<note_pipelines::EditOp>,
-) -> anyhow::Result<Option<NoteLinesData>> {
-    let note = note_pipelines::edit_note(ctx, id, expected_revision, tag, &ops).await?;
-    Ok(note.map(|note| NoteLinesData {
-        id: note.id,
-        revision: note.revision,
-        tag: note_pipelines::compute_tag(&note.content),
-        lines: note
-            .content
-            .split('\n')
-            .enumerate()
-            .map(|(idx, text)| NoteLine {
-                n: idx + 1,
-                text: text.to_string(),
-            })
-            .collect(),
-    }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct UpdateNoteToolInput {
-    pub id: String,
-    pub expected_revision: i64,
-    pub title: String,
-    pub content: String,
-    #[serde(default)]
-    pub labels: Vec<(String, String)>,
-}
-
-pub(crate) async fn update_note_tool(
-    ctx: &Context,
-    input: UpdateNoteToolInput,
-) -> anyhow::Result<Option<NoteDetailData>> {
-    Ok(note_pipelines::update_note_fields(
-        ctx,
-        &input.id,
-        note_pipelines::UpdateNoteFieldsInput {
-            expected_revision: input.expected_revision,
-            title: input.title,
-            content: input.content,
-            labels: input.labels,
-        },
-    )
-    .await?
-    .map(Into::into))
-}
-
 #[derive(Debug)]
 pub struct ReplaceNoteToolInput {
     pub id: String,

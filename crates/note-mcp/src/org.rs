@@ -76,15 +76,15 @@ pub const NOTE_TOOL_NAMES: [&str; 12] = [
     "bulk_update_note_labels",
     "delete_note",
     "delete_note_attachment",
-    "edit_note",
     "get_note",
     "get_note_attachment_content",
     "list_notes",
+    "patch_note",
     "put_note_attachment",
     "read_note_lines",
+    "replace_note",
     "save_note",
     "semantic_search",
-    "update_note",
 ];
 
 type WorkspaceRevisionOutput = CommandOutput<WorkspaceRevisionData>;
