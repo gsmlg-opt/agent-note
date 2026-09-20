@@ -82,10 +82,13 @@ pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, Content
     }
 
     let original: Vec<_> = content.split_inclusive('\n').collect();
-    let text = |raw: &str| match raw.strip_suffix('\n') {
-        Some(line) => line.strip_suffix('\r').unwrap_or(line).to_owned(),
-        None => raw.to_owned(),
-    };
+    let normalized_original: Vec<_> = original
+        .iter()
+        .map(|raw| match raw.strip_suffix('\n') {
+            Some(line) => line.strip_suffix('\r').unwrap_or(line),
+            None => *raw,
+        })
+        .collect();
     let mut cursor = 0;
     let mut result = String::new();
     let mut removed_unterminated_eof = false;
@@ -98,35 +101,39 @@ pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, Content
         if chunk.old_lines.is_empty() {
             return Err(fail("each hunk needs existing context or deletion lines"));
         }
-        let matches: Vec<_> = original
+        let mut matches = normalized_original
             .windows(chunk.old_lines.len())
             .enumerate()
             .filter(|(_, window)| {
                 window
                     .iter()
-                    .map(|line| text(line))
-                    .eq(chunk.old_lines.iter().cloned())
+                    .copied()
+                    .eq(chunk.old_lines.iter().map(String::as_str))
             })
-            .map(|(start, _)| start)
-            .collect();
-        let [start] = matches.as_slice() else {
+            .map(|(start, _)| start);
+        let Some(start) = matches.next() else {
             return Err(fail(
                 "context must match exactly one location in the original content",
             ));
         };
-        if *start < cursor {
+        if matches.next().is_some() {
+            return Err(fail(
+                "context must match exactly one location in the original content",
+            ));
+        }
+        if start < cursor {
             return Err(fail("hunks must be ordered and must not overlap"));
         }
 
-        result.extend(original[cursor..*start].iter().copied());
+        result.extend(original[cursor..start].iter().copied());
         let end = start + chunk.old_lines.len();
         if chunk.old_lines == chunk.new_lines {
-            result.extend(original[*start..end].iter().copied());
+            result.extend(original[start..end].iter().copied());
             cursor = end;
             continue;
         }
 
-        let newline = if original[*start].ends_with("\r\n") {
+        let newline = if original[start].ends_with("\r\n") {
             "\r\n"
         } else {
             "\n"
@@ -134,9 +141,16 @@ pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, Content
         let mut old_line_index = 0;
         let mut new_line_index = 0;
         for (index, prefix) in prefixes.iter().enumerate() {
+            let has_output_after = prefixes[index + 1..]
+                .iter()
+                .any(|remaining| matches!(remaining, ' ' | '+'));
             match prefix {
                 ' ' => {
-                    result.push_str(original[*start + old_line_index]);
+                    let raw = original[start + old_line_index];
+                    result.push_str(raw);
+                    if !raw.ends_with('\n') && has_output_after {
+                        result.push_str(newline);
+                    }
                     old_line_index += 1;
                     new_line_index += 1;
                 }
@@ -144,12 +158,7 @@ pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, Content
                 '+' => {
                     result.push_str(&chunk.new_lines[new_line_index]);
                     new_line_index += 1;
-                    if end != original.len()
-                        || content.ends_with('\n')
-                        || prefixes[index + 1..]
-                            .iter()
-                            .any(|remaining| matches!(remaining, ' ' | '+'))
-                    {
+                    if end != original.len() || content.ends_with('\n') || has_output_after {
                         result.push_str(newline);
                     }
                 }

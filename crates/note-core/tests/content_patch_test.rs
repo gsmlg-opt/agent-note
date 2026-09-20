@@ -56,6 +56,22 @@ fn preserves_mixed_line_endings_for_retained_context_in_a_changed_hunk() {
 }
 
 #[test]
+fn separates_inserted_text_after_unterminated_retained_lf_context() {
+    assert_eq!(
+        apply_content_patch("tail", "@@\n tail\n+next").unwrap(),
+        "tail\nnext"
+    );
+}
+
+#[test]
+fn separates_inserted_text_after_unterminated_retained_crlf_context() {
+    assert_eq!(
+        apply_content_patch("head\r\ntail", "@@\n head\n tail\n+next").unwrap(),
+        "head\r\ntail\r\nnext"
+    );
+}
+
+#[test]
 fn deleting_unterminated_final_line_does_not_add_lf_to_predecessor() {
     assert_eq!(
         apply_content_patch("kept\nremoved", "@@\n kept\n-removed").unwrap(),
