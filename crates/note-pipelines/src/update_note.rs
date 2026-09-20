@@ -22,7 +22,7 @@ pub async fn update_note(
     expected_revision: i64,
     input: SaveNoteInput,
 ) -> anyhow::Result<Option<Note>> {
-    update_note_inner(
+    commit_note_update(
         ctx,
         id,
         UpdateNoteFieldsInput {
@@ -41,10 +41,10 @@ pub async fn update_note_fields(
     id: &str,
     input: UpdateNoteFieldsInput,
 ) -> anyhow::Result<Option<Note>> {
-    update_note_inner(ctx, id, input, None).await
+    commit_note_update(ctx, id, input, None).await
 }
 
-async fn update_note_inner(
+pub(crate) async fn commit_note_update(
     ctx: &Context,
     id: &str,
     input: UpdateNoteFieldsInput,
