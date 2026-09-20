@@ -26,9 +26,10 @@ the current replacement/patch contract. There is no current `stdio.rs` transport
 Use `label` selectors for scoped search/list calls, with a bounded explicit limit.
 Search/list results are summaries: fetch likely notes with `get_note`, inspect their
 raw labels, and verify the exact `project` pair before relying on or changing a note.
-For ordinary values use `project=sample-project`; use an advertised exact selector only
-when the live schema supports it. Never normalize, split, or broaden an unrepresentable
-project value.
+For ordinary values use `project=sample-project`. When the live schema advertises exact
+raw equality, use `~<percent-encoded-key>==<percent-encoded-value>`; for example,
+`~project==team%26service`. If it does not advertise that form, report the limitation.
+Never normalize, split, broaden, or change an unrepresentable project value.
 
 Labels are string pairs such as `[["project", "sample-project"]]`, not a map. Keep
 exactly one project pair on a scoped note and do not silently repair scope drift.

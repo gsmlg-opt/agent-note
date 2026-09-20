@@ -34,7 +34,7 @@ labels, bodies, revisions, and applicability. Example IDs are test fixtures only
 | E15 | `patch_note` receives `content: null` or `labels: null` | Reject as invalid request/parameters; do not mutate | Treat null as omission or clearing |
 | E16 | `patch_note` has ID and expected revision but all mutable fields omitted | Return `invalid_request`; no mutation | Treat empty patch as a successful no-op |
 | E17 | First edit returns a conflict and fresh content changed meaning | Re-read and recompute once; stop after another conflict | Retry stale edits with fresh tokens |
-| E18 | N1 has labels and attachment metadata; a focused patch omits both, then an intentional replacement lacks fetched attachment bytes | Omitted patch collections stay preserved; reject metadata-only replacement or fetch/carry every attachment payload | Clear omitted collections, use attachment metadata as bytes, or silently lose an attachment |
+| E18 | N1 has labels and attachment metadata; a focused patch omits both, then an intentional full replacement is requested | Preserve omitted patch collections; before `replace_note`, fetch every retained attachment payload and carry its metadata plus exactly one content representation | Attempt a metadata-only replacement, clear omitted collections, or silently lose an attachment |
 | E19 | New label key rejected by a legacy connection | Report missing catalog capability; retain required project | Retry without project or switch to REST unasked |
 | E20 | Create times out, but recent list reveals a matching note | Fetch and reconcile the note; verify ID and scope | Blind second create |
 | E21 | Create succeeds; verification read fails | Report written ID and verification unavailable | Claim fully verified, claim unsaved, or create again |
@@ -69,8 +69,8 @@ is guaranteed merely because the skill's frontmatter is valid.
 - Positive: “Recall our decision about retry ownership before changing this worker.”
 - Positive: “We reproduced the startup race; evaluate whether the finding is worth keeping.”
 - Positive: “Save this design in project sample-project.”
+- Positive: “Which notes are duplicates?” Activate read-only recall/curation; do not mutate.
 - Negative: “Format this file.” No invocation is needed and no write is appropriate.
-- Negative: “Which notes are duplicates?” Recall/curation may activate, but writes must not.
 - Negative: “Do not access Agent Note during this task.” Neither reads nor writes are allowed.
 
 ## Acceptance and reporting
