@@ -16,13 +16,19 @@ pub struct UpdateNoteFieldsInput {
     pub labels: Vec<(String, String)>,
 }
 
+pub(crate) struct NoteUpdateCommit {
+    pub(crate) id: String,
+    pub(crate) revision: i64,
+    note: Option<Note>,
+}
+
 pub async fn update_note(
     ctx: &Context,
     id: &str,
     expected_revision: i64,
     input: SaveNoteInput,
 ) -> anyhow::Result<Option<Note>> {
-    commit_note_update(
+    let committed = commit_note_update(
         ctx,
         id,
         UpdateNoteFieldsInput {
@@ -33,7 +39,8 @@ pub async fn update_note(
         },
         Some(input.attachments),
     )
-    .await
+    .await?;
+    Ok(committed.note)
 }
 
 pub async fn update_note_fields(
@@ -41,7 +48,10 @@ pub async fn update_note_fields(
     id: &str,
     input: UpdateNoteFieldsInput,
 ) -> anyhow::Result<Option<Note>> {
-    commit_note_update(ctx, id, input, None).await
+    commit_note_update(ctx, id, input, None).await?;
+    Ok(Some(crate::get_note_metadata(ctx, id).await?.ok_or_else(
+        || crate::NoteMutationError::NotFound(id.to_string()),
+    )?))
 }
 
 pub(crate) async fn commit_note_update(
@@ -49,7 +59,7 @@ pub(crate) async fn commit_note_update(
     id: &str,
     input: UpdateNoteFieldsInput,
     attachments: Option<Vec<NoteAttachment>>,
-) -> anyhow::Result<Option<Note>> {
+) -> anyhow::Result<NoteUpdateCommit> {
     let session = ctx.storage().session().await?;
 
     let existing = match session.get_note(id).await? {
@@ -139,6 +149,28 @@ pub(crate) async fn commit_note_update(
             .get_note(id)
             .await?
             .ok_or_else(|| crate::NoteMutationError::NotFound(id.to_string()))?;
+        for key in &missing_keys {
+            transaction.insert_label_key_if_missing(key, "").await?;
+        }
+        let current_label_types: HashMap<String, LabelValueType> = transaction
+            .list_label_keys()
+            .await?
+            .into_iter()
+            .map(|label_key| (label_key.key, label_key.value_type))
+            .collect();
+        for (key, value) in &input.labels {
+            let value_type = current_label_types
+                .get(key)
+                .copied()
+                .unwrap_or(LabelValueType::Text);
+            if !validate_label_value(value_type, value) {
+                return Err(anyhow::Error::new(ValidationError::InvalidLabelValue {
+                    key: key.clone(),
+                    value: value.clone(),
+                    value_type,
+                }));
+            }
+        }
         let mutation = match attachment_metadata.as_deref() {
             Some(attachments) => {
                 transaction
@@ -173,9 +205,6 @@ pub(crate) async fn commit_note_update(
                 now,
             )
             .await?;
-        }
-        for key in &missing_keys {
-            transaction.insert_label_key(key, "").await?;
         }
         transaction.clear_note_labels(id).await?;
         let queued =
@@ -224,8 +253,8 @@ pub(crate) async fn commit_note_update(
         ctx.wake_embedding_jobs();
     }
 
-    match attachments {
-        Some(_) => Ok(Some(Note {
+    let note = match attachments {
+        Some(_) => Some(Note {
             id: id.to_string(),
             title: input.title,
             content: input.content,
@@ -237,11 +266,14 @@ pub(crate) async fn commit_note_update(
             updated_at: now,
             revision: note_revision,
             deleted_at: None,
-        })),
-        None => Ok(Some(crate::get_note_metadata(ctx, id).await?.ok_or_else(
-            || crate::NoteMutationError::NotFound(id.to_string()),
-        )?)),
-    }
+        }),
+        None => None,
+    };
+    Ok(NoteUpdateCommit {
+        id: id.to_string(),
+        revision: note_revision,
+        note,
+    })
 }
 
 pub async fn delete_note(ctx: &Context, id: &str, expected_revision: i64) -> anyhow::Result<bool> {

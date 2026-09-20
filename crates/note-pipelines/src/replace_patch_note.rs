@@ -126,7 +126,7 @@ pub async fn patch_note(
     }
 
     let attachments = attachments_changed.then_some(desired.attachments);
-    let note = commit_note_update(
+    let committed = commit_note_update(
         ctx,
         id,
         UpdateNoteFieldsInput {
@@ -137,13 +137,12 @@ pub async fn patch_note(
         },
         attachments,
     )
-    .await?
-    .ok_or_else(|| crate::NoteMutationError::NotFound(id.to_string()))?;
+    .await?;
 
     ctx.notify_note_mutated();
     Ok(NoteMutation {
-        id: note.id,
-        revision: note.revision,
+        id: committed.id,
+        revision: committed.revision,
         changed: true,
     })
 }

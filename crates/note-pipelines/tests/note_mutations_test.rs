@@ -1,16 +1,19 @@
 mod support;
 
-use note_attachments::FilesystemAttachmentStore;
-use note_core::{ContentPatch, ContentUpdate, NoteAttachment, ValidationError};
+use note_attachments::{
+    AttachmentStore, AttachmentStoreInfo, DeleteObjectOutcome, FilesystemAttachmentStore,
+    PutObjectRequest, StoredObject,
+};
+use note_core::{ContentPatch, ContentUpdate, LabelValueType, NoteAttachment, ValidationError};
 use note_embedding::StubEmbedder;
 use note_pipelines::{
     delete_note, drain_embedding_jobs, get_note, get_note_metadata, patch_note, replace_note,
-    save_note, Context, NoteMutationError, NoteMutationNotifier, PatchNoteInput, ReplacePatchError,
-    SaveNoteInput,
+    save_note, Context, EmbeddingJobNotifier, NoteMutationError, NoteMutationNotifier,
+    PatchNoteInput, ReplacePatchError, SaveNoteInput,
 };
 use note_storage::StorageBackend;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use support::{event_log, ControlledAttachmentStore, EventNotifier, EventStorageBackend};
@@ -27,6 +30,82 @@ impl CountingNotifier {
 impl NoteMutationNotifier for CountingNotifier {
     fn note_mutated(&self) {
         self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct LabelTypeRaceAttachmentStore {
+    inner: FilesystemAttachmentStore,
+    backend: Arc<dyn StorageBackend>,
+    armed: AtomicBool,
+}
+
+impl LabelTypeRaceAttachmentStore {
+    fn new(root: std::path::PathBuf, backend: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner: FilesystemAttachmentStore::new(root),
+            backend,
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl AttachmentStore for LabelTypeRaceAttachmentStore {
+    async fn put_immutable(&self, request: PutObjectRequest) -> anyhow::Result<StoredObject> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.backend
+                .session()
+                .await?
+                .update_label_key_with_type("score", "", LabelValueType::Number)
+                .await?;
+        }
+        self.inner.put_immutable(request).await
+    }
+
+    async fn read_object(&self, object_key: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.read_object(object_key).await
+    }
+
+    async fn delete_object(&self, object_key: &str) -> anyhow::Result<DeleteObjectOutcome> {
+        self.inner.delete_object(object_key).await
+    }
+
+    async fn read_legacy(&self, note_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.inner.read_legacy(note_id, path).await
+    }
+
+    fn info(&self) -> AttachmentStoreInfo {
+        self.inner.info()
+    }
+}
+
+struct FailGetNoteOnWakeNotifier {
+    backend: Arc<EventStorageBackend>,
+    armed: AtomicBool,
+}
+
+impl FailGetNoteOnWakeNotifier {
+    fn new(backend: Arc<EventStorageBackend>) -> Self {
+        Self {
+            backend,
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl EmbeddingJobNotifier for FailGetNoteOnWakeNotifier {
+    fn wake(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.backend.fail_next_repository_call("get_note");
+        }
     }
 }
 
@@ -749,6 +828,149 @@ async fn changed_mutation_notifies_once_and_wakes_only_for_queued_embedding_work
             .filter(|event| event.as_str() == "wake")
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn in_transaction_label_type_validation_rejects_a_publication_race() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let attachments = Arc::new(LabelTypeRaceAttachmentStore::new(
+        dir.path().join("attachments"),
+        backend.clone(),
+    ));
+    let ctx = Context::new(backend.clone(), Arc::new(StubEmbedder), attachments.clone());
+    let original = save_note(
+        &ctx,
+        input(
+            "Original",
+            "Body",
+            vec![attachment("old", "old.txt", b"old")],
+            &[("score", "not-a-number")],
+        ),
+    )
+    .await
+    .unwrap();
+    let before = get_note_metadata(&ctx, &original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    attachments.arm();
+
+    let error = patch_note(
+        &ctx,
+        &original.id,
+        original.revision,
+        PatchNoteInput {
+            title: Some("Must not commit".into()),
+            attachments: Some(vec![attachment("new", "new.txt", b"new")]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<ValidationError>(),
+        Some(ValidationError::InvalidLabelValue {
+            key,
+            value,
+            value_type: LabelValueType::Number,
+        }) if key == "score" && value == "not-a-number"
+    ));
+    let after = get_note_metadata(&ctx, &original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.title, before.title);
+    assert_eq!(after.content, before.content);
+    assert_eq!(after.attachments, before.attachments);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(
+        after
+            .labels
+            .iter()
+            .map(|label| (&label.key, &label.value))
+            .collect::<Vec<_>>(),
+        before
+            .labels
+            .iter()
+            .map(|label| (&label.key, &label.value))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn patch_acknowledges_and_notifies_without_a_post_commit_metadata_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let events = event_log();
+    let traced = Arc::new(EventStorageBackend::new(raw, events));
+    let backend: Arc<dyn StorageBackend> = traced.clone();
+    let wake = Arc::new(FailGetNoteOnWakeNotifier::new(traced.clone()));
+    let mutations = Arc::new(CountingNotifier::default());
+    let ctx = Context::with_embedding_job_notifier(
+        backend.clone(),
+        Arc::new(StubEmbedder),
+        note_embedding::EmbeddingBackendInfo::local_bge_m3(),
+        wake.clone(),
+        Arc::new(FilesystemAttachmentStore::new(
+            dir.path().join("attachments"),
+        )),
+    )
+    .with_note_mutation_notifier(mutations.clone());
+    let original = save_note(&ctx, input("Original", "Body", vec![], &[]))
+        .await
+        .unwrap();
+    wake.arm();
+
+    let mutation = patch_note(
+        &ctx,
+        &original.id,
+        original.revision,
+        PatchNoteInput {
+            title: Some("Committed".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(mutation.changed);
+    assert_eq!(mutation.revision, original.revision + 1);
+    assert_eq!(mutations.count(), 1);
+    assert_eq!(traced.repository_call_count("get_note"), 3);
+    let injected = backend
+        .session()
+        .await
+        .unwrap()
+        .get_note(&original.id)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        injected.to_string(),
+        "controlled repository failure at get_note"
+    );
+    assert_eq!(
+        backend
+            .session()
+            .await
+            .unwrap()
+            .get_note(&original.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .title,
+        "Committed"
     );
 }
 
