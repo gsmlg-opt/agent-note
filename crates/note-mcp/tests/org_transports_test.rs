@@ -816,6 +816,70 @@ async fn modern_http_validates_routing_headers_and_origin() {
 }
 
 #[tokio::test]
+async fn modern_org_http_rejects_custom_note_mutations_without_mutating_storage() {
+    let bundle = Bundle::new("modern-org-note-mutation-isolation").await;
+    let router = note_mcp::mcp_router(bundle.note, bundle.org);
+    let saved = call_modern(
+        &router,
+        1,
+        "save_note",
+        json!({"title": "Original", "content": "before", "labels": []}),
+    )
+    .await;
+    assert_success(&saved, "save note");
+    let note_id = tool_content(&saved)["id"].as_str().unwrap().to_owned();
+
+    for (id, name, arguments) in [
+        (
+            2,
+            "replace_note",
+            json!({
+                "id": note_id,
+                "expected_revision": 1,
+                "title": "Replaced",
+                "content": "after",
+                "attachments": [],
+                "labels": []
+            }),
+        ),
+        (
+            3,
+            "patch_note",
+            json!({"id": note_id, "expected_revision": 1, "title": "Patched"}),
+        ),
+    ] {
+        let (status, _, rejected) = post_modern(
+            &router,
+            "/org/mcp",
+            modern_message(
+                id,
+                "tools/call",
+                json!({"name": name, "arguments": arguments}),
+            ),
+            "tools/call",
+            Some(name),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {rejected}");
+        assert_eq!(rejected["jsonrpc"], "2.0", "{name}: {rejected}");
+        assert_eq!(rejected["id"], id, "{name}: {rejected}");
+        assert_eq!(
+            rejected["error"],
+            json!({"code": -32602, "message": "tool not found"}),
+            "{name}: {rejected}"
+        );
+        assert!(rejected.get("result").is_none(), "{name}: {rejected}");
+    }
+
+    let unchanged = call_modern(&router, 4, "get_note", json!({"id": note_id})).await;
+    assert_success(&unchanged, "get unchanged note");
+    assert_eq!(tool_content(&unchanged)["title"], "Original");
+    assert_eq!(tool_content(&unchanged)["content"], "before");
+    assert_eq!(tool_content(&unchanged)["revision"], 1);
+}
+
+#[tokio::test]
 async fn http_paths_expose_disjoint_note_and_org_tool_registries() {
     let bundle = Bundle::new("split-inventory").await;
     let router = note_mcp::mcp_router(bundle.note, bundle.org);

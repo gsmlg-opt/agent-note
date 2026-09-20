@@ -1016,7 +1016,7 @@ impl ServerHandler for NoteMcpServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         match request.name.as_ref() {
-            "replace_note" => {
+            "replace_note" if self.tool_router.has_route("replace_note") => {
                 let params = serde_json::from_value(serde_json::Value::Object(
                     request.arguments.unwrap_or_default(),
                 ))
@@ -1025,7 +1025,7 @@ impl ServerHandler for NoteMcpServer {
                 })?;
                 self.replace_note(Parameters(params)).await.map(Into::into)
             }
-            "patch_note" => {
+            "patch_note" if self.tool_router.has_route("patch_note") => {
                 let params = serde_json::from_value(serde_json::Value::Object(
                     request.arguments.unwrap_or_default(),
                 ))
