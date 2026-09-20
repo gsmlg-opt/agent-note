@@ -48,6 +48,14 @@ fn preserves_unicode_crlf_mixed_line_endings_final_newline_and_unterminated_line
 }
 
 #[test]
+fn preserves_mixed_line_endings_for_retained_context_in_a_changed_hunk() {
+    assert_eq!(
+        apply_content_patch("a\nb\r\nc\n", "@@\n a\n b\n-c\n+C").unwrap(),
+        "a\nb\r\nC\n"
+    );
+}
+
+#[test]
 fn deleting_unterminated_final_line_does_not_add_lf_to_predecessor() {
     assert_eq!(
         apply_content_patch("kept\nremoved", "@@\n kept\n-removed").unwrap(),

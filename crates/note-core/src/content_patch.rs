@@ -49,6 +49,20 @@ pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, Content
             "expected @@ hunks with context, - deletion, and + insertion lines; file directives are not supported",
         ));
     }
+    let hunk_prefixes = patch_lines
+        .iter()
+        .skip(1)
+        .fold(vec![Vec::new()], |mut hunks, line| {
+            if *line == "@@" {
+                hunks.push(Vec::new());
+            } else {
+                hunks
+                    .last_mut()
+                    .expect("a hunk exists after the initial @@")
+                    .push(line.chars().next().expect("validated non-empty patch line"));
+            }
+            hunks
+        });
 
     let body = patch.strip_suffix('\n').unwrap_or(patch);
     let envelope = format!("*** Begin Patch\n*** Update File: content.md\n{body}\n*** End Patch");
@@ -76,7 +90,11 @@ pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, Content
     let mut result = String::new();
     let mut removed_unterminated_eof = false;
 
-    for chunk in chunks {
+    if chunks.len() != hunk_prefixes.len() {
+        return Err(fail("expected plain @@ hunks"));
+    }
+
+    for (chunk, prefixes) in chunks.iter().zip(hunk_prefixes) {
         if chunk.old_lines.is_empty() {
             return Err(fail("each hunk needs existing context or deletion lines"));
         }
@@ -113,17 +131,33 @@ pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, Content
         } else {
             "\n"
         };
-        for (index, line) in chunk.new_lines.iter().enumerate() {
-            result.push_str(line);
-            if end != original.len()
-                || content.ends_with('\n')
-                || index + 1 != chunk.new_lines.len()
-            {
-                result.push_str(newline);
+        let mut old_line_index = 0;
+        let mut new_line_index = 0;
+        for (index, prefix) in prefixes.iter().enumerate() {
+            match prefix {
+                ' ' => {
+                    result.push_str(original[*start + old_line_index]);
+                    old_line_index += 1;
+                    new_line_index += 1;
+                }
+                '-' => old_line_index += 1,
+                '+' => {
+                    result.push_str(&chunk.new_lines[new_line_index]);
+                    new_line_index += 1;
+                    if end != original.len()
+                        || content.ends_with('\n')
+                        || prefixes[index + 1..]
+                            .iter()
+                            .any(|remaining| matches!(remaining, ' ' | '+'))
+                    {
+                        result.push_str(newline);
+                    }
+                }
+                _ => unreachable!("patch prefixes were validated before parsing"),
             }
         }
         removed_unterminated_eof =
-            end == original.len() && !content.ends_with('\n') && chunk.new_lines.is_empty();
+            end == original.len() && !content.ends_with('\n') && prefixes.last() == Some(&'-');
         cursor = end;
     }
     result.extend(original[cursor..].iter().copied());
