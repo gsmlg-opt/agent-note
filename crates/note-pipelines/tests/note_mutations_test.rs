@@ -11,10 +11,12 @@ use note_pipelines::{
     save_note, Context, EmbeddingJobNotifier, NoteMutationError, NoteMutationNotifier,
     PatchNoteInput, ReplacePatchError, SaveNoteInput,
 };
-use note_storage::StorageBackend;
+use note_storage::{
+    BackendInfo, StorageBackend, StorageResult, StorageSession, StorageTransaction, TransactionMode,
+};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use support::{event_log, ControlledAttachmentStore, EventNotifier, EventStorageBackend};
 
@@ -30,6 +32,60 @@ impl CountingNotifier {
 impl NoteMutationNotifier for CountingNotifier {
     fn note_mutated(&self) {
         self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+enum BeginRace {
+    DeleteLabelKey(String),
+    ChangeLabelType {
+        key: String,
+        value_type: LabelValueType,
+    },
+}
+
+struct BeginRaceStorageBackend {
+    inner: Arc<dyn StorageBackend>,
+    race: Mutex<Option<BeginRace>>,
+}
+
+impl BeginRaceStorageBackend {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            race: Mutex::new(None),
+        }
+    }
+
+    fn arm(&self, race: BeginRace) {
+        *self.race.lock().unwrap() = Some(race);
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for BeginRaceStorageBackend {
+    async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+        self.inner.session().await
+    }
+
+    async fn begin(&self, mode: TransactionMode) -> StorageResult<Box<dyn StorageTransaction>> {
+        let race = self.race.lock().unwrap().take();
+        if let Some(race) = race {
+            let session = self.inner.session().await?;
+            match race {
+                BeginRace::DeleteLabelKey(key) => session.delete_label_key(&key).await?,
+                BeginRace::ChangeLabelType { key, value_type } => {
+                    session
+                        .update_label_key_with_type(&key, "", value_type)
+                        .await?
+                }
+            }
+            drop(session);
+        }
+        self.inner.begin(mode).await
+    }
+
+    async fn info(&self) -> StorageResult<BackendInfo> {
+        self.inner.info().await
     }
 }
 
@@ -469,6 +525,152 @@ async fn semantic_noop_preserves_all_committed_and_derived_state() {
     let events = rig.events.lock().unwrap();
     assert!(events[0].starts_with("read_object:"));
     assert_eq!(&events[1..], ["begin", "commit"]);
+}
+
+#[tokio::test]
+async fn noop_reconciles_labels_deleted_after_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let racing = Arc::new(BeginRaceStorageBackend::new(raw));
+    let backend: Arc<dyn StorageBackend> = racing.clone();
+    let mutations = Arc::new(CountingNotifier::default());
+    let ctx = Context::new(
+        backend.clone(),
+        Arc::new(StubEmbedder),
+        Arc::new(FilesystemAttachmentStore::new(
+            dir.path().join("attachments"),
+        )),
+    )
+    .with_note_mutation_notifier(mutations.clone());
+    let original = save_note(
+        &ctx,
+        input("Original", "Body", vec![], &[("state", "current")]),
+    )
+    .await
+    .unwrap();
+    racing.arm(BeginRace::DeleteLabelKey("state".into()));
+
+    let mutation = patch_note(
+        &ctx,
+        &original.id,
+        original.revision,
+        PatchNoteInput {
+            labels: Some(vec![("state".into(), "current".into())]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(mutation.changed);
+    assert_eq!(mutation.revision, original.revision + 1);
+    let after = get_note_metadata(&ctx, &original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.revision, original.revision + 1);
+    assert_eq!(
+        after
+            .labels
+            .iter()
+            .map(|label| (label.key.clone(), label.value.clone()))
+            .collect::<Vec<_>>(),
+        [("state".to_string(), "current".to_string())]
+    );
+    assert_eq!(mutations.count(), 1);
+}
+
+#[tokio::test]
+async fn noop_revalidates_label_types_changed_after_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Arc<dyn StorageBackend> = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let racing = Arc::new(BeginRaceStorageBackend::new(raw));
+    let backend: Arc<dyn StorageBackend> = racing.clone();
+    let mutations = Arc::new(CountingNotifier::default());
+    let ctx = Context::new(
+        backend.clone(),
+        Arc::new(StubEmbedder),
+        Arc::new(FilesystemAttachmentStore::new(
+            dir.path().join("attachments"),
+        )),
+    )
+    .with_note_mutation_notifier(mutations.clone());
+    let original = save_note(
+        &ctx,
+        input("Original", "Body", vec![], &[("score", "not-a-number")]),
+    )
+    .await
+    .unwrap();
+    let before = get_note_metadata(&ctx, &original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    racing.arm(BeginRace::ChangeLabelType {
+        key: "score".into(),
+        value_type: LabelValueType::Number,
+    });
+
+    let error = patch_note(
+        &ctx,
+        &original.id,
+        original.revision,
+        PatchNoteInput {
+            labels: Some(vec![("score".into(), "not-a-number".into())]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<ValidationError>(),
+        Some(ValidationError::InvalidLabelValue {
+            key,
+            value,
+            value_type: LabelValueType::Number,
+        }) if key == "score" && value == "not-a-number"
+    ));
+    let after = get_note_metadata(&ctx, &original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.title, before.title);
+    assert_eq!(after.content, before.content);
+    assert_eq!(after.attachments, before.attachments);
+    assert_eq!(
+        after
+            .labels
+            .iter()
+            .map(|label| (&label.key, &label.value))
+            .collect::<Vec<_>>(),
+        before
+            .labels
+            .iter()
+            .map(|label| (&label.key, &label.value))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.updated_at, before.updated_at);
+    let score = backend
+        .session()
+        .await
+        .unwrap()
+        .list_label_keys()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|label_key| label_key.key == "score")
+        .unwrap();
+    assert_eq!(score.value_type, LabelValueType::Number);
+    assert_eq!(mutations.count(), 0);
 }
 
 #[tokio::test]

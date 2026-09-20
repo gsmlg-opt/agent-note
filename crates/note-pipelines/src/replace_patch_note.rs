@@ -116,8 +116,7 @@ pub async fn patch_note(
         || !labels_equal(&desired.labels, &existing_labels)
         || attachments_changed;
 
-    if !changed {
-        confirm_noop_revision(ctx, id, expected_revision).await?;
+    if !changed && confirm_noop_state(ctx, id, expected_revision, &desired).await? {
         return Ok(NoteMutation {
             id: id.to_string(),
             revision: expected_revision,
@@ -227,18 +226,29 @@ fn ensure_revision(id: &str, expected_revision: i64, current_revision: i64) -> a
     }
 }
 
-async fn confirm_noop_revision(
+async fn confirm_noop_state(
     ctx: &Context,
     id: &str,
     expected_revision: i64,
-) -> anyhow::Result<()> {
+    desired: &SaveNoteInput,
+) -> anyhow::Result<bool> {
     let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
     let result = async {
         let current = transaction
             .get_note(id)
             .await?
             .ok_or_else(|| crate::NoteMutationError::NotFound(id.to_string()))?;
-        ensure_revision(id, expected_revision, current.revision)
+        ensure_revision(id, expected_revision, current.revision)?;
+        let label_keys = transaction.list_label_keys().await?;
+        validate_desired(desired, &label_keys)?;
+        let current_labels = current
+            .labels
+            .iter()
+            .map(|label| (label.key.clone(), label.value.clone()))
+            .collect::<Vec<_>>();
+        Ok(current.title == desired.title
+            && current.content == desired.content
+            && labels_equal(&current_labels, &desired.labels))
     }
     .await;
     crate::save_note::finish_transaction(transaction, result).await
