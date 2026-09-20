@@ -3,9 +3,9 @@ use note_pipelines::{
     bulk_update_note_labels as pipeline_bulk_update_note_labels, delete_note,
     delete_note_attachment as pipeline_delete_note_attachment, get_note_attachment_by_id,
     get_note_metadata, list_note_summaries, put_note_attachment as pipeline_put_note_attachment,
-    save_note, search_notes_filtered, update_note_fields,
+    save_note, search_notes_filtered,
     BulkUpdateNoteLabelsInput as PipelineBulkUpdateNoteLabelsInput, Context, ListNotesParams,
-    SaveNoteInput as PipelineSaveNoteInput, UpdateNoteFieldsInput,
+    SaveNoteInput as PipelineSaveNoteInput,
 };
 use serde::{Deserialize, Serialize};
 
@@ -208,7 +208,7 @@ pub async fn read_note_lines_tool(
         }))
 }
 
-pub async fn edit_note_tool(
+pub(crate) async fn edit_note_tool(
     ctx: &Context,
     id: &str,
     expected_revision: i64,
@@ -234,7 +234,7 @@ pub async fn edit_note_tool(
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UpdateNoteToolInput {
+pub(crate) struct UpdateNoteToolInput {
     pub id: String,
     pub expected_revision: i64,
     pub title: String,
@@ -243,14 +243,14 @@ pub struct UpdateNoteToolInput {
     pub labels: Vec<(String, String)>,
 }
 
-pub async fn update_note_tool(
+pub(crate) async fn update_note_tool(
     ctx: &Context,
     input: UpdateNoteToolInput,
 ) -> anyhow::Result<Option<NoteDetailData>> {
-    Ok(update_note_fields(
+    Ok(note_pipelines::update_note_fields(
         ctx,
         &input.id,
-        UpdateNoteFieldsInput {
+        note_pipelines::UpdateNoteFieldsInput {
             expected_revision: input.expected_revision,
             title: input.title,
             content: input.content,
@@ -259,6 +259,66 @@ pub async fn update_note_tool(
     )
     .await?
     .map(Into::into))
+}
+
+#[derive(Debug)]
+pub struct ReplaceNoteToolInput {
+    pub id: String,
+    pub expected_revision: i64,
+    pub title: String,
+    pub content: String,
+    pub attachments: Vec<NoteAttachment>,
+    pub labels: Vec<(String, String)>,
+}
+
+#[derive(Debug)]
+pub struct PatchNoteToolInput {
+    pub id: String,
+    pub expected_revision: i64,
+    pub patch: note_pipelines::PatchNoteInput,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct NoteMutationData {
+    pub id: String,
+    pub revision: i64,
+    pub changed: bool,
+}
+
+pub async fn replace_note_tool(
+    ctx: &Context,
+    input: ReplaceNoteToolInput,
+) -> anyhow::Result<NoteMutationData> {
+    let mutation = note_pipelines::replace_note(
+        ctx,
+        &input.id,
+        input.expected_revision,
+        PipelineSaveNoteInput {
+            title: input.title,
+            content: input.content,
+            attachments: input.attachments,
+            labels: input.labels,
+        },
+    )
+    .await?;
+    Ok(NoteMutationData {
+        id: mutation.id,
+        revision: mutation.revision,
+        changed: mutation.changed,
+    })
+}
+
+pub async fn patch_note_tool(
+    ctx: &Context,
+    input: PatchNoteToolInput,
+) -> anyhow::Result<NoteMutationData> {
+    let mutation =
+        note_pipelines::patch_note(ctx, &input.id, input.expected_revision, input.patch).await?;
+    Ok(NoteMutationData {
+        id: mutation.id,
+        revision: mutation.revision,
+        changed: mutation.changed,
+    })
 }
 
 pub async fn delete_note_tool(

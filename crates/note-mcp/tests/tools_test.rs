@@ -1,18 +1,22 @@
 use note_attachments::FilesystemAttachmentStore;
 use note_core::{
-    DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm, DuplicateNoteError, SearchConfig,
-    SystemConfig,
+    ContentPatch, ContentUpdate, DuplicateCheckConfig, DuplicateCheckRule, DuplicateCheckTerm,
+    DuplicateNoteError, NoteAttachment, SearchConfig, SystemConfig,
 };
 use note_embedding::StubEmbedder;
 use note_mcp::{
-    bulk_update_note_labels_tool, delete_note_attachment_tool, delete_note_tool, edit_note_tool,
-    get_note_attachment_content_tool, get_note_tool, list_notes_tool, put_note_attachment_tool,
-    read_note_lines_tool, save_note_tool, semantic_search_tool, update_note_tool,
-    AttachmentMetadataData, BulkUpdateNoteLabelsToolInput, GetNoteAttachmentContentToolInput,
-    NoteDetailData, NoteSummaryData, PutNoteAttachmentToolInput, PutNoteAttachmentToolOutput,
-    SaveNoteToolInput, SemanticSearchToolInput, UpdateNoteToolInput,
+    bulk_update_note_labels_tool, delete_note_attachment_tool, delete_note_tool,
+    get_note_attachment_content_tool, get_note_tool, list_notes_tool, patch_note_tool,
+    put_note_attachment_tool, read_note_lines_tool, replace_note_tool, save_note_tool,
+    semantic_search_tool, AttachmentMetadataData, BulkUpdateNoteLabelsToolInput,
+    GetNoteAttachmentContentToolInput, NoteMutationData, PatchNoteToolInput,
+    PutNoteAttachmentToolInput, PutNoteAttachmentToolOutput, ReplaceNoteToolInput,
+    SaveNoteToolInput, SemanticSearchToolInput,
 };
-use note_pipelines::{drain_embedding_jobs, update_system_config, Context, EditOp};
+use note_pipelines::{
+    drain_embedding_jobs, update_system_config, Context, NoteMutationError,
+    PatchNoteInput as PipelinePatchNoteInput, ReplacePatchError,
+};
 use note_storage::StorageBackend;
 use note_storage_turso::TursoStorage;
 use serde_json::json;
@@ -76,13 +80,6 @@ fn tool_input_deserialization_preserves_intended_compatibility() {
         "content": "Body"
     }))
     .is_ok());
-    assert!(serde_json::from_value::<UpdateNoteToolInput>(json!({
-        "id": "note-1",
-        "expected_revision": 1,
-        "title": "Title",
-        "content": "Body"
-    }))
-    .is_ok());
     assert!(serde_json::from_value::<SemanticSearchToolInput>(json!({
         "query": "body",
         "limit": 5
@@ -92,20 +89,6 @@ fn tool_input_deserialization_preserves_intended_compatibility() {
         "title": "Title",
         "content": "Body",
         "unknown": true
-    }))
-    .is_err());
-    assert!(serde_json::from_value::<UpdateNoteToolInput>(json!({
-        "id": "note-1",
-        "expected_revision": 1,
-        "title": "Title",
-        "content": "Body",
-        "unknown": true
-    }))
-    .is_err());
-    assert!(serde_json::from_value::<UpdateNoteToolInput>(json!({
-        "id": "note-1",
-        "title": "Title",
-        "content": "Body"
     }))
     .is_err());
     assert!(serde_json::from_value::<SemanticSearchToolInput>(json!({
@@ -218,153 +201,237 @@ async fn save_then_put_text_and_binary_attachments() {
 }
 
 #[tokio::test]
-async fn get_update_list_and_line_read_do_not_require_attachment_content() {
-    let (ctx, backend, _dir) = test_context().await;
-    let note_id = save(&ctx, "Metadata", "First line").await;
-    put_note_attachment_tool(
+async fn replace_note_tool_replaces_all_writable_fields_and_attachment_bytes() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let note_id = save(&ctx, "Original", "Original content").await;
+    let attachment_bytes = vec![0, 159, 146, 150, 255];
+
+    let mutation = replace_note_tool(
         &ctx,
-        put_input(
-            &note_id,
-            1,
-            "missing",
-            "./missing.bin",
-            "application/octet-stream",
-            vec![1, 2, 3],
-        ),
+        ReplaceNoteToolInput {
+            id: note_id.clone(),
+            expected_revision: 1,
+            title: "Replacement".into(),
+            content: "Replacement content".into(),
+            attachments: vec![NoteAttachment {
+                id: "binary".into(),
+                path: "files/binary.bin".into(),
+                mime: "application/octet-stream".into(),
+                description: "binary attachment".into(),
+                content: attachment_bytes.clone(),
+                storage: None,
+            }],
+            labels: vec![("topic".into(), "rust".into())],
+        },
     )
     .await
     .unwrap();
-    let transaction = backend
-        .begin(note_storage::TransactionMode::Deferred)
-        .await
-        .unwrap();
-    let note = transaction.get_note(&note_id).await.unwrap().unwrap();
-    let missing_key = note
-        .attachments
-        .iter()
-        .find(|a| a.id == "missing")
-        .unwrap()
-        .storage
-        .as_ref()
-        .unwrap()
-        .object_key
-        .clone();
-    ctx.attachments().delete_object(&missing_key).await.unwrap();
 
-    let fetched = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
-    assert_eq!(fetched.content, "First line");
-    assert_eq!(fetched.attachments.len(), 1);
-    assert_eq!(fetched.attachments[0].id, "missing");
-
-    let updated = update_note_tool(
-        &ctx,
-        UpdateNoteToolInput {
+    assert_eq!(
+        mutation,
+        NoteMutationData {
             id: note_id.clone(),
-            expected_revision: fetched.revision,
-            title: "Metadata updated".into(),
-            content: "Updated line".into(),
-            labels: vec![("topic".into(), "rust".into())],
+            revision: 2,
+            changed: true,
+        }
+    );
+    let saved = get_note_attachment_content_tool(
+        &ctx,
+        GetNoteAttachmentContentToolInput {
+            note_id: note_id.clone(),
+            attachment_id: "binary".into(),
         },
     )
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(updated.title, "Metadata updated");
-    assert_eq!(updated.attachments, fetched.attachments);
-    let NoteDetailData {
-        id,
-        title,
-        content,
-        attachments,
-        labels,
-        created_at,
-        updated_at,
-        revision: _,
-    } = updated;
-    assert_eq!(id, note_id);
-    assert_eq!(title, "Metadata updated");
-    assert_eq!(content, "Updated line");
-    assert_eq!(attachments.len(), 1);
-    assert_eq!(labels.len(), 1);
-    assert_eq!(labels[0].key, "topic");
-    assert_eq!(labels[0].value, "rust");
-    assert!(created_at > 0);
-    assert!(updated_at >= created_at);
-
-    let lines = read_note_lines_tool(&ctx, &note_id).await.unwrap().unwrap();
-    assert_eq!(lines.lines.len(), 1);
-    assert_eq!(lines.lines[0].text, "Updated line");
-
-    let listed = list_notes_tool(&ctx, None, None, None).await.unwrap();
-    assert_eq!(listed.len(), 1);
-    let NoteSummaryData {
-        id,
-        title,
-        labels,
-        created_at,
-        updated_at,
-        revision: _,
-    } = listed.into_iter().next().unwrap();
-    assert_eq!(id, note_id);
-    assert_eq!(title, "Metadata updated");
-    assert_eq!(labels.len(), 1);
-    assert_eq!(labels[0].key, "topic");
-    assert_eq!(labels[0].value, "rust");
-    assert!(updated_at >= created_at);
+    assert_eq!(saved.content, attachment_bytes);
+    let note = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
+    assert_eq!(note.title, "Replacement");
+    assert_eq!(note.content, "Replacement content");
+    assert_eq!(note.labels[0].key, "topic");
+    assert_eq!(note.labels[0].value, "rust");
 }
 
 #[tokio::test]
-async fn line_edit_preserves_attachment_metadata_without_reading_bytes() {
-    let (ctx, backend, _dir) = test_context().await;
-    let note_id = save(&ctx, "Line edit", "First line").await;
+async fn patch_note_tool_preserves_omitted_fields_and_supports_content_and_clearing() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let note_id = save(&ctx, "Original", "one\ntwo\nthree\n").await;
     put_note_attachment_tool(
         &ctx,
         put_input(
             &note_id,
             1,
-            "blob",
-            "./blob.bin",
-            "application/octet-stream",
-            vec![0, 1, 2],
+            "old",
+            "files/old.txt",
+            "text/plain",
+            b"old bytes".to_vec(),
         ),
     )
     .await
     .unwrap();
-    let transaction = backend
-        .begin(note_storage::TransactionMode::Deferred)
-        .await
-        .unwrap();
-    let note = transaction.get_note(&note_id).await.unwrap().unwrap();
-    let missing_key = note
-        .attachments
-        .iter()
-        .find(|a| a.id == "blob")
-        .unwrap()
-        .storage
-        .as_ref()
-        .unwrap()
-        .object_key
-        .clone();
-    ctx.attachments().delete_object(&missing_key).await.unwrap();
-    let read = read_note_lines_tool(&ctx, &note_id).await.unwrap().unwrap();
+    let original = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
 
-    let edited = edit_note_tool(
+    let title = patch_note_tool(
         &ctx,
-        &note_id,
-        read.revision,
-        &read.tag,
-        vec![EditOp::InsertTail {
-            lines: vec!["Second line".into()],
-        }],
+        PatchNoteToolInput {
+            id: note_id.clone(),
+            expected_revision: original.revision,
+            patch: PipelinePatchNoteInput {
+                title: Some("Changed title".into()),
+                labels: Some(vec![("topic".into(), "rust".into())]),
+                ..Default::default()
+            },
+        },
     )
     .await
-    .unwrap()
     .unwrap();
+    let preserved = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
+    assert_eq!(preserved.content, "one\ntwo\nthree\n");
+    assert_eq!(preserved.attachments[0].id, "old");
+    assert_eq!(preserved.labels[0].key, "topic");
+    assert_eq!(preserved.labels[0].value, "rust");
 
-    assert_eq!(edited.lines.len(), 2);
-    let fetched = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
-    assert_eq!(fetched.content, "First line\nSecond line");
-    assert_eq!(fetched.attachments[0].id, "blob");
+    let content = patch_note_tool(
+        &ctx,
+        PatchNoteToolInput {
+            id: note_id.clone(),
+            expected_revision: title.revision,
+            patch: PipelinePatchNoteInput {
+                content: Some(ContentUpdate::Replace("alpha\nbeta\ngamma\n".into())),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let contextual = patch_note_tool(
+        &ctx,
+        PatchNoteToolInput {
+            id: note_id.clone(),
+            expected_revision: content.revision,
+            patch: PipelinePatchNoteInput {
+                content: Some(ContentUpdate::ApplyPatch(ContentPatch {
+                    apply_patch: "@@\n alpha\n-beta\n+BETA\n gamma\n".into(),
+                })),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let cleared = patch_note_tool(
+        &ctx,
+        PatchNoteToolInput {
+            id: note_id.clone(),
+            expected_revision: contextual.revision,
+            patch: PipelinePatchNoteInput {
+                attachments: Some(vec![]),
+                labels: Some(vec![]),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(cleared.changed);
+    let saved = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
+    assert_eq!(saved.content, "alpha\nBETA\ngamma\n");
+    assert!(saved.attachments.is_empty());
+    assert!(saved.labels.is_empty());
+}
+
+#[tokio::test]
+async fn patch_note_tool_returns_semantic_noop_and_preserves_typed_errors() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let note_id = save(&ctx, "Original", "Body").await;
+
+    let noop = patch_note_tool(
+        &ctx,
+        PatchNoteToolInput {
+            id: note_id.clone(),
+            expected_revision: 1,
+            patch: PipelinePatchNoteInput {
+                title: Some("Original".into()),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        noop,
+        NoteMutationData {
+            id: note_id.clone(),
+            revision: 1,
+            changed: false,
+        }
+    );
+
+    let stale = patch_note_tool(
+        &ctx,
+        PatchNoteToolInput {
+            id: note_id.clone(),
+            expected_revision: 2,
+            patch: PipelinePatchNoteInput {
+                title: Some("Stale".into()),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(stale.downcast_ref::<NoteMutationError>().is_some());
+
+    let validation = patch_note_tool(
+        &ctx,
+        PatchNoteToolInput {
+            id: note_id.clone(),
+            expected_revision: 1,
+            patch: PipelinePatchNoteInput::default(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        validation.downcast_ref::<ReplacePatchError>(),
+        Some(&ReplacePatchError::InvalidRequest(
+            "patch must provide at least one field".into()
+        ))
+    );
+
+    let patch_failure = patch_note_tool(
+        &ctx,
+        PatchNoteToolInput {
+            id: note_id,
+            expected_revision: 1,
+            patch: PipelinePatchNoteInput {
+                content: Some(ContentUpdate::ApplyPatch(ContentPatch {
+                    apply_patch: "@@\n-not present\n+replacement\n".into(),
+                })),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        patch_failure.downcast_ref::<ReplacePatchError>(),
+        Some(ReplacePatchError::PatchFailed(_))
+    ));
+}
+
+#[tokio::test]
+async fn read_note_lines_tool_is_a_read_only_inspection_helper() {
+    let (ctx, _backend, _dir) = test_context().await;
+    let note_id = save(&ctx, "Inspection", "First line\nSecond line").await;
+
+    let lines = read_note_lines_tool(&ctx, &note_id).await.unwrap().unwrap();
+
+    assert_eq!(lines.revision, 1);
+    assert_eq!(lines.lines.len(), 2);
+    assert_eq!(lines.lines[0].text, "First line");
+    assert_eq!(lines.lines[1].text, "Second line");
 }
 
 #[tokio::test]
