@@ -682,10 +682,13 @@ failures are `isError` structured `{code, message, details, retryable}` results 
 `internal_error`.
 
 `get_note` includes note data and attachment metadata only (`id`, `path`, `mime`, `description`), not
-attachment bytes. Fetch each retained attachment with `get_note_attachment_content` before a full
-replacement, then carry its bytes in that replacement using exactly one of `content` or
-`content_base64`; otherwise it is not preserved. Standalone attachment tools and bulk-label updates
-remain available. REST and frontend internal line-edit behavior remain separate and unchanged.
+attachment bytes. `replace_note.attachments` is the complete desired set, so omitting an existing
+attachment deliberately removes it on a successful replacement. To retain one, copy its metadata
+and exactly one payload representation fetched with `get_note_attachment_content`; an included
+metadata entry without exactly one of `content` or `content_base64` is malformed JSON-RPC
+invalid-params, rejects the whole request atomically, and leaves the existing note unchanged.
+Standalone attachment tools and bulk-label updates remain available. REST and frontend internal
+line-edit behavior remain separate and unchanged.
 
 `/org/mcp` exposes exactly these 40 Org tools:
 

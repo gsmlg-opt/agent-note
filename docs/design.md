@@ -489,10 +489,13 @@ timestamp, attachment blobs, labels, or search/embedding state; success returns 
 failures are `isError` structured `{code, message, details, retryable}` results using `not_found`,
 `revision_conflict`, `patch_failed`, `invalid_request`, `validation_error`, or `internal_error`.
 
-`get_note` returns attachment metadata only, never attachment bytes. A full replacement that keeps
-attachments must fetch each byte payload with `get_note_attachment_content` and carry it using
-exactly one of `content` or `content_base64`; otherwise the attachment is not preserved. Standalone
-attachment tools and `bulk_update_note_labels` remain available.
+`get_note` returns attachment metadata only, never attachment bytes. `replace_note.attachments` is
+the complete desired set, so omitting an existing attachment deliberately removes it on a successful
+replacement. To retain one, copy its metadata and exactly one payload representation fetched with
+`get_note_attachment_content`; an included metadata entry without exactly one of `content` or
+`content_base64` is malformed JSON-RPC invalid-params, rejects the whole request atomically, and
+leaves the existing note unchanged. Standalone attachment tools and `bulk_update_note_labels` remain
+available.
 
 REST `POST /api/notes/search` and MCP `semantic_search` expose the same search-summary fields:
 `id`, `title`, `revision`, `score`, `labels`, `created_at`, and `updated_at`. Neither transport
