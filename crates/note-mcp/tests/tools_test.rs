@@ -204,7 +204,8 @@ async fn save_then_put_text_and_binary_attachments() {
 async fn replace_note_tool_replaces_all_writable_fields_and_attachment_bytes() {
     let (ctx, _backend, _dir) = test_context().await;
     let note_id = save(&ctx, "Original", "Original content").await;
-    let attachment_bytes = vec![0, 159, 146, 150, 255];
+    let text_bytes = b"plain text\n".to_vec();
+    let binary_bytes = vec![0, 159, 146, 150, 255];
 
     let mutation = replace_note_tool(
         &ctx,
@@ -213,14 +214,24 @@ async fn replace_note_tool_replaces_all_writable_fields_and_attachment_bytes() {
             expected_revision: 1,
             title: "Replacement".into(),
             content: "Replacement content".into(),
-            attachments: vec![NoteAttachment {
-                id: "binary".into(),
-                path: "files/binary.bin".into(),
-                mime: "application/octet-stream".into(),
-                description: "binary attachment".into(),
-                content: attachment_bytes.clone(),
-                storage: None,
-            }],
+            attachments: vec![
+                NoteAttachment {
+                    id: "text".into(),
+                    path: "files/text.txt".into(),
+                    mime: "text/plain".into(),
+                    description: "text attachment".into(),
+                    content: text_bytes.clone(),
+                    storage: None,
+                },
+                NoteAttachment {
+                    id: "binary".into(),
+                    path: "files/binary.bin".into(),
+                    mime: "application/octet-stream".into(),
+                    description: "binary attachment".into(),
+                    content: binary_bytes.clone(),
+                    storage: None,
+                },
+            ],
             labels: vec![("topic".into(), "rust".into())],
         },
     )
@@ -235,7 +246,21 @@ async fn replace_note_tool_replaces_all_writable_fields_and_attachment_bytes() {
             changed: true,
         }
     );
-    let saved = get_note_attachment_content_tool(
+    let text = get_note_attachment_content_tool(
+        &ctx,
+        GetNoteAttachmentContentToolInput {
+            note_id: note_id.clone(),
+            attachment_id: "text".into(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(text.content, text_bytes);
+    assert_eq!(text.attachment.path, "files/text.txt");
+    assert_eq!(text.attachment.mime, "text/plain");
+    assert_eq!(text.attachment.description, "text attachment");
+    let binary = get_note_attachment_content_tool(
         &ctx,
         GetNoteAttachmentContentToolInput {
             note_id: note_id.clone(),
@@ -245,7 +270,10 @@ async fn replace_note_tool_replaces_all_writable_fields_and_attachment_bytes() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(saved.content, attachment_bytes);
+    assert_eq!(binary.content, binary_bytes);
+    assert_eq!(binary.attachment.path, "files/binary.bin");
+    assert_eq!(binary.attachment.mime, "application/octet-stream");
+    assert_eq!(binary.attachment.description, "binary attachment");
     let note = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
     assert_eq!(note.title, "Replacement");
     assert_eq!(note.content, "Replacement content");
@@ -424,14 +452,44 @@ async fn patch_note_tool_returns_semantic_noop_and_preserves_typed_errors() {
 #[tokio::test]
 async fn read_note_lines_tool_is_a_read_only_inspection_helper() {
     let (ctx, _backend, _dir) = test_context().await;
-    let note_id = save(&ctx, "Inspection", "First line\nSecond line").await;
+    let note_id = save_note_tool(
+        &ctx,
+        SaveNoteToolInput {
+            title: "Inspection".into(),
+            content: "First line\nSecond line".into(),
+            labels: vec![("topic".into(), "inspection".into())],
+        },
+    )
+    .await
+    .unwrap()
+    .id;
+    put_note_attachment_tool(
+        &ctx,
+        put_input(
+            &note_id,
+            1,
+            "inspect",
+            "files/inspect.txt",
+            "text/plain",
+            b"inspection bytes".to_vec(),
+        ),
+    )
+    .await
+    .unwrap();
+    let before = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
 
     let lines = read_note_lines_tool(&ctx, &note_id).await.unwrap().unwrap();
+    let after = get_note_tool(&ctx, &note_id).await.unwrap().unwrap();
 
-    assert_eq!(lines.revision, 1);
+    assert_eq!(lines.revision, before.revision);
     assert_eq!(lines.lines.len(), 2);
     assert_eq!(lines.lines[0].text, "First line");
     assert_eq!(lines.lines[1].text, "Second line");
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.title, before.title);
+    assert_eq!(after.content, before.content);
+    assert_eq!(after.labels, before.labels);
+    assert_eq!(after.attachments, before.attachments);
 }
 
 #[tokio::test]
