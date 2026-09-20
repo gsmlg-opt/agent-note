@@ -1,62 +1,31 @@
 # Agent Note — shared project knowledge skill
 
-This is a proposed replacement for the existing `skills/agent-note/` package in
-`gsmlg-opt/agent-note`. It keeps the skill name and project-declaration convention,
-adds explicit setup/recall/capture/curate workflows, and separates durable knowledge from
-routine task reporting. It is instruction-only: no runtime scripts or new server
-features are required.
+Version 1.2.0 is the repository-owned Agent Note instruction package. It supports
+setup, recall, qualified capture, and authorized curation of project-scoped knowledge.
+It is instruction-only: it neither packages/installs itself nor changes the MCP server,
+even though this repository contains the server contract it teaches.
 
 ## Package contents
 
-- `SKILL.md`: operational workflow, quality gate, scope, and safe-write rules.
-- `agents/openai.yaml`: optional Codex presentation, invocation, and dependency metadata.
-- `references/project-setup.md`: scoped, idempotent AGENTS.md setup and verification.
-- `references/mcp-contract.md`: observed interface differences and safe adaptation.
-- `references/examples.md`: positive, negative, and borderline examples.
-- `assets/note-template.md`: optional evidence-first knowledge template.
-- `assets/AGENTS.snippet.md`: small per-project entry point.
-- `evals/cases.md`: 42 behavioral cases plus trigger checks; not executed results.
-- `SOURCES.md`: review basis, limitations, and differences from the existing skill.
-- `VALIDATION.md`: checks performed on the delivered files.
+- `SKILL.md`: operational workflow, scope/authority rules, and mutation guidance.
+- `agents/openai.yaml`: optional Codex display, invocation, and MCP alias metadata.
+- `references/project-setup.md`: scoped, idempotent AGENTS.md setup.
+- `references/mcp-contract.md`: current HTTP MCP replacement/patch contract.
+- `references/examples.md`: capture, curation, patch, replacement, and conflict examples.
+- `assets/`: optional note template and project entry-point snippet.
+- `evals/cases.md`: 42 expected-behavior fixtures, not executed results.
+- `SOURCES.md` and `VALIDATION.md`: local review basis and recorded checks.
 
-Only the main file is needed to discover the skill. Keep the supporting files beside
-it; they are loaded when referenced, not pasted into every project's instructions.
+Keep the source package under `skills/agent-note/`. Do not edit an installed copy as
+the source of truth. Installation into a client discovery root is a separate, deliberate
+operation and must preserve its local connection configuration.
 
-## Use in the repository
+## Use in a project
 
-Apply the package's contents under `skills/agent-note/`, reviewing the diff against
-any concurrent or local changes. Leave `.agents/skills/deploy/` and unrelated source
-code untouched. Keep one maintained source package rather than independently editing
-copies in every consuming repository.
-
-## Install for Codex locally
-
-Place this complete `agent-note/` directory under one chosen discovery root:
-
-- Shared across your projects: `$HOME/.agents/skills/agent-note/`.
-- Repository-scoped: `<repository>/.agents/skills/agent-note/`.
-
-Do not install the same skill in multiple scopes accidentally. Existing installations
-should be merged/replaced deliberately, preserving local connection settings. Codex
-also documents symlink support for local skill directories; a managed checkout can
-serve as the single local source. Pin or review updates to that checkout as needed.
-
-Other clients should receive the same directory through their own supported skill
-loader. The format is portable; this delivery does not certify every client's loader
-or implicit invocation behavior. This ZIP is a standalone skill, not a plugin package
-and not a promise of one-click installation in ChatGPT web.
-
-The optional `agents/openai.yaml` retains the repository's dependency alias
-`agent_note`. Match that alias to your existing MCP connection when needed. It is not
-a URL, project label, automatic connection configuration, or permission grant. The
-skill must inspect tools exposed by the actual connection. No endpoint or secret is
-bundled. Implicit invocation is enabled for workflow selection, not unrestricted writes.
-
-## Configure each project
-
-Version 1.1 adds an explicit Setup workflow. Ask a coding agent with this skill
-available to read `references/project-setup.md` and `assets/AGENTS.snippet.md`, then
-configure the current repository's `AGENTS.md` using an exact project value. Example:
+Ask an agent with this skill to configure an exact project declaration in the applicable
+`AGENTS.md`, or use it for read-only recall, a qualified capture, or authorized curation.
+Setup is a repository edit, not an MCP mutation. The skill never guesses the project
+from a directory, remote, or note; it preserves an existing explicit-write-only policy.
 
 ```text
 Use the agent-note skill to set up Agent Note in this project's AGENTS.md.
@@ -65,63 +34,18 @@ Update the existing Agent Note section in place, preserve unrelated instructions
 and show the diff. Do not create or modify notes, or commit/push these changes.
 ```
 
-This is a natural-language request, not a new CLI/MCP command. It requires authorized
-file editing for application; without that access the result is an unapplied patch.
-Keep an existing read-only or explicit-save-only policy unless changing it is part
-of the request. Repeating the same setup should leave the file unchanged.
+For normal note work, the client must inspect its live schema first. In the reviewed
+current server, Note MCP is HTTP-only at `/mcp`; Org MCP is separately available at
+`/org/mcp`. Use `patch_note` for focused revision-guarded changes and `replace_note`
+only with the complete intended note state. See [the MCP contract](references/mcp-contract.md).
 
-The manual alternative remains:
+## Positioning and limits
 
-Replace `<exact-project-label>` in `assets/AGENTS.snippet.md` and add that section to
-the applicable `AGENTS.md`. For Synapsis the declaration is:
+The skill keeps setup/recall/capture/curate distinct and treats routine progress as a
+valid skip. It requires exact scope verification, duplicate checks, explicit write
+authority, direct readback, cautious conflict handling, and special authorization for
+deletion, attachment removal, and bulk changes. It never stores secrets.
 
-```markdown
-Agent Note project: synapsis
-```
-
-For another project use its intended existing label, not a value inferred from its
-repository name. Multiple repositories may intentionally share one project value.
-Do not use `agent-note` for all projects merely because it is the storage service.
-
-The supplied snippet authorizes qualified capture at the stated boundaries. For a
-read-only policy, replace that permission with “Recall only; write only on my explicit
-request.” A skill description alone does not guarantee invocation at task completion;
-the project entry point provides the operational trigger, and a harness can invoke
-it explicitly when stronger coordination is required.
-
-## Example invocations
-
-```text
-$agent-note recall the decisions relevant to this task in the configured project.
-
-$agent-note evaluate the validated findings from this work slice;
-update existing knowledge where appropriate and skip routine progress.
-
-$agent-note audit the notes in project synapsis and propose consolidation;
-do not modify notes yet.
-```
-
-`setup`, `recall`, `capture`, and `curate` are natural-language workflow choices, not MCP
-operations or a new command-line parser.
-
-## Adoption sequence
-
-Install the skill and project declarations first. Run read-only recall and audit
-cases against real notes. Run mutation cases only against an isolated test project.
-Then use it for normal scoped capture. Existing contradictory notes will not be
-rewritten automatically; approve a separate curation task for them.
-
-## Validation limits
-
-The files were checked for YAML validity, required skill metadata, internal references,
-UTF-8/LF text, evaluation-case integrity, and archive integrity. No live note was
-created, edited, relabeled, or deleted. No Rust tests or model-behavior suite was run.
-The source review used public GitHub pages because the connector returned FORBIDDEN;
-a local clone was unavailable. See `SOURCES.md` and `VALIDATION.md` for the exact basis.
-
-## Authoring references
-
-- [Agent Skills specification](https://agentskills.io/specification)
-- [OpenAI local skills and optional metadata](https://developers.openai.com/codex/build-skills)
-
-Plugin packaging and distribution can be added later without changing this workflow.
+No model evaluation, client-discovery run, or live note mutation is implied by this
+package. The behavioral fixtures are expected behavior only. See `VALIDATION.md` for
+the checks actually run for this version and `SOURCES.md` for the local source review.

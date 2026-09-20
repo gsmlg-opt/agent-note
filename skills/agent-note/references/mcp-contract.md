@@ -1,106 +1,83 @@
 # Agent Note MCP contract and compatibility
 
-Read this before the first mutation, then inspect the tools actually exposed by the
-client. This is a writing workflow, not a replacement RPC schema. Prefer the live
-schema for arguments and returned values; an error that contradicts it indicates a
-connection/version mismatch, not permission to invent fields or bypass a guard.
+Read this before the first mutation, then inspect the tools and schemas exposed by
+the connected server. Runtime schema is authoritative: a repository checkout and a
+deployment can differ. Do not invent fields, broaden scope, or bypass a rejected guard.
 
-## Reviewed evidence
+## Reviewed implementation
 
-Public `gsmlg-opt/agent-note` main sources were inspected on 2026-09-08. The reviewed
-`crates/note-mcp/src/stdio.rs` and `tools.rs` differ from the eight-tool connection
-exposed in the authoring conversation. Neither deployment version nor a common
-commit was established. These are observed interface profiles, not version labels.
+The local feature checkout was reviewed against base `39106fe18d0fd79922c6ba6f57f6d26ddbbfaca9`
+on 2026-09-21. `crates/note-mcp/src/http.rs` serves HTTP-only, stateless Streamable
+HTTP endpoints: Note tools at `/mcp` and Org tools at `/org/mcp`. `server.rs` owns the
+wire schemas and handlers; `tools.rs` is the transport-neutral wrapper boundary.
 
-| Operation | Reviewed repository source | Authoring connection |
-| --- | --- | --- |
-| `save_note` | Title, content, labels; no embedded attachments | Also exposes optional attachments |
-| `edit_note` | ID, expected revision, tag, edits | ID, tag, edits; no revision argument |
-| `update_note` | ID, expected revision, title, content, labels; preserves attachments | No revision argument; also exposes attachments |
-| `delete_note` | ID and expected revision | ID only |
-| Label keys | Missing keys can be created by note writes | Description restricts writes to existing keys |
-| Additional tools | Separate attachment tools and bulk label updates | Not exposed in this connection |
+`/mcp` has exactly these 12 Note tools:
 
-No mutation was performed to probe these differences. Runtime behavior was not
-verified. Read the deployment schema again rather than identifying it by tool count.
+`bulk_update_note_labels`, `delete_note`, `delete_note_attachment`, `get_note`,
+`get_note_attachment_content`, `list_notes`, `patch_note`, `put_note_attachment`,
+`read_note_lines`, `replace_note`, `save_note`, and `semantic_search`.
 
-## Scope, labels, and reads
+Older connections that expose `edit_note` or `update_note` are superseded compatibility
+profiles, not a recommended baseline. Do not select them when the live schema exposes
+the current replacement/patch contract. There is no current `stdio.rs` transport source.
 
-Use the `label` selector argument on search/list calls. Use an explicit positive
-`limit`; `list_notes` also supports `offset`. List/search return summaries: fetch
-bodies by ID before relying on or changing them. Titles and ranks are search aids,
-not correctness or applicability scores. Verify the exact project label in results.
+## Scope, reads, and labels
 
-For ordinary project values, use `project=synapsis`. The reviewed repository also
-documents exact selectors of the form `~<percent-encoded-key>==<percent-encoded-value>`;
-for example `~project==team%26service`. Use this only when the live schema advertises
-it. A legacy connection must not silently strip, split, normalize, or broaden an
-unrepresentable project selector. Report the limitation instead. Do not change the
-configured project value merely to make a query succeed.
+Use `label` selectors for scoped search/list calls, with a bounded explicit limit.
+Search/list results are summaries: fetch likely notes with `get_note`, inspect their
+raw labels, and verify the exact `project` pair before relying on or changing a note.
+For ordinary values use `project=sample-project`; use an advertised exact selector only
+when the live schema supports it. Never normalize, split, or broaden an unrepresentable
+project value.
 
-Write labels as string pairs, for example `[["project", "synapsis"]]`; this is not a
-map and `project: synapsis` is not one combined key. Do not duplicate keys. Keep type,
-status, scope, and provenance in the body unless the project configures such labels.
-Never drop the project label to recover from a validation error, and never use a
-bulk operation or REST fallback to repair a catalog without authorization.
+Labels are string pairs such as `[["project", "sample-project"]]`, not a map. Keep
+exactly one project pair on a scoped note and do not silently repair scope drift.
+`get_note` returns content, labels, attachment metadata, and `revision`; attachment
+metadata does not contain attachment bytes.
 
-## Body edit sequence
+## Current mutation workflow
 
-1. Fetch note details; confirm target ID, project, intended scope, and existing data.
-2. Read numbered lines. When both reads expose revisions and they differ, re-read
-   details and lines until they describe one coherent edit base or stop.
-3. Build edits against the returned original 1-based line numbers. `swap` and
-   `delete` ranges are inclusive. Do not renumber later operations as though earlier
-   operations had already executed; avoid overlapping operations.
-4. Supply the returned tag, and the revision as `expected_revision` wherever the
-   live tool supports it. Treat tokens as opaque and tied to that read.
-5. On conflict, inspect fresh content and redo the decision, then rebuild edits.
-   Permit one fresh attempt; another conflict ends the operation with a report.
-6. Read details again to verify content and project scope.
+1. Inspect the live schemas. Read `get_note`, verify target/scope/project labels, and
+   retain `get_note.revision` as `expected_revision`.
+2. Use `patch_note` for focused changes. `title`, `content`, `attachments`, and `labels`
+   are optional only by omission: omitted preserves; supplied collection arrays replace
+   the whole collection; `[]` clears it; explicit `null` is invalid. A patch with every
+   mutable field omitted is `invalid_request`.
+3. Send content either as a full string or as `{ "apply_patch": "..." }`. The patch
+   contains one or more plain `@@` hunks; each hunk has context or deletion lines that
+   match exactly once in the original content. It accepts no line numbers, tags,
+   paths/file directives, patch envelopes, or fuzzy application. `read_note_lines` can
+   help inspect Markdown but supplies no mutation token and is not required before a
+   patch; its returned revision and tag are informational.
+4. Use `replace_note` only for an intentional complete replacement. It requires ID,
+   `expected_revision`, title, full content, full attachment set, and full label set.
+   Empty arrays deliberately clear their collections.
+5. Before a patch or replacement supplies an attachment set, call
+   `get_note_attachment_content` for every attachment to retain; send each returned
+   metadata record with exactly one of `content` or `content_base64`. Metadata without
+   a payload, or both payload representations, is rejected before mutation. Omitting an
+   existing attachment from the supplied set removes it if the mutation succeeds.
+6. A successful semantic no-op reports `changed: false` and retains the revision. On
+   `revision_conflict`, re-read and semantically recompute once; never replay stale
+   content with a replacement revision. A second conflict ends the operation.
+7. Read `get_note` after the write and verify intended state and the project label.
 
-A tag-only legacy edit guards the body, not all metadata or project-label races.
-Keep it body-only; do not claim note-wide concurrency protection. Coordinate writers
-and defer edits when project ownership or scope is concurrently changing.
+`replace_note` and `patch_note` return structured mutation results. Expected operational
+error codes are `not_found`, `revision_conflict`, `patch_failed`, `invalid_request`,
+`validation_error`, and `internal_error`; each provides `code`, `message`, `details`,
+and `retryable`. Treat error details as diagnostic data, not authorization to retry.
 
-## Complete updates and attachments
+## Authorized destructive and bulk work
 
-A complete update must preserve the full intended label set, title, content, and
-unrelated scopes. With a revision-aware tool, read fresh details and send that
-revision. If it lacks a full-update guard, use a supported body edit instead or
-return a proposed title/label change; do not force a full overwrite.
-
-Do not put attachments into current source-profile save/update requests. Separate
-attachment tools, when exposed, handle bytes; note details contain metadata. Do not
-pass metadata as content or an empty attachment array to an older full-update tool
-without confirming its replacement semantics. Routine knowledge capture needs no
-attachments. An unavailable attachment operation is a partial capability, not a
-reason to lose existing data or claim an upload succeeded.
-
-## Ambiguous results and multi-note changes
-
-Before retrying any uncertain write, read the target when its ID is known. After an
-uncertain create with no ID, inspect recent notes in the same project and fetch
-plausible matches to compare scope/content. An inconclusive check is not proof that
-creation failed. Stop with an unknown outcome instead of blindly creating again.
-
-Use direct reads to verify writes: the README describes queued body embeddings, so
-immediate semantic visibility is not a reliable save acknowledgement. Search plus
-save also does not provide a cross-agent uniqueness transaction.
-
-For approved consolidation, save/update and verify the retained note first. Then
-mark each replaced note with the retained ID, reason, and applicable scope. Never
-claim these calls are atomic. Keep a list of completed and outstanding IDs; do not
-delete either side to compensate for a timeout or partial failure.
-
-For an explicitly authorized deletion, re-read the exact target and use every guard
-the live tool accepts. Distinguish `deleted`, `already absent`, and unknown outcome.
-Legacy ID-only deletion has no advertised revision protection; do not claim otherwise.
-Bulk relabeling and migration remain separate explicit operations, not curation shortcuts.
+Deletion, attachment removal, bulk relabeling, and project migration still need explicit
+authorization and exact targets. Re-read exact targets and use the current guards. A
+multi-note curation operation is not assumed atomic: verify the retained/replacement
+note before marking older records superseded, and report partial completion honestly.
 
 ## Sources
 
-- [Transport schemas and contract tests](https://github.com/gsmlg-opt/agent-note/blob/main/crates/note-mcp/src/stdio.rs)
-- [Tool wrappers and data shapes](https://github.com/gsmlg-opt/agent-note/blob/main/crates/note-mcp/src/tools.rs)
-- [Repository architecture and indexing pipeline](https://github.com/gsmlg-opt/agent-note/blob/main/README.md)
-- Authoring-session tool schemas: `Agent_Note`, observed 2026-09-08. These are not a
-  repository release or a guarantee about another client's connection.
+- `crates/note-mcp/src/http.rs` — HTTP routing and Streamable HTTP behavior.
+- `crates/note-mcp/src/server.rs` — Note inventory, schemas, handlers, result mapping.
+- `crates/note-mcp/src/tools.rs` — Note detail, attachment, and mutation wrapper data.
+- `crates/note-mcp/tests/org_inventory_test.rs` — split-route inventory coverage.
+- `README.md`, "MCP servers" — published endpoint, inventory, and mutation guidance.

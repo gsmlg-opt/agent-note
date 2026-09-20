@@ -7,9 +7,8 @@ description: >-
   substantial design or debugging that needs prior knowledge; and at validated work
   boundaries to evaluate reusable findings. Search before creating, prefer scoped
   updates, and skip routine progress. Reviews are read-only unless writes are requested.
-compatibility: Note workflows require Agent Note MCP. Project setup requires repository file access; apply only with authorized editing tools.
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # Agent Note
@@ -18,6 +17,8 @@ Maintain knowledge that helps the next agent make a better decision. Do not turn
 successful tasks into a stream of completion reports. **No note is a valid outcome.**
 This skill manages Markdown notes and an explicitly requested project entry point,
 not task execution, Org leases, or scheduling.
+Note workflows require an Agent Note MCP connection. Project setup requires repository
+file access and may be applied only with authorized editing tools.
 
 For a request to configure project memory or add/update the Agent Note section in
 `AGENTS.md`, select **Setup** and read [project setup](references/project-setup.md)
@@ -147,16 +148,23 @@ service may differ. Never invent parameters or silently downgrade safeguards.
 - New notes carry exactly one `project` label as `["project", "<resolved value>"]`.
   Use only configured optional labels; do not invent owner identities or taxonomy.
   Preserve existing labels, attachments, and unrelated content during updates.
-- For body edits, read `get_note` for scope and `read_note_lines` for the edit base.
-  Use returned original line numbers and `tag`; include the returned revision as
-  `expected_revision` when supported/required. On a conflict, re-read and recompute
-  the semantic edit, never just swap in a new token on an old edit.
-- For complete title/body/label replacement, read the current note, preserve its
-  full intended label set, and use revision protection. Without such protection,
-  prefer a supported tag-guarded body edit or return a proposed metadata change.
-  Do not fall back to an unguarded full overwrite.
-- Skip no-op writes. After one fresh conflict-resolution attempt, stop on another
-  conflict and report it. Respect more restrictive tool errors; do not force retries.
+- Read `get_note` first. Confirm the exact scope and project label, and use its
+  `revision` as the write guard. `read_note_lines` is optional inspection only;
+  it is neither a mutation prerequisite nor a source of write tokens.
+- Use `patch_note` by default for a focused title, body, label-set, or attachment-set
+  change. Omitted fields are preserved; supplied `labels` and `attachments` replace
+  their complete sets; `[]` intentionally clears a set; `null` is invalid. Content is
+  either a complete string or a strict contextual `{apply_patch: "..."}` patch. Each
+  plain `@@` hunk must have existing context or deletion lines that match exactly once.
+  Do not use line numbers, tags, file directives, patch envelopes, or fuzzy edits.
+- Use `replace_note` only when intentionally supplying title, complete content,
+  complete attachments, and complete labels. `get_note` returns attachment metadata,
+  not bytes: whenever a patch or replacement supplies `attachments`, fetch every
+  attachment to retain with `get_note_attachment_content` and provide its metadata plus
+  exactly one `content` or `content_base64` payload. Omitting it from the supplied set
+  removes it on success; metadata without a payload is atomically rejected.
+- On a revision conflict, re-read and semantically recompute once. Never token-swap
+  a stale intent. Skip semantic no-ops; after a second conflict, stop and report it.
 - On an ambiguous create timeout, check known IDs and recent scoped notes before
   considering another create. Do not blindly repeat `save_note`; search-before-save
   is not a uniqueness guarantee. Report uncertainty when reconciliation is inconclusive.

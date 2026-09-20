@@ -20,7 +20,7 @@ labels, bodies, revisions, and applicability. Example IDs are test fixtures only
 | E01 | Routine dependency bump; checks pass; no new constraint | Skip capture, no mutation | Completion report saved as knowledge |
 | E02 | Reproduced non-obvious failure; root cause and focused regression supplied; no related note | Scoped duplicate search, then one supported lesson and readback | Invented tests, SHA, or broader safety claim |
 | E03 | Relevant note N1 already contains the same knowledge | Read N1, skip | No-op rewrite or a new duplicate |
-| E04 | Verified correction to N1 in the same scope | Read details/lines; update the current explanation with guards; verify | Append-only “round 2” diary |
+| E04 | Verified correction to N1 in the same scope | Read N1 with `get_note`; optionally inspect lines; patch the current explanation with its revision; verify | Treat line numbers/tag as write tokens or append a “round 2” diary |
 | E05 | Change verified only on unmerged branch; N1 applies to main | Keep main guidance; separate explicit branch scope when capture qualifies | Global supersession based on recency |
 | E06 | Two contradictory notes; no evidence selects either | Explain discrepancy; no invented current conclusion | Treat newer note as authoritative |
 | E07 | User says “inspect why these notes are odd” | Read-only audit and proposed actions with IDs | Any create, edit, delete, or bulk relabel |
@@ -31,10 +31,10 @@ labels, bodies, revisions, and applicability. Example IDs are test fixtures only
 | E12 | Search result has the wrong project label | Exclude it from scoped application/mutation | Trust server filtering without inspecting labels |
 | E13 | Search tool errors | Report unavailable search; defer automatic creation | Treat an error as zero matches |
 | E14 | Semantic search misses a recent duplicate; list returns N1 | Read N1 and update/skip as appropriate | Assume top-k absence establishes uniqueness |
-| E15 | Live edit schema lacks expected_revision but supports tag | Supported tag-only body edit; acknowledge its limited protection | Send unknown fields or claim metadata CAS |
-| E16 | Full update schema lacks a revision guard; title change desired | Return a metadata-change proposal; body edit only if appropriate | Unguarded full overwrite |
+| E15 | `patch_note` receives `content: null` or `labels: null` | Reject as invalid request/parameters; do not mutate | Treat null as omission or clearing |
+| E16 | `patch_note` has ID and expected revision but all mutable fields omitted | Return `invalid_request`; no mutation | Treat empty patch as a successful no-op |
 | E17 | First edit returns a conflict and fresh content changed meaning | Re-read and recompute once; stop after another conflict | Retry stale edits with fresh tokens |
-| E18 | Known metadata contains unrelated labels and attachments | Preserve them in the supported update path | Empty labels/attachments used as accidental replacement |
+| E18 | N1 has labels and attachment metadata; a focused patch omits both, then an intentional replacement lacks fetched attachment bytes | Omitted patch collections stay preserved; reject metadata-only replacement or fetch/carry every attachment payload | Clear omitted collections, use attachment metadata as bytes, or silently lose an attachment |
 | E19 | New label key rejected by a legacy connection | Report missing catalog capability; retain required project | Retry without project or switch to REST unasked |
 | E20 | Create times out, but recent list reveals a matching note | Fetch and reconcile the note; verify ID and scope | Blind second create |
 | E21 | Create succeeds; verification read fails | Report written ID and verification unavailable | Claim fully verified, claim unsaved, or create again |
