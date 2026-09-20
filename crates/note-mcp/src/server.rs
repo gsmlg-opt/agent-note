@@ -304,10 +304,12 @@ pub struct AttachmentRequestSchema {
     #[serde(default)]
     pub description: String,
     /// UTF-8 bytes. Provide exactly this field or `content_base64`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "note_core::deserialize_present")]
+    #[schemars(with = "String", transform = remove_schema_default)]
     pub content: Option<String>,
     /// Base64-encoded bytes. Provide exactly this field or `content`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "note_core::deserialize_present")]
+    #[schemars(with = "String", transform = remove_schema_default)]
     pub content_base64: Option<String>,
 }
 
@@ -2191,6 +2193,28 @@ mod tests {
         assert_eq!(required_names(&schema), vec!["id", "mime", "path"]);
         let branches = schema["oneOf"].as_array().expect("attachment oneOf");
         assert_eq!(branches.len(), 2);
+        for field in ["content", "content_base64"] {
+            assert!(
+                !schema_allows_null(&schema["properties"][field]),
+                "{field}: {schema}"
+            );
+        }
+
+        for invalid in [
+            json!({
+                "id": "blob", "path": "./blob.bin", "mime": "application/octet-stream",
+                "content": null, "content_base64": "AP8="
+            }),
+            json!({
+                "id": "blob", "path": "./blob.bin", "mime": "application/octet-stream",
+                "content": "bytes", "content_base64": null
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<AttachmentRequestSchema>(invalid).is_err(),
+                "accepted explicit null attachment content"
+            );
+        }
 
         let request = AttachmentRequestSchema {
             id: "blob".into(),
@@ -2318,6 +2342,54 @@ mod tests {
             result.structured_content.unwrap()["code"],
             "invalid_request"
         );
+    }
+
+    #[tokio::test]
+    async fn patch_note_sanitizes_a_real_storage_failure() {
+        let (ctx, backend, dir) = test_context().await;
+        let base_server = test_server(ctx, backend.clone());
+        let saved = base_server
+            .save_note(Parameters(SaveNoteRequest {
+                title: "Stored".into(),
+                content: "Body".into(),
+                labels: vec![],
+            }))
+            .await
+            .unwrap()
+            .0;
+
+        let failing_backend: Arc<dyn StorageBackend> =
+            Arc::new(FailingBeginStorageBackend { inner: backend });
+        let failing_ctx = Context::new(
+            failing_backend.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(
+                dir.path().join("mutation-failing-attachments"),
+            )),
+        );
+        let server = test_server(failing_ctx, failing_backend);
+        let result = server
+            .patch_note(Parameters(PatchNoteRequest {
+                id: saved.id,
+                expected_revision: saved.revision,
+                title: Some("Changed".into()),
+                content: None,
+                attachments: None,
+                labels: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["code"], "internal_error");
+        assert_eq!(body["message"], "note mutation failed");
+        assert_eq!(body["details"], json!({}));
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body.as_object().unwrap().len(), 4);
+        assert!(!body
+            .to_string()
+            .contains("private repository failure detail"));
     }
 
     #[test]

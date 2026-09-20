@@ -893,6 +893,90 @@ async fn note_http_exposes_replace_and_patch_structured_results() {
     assert_eq!(tool_content(&replaced)["changed"], true);
     assert_eq!(replaced["result"]["resultType"], "complete", "{replaced}");
 
+    let replace_noop = call_modern(
+        &router,
+        id,
+        "replace_note",
+        json!({
+            "id": note_id,
+            "expected_revision": 2,
+            "title": "Replaced",
+            "content": "after",
+            "attachments": [],
+            "labels": []
+        }),
+    )
+    .await;
+    id += 1;
+    assert_success(&replace_noop, "no-op replace note");
+    assert_eq!(replace_noop["result"]["resultType"], "complete");
+    assert_eq!(tool_content(&replace_noop)["changed"], false);
+    assert_eq!(tool_content(&replace_noop)["revision"], 2);
+
+    for arguments in [
+        json!({
+            "id": note_id, "expected_revision": 2, "title": "Missing labels",
+            "content": "after", "attachments": []
+        }),
+        json!({
+            "id": note_id, "expected_revision": 2, "title": "Unknown",
+            "content": "after", "attachments": [], "labels": [], "unknown": true
+        }),
+        json!({
+            "id": note_id, "expected_revision": 2, "title": "Null text",
+            "content": "after", "labels": [], "attachments": [{
+                "id": "blob", "path": "./blob.bin", "mime": "application/octet-stream",
+                "content": null, "content_base64": "AP8="
+            }]
+        }),
+        json!({
+            "id": note_id, "expected_revision": 2, "title": "Null base64",
+            "content": "after", "labels": [], "attachments": [{
+                "id": "blob", "path": "./blob.bin", "mime": "application/octet-stream",
+                "content": "bytes", "content_base64": null
+            }]
+        }),
+    ] {
+        let malformed = call_modern(&router, id, "replace_note", arguments).await;
+        id += 1;
+        assert_eq!(malformed["error"]["code"], -32602, "{malformed}");
+        assert!(malformed.get("result").is_none(), "{malformed}");
+    }
+
+    let replace_conflict = call_modern(
+        &router,
+        id,
+        "replace_note",
+        json!({
+            "id": note_id,
+            "expected_revision": 1,
+            "title": "Stale",
+            "content": "stale",
+            "attachments": [],
+            "labels": []
+        }),
+    )
+    .await;
+    id += 1;
+    assert_eq!(replace_conflict["result"]["resultType"], "complete");
+    assert_eq!(replace_conflict["result"]["isError"], true);
+    assert_eq!(tool_content(&replace_conflict)["code"], "revision_conflict");
+    assert!(tool_content(&replace_conflict)["message"].is_string());
+    assert!(tool_content(&replace_conflict)["details"].is_object());
+    assert_eq!(tool_content(&replace_conflict)["retryable"], false);
+    assert_eq!(
+        tool_content(&replace_conflict)
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["code", "details", "message", "retryable"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+
     let patched = call_modern(
         &router,
         id,
