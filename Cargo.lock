@@ -3693,6 +3693,7 @@ name = "note-core"
 version = "0.1.0"
 dependencies = [
  "agcodex-apply-patch",
+ "aho-corasick",
  "base64 0.22.1",
  "chrono",
  "regex",

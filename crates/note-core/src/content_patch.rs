@@ -1,5 +1,10 @@
 use agcodex_apply_patch::{parse_patch, Hunk};
+use aho_corasick::AhoCorasick;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+const UNIQUE_CONTEXT_ERROR: &str =
+    "context must match exactly one location in the original content";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -33,6 +38,48 @@ where
     T: Deserialize<'de>,
 {
     T::deserialize(deserializer).map(Some)
+}
+
+fn append_encoded_line(encoded: &mut Vec<u8>, line: &str) {
+    encoded.extend_from_slice(&(line.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(line.as_bytes());
+}
+
+fn unique_pattern_locations(
+    normalized_original: &[&str],
+    patterns: &[Vec<u8>],
+) -> Result<Vec<usize>, ContentPatchError> {
+    let fail = || ContentPatchError {
+        message: UNIQUE_CONTEXT_ERROR.to_owned(),
+    };
+    let mut encoded_original = Vec::new();
+    let mut boundary_lines = HashMap::with_capacity(normalized_original.len().saturating_add(1));
+    boundary_lines.insert(0, 0);
+    for (line_index, line) in normalized_original.iter().enumerate() {
+        append_encoded_line(&mut encoded_original, line);
+        boundary_lines.insert(encoded_original.len(), line_index + 1);
+    }
+
+    let matcher = AhoCorasick::new(patterns).map_err(|_| fail())?;
+    let mut locations = vec![None; patterns.len()];
+    // Expected: O(encoded source + total encoded patterns + emitted matches).
+    for found in matcher.find_overlapping_iter(&encoded_original) {
+        let Some(&start_line) = boundary_lines.get(&found.start()) else {
+            continue;
+        };
+        if !boundary_lines.contains_key(&found.end()) {
+            continue;
+        }
+        let location = &mut locations[found.pattern().as_usize()];
+        if location.replace(start_line).is_some() {
+            return Err(fail());
+        }
+    }
+
+    locations
+        .into_iter()
+        .map(|location| location.ok_or_else(&fail))
+        .collect()
 }
 
 pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, ContentPatchError> {
@@ -89,38 +136,30 @@ pub fn apply_content_patch(content: &str, patch: &str) -> Result<String, Content
             None => *raw,
         })
         .collect();
-    let mut cursor = 0;
-    let mut result = String::new();
-    let mut removed_unterminated_eof = false;
 
     if chunks.len() != hunk_prefixes.len() {
         return Err(fail("expected plain @@ hunks"));
     }
+    if chunks.iter().any(|chunk| chunk.old_lines.is_empty()) {
+        return Err(fail("each hunk needs existing context or deletion lines"));
+    }
 
-    for (chunk, prefixes) in chunks.iter().zip(hunk_prefixes) {
-        if chunk.old_lines.is_empty() {
-            return Err(fail("each hunk needs existing context or deletion lines"));
-        }
-        let mut matches = normalized_original
-            .windows(chunk.old_lines.len())
-            .enumerate()
-            .filter(|(_, window)| {
-                window
-                    .iter()
-                    .copied()
-                    .eq(chunk.old_lines.iter().map(String::as_str))
-            })
-            .map(|(start, _)| start);
-        let Some(start) = matches.next() else {
-            return Err(fail(
-                "context must match exactly one location in the original content",
-            ));
-        };
-        if matches.next().is_some() {
-            return Err(fail(
-                "context must match exactly one location in the original content",
-            ));
-        }
+    let encoded_patterns: Vec<_> = chunks
+        .iter()
+        .map(|chunk| {
+            let mut encoded = Vec::new();
+            for line in &chunk.old_lines {
+                append_encoded_line(&mut encoded, line);
+            }
+            encoded
+        })
+        .collect();
+    let locations = unique_pattern_locations(&normalized_original, &encoded_patterns)?;
+    let mut cursor = 0;
+    let mut result = String::new();
+    let mut removed_unterminated_eof = false;
+
+    for ((chunk, prefixes), start) in chunks.iter().zip(hunk_prefixes).zip(locations) {
         if start < cursor {
             return Err(fail("hunks must be ordered and must not overlap"));
         }

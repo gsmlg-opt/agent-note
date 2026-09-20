@@ -40,6 +40,56 @@ fn applies_multiple_ordered_non_overlapping_hunks() {
 }
 
 #[test]
+fn applies_many_uniquely_anchored_hunks_in_a_large_repeated_prefix_body() {
+    const HUNK_COUNT: usize = 192;
+    const REPEATED_PREFIX_LINES: usize = 48;
+
+    let mut content = String::new();
+    let mut patch = String::new();
+    let mut expected = String::new();
+    for hunk in 0..HUNK_COUNT {
+        patch.push_str("@@\n");
+        for _ in 0..REPEATED_PREFIX_LINES {
+            content.push_str("repeated prefix\n");
+            patch.push_str(" repeated prefix\n");
+            expected.push_str("repeated prefix\n");
+        }
+        content.push_str(&format!("anchor-{hunk}\n"));
+        patch.push_str(&format!("-anchor-{hunk}\n+updated-{hunk}\n"));
+        expected.push_str(&format!("updated-{hunk}\n"));
+    }
+
+    assert_eq!(apply_content_patch(&content, &patch).unwrap(), expected);
+}
+
+#[test]
+fn rejects_ambiguity_while_matching_many_hunks_together() {
+    const HUNK_COUNT: usize = 64;
+
+    let mut content = String::new();
+    let mut patch = String::new();
+    for hunk in 0..HUNK_COUNT {
+        let anchor = if hunk == HUNK_COUNT - 1 { 0 } else { hunk };
+        content.push_str("repeated prefix\n");
+        content.push_str(&format!("anchor-{anchor}\n"));
+        patch.push_str("@@\n repeated prefix\n");
+        patch.push_str(&format!("-anchor-{hunk}\n+updated-{hunk}\n"));
+    }
+
+    let error = apply_content_patch(&content, &patch).unwrap_err();
+    assert_eq!(
+        error.message,
+        "context must match exactly one location in the original content"
+    );
+}
+
+#[test]
+fn duplicate_hunk_patterns_reach_overlap_validation() {
+    let error = apply_content_patch("old\n", "@@\n-old\n+first\n@@\n-old\n+second").unwrap_err();
+    assert_eq!(error.message, "hunks must be ordered and must not overlap");
+}
+
+#[test]
 fn preserves_unicode_crlf_mixed_line_endings_final_newline_and_unterminated_line() {
     assert_eq!(
         apply_content_patch("α\r\nold\nβ\r\nlast", "@@\n α\n-old\n+新\n β",).unwrap(),
