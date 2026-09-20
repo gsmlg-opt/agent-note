@@ -653,34 +653,39 @@ retrying.
 
 ## MCP
 
-Agent Note supports MCP 2026-07-28 over Streamable HTTP only. `/mcp` exposes the twelve
-Markdown-note tools; `/org/mcp` exposes the forty Org tools. MCP clients connect to the HTTP
-endpoint that owns the tools they need.
+Agent Note supports stateless MCP 2026-07-28 over Streamable HTTP only. `/mcp` exposes exactly these
+twelve Markdown-note tools: `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`,
+`patch_note`, `replace_note`, `delete_note`, `list_notes`, `semantic_search`,
+`put_note_attachment`, `get_note_attachment_content`, and `delete_note_attachment`. `/org/mcp`
+exposes the separate forty Org tools; a tool is unavailable on the other endpoint. Explicit label-key
+catalog management remains REST/UI-only.
 
-It exposes `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`, `edit_note`,
-`update_note`, `delete_note`, `list_notes`, `semantic_search`, `put_note_attachment`,
-`get_note_attachment_content`, and `delete_note_attachment`. Explicit label-key catalog management
-is REST/UI-only. `list_notes` returns exactly `id`, `title`, `labels`, `created_at`, `updated_at`,
-and `revision` for each result. `semantic_search` returns exactly `id`, `title`, `revision`, `score`,
-`labels`, `created_at`, and `updated_at`, matching the REST search summary. Neither response includes
-note content, attachments, or `deleted_at`.
+Read `get_note.revision` before either note mutation: it is the write guard for both `replace_note`
+and `patch_note`. `read_note_lines` is optional inspection only; its tag and line numbers are not
+write preconditions. On `revision_conflict`, re-read the note and recompute the mutation, rather than
+swapping in the returned revision token.
 
-`get_note` and `update_note` return note content plus attachment metadata (`id`, `path`, `mime`, and
-`description`) without attachment bytes, plus the authoritative note `revision`. `read_note_lines`
-returns both `revision` and the content-specific `tag`; `edit_note` requires both. `update_note`,
-`delete_note`, `put_note_attachment`, and `delete_note_attachment` also require
-`expected_revision`. Successful save, update, edit, and attachment-put results expose the resulting
-revision. MCP `save_note` and `update_note` do not accept inline
-attachments. Create or replace one attachment with `put_note_attachment`, and remove one with
-`delete_note_attachment`; both address it by its stable `attachment_id`. An existing attachment id
-cannot change its normalized path, so rename an attachment with delete followed by put.
-`get_note_attachment_content` is the only MCP tool that reads attachment bytes. It returns exactly
-one content representation: direct `content` when the bytes are valid UTF-8, otherwise canonical
-Base64 in `content_base64`. These changes apply only to MCP; REST attachment behavior is unchanged.
+`replace_note` is a closed full replacement: it requires `id`, positive `expected_revision`, `title`,
+complete `content`, complete `attachments`, and complete `labels`. Omitted collections are invalid;
+`[]` clears a collection. `patch_note` is a closed partial replacement: it requires `id`, positive
+`expected_revision`, and at least one writable field. Omitted writable fields are preserved, while
+supplied arrays replace the whole collection and `[]` clears it; explicit `null` and unknown fields
+are invalid. Its `content` is either a complete string or strict `{ "apply_patch": "..." }` content.
+The patch uses plain `@@` hunks with exact, unique context/deletions, in ordered non-overlapping
+locations; file directives, fuzzy matching, and unanchored edits are rejected.
 
-Ordinary-note MCP conflicts use the same `code`, `message`, `details`, and `retryable` fields as
-REST, including `stale_revision` with the expected and current revision. Missing required inputs
-are protocol caller errors; missing notes are `not_found`; storage failures use safe messages.
+Both mutations are atomic. A semantic no-op returns `changed: false` and preserves revision,
+timestamp, attachment blobs, labels, and search/embedding state. A successful mutation returns only
+`id`, `revision`, and `changed`. Malformed arguments are JSON-RPC invalid-params errors. Operational
+failures are `isError` structured `{code, message, details, retryable}` results with one of
+`not_found`, `revision_conflict`, `patch_failed`, `invalid_request`, `validation_error`, or
+`internal_error`.
+
+`get_note` includes note data and attachment metadata only (`id`, `path`, `mime`, `description`), not
+attachment bytes. Fetch each retained attachment with `get_note_attachment_content` before a full
+replacement, then carry its bytes in that replacement using exactly one of `content` or
+`content_base64`; otherwise it is not preserved. Standalone attachment tools and bulk-label updates
+remain available. REST and frontend internal line-edit behavior remain separate and unchanged.
 
 `/org/mcp` exposes exactly these 40 Org tools:
 

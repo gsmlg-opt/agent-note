@@ -438,11 +438,12 @@ Use yew-duskmoon-ui primitives (`Card`, `Input`, `TextArea`, `Tag`) rather than 
 
 ## 8. MCP Integration
 
-MCP 2026-07-28 is served over Streamable HTTP only. `/mcp` exposes the twelve Markdown-note tools:
-`bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`, `edit_note`,
-`update_note`, `delete_note`, `list_notes`, `semantic_search`, `put_note_attachment`,
-`get_note_attachment_content`, and `delete_note_attachment`. Explicit label-key catalog management
-remains REST/UI-only.
+MCP 2026-07-28 is stateless Streamable HTTP only. `/mcp` exposes exactly these twelve
+Markdown-note tools: `bulk_update_note_labels`, `save_note`, `get_note`, `read_note_lines`,
+`patch_note`, `replace_note`, `delete_note`, `list_notes`, `semantic_search`,
+`put_note_attachment`, `get_note_attachment_content`, and `delete_note_attachment`. `/org/mcp`
+exposes a separate forty-tool Org inventory, so neither endpoint exposes the other's tools. Explicit
+label-key catalog management remains REST/UI-only.
 
 `/org/mcp` exposes the exact 40 Org tools:
 
@@ -468,14 +469,30 @@ one Markdown-note `Context` and one `Arc<OrgContext>` over the same storage back
 those exact contexts into their HTTP endpoint. `/mcp` and `/org/mcp` implement MCP 2026-07-28
 Streamable HTTP. They expose separate tool inventories and have no stdio transport.
 
-Markdown-note detail, summary, and search results expose `revision`. Line reads expose both that
-authoritative note-wide revision and a content tag. MCP update, edit, soft-delete, attachment put,
-and attachment delete inputs require `expected_revision`; line edit additionally requires its read
-tag. REST full update requires the field in JSON, delete routes require it as a query parameter, and
-Trash restore carries one expected revision per note. Both transports map ordinary-note conflicts
-to the common structured envelope (`code`, `message`, `details`, `retryable`), with
-`stale_revision` details containing `note_id`, `expected_revision`, and `current_revision`. Clients
-must refetch and merge or deliberately reapply rather than automatically retrying stale data.
+`get_note.revision` is the positive `expected_revision` write guard for both MCP mutations.
+`read_note_lines` is optional inspection: its tag and numbered lines are not write preconditions. On
+`revision_conflict`, clients re-read and recompute the mutation rather than token-swapping. REST and
+frontend internal line-edit behavior remains separate and unchanged.
+
+`replace_note` is a closed full replacement requiring `id`, positive `expected_revision`, `title`,
+complete `content`, complete `attachments`, and complete `labels`; omitted collections are invalid,
+while `[]` clears them. `patch_note` is a closed partial replacement requiring `id`, positive
+`expected_revision`, and at least one writable field. Omitted writable fields are preserved;
+supplied arrays replace the whole collection and `[]` clears it; explicit `null` and unknown fields
+are invalid. Its `content` accepts either a complete string or strict `{ "apply_patch": "..." }`.
+That patch uses plain `@@` hunks with exact, unique context/deletions in ordered non-overlapping
+locations; file directives, fuzzy matching, and unanchored edits are rejected.
+
+Both mutations are atomic. A semantic no-op returns `changed: false` without changing the revision,
+timestamp, attachment blobs, labels, or search/embedding state; success returns only `id`,
+`revision`, and `changed`. Malformed arguments are JSON-RPC invalid-params errors. Operational
+failures are `isError` structured `{code, message, details, retryable}` results using `not_found`,
+`revision_conflict`, `patch_failed`, `invalid_request`, `validation_error`, or `internal_error`.
+
+`get_note` returns attachment metadata only, never attachment bytes. A full replacement that keeps
+attachments must fetch each byte payload with `get_note_attachment_content` and carry it using
+exactly one of `content` or `content_base64`; otherwise the attachment is not preserved. Standalone
+attachment tools and `bulk_update_note_labels` remain available.
 
 REST `POST /api/notes/search` and MCP `semantic_search` expose the same search-summary fields:
 `id`, `title`, `revision`, `score`, `labels`, `created_at`, and `updated_at`. Neither transport
