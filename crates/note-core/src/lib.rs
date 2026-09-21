@@ -11,5 +11,7 @@ pub mod fusion;
 pub use fusion::*;
 pub mod line_edit;
 pub use line_edit::*;
+#[cfg(not(target_family = "wasm"))]
 pub mod content_patch;
+#[cfg(not(target_family = "wasm"))]
 pub use content_patch::*;
