@@ -347,6 +347,7 @@ fn batch_toolbar(
     selected_count: usize,
     batch_mutating: bool,
     workflow_open: bool,
+    notes_query: &NotesQueryParams,
     refs: BatchLabelToolbarRefs,
     on_open: Callback<BatchLabelMode>,
     on_delete: Callback<()>,
@@ -384,7 +385,7 @@ fn batch_toolbar(
                 <button ref={update_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Update)}>{ "Update label" }</button>
                 <button ref={remove_ref} type="button" class="btn btn-outline" disabled={disabled} onclick={open(BatchLabelMode::Remove)}>{ "Remove label" }</button>
                 <button ref={delete_ref} type="button" class="btn btn-error" disabled={disabled} onclick={delete}>{ "Delete selected" }</button>
-                <Link<Route> to={Route::NewNote} classes={classes!("btn", "btn-primary")}>{ "New note" }</Link<Route>>
+                <Link<Route, NotesQueryParams> to={Route::NewNote} query={Some(notes_query.clone())} classes={classes!("btn", "btn-primary")}>{ "New note" }</Link<Route, NotesQueryParams>>
             </div>
         </div>
     }
@@ -1974,7 +1975,7 @@ pub fn notes_page() -> Html {
                 <p class="loading">{ "Loading…" }</p>
             } else {
                 if results.as_ref().is_some_and(|hits| !hits.is_empty()) || (results.is_none() && !notes.is_empty()) {
-                    { batch_toolbar(selected_visible_count, batch_mutating, batch_workflow_open, batch_toolbar_refs.clone(), on_open_batch_label, on_open_batch_delete) }
+                    { batch_toolbar(selected_visible_count, batch_mutating, batch_workflow_open, &notes_query, batch_toolbar_refs.clone(), on_open_batch_label, on_open_batch_delete) }
                 }
                 if let Some(hits) = &*results {
                     { search_results_view(hits, &page, &page_size, &selected, &select_all_ref, on_select_all.clone(), on_selection_change.clone(), batch_mutating, &delete_target, &notes_query, on_quick_add_filter.clone(), on_page_change.clone(), on_page_size_change.clone(), on_refresh.clone()) }
@@ -2252,9 +2253,9 @@ fn note_table(
         return html! {
             <div class="empty">
                 <p>{ "No notes yet." }</p>
-                <Link<Route> to={Route::NewNote} classes={classes!("btn", "btn-primary")}>
+                <Link<Route, NotesQueryParams> to={Route::NewNote} query={Some(notes_query.clone())} classes={classes!("btn", "btn-primary")}>
                     { "Write your first note" }
-                </Link<Route>>
+                </Link<Route, NotesQueryParams>>
             </div>
         };
     }
@@ -3070,6 +3071,7 @@ mod tests {
             0,
             false,
             false,
+            &notes_query_params(&default_notes_url_state()),
             BatchLabelToolbarRefs::default(),
             Callback::noop(),
             Callback::noop(),
@@ -3100,6 +3102,7 @@ mod tests {
             2,
             false,
             false,
+            &notes_query_params(&default_notes_url_state()),
             BatchLabelToolbarRefs::default(),
             Callback::noop(),
             Callback::noop(),
@@ -3114,6 +3117,7 @@ mod tests {
             2,
             true,
             false,
+            &notes_query_params(&default_notes_url_state()),
             BatchLabelToolbarRefs::default(),
             Callback::noop(),
             Callback::noop(),
@@ -3462,7 +3466,9 @@ mod tests {
 
         assert!(source[background..].contains("inert={batch_workflow_open}"));
         assert!(source[background..].contains("aria-busy={batch_mutating.to_string()}"));
-        assert!(source[background..].contains("<Link<Route> to={Route::NewNote}"));
+        assert!(source[background..].contains(
+            "<Link<Route, NotesQueryParams> to={Route::NewNote} query={Some(notes_query.clone())}"
+        ));
         assert!(source.contains("let batch_focus_return_mode = use_mut_ref"));
         assert!(source.contains("ref={batch_success_ref.clone()} role=\"status\" tabindex=\"-1\""));
         assert!(source.contains("let batch_delete_focus_return = use_mut_ref"));
@@ -3482,9 +3488,27 @@ mod tests {
             .expect("end of batch actions container");
         let toolbar_snippet = &source[toolbar_start..toolbar_start + toolbar_end];
 
-        assert!(toolbar_snippet.contains("<Link<Route> to={Route::NewNote}"));
+        assert!(toolbar_snippet.contains(
+            "<Link<Route, NotesQueryParams> to={Route::NewNote} query={Some(notes_query.clone())}"
+        ));
         assert!(toolbar_snippet.contains(r#"classes={classes!("btn", "btn-primary")}"#));
         assert!(toolbar_snippet.contains(r#"{ "New note" }"#));
+    }
+
+    #[test]
+    fn empty_state_new_note_link_carries_current_label_query() {
+        let source = include_str!("notes.rs");
+        let empty_state = source
+            .split("fn note_table(")
+            .nth(1)
+            .expect("note table")
+            .split("let all_selected")
+            .next()
+            .expect("empty state");
+
+        assert!(empty_state.contains(
+            "<Link<Route, NotesQueryParams> to={Route::NewNote} query={Some(notes_query.clone())}"
+        ));
     }
 
     #[test]
