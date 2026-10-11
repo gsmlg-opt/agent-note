@@ -17,6 +17,7 @@ pub struct AppState {
     pub note: Arc<Context>,
     pub org: Arc<OrgContext>,
     pub pdf_export: Option<Arc<PdfExportRuntime>>,
+    pub sync: Arc<crate::sync_client::SyncRuntime>,
 }
 
 impl AppState {
@@ -25,7 +26,13 @@ impl AppState {
             note,
             org,
             pdf_export: None,
+            sync: crate::sync_client::SyncRuntime::new(&[]),
         }
+    }
+
+    pub fn with_sync(mut self, runtime: Arc<crate::sync_client::SyncRuntime>) -> Self {
+        self.sync = runtime;
+        self
     }
 
     pub fn with_pdf_export(

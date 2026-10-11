@@ -4163,6 +4163,7 @@ mod tests {
         note_pipelines::update_system_config(
             &ctx,
             &note_core::SystemConfig {
+                sync: note_core::sync::SyncConfig::default(),
                 category_labels: Vec::new(),
                 search: note_core::SearchConfig::default(),
                 duplicate_check: note_core::DuplicateCheckConfig {

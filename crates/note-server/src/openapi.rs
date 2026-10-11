@@ -62,6 +62,26 @@ pub(crate) struct SystemConfigSchema {
         default = json!({"enabled": false, "rules": []})
     )]
     pub duplicate_check: DuplicateCheckConfigSchema,
+    #[schema(required = false, default = json!({"enabled":false,"connection_profile":null,"rules":[]}))]
+    pub sync: SyncConfigSchema,
+}
+
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct SyncConfigSchema {
+    #[schema(required = false, default = false)]
+    pub enabled: bool,
+    #[schema(required = false)]
+    pub connection_profile: Option<String>,
+    #[schema(required = false, default = json!([]))]
+    pub rules: Vec<SyncRuleSchema>,
+}
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct SyncRuleSchema {
+    pub id: String,
+    pub enabled: bool,
+    pub selector: String,
 }
 
 #[derive(ToSchema)]
@@ -170,6 +190,7 @@ pub fn rest_router() -> (Router<crate::AppState>, OpenApi) {
         .merge(crate::notes_api::notes_router::<crate::AppState>())
         .merge(crate::labels_api::labels_router::<crate::AppState>())
         .merge(crate::system_api::system_router::<crate::AppState>())
+        .merge(crate::sync_client::api::router())
         .merge(crate::export_api::export_router::<crate::AppState>())
         .merge(crate::org_api::router())
         .split_for_parts();
@@ -1229,6 +1250,7 @@ mod tests {
     #[test]
     fn system_schema_fields_match_runtime_serialization() {
         let runtime_config = note_core::SystemConfig {
+            sync: note_core::sync::SyncConfig::default(),
             category_labels: vec!["project".to_string()],
             search: note_core::SearchConfig::default(),
             duplicate_check: note_core::DuplicateCheckConfig {

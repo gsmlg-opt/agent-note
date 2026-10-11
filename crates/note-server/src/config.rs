@@ -34,6 +34,14 @@ struct FileConfig {
     embedding: Option<FileEmbeddingConfig>,
     attachments: Option<FileAttachmentConfig>,
     export: Option<FileExportConfig>,
+    sync: Option<FileSyncConfig>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSyncConfig {
+    #[serde(default)]
+    connections: Vec<crate::sync_client::SyncConnection>,
 }
 
 #[derive(Default, Deserialize)]
@@ -202,6 +210,7 @@ pub struct RuntimeConfig {
     pub embedding: EmbeddingConfig,
     pub attachments: AttachmentConfig,
     pub pdf_export: PdfExportConfig,
+    pub sync_connections: Vec<crate::sync_client::SyncConnection>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -340,6 +349,20 @@ fn resolve_runtime_config(
     let embedding = resolve_embedding(file_embedding, &env, config_base)?;
     let attachments = resolve_attachments(file_attachments, &env, config_base)?;
     let pdf_export = resolve_pdf_export(file_pdf_export)?;
+    let mut sync_connections = file.sync.unwrap_or_default().connections;
+    let mut sync_ids = std::collections::HashSet::new();
+    for connection in &mut sync_connections {
+        connection.validate()?;
+        if !sync_ids.insert(connection.id.clone()) {
+            anyhow::bail!("sync connection IDs must be unique");
+        }
+        connection.client_cert = resolve_path(config_base, connection.client_cert.clone());
+        connection.client_key = resolve_path(config_base, connection.client_key.clone());
+        connection.ca_cert = connection
+            .ca_cert
+            .take()
+            .map(|path| resolve_path(config_base, path));
+    }
     persist_missing_bind_addr(&config_path, &bind_addr)?;
 
     Ok(RuntimeConfig {
@@ -349,6 +372,7 @@ fn resolve_runtime_config(
         embedding,
         attachments,
         pdf_export,
+        sync_connections,
     })
 }
 
@@ -767,6 +791,50 @@ fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn sync_profiles_resolve_private_paths_against_config_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[server]
+bind_addr = "127.0.0.1:6222"
+[[sync.connections]]
+id = "gao_note"
+url = "wss://admin.gsmlg.org/note-sync/websocket?vsn=2.0.0"
+client_cert = "certs/client.pem"
+client_key = "certs/client.key"
+ca_cert = "certs/ca.pem"
+"#,
+        )
+        .unwrap();
+        let config = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some(path),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(config.sync_connections.len(), 1);
+        assert_eq!(
+            config.sync_connections[0].client_cert,
+            dir.path().join("certs/client.pem")
+        );
+        assert_eq!(
+            config.sync_connections[0].client_key,
+            dir.path().join("certs/client.key")
+        );
+        let public = serde_json::to_string(&config.sync_connections[0].public_profile()).unwrap();
+        assert!(!public.contains("client.pem"));
+        assert!(!public.contains("client.key"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&public).unwrap()["id"],
+            "gao_note"
+        );
+    }
 
     #[test]
     fn debug_policy_creates_and_migrates_the_implicit_config() {
@@ -1394,6 +1462,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
                 path: "/tmp/attachments".into(),
             },
             pdf_export: PdfExportConfig::default(),
+            sync_connections: vec![],
         };
 
         for rendered in [format!("{:?}", config.database), format!("{config:?}")] {
@@ -1423,6 +1492,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
                 path: "/tmp/attachments".into(),
             },
             pdf_export: PdfExportConfig::default(),
+            sync_connections: vec![],
         };
 
         let rendered = format!("{config:?}");
@@ -1454,6 +1524,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
                 force_path_style: true,
             },
             pdf_export: PdfExportConfig::default(),
+            sync_connections: vec![],
         };
 
         for rendered in [format!("{:?}", config.attachments), format!("{config:?}")] {

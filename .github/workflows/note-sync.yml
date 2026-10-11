@@ -1,0 +1,22 @@
+name: Note sync protocol
+on:
+  push:
+    paths: ['crates/note-server/**', 'crates/note-core/**', 'crates/note-pipelines/**', 'docs/sync/**', 'Cargo.lock', '.github/workflows/note-sync.yml']
+  pull_request:
+    paths: ['crates/note-server/**', 'crates/note-core/**', 'crates/note-pipelines/**', 'docs/sync/**', 'Cargo.lock', '.github/workflows/note-sync.yml']
+jobs:
+  phoenix-mtls:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          elixir-version: '1.18'
+      - run: mix local.hex --force && mix local.rebar --force
+      - name: Unit and mTLS contracts
+        run: cargo test --locked -p note-server --lib sync_client
+      - name: Actual Phoenix 1.8.15 interoperability and hash vectors
+        run: crates/note-server/tests/fixtures/phoenix-sync/run.sh

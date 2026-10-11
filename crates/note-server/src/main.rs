@@ -559,11 +559,19 @@ async fn main() -> anyhow::Result<()> {
     let scheduler = tokio::spawn(run_embedding_scheduler(
         ctx.clone(),
         embedding.wake.clone(),
-        scheduler_shutdown_rx,
+        scheduler_shutdown_rx.clone(),
     ));
 
+    let sync_runtime = note_server::sync_client::SyncRuntime::new(&config.sync_connections);
+    let sync_worker = tokio::spawn(note_server::sync_client::run(
+        ctx.clone(),
+        config.sync_connections.clone(),
+        sync_runtime.clone(),
+        scheduler_shutdown_rx,
+    ));
     let mcp_contexts = compose_mcp_contexts(ctx.clone(), &org_runtime);
-    let mut app_state = AppState::new(ctx.clone(), mcp_contexts.org.clone());
+    let mut app_state =
+        AppState::new(ctx.clone(), mcp_contexts.org.clone()).with_sync(sync_runtime);
     if config.pdf_export.enabled {
         let renderer_url = config
             .pdf_export
@@ -689,6 +697,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = scheduler_shutdown_tx.send(true);
     let _ = scheduler.await;
     let _ = trash_retention.await;
+    let _ = sync_worker.await;
     shutdown_embedding(&mut embedding).await;
     run_result?;
     Ok(())
@@ -754,8 +763,8 @@ mod tests {
             })
             .sum::<usize>();
 
-        assert_eq!(paths.len(), 57);
-        assert_eq!(operation_count, 68);
+        assert_eq!(paths.len(), 59);
+        assert_eq!(operation_count, 70);
         assert!(!paths.keys().any(|path| path.starts_with("/mcp")));
         assert!(!paths.keys().any(|path| path.starts_with("/org/mcp")));
         assert!(document["tags"]
@@ -1109,6 +1118,7 @@ mod tests {
                 path: attachments_dir.clone(),
             },
             pdf_export: note_server::config::PdfExportConfig::default(),
+            sync_connections: vec![],
         };
 
         ensure_data_directories(&local).unwrap();
@@ -1140,6 +1150,7 @@ mod tests {
                 force_path_style: false,
             },
             pdf_export: note_server::config::PdfExportConfig::default(),
+            sync_connections: vec![],
         };
 
         ensure_data_directories(&external).unwrap();
@@ -1162,6 +1173,7 @@ mod tests {
                 path: temp.path().join("attachments"),
             },
             pdf_export: note_server::config::PdfExportConfig::default(),
+            sync_connections: vec![],
         };
 
         ensure_data_directories(&config).unwrap();
