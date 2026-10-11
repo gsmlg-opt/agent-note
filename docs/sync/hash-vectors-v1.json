@@ -1,0 +1,47 @@
+{
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "name": "purge",
+      "snapshot": null,
+      "canonical_utf8": "null",
+      "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+    },
+    {
+      "name": "unicode_and_empty_attachment",
+      "snapshot": {
+        "title": "同步 \"note\" 🙂",
+        "content": "# Hello\n路径 /assets/empty.bin <&>\t\\\u0000 ",
+        "labels": [
+          {
+            "key": "count",
+            "value": "42",
+            "description": "",
+            "value_type": "number"
+          },
+          {
+            "key": "project",
+            "value": "bear_note",
+            "description": "中文",
+            "value_type": "text"
+          }
+        ],
+        "created_at": 1760123456,
+        "updated_at": 1760123457,
+        "deleted_at": null,
+        "attachments": [
+          {
+            "id": "00000000-0000-4000-8000-000000000001",
+            "path": "assets/empty.bin",
+            "mime": "application/octet-stream",
+            "description": "",
+            "size_bytes": 0,
+            "checksum_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        ]
+      },
+      "canonical_utf8": "{\"attachments\":[{\"checksum_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\",\"description\":\"\",\"id\":\"00000000-0000-4000-8000-000000000001\",\"mime\":\"application/octet-stream\",\"path\":\"assets/empty.bin\",\"size_bytes\":0}],\"content\":\"# Hello\\n路径 /assets/empty.bin <&>\\t\\\\\\u0000 \",\"created_at\":1760123456,\"deleted_at\":null,\"labels\":[{\"description\":\"\",\"key\":\"count\",\"value\":\"42\",\"value_type\":\"number\"},{\"description\":\"中文\",\"key\":\"project\",\"value\":\"bear_note\",\"value_type\":\"text\"}],\"title\":\"同步 \\\"note\\\" 🙂\",\"updated_at\":1760123457}",
+      "sha256": "ba290eb78dee6dc16a68564a513cbbfe0e5be1352c50f03972ca069d91582860"
+    }
+  ]
+}

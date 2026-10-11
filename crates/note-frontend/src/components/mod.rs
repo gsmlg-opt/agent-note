@@ -6,6 +6,7 @@ pub mod org_document_table;
 pub mod org_event_table;
 pub mod org_table;
 pub mod org_workspace_form;
+pub mod system_sync;
 
 pub use app_bar::AppBar;
 pub use modal::Modal;

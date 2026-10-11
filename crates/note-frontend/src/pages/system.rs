@@ -5,6 +5,7 @@ use yew_duskmoon::Alert;
 
 use crate::api;
 use crate::components::icons;
+use crate::components::system_sync::{sync_config_error, SystemSync};
 use crate::state::{DuplicateCheckRule, DuplicateCheckTerm, LabelKey, SystemConfig, SystemInfo};
 use crate::theme::{apply_theme, get_saved_theme, ThemeMode};
 
@@ -216,6 +217,11 @@ pub fn system_page() -> Html {
                 return;
             };
             next.search.minimum_score = minimum_score;
+            if let Some(message) = sync_config_error(&next.sync) {
+                error.set(Some(message));
+                saved.set(false);
+                return;
+            }
             saving.set(true);
             error.set(None);
             saved.set(false);
@@ -296,6 +302,18 @@ pub fn system_page() -> Html {
             if *loading {
                 <p class="loading">{ "Loading..." }</p>
             } else if let Some(current) = &*config {
+
+                <SystemSync value={current.sync.clone()} saving={*saving} onchange={{
+                    let config = config.clone();
+                    let saved = saved.clone();
+                    Callback::from(move |sync| {
+                        if let Some(mut next) = (*config).clone() {
+                            next.sync = sync;
+                            config.set(Some(next));
+                            saved.set(false);
+                        }
+                    })
+                }} />
 
                 <section class="system-section" aria-labelledby="category-labels-title">
                     <div class="system-section-head">
@@ -487,7 +505,7 @@ pub fn system_page() -> Html {
                         type="button"
                         class="btn btn-primary"
                         onclick={on_save}
-                        disabled={*saving || minimum_score_invalid}
+                        disabled={*saving || minimum_score_invalid || sync_config_error(&current.sync).is_some()}
                     >
                         { if *saving { "Saving..." } else { "Save settings" } }
                     </button>

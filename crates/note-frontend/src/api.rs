@@ -155,6 +155,53 @@ async fn ok_or_body_error(resp: Response) -> Result<Response, String> {
 
 // ---- System ----
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncProfile {
+    pub id: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncBlockedNote {
+    pub note_id: String,
+    pub event_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncStatus {
+    pub profiles: Vec<SyncProfile>,
+    pub state: String,
+    pub last_error: Option<String>,
+    pub last_success_at: Option<i64>,
+    pub pending_notes: u64,
+    pub initializing: bool,
+    pub node_id: Option<String>,
+    pub peer_node_id: Option<String>,
+    #[serde(default)]
+    pub blocked_notes: Vec<SyncBlockedNote>,
+}
+
+pub async fn get_sync_status() -> Result<SyncStatus, String> {
+    let response = Request::get("/api/system/sync")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    ok_or_body_error(response)
+        .await?
+        .json()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn retry_sync() -> Result<(), String> {
+    let response = Request::post("/api/system/sync/retry")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    ok_or_body_error(response).await.map(|_| ())
+}
+
 pub async fn get_system_config() -> Result<SystemConfig, String> {
     let resp = Request::get("/api/system/config")
         .send()

@@ -10,15 +10,18 @@
 
 ## Implementation and verification checklist
 
-- [ ] Define backward-compatible SyncConfig, HLC, canonical snapshots, descriptor/ACK and generation semantics; validate core ordering and selector configuration.
-- [ ] Add per-record durable storage and additive migrations to both adapters; prove persistence, keyset enumeration, rollback and restart in shared contracts.
-- [ ] Capture all writer families atomically, including bulk labels, import and catalog cascades; prove pending coalescing, tombstones and bootstrap overlap.
-- [ ] Implement version-preserving inbound apply and local revision invalidation; prove LWW, duplicate replay, UUID preservation, labels, trash/restore/purge and no echo.
-- [ ] Protect pending/read attachment generations against cleanup with coordinated reservations; prove old-transfer/new-version and cleanup/reference races.
-- [ ] Implement preprovisioned credential profiles, Phoenix V2 client, inventory/chunks/committed ACK/heartbeat/retry/shutdown and safe status/retry HTTP APIs.
-- [ ] Add System profile/rule editor, live status and retry feedback without exposing credentials; run relevant frontend logic tests and Wasm compilation.
-- [ ] Run local mTLS negative/positive tests and actual Phoenix Channel fixture interoperability; distinguish fixtures from production qualification.
-- [ ] Review requirements and code independently, repair material findings, update protocol/handoff documentation and record exact validation results.
+- [x] Define backward-compatible SyncConfig, HLC, canonical snapshots, descriptor/ACK and generation semantics; validate core ordering and selector configuration.
+- [x] Add per-record durable storage and additive migrations to both adapters; prove persistence, keyset enumeration, rollback and restart in shared contracts.
+- [x] Capture all writer families atomically, including bulk labels, import and catalog cascades; prove pending coalescing, tombstones and bootstrap overlap.
+- [x] Implement version-preserving inbound apply and local revision invalidation; prove LWW, duplicate replay, UUID preservation, labels, trash/restore/purge and no echo.
+- [x] Protect pending/read attachment generations against cleanup with coordinated reservations; prove old-transfer/new-version and cleanup/reference races.
+- [x] Implement preprovisioned credential profiles, Phoenix V2 client, inventory/chunks/committed ACK/heartbeat/retry/shutdown and safe status/retry HTTP APIs.
+- [x] Add System profile/rule editor, live status and retry feedback without exposing credentials; run relevant frontend logic tests and Wasm compilation.
+- [x] Run local mTLS negative/positive tests and actual Phoenix Channel fixture interoperability; distinguish fixtures from production qualification.
+- [x] Review requirements and code independently, repair material findings, update protocol/handoff documentation and record exact validation results.
+
+See [the phase 1 validation report](../../sync/phase-1-validation-2026-10-11.md) for
+scoped test counts, actual Phoenix evidence, browser checks and remaining limits.
 
 ## Ownership and sequencing
 

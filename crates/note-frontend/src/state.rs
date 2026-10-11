@@ -134,6 +134,8 @@ pub struct SystemConfig {
     pub search: SearchConfig,
     #[serde(default)]
     pub duplicate_check: DuplicateCheckConfig,
+    #[serde(default)]
+    pub sync: note_core::sync::SyncConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -266,6 +268,9 @@ mod tests {
                 .unwrap();
 
         assert!(omitted.category_labels.is_empty());
+        assert!(!omitted.sync.enabled);
+        assert!(omitted.sync.connection_profile.is_none());
+        assert!(omitted.sync.rules.is_empty());
         assert_eq!(configured.category_labels, ["team", "project"]);
     }
 
@@ -279,7 +284,7 @@ mod tests {
         assert_eq!(config.category_labels, ["project=yellow-dog", "project="]);
         assert_eq!(
             serde_json::to_string(&config).unwrap(),
-            r#"{"category_labels":["project=yellow-dog","project="],"search":{"minimum_score":0.01},"duplicate_check":{"enabled":false,"rules":[]}}"#
+            r#"{"category_labels":["project=yellow-dog","project="],"search":{"minimum_score":0.01},"duplicate_check":{"enabled":false,"rules":[]},"sync":{"enabled":false,"connection_profile":null,"rules":[]}}"#
         );
     }
 

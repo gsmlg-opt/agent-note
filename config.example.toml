@@ -97,3 +97,22 @@ enabled = false
 # max_pixels_per_image = 20000000
 # max_combined_pixels = 80000000
 # max_pdf_bytes = 33554432
+
+# Optional GaoNote sync connection. Credentials are provisioned on the server;
+# select this profile and enable label rules on the System page after the
+# receiving service has implemented the synchronization protocol.
+#
+# [[sync.connections]]
+# id = "gaonote"
+# url = "wss://admin.gsmlg.org/note-sync/websocket?vsn=2.0.0"
+# client_cert = "/run/credentials/agent-note/client-chain.pem"
+# client_key = "/run/credentials/agent-note/client-key.pem"
+# ca_cert = "/run/credentials/agent-note/server-ca.pem"
+# max_blob_bytes = 536870912
+#
+# Relative credential paths resolve against this config file's directory.
+# Omit ca_cert to use public/system trust roots. With ca_cert, only the roots
+# in that file are trusted. The server hostname and chain are always verified.
+# Transfer chunks are bounded; max_blob_bytes limits each staged/read object
+# and defaults to 512 MiB. Existing object stores use bounded whole-object I/O
+# at final apply, even though WebSocket transfer and staging are chunked.

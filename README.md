@@ -416,6 +416,50 @@ are:
   (`AWS_REGION`), optional `endpoint` (`NOTE_S3_ENDPOINT`), and `force_path_style`
   (`NOTE_S3_FORCE_PATH_STYLE`, default `false`).
 
+### GaoNote synchronization
+
+The System page can synchronize notes selected by labels, such as
+`project=bear_note`, with one GaoNote connection. Multiple enabled selectors form
+an OR union. Synchronization includes full Markdown, title, typed labels,
+attachments, trash/restore and permanent deletion. Initial merge uses note UUIDs;
+the latest complete version wins. Removing a matching label sends a final
+snapshot and preserves both copies as independent notes. Pausing keeps capturing
+changes for later delivery.
+
+Provision a connection in the server's runtime TOML before selecting it in System:
+
+```toml
+[[sync.connections]]
+id = "gao_note"
+url = "wss://admin.gsmlg.org/note-sync/websocket?vsn=2.0.0"
+client_cert = "/run/credentials/agent-note/client-chain.pem"
+client_key = "/run/credentials/agent-note/client-key.pem"
+# Omit ca_cert to use native roots; a supplied CA replaces native trust.
+ca_cert = "/run/credentials/agent-note/server-ca.pem"
+max_blob_bytes = 536870912
+```
+
+Certificate paths resolve from the config directory. Restart the server after
+changing profiles. Private keys and credential paths stay on the server; System
+shows public profiles, connection state, pending count, last confirmation and
+errors, with manual retry. A rejected note remains pending and identifies the
+affected note in System while other notes continue syncing. Correct it and save
+again, or use manual retry to attempt the same version again.
+You can correct the selected profile before pairing;
+after a peer is registered, this database retains its profile and peer identity.
+Transfer errors preserve pending work and normal note
+use. The aggregate limit includes event JSON and attachment bytes; larger notes
+remain editable locally but cannot transfer until they fit the negotiated limit.
+Older attachments without stored size/checksum metadata need a bounded read to
+seed synchronization. A legacy file larger than 512 MiB stops that scan or
+capture until it is migrated to immutable storage, replaced or removed.
+
+This implements the Agent Note client. GaoNote still needs the dedicated
+authenticated receiver described in [the v1 protocol](docs/sync/gaonote-protocol-v1.md).
+The existing anonymous socket and browser mTLS are insufficient for this channel.
+See [the approved design](docs/superpowers/specs/2026-10-11-gaonote-sync-design.md)
+for the phase boundary and [config.example.toml](config.example.toml) for all options.
+
 ### PostgreSQL
 
 PostgreSQL is a complete external storage adapter. A mandatory configuration file selecting it can
