@@ -643,6 +643,7 @@ async fn enable_duplicate_series_rule(ctx: &Context) {
     update_system_config(
         ctx,
         &SystemConfig {
+            sync: Default::default(),
             category_labels: Vec::new(),
             duplicate_check: DuplicateCheckConfig {
                 enabled: true,
@@ -2207,6 +2208,7 @@ async fn empty_title_is_rejected() {
 
 fn duplicate_config(terms: &[(&str, Option<&str>)]) -> SystemConfig {
     SystemConfig {
+        sync: Default::default(),
         category_labels: Vec::new(),
         duplicate_check: DuplicateCheckConfig {
             enabled: true,

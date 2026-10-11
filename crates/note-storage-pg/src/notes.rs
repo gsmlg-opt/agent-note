@@ -161,6 +161,83 @@ fn push_balanced_conjunction(
 
 #[async_trait::async_trait]
 impl NotesRepository for PgSession {
+    async fn get_sync_note(&self, id: &str) -> StorageResult<Option<Note>> {
+        let mut connection = self.connection().await?;
+        sqlx::query_as::<_, NoteRow>(
+            "SELECT n.id, n.title, n.content, n.attachments, n.created_at, n.updated_at,
+                    n.note_revision, n.deleted_at, labels.labels
+             FROM notes n
+             CROSS JOIN LATERAL (
+                 SELECT COALESCE(
+                     jsonb_agg(
+                         jsonb_build_object(
+                             'key', lk.key,
+                             'value', nl.value,
+                             'description', lk.description,
+                             'value_type', lk.value_type
+                         )
+                         ORDER BY lk.key
+                     ),
+                     '[]'::jsonb
+                 ) AS labels
+                 FROM note_labels nl
+                 JOIN label_keys lk ON lk.id = nl.label_key_id
+                 WHERE nl.note_id = n.id
+             ) labels
+             WHERE n.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("query note", error))?
+        .map(NoteRow::into_note)
+        .transpose()
+    }
+
+    async fn put_sync_note(&self, note: NewNote<'_>) -> StorageResult<()> {
+        let attachments = serialize_attachments(note.attachments)?;
+        let mut connection = self.connection().await?;
+        sqlx::query(
+            "INSERT INTO notes (
+                 id, title, content, attachments, created_at, updated_at, note_revision, deleted_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT(id) DO UPDATE SET title=EXCLUDED.title,content=EXCLUDED.content,attachments=EXCLUDED.attachments,created_at=EXCLUDED.created_at,updated_at=EXCLUDED.updated_at,deleted_at=EXCLUDED.deleted_at,note_revision=notes.note_revision+1",
+        )
+        .bind(note.id)
+        .bind(note.title)
+        .bind(note.content)
+        .bind(attachments)
+        .bind(note.created_at)
+        .bind(note.updated_at)
+        .bind(note.note_revision)
+        .bind(note.deleted_at)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("insert note", error))?;
+        Ok(())
+    }
+
+    async fn list_sync_note_ids(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        let mut conn = self.connection().await?;
+        sqlx::query_scalar("SELECT id FROM notes WHERE id>$1 ORDER BY id LIMIT $2")
+            .bind(after.unwrap_or(""))
+            .bind(limit.min(1000) as i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| map_sqlx_error("scan sync notes", e))
+    }
+    async fn purge_sync_note(&self, id: &str) -> StorageResult<()> {
+        let mut conn = self.connection().await?;
+        sqlx::query("DELETE FROM notes WHERE id=$1")
+            .bind(id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_sqlx_error("purge sync note", e))?;
+        Ok(())
+    }
     async fn insert_note(&self, note: NewNote<'_>) -> StorageResult<()> {
         let attachments = serialize_attachments(note.attachments)?;
         let mut connection = self.connection().await?;

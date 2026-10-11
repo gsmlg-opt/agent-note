@@ -168,6 +168,27 @@ pub(crate) async fn run_attachment_cleanup_once(ctx: &crate::Context) {
     };
 
     for operation in operations {
+        let reserved = crate::sync::reserve_sync_attachment_cleanup(
+            ctx,
+            &operation.note_id,
+            &operation.object_key,
+            operation.storage_generation == LEGACY_STORAGE_GENERATION,
+        )
+        .await;
+        if !matches!(reserved, Ok(true)) {
+            let _ = session
+                .fail_attachment_operation(
+                    &operation.id,
+                    &owner,
+                    operation.attempts,
+                    AttachmentOperationStatus::Pending,
+                    Some(now.saturating_add(CLEANUP_RETRY_SECONDS)),
+                    "attachment is referenced or pinned; retry pending",
+                    now,
+                )
+                .await;
+            continue;
+        }
         let deleted = if operation.storage_generation == LEGACY_STORAGE_GENERATION {
             ctx.attachments()
                 .delete_legacy(&operation.note_id, &operation.object_key)

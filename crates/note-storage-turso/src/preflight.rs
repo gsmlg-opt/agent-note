@@ -16,7 +16,8 @@ pub(crate) const SCHEMA_V3_VERSION: u32 = 3;
 pub(crate) const SCHEMA_V4_VERSION: u32 = 4;
 pub(crate) const SCHEMA_V5_VERSION: u32 = 5;
 pub(crate) const PREVIOUS_SCHEMA_VERSION: u32 = 6;
-pub(crate) const SCHEMA_VERSION: u32 = 7;
+pub(crate) const SCHEMA_V7_VERSION: u32 = 7;
+pub(crate) const SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Preflight {
@@ -208,6 +209,7 @@ fn classify_header(path: &Path, header: &[u8]) -> StorageResult<Preflight> {
             | SCHEMA_V4_VERSION
             | SCHEMA_V5_VERSION
             | PREVIOUS_SCHEMA_VERSION
+            | SCHEMA_V7_VERSION
             | SCHEMA_VERSION
     ) {
         return Err(unsupported_schema(user_version));

@@ -190,6 +190,7 @@ pub async fn put_note_attachment(
             )
             .await?;
         }
+        crate::sync::capture_note(ctx, transaction.as_ref(), note_id, false).await?;
         anyhow::Ok(PutNoteAttachmentResult {
             attachment: stored_attachment,
             created,
@@ -339,6 +340,7 @@ pub async fn delete_note_attachment(
             chrono::Utc::now().timestamp(),
         )
         .await?;
+        crate::sync::capture_note(ctx, transaction.as_ref(), note_id, false).await?;
         Ok(DeleteNoteAttachmentResult::Applied { revision })
     }
     .await;

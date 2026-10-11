@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::preflight::{
     incompatible_database, preflight, unsupported_schema, Preflight, APPLICATION_ID,
     OLDEST_SCHEMA_VERSION, PREVIOUS_SCHEMA_VERSION, SCHEMA_V3_VERSION, SCHEMA_V4_VERSION,
-    SCHEMA_V5_VERSION, SCHEMA_VERSION,
+    SCHEMA_V5_VERSION, SCHEMA_V7_VERSION, SCHEMA_VERSION,
 };
 
 const SCHEMA: &str = include_str!("../schema.sql");
@@ -109,6 +109,7 @@ impl TursoSession {
                     | SCHEMA_V4_VERSION
                     | SCHEMA_V5_VERSION
                     | PREVIOUS_SCHEMA_VERSION
+                    | SCHEMA_V7_VERSION
                     | SCHEMA_VERSION
             ) {
                 return Err(unsupported_schema(version));
@@ -302,10 +303,19 @@ impl TursoSession {
                 set_user_version(&self.connection, SCHEMA_VERSION).await?;
             }
             OpenedState::Existing {
+                version: SCHEMA_V7_VERSION,
+            } => {}
+            OpenedState::Existing {
                 version: SCHEMA_VERSION,
             } => {}
             OpenedState::Existing { version } => return Err(unsupported_schema(version)),
         }
+
+        self.connection
+            .execute_batch(include_str!("../migrations/0007_to_0008_sync.sql"))
+            .await
+            .map_err(|error| map_turso_error("migrate database schema from v7 to v8", error))?;
+        set_user_version(&self.connection, SCHEMA_VERSION).await?;
 
         self.connection
             .execute("COMMIT", ())

@@ -217,7 +217,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
         });
     }
 
-    let transaction = match ctx.storage().begin(TransactionMode::Deferred).await {
+    let transaction = match ctx.storage().begin(TransactionMode::Immediate).await {
         Ok(transaction) => transaction,
         Err(error) => {
             return Err(cleanup_import_notes(ctx, published_notes, error.into()).await);
@@ -265,6 +265,7 @@ pub async fn import_data(ctx: &Context, data: ExportData) -> anyhow::Result<Impo
             for (key, value) in &note.labels {
                 transaction.attach_label(&note.id, key, value).await?;
             }
+            crate::sync::capture_imported_note(ctx, transaction.as_ref(), &note.id).await?;
             stats.notes_added += 1;
             inserted.push(true);
         }

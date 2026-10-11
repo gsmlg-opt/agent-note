@@ -15,3 +15,6 @@ pub use line_edit::*;
 pub mod content_patch;
 #[cfg(not(target_family = "wasm"))]
 pub use content_patch::*;
+
+pub mod sync;
+pub use sync::{SyncConfig, SyncRule};

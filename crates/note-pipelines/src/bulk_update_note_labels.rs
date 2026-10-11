@@ -177,6 +177,7 @@ pub async fn bulk_update_note_labels(
             }
             if changed {
                 transaction.advance_note_updated_at(&note_id, now).await?;
+                crate::sync::capture_note(ctx, transaction.as_ref(), &note_id, false).await?;
                 updated += 1;
             }
         }

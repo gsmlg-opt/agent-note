@@ -8,6 +8,85 @@ const EMBEDDING_FINGERPRINT_KEY: &str = "embedding_fingerprint";
 
 #[async_trait::async_trait]
 impl SettingsRepository for TursoSession {
+    async fn get_sync_record(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> StorageResult<Option<serde_json::Value>> {
+        let _guard = self.operation_guard().await;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT value FROM sync_records WHERE namespace=?1 AND record_key=?2",
+                turso::params![namespace, key],
+            )
+            .await
+            .map_err(|e| map_turso_error("read sync record", e))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| map_turso_error("read sync row", e))?
+        else {
+            return Ok(None);
+        };
+        let value = row
+            .get::<String>(0)
+            .map_err(|e| map_turso_error("decode sync row", e))?;
+        serde_json::from_str(&value).map(Some).map_err(|e| {
+            StorageError::with_source(StorageErrorKind::Corrupt, "decode sync JSON", e)
+        })
+    }
+    async fn put_sync_record(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> StorageResult<()> {
+        let _guard = self.operation_guard().await;
+        self.connection.execute("INSERT INTO sync_records(namespace,record_key,value) VALUES(?1,?2,?3) ON CONFLICT(namespace,record_key) DO UPDATE SET value=excluded.value",turso::params![namespace,key,value.to_string()]).await.map_err(|e|map_turso_error("store sync record",e))?;
+        Ok(())
+    }
+    async fn delete_sync_record(&self, namespace: &str, key: &str) -> StorageResult<()> {
+        let _guard = self.operation_guard().await;
+        self.connection
+            .execute(
+                "DELETE FROM sync_records WHERE namespace=?1 AND record_key=?2",
+                turso::params![namespace, key],
+            )
+            .await
+            .map_err(|e| map_turso_error("delete sync record", e))?;
+        Ok(())
+    }
+    async fn list_sync_records(
+        &self,
+        namespace: &str,
+        after_key: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<(String, serde_json::Value)>> {
+        let _guard = self.operation_guard().await;
+        let mut rows=self.connection.query("SELECT record_key,value FROM sync_records WHERE namespace=?1 AND record_key>?2 ORDER BY record_key LIMIT ?3",turso::params![namespace,after_key.unwrap_or(""),limit.min(1000) as i64]).await.map_err(|e|map_turso_error("scan sync records",e))?;
+        let mut records = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| map_turso_error("read sync records", e))?
+        {
+            let key = row
+                .get::<String>(0)
+                .map_err(|e| map_turso_error("decode sync key", e))?;
+            let value = row
+                .get::<String>(1)
+                .map_err(|e| map_turso_error("decode sync value", e))?;
+            records.push((
+                key,
+                serde_json::from_str(&value).map_err(|e| {
+                    StorageError::with_source(StorageErrorKind::Corrupt, "decode sync JSON", e)
+                })?,
+            ));
+        }
+        Ok(records)
+    }
+
     async fn get_system_config(&self) -> StorageResult<SystemConfig> {
         let _operation_guard = self.operation_guard().await;
         let mut rows = self

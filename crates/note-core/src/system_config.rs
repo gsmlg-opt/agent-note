@@ -8,6 +8,8 @@ pub const DEFAULT_MINIMUM_SEARCH_SCORE: f32 = 0.01;
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SystemConfig {
     #[serde(default)]
+    pub sync: crate::sync::SyncConfig,
+    #[serde(default)]
     pub category_labels: Vec<String>,
     #[serde(default)]
     pub duplicate_check: DuplicateCheckConfig,
@@ -75,6 +77,7 @@ pub struct DuplicateCheckTerm {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SystemConfigValidationError {
     InvalidSearchMinimumScore,
+    InvalidSyncConfig { message: String },
     EmptyCategoryLabel { index: usize },
     CategoryLabelHasOuterWhitespace { index: usize },
     DuplicateCategoryLabelEntry { entry: String },
@@ -90,6 +93,7 @@ pub enum SystemConfigValidationError {
 impl std::fmt::Display for SystemConfigValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidSyncConfig { message } => write!(f, "invalid sync config: {message}"),
             Self::InvalidSearchMinimumScore => {
                 write!(f, "search minimum score must be finite and non-negative")
             }
@@ -168,6 +172,41 @@ impl std::fmt::Display for CategoryLabelConfigError {
 impl std::error::Error for CategoryLabelConfigError {}
 
 pub fn validate_system_config(config: &SystemConfig) -> Result<(), SystemConfigValidationError> {
+    let mut sync_ids = HashSet::new();
+    if config.sync.enabled
+        && config
+            .sync
+            .connection_profile
+            .as_deref()
+            .is_none_or(|profile| profile.trim().is_empty())
+    {
+        return Err(SystemConfigValidationError::InvalidSyncConfig {
+            message: "connection profile is required".into(),
+        });
+    }
+    for rule in &config.sync.rules {
+        if rule.id.trim().is_empty() || !sync_ids.insert(&rule.id) {
+            return Err(SystemConfigValidationError::InvalidSyncConfig {
+                message: "rule IDs must be non-empty and unique".into(),
+            });
+        }
+        let selectors = crate::try_parse_label_selectors(&rule.selector).map_err(|error| {
+            SystemConfigValidationError::InvalidSyncConfig {
+                message: error.to_string(),
+            }
+        })?;
+        if selectors.is_empty()
+            || selectors.iter().any(|s| s.key.is_empty())
+            || rule
+                .selector
+                .split('&')
+                .any(|part| part.trim().is_empty() || part.trim().starts_with(['=', '>', '<', '!']))
+        {
+            return Err(SystemConfigValidationError::InvalidSyncConfig {
+                message: "rule selector must contain valid label conditions".into(),
+            });
+        }
+    }
     if !config.search.minimum_score.is_finite() || config.search.minimum_score < 0.0 {
         return Err(SystemConfigValidationError::InvalidSearchMinimumScore);
     }
@@ -561,6 +600,7 @@ mod tests {
     #[test]
     fn validates_rule_shape() {
         let config = SystemConfig {
+            sync: Default::default(),
             category_labels: Vec::new(),
             duplicate_check: DuplicateCheckConfig {
                 enabled: true,
@@ -577,6 +617,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_keys_within_a_rule() {
         let config = SystemConfig {
+            sync: Default::default(),
             category_labels: Vec::new(),
             duplicate_check: DuplicateCheckConfig {
                 enabled: true,
@@ -599,6 +640,7 @@ mod tests {
     #[test]
     fn rejects_label_keys_with_outer_whitespace() {
         let config = SystemConfig {
+            sync: Default::default(),
             category_labels: Vec::new(),
             duplicate_check: DuplicateCheckConfig {
                 enabled: true,

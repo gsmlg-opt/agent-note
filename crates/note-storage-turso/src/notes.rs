@@ -322,6 +322,100 @@ fn push_balanced_conjunction(sql: &mut String, predicates: &[String]) {
 
 #[async_trait::async_trait]
 impl NotesRepository for TursoSession {
+    async fn get_sync_note(&self, id: &str) -> StorageResult<Option<Note>> {
+        let _operation_guard = self.operation_guard().await;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT id, title, content, attachments, created_at, updated_at, note_revision, deleted_at
+                 FROM notes
+                 WHERE id = ?1",
+                turso::params![id],
+            )
+            .await
+            .map_err(|error| map_turso_error("query note", error))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| map_turso_error("read note", error))?
+        else {
+            return Ok(None);
+        };
+        let row = decode_note_row(&row)?;
+        drop(rows);
+
+        Ok(Some(Note {
+            labels: labels_for_note_unlocked(self, &row.id).await?,
+            id: row.id,
+            title: row.title,
+            content: row.content,
+            attachments: row.attachments,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            revision: row.revision,
+            deleted_at: row.deleted_at,
+        }))
+    }
+
+    async fn put_sync_note(&self, note: NewNote<'_>) -> StorageResult<()> {
+        let _operation_guard = self.operation_guard().await;
+        let attachments = serialize_attachments(note.attachments)?;
+        self.connection
+            .execute(
+                "INSERT INTO notes (
+                     id, title, content, attachments, created_at, updated_at, note_revision, deleted_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(id) DO UPDATE SET title=excluded.title,content=excluded.content,attachments=excluded.attachments,created_at=excluded.created_at,updated_at=excluded.updated_at,deleted_at=excluded.deleted_at,note_revision=notes.note_revision+1",
+                turso::params![
+                    note.id,
+                    note.title,
+                    note.content,
+                    attachments,
+                    note.created_at,
+                    note.updated_at,
+                    note.note_revision,
+                    note.deleted_at
+                ],
+            )
+            .await
+            .map_err(|error| map_turso_error("insert note", error))?;
+        Ok(())
+    }
+
+    async fn list_sync_note_ids(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        let _guard = self.operation_guard().await;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT id FROM notes WHERE id>?1 ORDER BY id LIMIT ?2",
+                turso::params![after.unwrap_or(""), limit.min(1000) as i64],
+            )
+            .await
+            .map_err(|e| map_turso_error("scan sync notes", e))?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| map_turso_error("read sync notes", e))?
+        {
+            ids.push(
+                row.get::<String>(0)
+                    .map_err(|e| map_turso_error("decode sync note id", e))?,
+            );
+        }
+        Ok(ids)
+    }
+    async fn purge_sync_note(&self, id: &str) -> StorageResult<()> {
+        let _guard = self.operation_guard().await;
+        self.connection
+            .execute("DELETE FROM notes WHERE id=?1", turso::params![id])
+            .await
+            .map_err(|e| map_turso_error("purge sync note", e))?;
+        Ok(())
+    }
     async fn insert_note(&self, note: NewNote<'_>) -> StorageResult<()> {
         let _operation_guard = self.operation_guard().await;
         let attachments = serialize_attachments(note.attachments)?;

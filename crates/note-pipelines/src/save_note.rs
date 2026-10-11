@@ -167,6 +167,7 @@ pub async fn save_note(ctx: &Context, input: SaveNoteInput) -> anyhow::Result<No
         for (key, value) in &input.labels {
             transaction.attach_label(&id, key, value).await?;
         }
+        crate::sync::capture_note(ctx, transaction.as_ref(), &id, false).await?;
         let resolved_labels: Vec<Label> = transaction.labels_for_note(&id).await?;
         anyhow::Ok((queued, resolved_labels))
     }

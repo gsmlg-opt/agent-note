@@ -21,6 +21,7 @@ async fn system_config_defaults_and_persists() {
     );
 
     let config = SystemConfig {
+        sync: Default::default(),
         category_labels: Vec::new(),
         duplicate_check: DuplicateCheckConfig {
             enabled: true,
@@ -103,4 +104,14 @@ async fn embedding_fingerprint_rejects_blank_values() {
         fixture.session.get_embedding_fingerprint().await.unwrap(),
         None
     );
+}
+#[tokio::test]
+async fn sync_record_contracts_use_business_transaction_and_key_pagination() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = std::sync::Arc::new(
+        TursoStorage::open(dir.path().join("sync.db"))
+            .await
+            .unwrap(),
+    );
+    note_storage_contract_tests::run_sync_records(storage).await;
 }

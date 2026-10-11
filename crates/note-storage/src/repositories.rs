@@ -263,6 +263,37 @@ pub enum OrgDocumentOwnershipMoveResult {
 
 #[async_trait::async_trait]
 pub trait NotesRepository: Send + Sync {
+    /// Includes soft deleted notes. Used only by replication inside an immediate transaction.
+    async fn get_sync_note(&self, id: &str) -> StorageResult<Option<note_core::Note>> {
+        self.get_note(id).await
+    }
+    async fn list_sync_note_ids(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        let _ = (after, limit);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "sync note scan unsupported",
+        ))
+    }
+    /// Replaces a winning remote snapshot, incrementing the LOCAL editor revision.
+    async fn put_sync_note(&self, note: NewNote<'_>) -> StorageResult<()> {
+        let _ = note;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "sync note apply unsupported",
+        ))
+    }
+    async fn purge_sync_note(&self, id: &str) -> StorageResult<()> {
+        let _ = id;
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "sync note purge unsupported",
+        ))
+    }
+
     async fn insert_note(&self, note: NewNote<'_>) -> StorageResult<()>;
     async fn get_note_revision(&self, id: &str) -> StorageResult<Option<i64>>;
     async fn note_exists(&self, id: &str) -> StorageResult<bool>;
@@ -530,6 +561,49 @@ pub trait RetrievalRepository: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait SettingsRepository: Send + Sync {
+    async fn get_sync_record(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> StorageResult<Option<serde_json::Value>> {
+        let _ = (namespace, key);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "sync records unsupported",
+        ))
+    }
+    async fn put_sync_record(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> StorageResult<()> {
+        let _ = (namespace, key, value);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "sync records unsupported",
+        ))
+    }
+    async fn delete_sync_record(&self, namespace: &str, key: &str) -> StorageResult<()> {
+        let _ = (namespace, key);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "sync records unsupported",
+        ))
+    }
+    async fn list_sync_records(
+        &self,
+        namespace: &str,
+        after_key: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<(String, serde_json::Value)>> {
+        let _ = (namespace, after_key, limit);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "sync records unsupported",
+        ))
+    }
+
     async fn get_system_config(&self) -> StorageResult<note_core::SystemConfig>;
     async fn set_system_config(&self, config: &note_core::SystemConfig) -> StorageResult<()>;
     async fn get_embedding_fingerprint(&self) -> StorageResult<Option<String>>;

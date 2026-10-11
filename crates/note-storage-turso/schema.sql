@@ -310,3 +310,5 @@ CREATE TABLE org_operations (
     created_at INTEGER NOT NULL,
     PRIMARY KEY (workspace_id, operation_id)
 );
+
+CREATE TABLE IF NOT EXISTS sync_records (namespace TEXT NOT NULL, record_key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(namespace, record_key));

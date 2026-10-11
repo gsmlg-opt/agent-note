@@ -1348,6 +1348,7 @@ async fn embedding_chunks_jobs_dashboard_and_settings_follow_repository_semantic
         SystemConfig::default()
     );
     let config = SystemConfig {
+        sync: Default::default(),
         category_labels: Vec::new(),
         duplicate_check: DuplicateCheckConfig {
             enabled: true,
@@ -1593,4 +1594,17 @@ async fn dashboard_status_never_mixes_cross_session_snapshots() {
 
     drop(reader);
     database.cleanup(Some(&storage)).await.unwrap();
+}
+#[tokio::test]
+async fn sync_record_contracts_use_business_transaction_and_key_pagination() {
+    let Some(admin_url) =
+        configured_url_or_skip("sync_record_contracts_use_business_transaction_and_key_pagination")
+    else {
+        return;
+    };
+    let database = TestDatabase::create(&admin_url).await;
+    database.provision_vector().await;
+    let storage = std::sync::Arc::new(PgStorage::connect(&database.url, 2).await.unwrap());
+    note_storage_contract_tests::run_sync_records(storage.clone()).await;
+    database.cleanup(Some(storage.as_ref())).await.unwrap();
 }

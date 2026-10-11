@@ -94,11 +94,35 @@ pub async fn update_system_config(ctx: &Context, config: &SystemConfig) -> anyho
                 }));
             }
         }
+        let previous = transaction.get_system_config().await?;
+        if previous.sync.connection_profile.is_some()
+            && previous.sync.connection_profile != config.sync.connection_profile
+        {
+            if config.sync.connection_profile.is_none() {
+                anyhow::bail!("retain the selected sync connection profile while paused");
+            }
+            let old_profile = previous.sync.connection_profile.as_deref().unwrap();
+            if transaction
+                .get_sync_record("peer", old_profile)
+                .await?
+                .is_some()
+            {
+                anyhow::bail!("sync connection profile cannot change after registration");
+            }
+            crate::sync::reset_unregistered_sync_profile(transaction.as_ref()).await?;
+        }
         transaction.set_system_config(config).await?;
+        if previous.sync.connection_profile.is_some() {
+            crate::sync::reconcile_rules(ctx, transaction.as_ref()).await?;
+        }
         anyhow::Ok(())
     }
     .await;
-    crate::save_note::finish_transaction(transaction, result).await
+    crate::save_note::finish_transaction(transaction, result).await?;
+    if config.sync.connection_profile.is_some() {
+        crate::sync::initialize_sync(ctx).await?;
+    }
+    Ok(())
 }
 
 pub async fn category_label_summaries(ctx: &Context) -> anyhow::Result<Vec<CategoryLabelSummary>> {

@@ -213,6 +213,7 @@ pub(crate) async fn commit_note_update(
         for (key, value) in &input.labels {
             transaction.attach_label(id, key, value).await?;
         }
+        crate::sync::capture_note(ctx, transaction.as_ref(), id, false).await?;
         let resolved_labels: Vec<Label> = transaction.labels_for_note(id).await?;
         anyhow::Ok((queued, resolved_labels, note_revision))
     }
@@ -284,6 +285,7 @@ pub async fn delete_note(ctx: &Context, id: &str, expected_revision: i64) -> any
             .await?;
         let revision = crate::mutation_error::mutation_revision(id, result)?;
         transaction.clear_note_search_data(id).await?;
+        crate::sync::capture_note(ctx, transaction.as_ref(), id, false).await?;
         anyhow::Ok(revision > expected_revision)
     }
     .await;
@@ -301,6 +303,7 @@ pub async fn permanently_delete_note(
             .get_deleted_note_snapshot(id)
             .await?
             .ok_or_else(|| crate::NoteMutationError::NotFound(id.to_string()))?;
+        crate::sync::capture_note(ctx, transaction.as_ref(), id, true).await?;
         crate::mutation_error::mutation_revision(
             id,
             transaction
@@ -314,6 +317,7 @@ pub async fn permanently_delete_note(
             chrono::Utc::now().timestamp(),
         )
         .await?;
+        crate::sync::capture_purge(transaction.as_ref(), id).await?;
         anyhow::Ok(())
     }
     .await;
@@ -369,6 +373,7 @@ pub async fn restore_notes(ctx: &Context, entries: &[RestoreNoteInput]) -> anyho
                 now,
             )
             .await?;
+            crate::sync::capture_note(ctx, transaction.as_ref(), &entry.id, false).await?;
             applied.push((entry.id.clone(), note_revision));
         }
         anyhow::Ok((queued, applied))
@@ -397,6 +402,7 @@ pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Res
             let Some(snapshot) = transaction.get_deleted_note_snapshot(id).await? else {
                 continue;
             };
+            crate::sync::capture_note(ctx, transaction.as_ref(), id, true).await?;
             let result = transaction
                 .permanently_delete_note(id, snapshot.revision)
                 .await?;
@@ -408,6 +414,7 @@ pub async fn purge_expired_deleted_notes(ctx: &Context, now: i64) -> anyhow::Res
                     now,
                 )
                 .await?;
+                crate::sync::capture_purge(transaction.as_ref(), id).await?;
                 deleted += 1;
             }
         }

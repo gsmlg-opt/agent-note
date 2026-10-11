@@ -99,6 +99,8 @@ pub async fn batch_update_note_labels(
                 for note_id in eligible_ids {
                     if transaction.set_note_label(note_id, key, value).await? {
                         transaction.advance_note_updated_at(note_id, now).await?;
+                        crate::sync::capture_note(ctx, transaction.as_ref(), note_id, false)
+                            .await?;
                         updated += 1;
                     }
                 }
@@ -118,6 +120,8 @@ pub async fn batch_update_note_labels(
                     };
                     if changed {
                         transaction.advance_note_updated_at(note_id, now).await?;
+                        crate::sync::capture_note(ctx, transaction.as_ref(), note_id, false)
+                            .await?;
                         updated += 1;
                     }
                 }
@@ -126,6 +130,8 @@ pub async fn batch_update_note_labels(
                 for note_id in eligible_ids {
                     if transaction.remove_note_label(note_id, key).await? {
                         transaction.advance_note_updated_at(note_id, now).await?;
+                        crate::sync::capture_note(ctx, transaction.as_ref(), note_id, false)
+                            .await?;
                         updated += 1;
                     }
                 }

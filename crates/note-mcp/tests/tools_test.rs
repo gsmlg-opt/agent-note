@@ -620,6 +620,7 @@ async fn save_note_tool_honors_duplicate_check_config() {
     update_system_config(
         &ctx,
         &SystemConfig {
+            sync: Default::default(),
             category_labels: Vec::new(),
             duplicate_check: DuplicateCheckConfig {
                 enabled: true,

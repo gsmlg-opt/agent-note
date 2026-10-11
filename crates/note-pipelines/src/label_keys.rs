@@ -19,10 +19,15 @@ pub async fn define_label_key_with_type(
     // Preserve the typed error in the anyhow chain (rather than a bail! string) so the REST handler
     // can downcast to distinguish these caller-fault cases (400) from storage failures (500).
     validate_label_key(key).map_err(anyhow::Error::new)?;
-    let session = ctx.storage().session().await?;
-    Ok(session
-        .insert_label_key_with_type(key, description, value_type)
-        .await?)
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let result = async {
+        transaction
+            .insert_label_key_with_type(key, description, value_type)
+            .await?;
+        crate::sync::capture_catalog(ctx, transaction.as_ref(), key).await
+    }
+    .await;
+    crate::save_note::finish_transaction(transaction, result).await
 }
 
 pub async fn list_label_keys(ctx: &Context) -> anyhow::Result<Vec<LabelKey>> {
@@ -36,8 +41,13 @@ pub async fn label_note_counts(ctx: &Context) -> anyhow::Result<Vec<(String, usi
 }
 
 pub async fn update_label_key(ctx: &Context, key: &str, description: &str) -> anyhow::Result<()> {
-    let session = ctx.storage().session().await?;
-    Ok(session.update_label_key(key, description).await?)
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let result = async {
+        transaction.update_label_key(key, description).await?;
+        crate::sync::capture_catalog(ctx, transaction.as_ref(), key).await
+    }
+    .await;
+    crate::save_note::finish_transaction(transaction, result).await
 }
 
 pub async fn update_label_key_with_type(
@@ -46,10 +56,15 @@ pub async fn update_label_key_with_type(
     description: &str,
     value_type: LabelValueType,
 ) -> anyhow::Result<()> {
-    let session = ctx.storage().session().await?;
-    Ok(session
-        .update_label_key_with_type(key, description, value_type)
-        .await?)
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let result = async {
+        transaction
+            .update_label_key_with_type(key, description, value_type)
+            .await?;
+        crate::sync::capture_catalog(ctx, transaction.as_ref(), key).await
+    }
+    .await;
+    crate::save_note::finish_transaction(transaction, result).await
 }
 
 pub fn parse_label_value_type(input: &str) -> anyhow::Result<LabelValueType> {
@@ -72,7 +87,11 @@ pub async fn delete_label_key(ctx: &Context, key: &str) -> anyhow::Result<()> {
                 },
             ));
         }
+        let affected = crate::sync::catalog_note_ids(transaction.as_ref(), key).await?;
         transaction.delete_label_key(key).await?;
+        for id in affected {
+            crate::sync::capture_note(ctx, transaction.as_ref(), &id, false).await?;
+        }
         anyhow::Ok(())
     }
     .await;

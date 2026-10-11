@@ -34,6 +34,7 @@ pub async fn batch_delete_notes(
                     .await?,
             )?;
             transaction.clear_note_search_data(&target.id).await?;
+            crate::sync::capture_note(ctx, transaction.as_ref(), &target.id, false).await?;
         }
 
         Ok(BatchDeleteNotesResult {

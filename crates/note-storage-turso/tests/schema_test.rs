@@ -5,7 +5,7 @@ use std::path::Path;
 use std::str::FromStr as _;
 
 const APPLICATION_ID: u32 = 0x414E4F54;
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 fn normalize_schema_sql(sql: &str) -> String {
     sql.split_whitespace()
@@ -454,7 +454,7 @@ async fn unsupported_marked_schema_is_rejected_without_modification() {
     let path = dir.path().join("future.db");
     drop(TursoStorage::open(&path).await.unwrap());
     let mut before = std::fs::read(&path).unwrap();
-    before[60..64].copy_from_slice(&8_u32.to_be_bytes());
+    before[60..64].copy_from_slice(&(SCHEMA_VERSION + 1).to_be_bytes());
     std::fs::write(&path, &before).unwrap();
 
     let error = match TursoStorage::open(&path).await {
@@ -1215,4 +1215,78 @@ async fn configured_sessions_and_initialization_survive_reopen() {
         rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
         1
     );
+}
+#[tokio::test]
+async fn schema_v7_migration_preserves_notes_labels_settings_attachments_and_sync_records() {
+    use note_storage::SettingsRepository;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("schema-v7.db");
+    {
+        let database = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let connection = database.connect().unwrap();
+        connection.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        let v7_schema = include_str!("../schema.sql")
+            .split("CREATE TABLE IF NOT EXISTS sync_records")
+            .next()
+            .unwrap();
+        connection.execute_batch(v7_schema).await.unwrap();
+        let attachments=serde_json::json!([{"id":"file","path":"image.png","mime":"image/png","description":"survivor","object_key":"notes/object","storage_generation":"generation","size_bytes":3,"checksum_sha256":"abc"}]).to_string();
+        connection.execute("INSERT INTO notes(id,title,content,attachments,created_at,updated_at,note_revision,deleted_at) VALUES('survivor','Preserved','markdown',?1,10,20,7,NULL)",turso::params![attachments]).await.unwrap();
+        connection.execute("INSERT INTO label_keys(id,key,description,value_type) VALUES(1,'project','Project','text')",()).await.unwrap();
+        connection.execute("INSERT INTO note_labels(note_id,label_key_id,value) VALUES('survivor',1,'bear_note')",()).await.unwrap();
+        connection.execute("INSERT INTO app_settings(key,value) VALUES('system_config','{\"search\":{\"minimum_score\":0.05}}')",()).await.unwrap();
+        connection
+            .execute("PRAGMA application_id = 1095651156", ())
+            .await
+            .unwrap();
+        connection
+            .execute("PRAGMA user_version = 7", ())
+            .await
+            .unwrap();
+        connection.execute("COMMIT", ()).await.unwrap();
+        connection.cacheflush().unwrap();
+        let mut rows = connection
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .unwrap();
+        while rows.next().await.unwrap().is_some() {}
+    }
+    {
+        let storage = TursoStorage::open(&path).await.unwrap();
+        let session = storage.connect().await.unwrap();
+        let note = session.get_note("survivor").await.unwrap().unwrap();
+        assert_eq!((note.title.as_str(), note.revision), ("Preserved", 7));
+        assert_eq!(note.labels[0].value, "bear_note");
+        assert_eq!(
+            note.attachments[0].storage.as_ref().unwrap().object_key,
+            "notes/object"
+        );
+        assert_eq!(
+            session
+                .get_system_config()
+                .await
+                .unwrap()
+                .search
+                .minimum_score,
+            0.05
+        );
+        session
+            .put_sync_record("migration", "durable", &serde_json::json!({"clock":8}))
+            .await
+            .unwrap();
+    }
+    let storage = TursoStorage::open(&path).await.unwrap();
+    let session = storage.connect().await.unwrap();
+    assert_eq!(
+        session
+            .get_sync_record("migration", "durable")
+            .await
+            .unwrap(),
+        Some(serde_json::json!({"clock":8}))
+    );
+    database_header(&path);
 }
