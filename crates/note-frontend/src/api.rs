@@ -161,6 +161,92 @@ pub struct SyncProfile {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncConnectionMode {
+    Direct,
+    Ssh,
+    #[default]
+    Mtls,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncSshSummary {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub has_identity_file: bool,
+    pub has_known_hosts_file: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SyncSshUpdate {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_hosts_file: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncConnectionSummary {
+    #[serde(default)]
+    pub mode: SyncConnectionMode,
+    pub ssh: Option<SyncSshSummary>,
+    pub id: String,
+    pub url: String,
+    pub max_blob_bytes: u64,
+    pub has_client_cert: bool,
+    pub has_client_key: bool,
+    pub has_ca_cert: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SyncConnectionUpdate {
+    pub mode: SyncConnectionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SyncSshUpdate>,
+    pub id: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
+    pub max_blob_bytes: u64,
+}
+
+pub async fn get_sync_connections() -> Result<Vec<SyncConnectionSummary>, String> {
+    let response = Request::get("/api/system/sync/connections")
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    ok_or_body_error(response)
+        .await?
+        .json()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn update_sync_connection(
+    connection: &SyncConnectionUpdate,
+) -> Result<SyncConnectionSummary, String> {
+    let response = Request::put("/api/system/sync/connections")
+        .json(connection)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    ok_or_body_error(response)
+        .await?
+        .json()
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SyncBlockedNote {
     pub note_id: String,

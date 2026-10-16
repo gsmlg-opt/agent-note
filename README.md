@@ -426,11 +426,45 @@ the latest complete version wins. Removing a matching label sends a final
 snapshot and preserves both copies as independent notes. Pausing keeps capturing
 changes for later delivery.
 
-Provision a connection in the server's runtime TOML before selecting it in System:
+In **System → GaoNote sync**, choose **Add connection**, select a connection
+method, and enter the GaoNote WebSocket address for the desired environment. The
+production address is a default; you can replace it with a test server address.
+
+| Method | Address and configuration |
+| --- | --- |
+| Direct connection | A `ws://` or `wss://` GaoNote address, without a client certificate. WSS verifies the server certificate using native roots or a selected CA file. |
+| SSH tunnel | A `ws://` GaoNote address reachable **from the SSH host**, plus SSH host, port, username, private-key file and `known_hosts` file on the Agent Note server. Agent Note establishes and maintains the tunnel automatically. |
+| mTLS | A `wss://` GaoNote address, client certificate/key files, and optional server CA file on the Agent Note server. |
+
+All socket addresses include the Phoenix path and `vsn=2.0.0`, for example
+`ws://127.0.0.1:4114/note-sync/websocket?vsn=2.0.0` for GaoNote's private SSH
+endpoint. In SSH mode, that loopback address refers to the SSH host. Agent Note initiates the
+connection; both peers send note data through it. GaoNote does not connect back.
+
+Save the connection, select it, add selectors such as `project=bear_note`, keep
+sync paused, and choose **Save settings**. System then shows the local node ID for
+receiver registration. Once the target receiver is configured for that node and
+connection method, enable sync and choose **Save settings** again.
+**Edit connection** updates its address, method, credentials and transfer limit
+without restarting the server. Connection changes are saved separately from label
+rules and the enable/pause switch.
+
+Certificate, SSH key and `known_hosts` files must already be provisioned on the
+server (and mounted into the container when applicable). The UI accepts file paths;
+it does not upload private keys. Existing paths are never returned to the browser.
+When editing, blank credential fields keep their current paths for that method.
+Switching methods drops credentials that do not apply. For WSS, the CA setting
+offers keeping the existing CA, using native roots, or replacing it. SSH uses
+strict host-key checking and key authentication; it does not prompt for passwords.
+The container image includes the OpenSSH client. See
+[SSH setup](docs/sync/ssh-tunnel.md) for the receiver listener and peer registration.
+
+Runtime TOML can also seed the initial connection catalog:
 
 ```toml
 [[sync.connections]]
 id = "gao_note"
+mode = "mtls" # Omitted mode also means mTLS for existing configurations.
 url = "wss://admin.gsmlg.org/note-sync/websocket?vsn=2.0.0"
 client_cert = "/run/credentials/agent-note/client-chain.pem"
 client_key = "/run/credentials/agent-note/client-key.pem"
@@ -439,9 +473,20 @@ ca_cert = "/run/credentials/agent-note/server-ca.pem"
 max_blob_bytes = 536870912
 ```
 
-Certificate paths resolve from the config directory. Restart the server after
-changing profiles. Private keys and credential paths stay on the server; System
-shows public profiles, connection state, pending count, last confirmation and
+Credential paths resolve from the runtime config directory. UI-managed profiles
+are persisted in a separate server-owned `sync-connections.json`, outside the note
+database and note exports. Once that file exists, it is the authoritative catalog
+and takes precedence over TOML profiles. Its default location is beside the
+embedded database, or in the parent of the filesystem attachments directory for
+PostgreSQL, falling back to the runtime config directory. Override it with
+`[sync].profiles_path` or `NOTE_SYNC_PROFILES_PATH` (file configuration takes
+precedence); relative paths resolve from the runtime config directory. The catalog
+directory must be writable and persistent. A read-only runtime TOML is supported.
+
+Connection saves validate the method, address and relevant local credential files
+before replacing the catalog. They reconnect the worker automatically and retain
+pending work and the paired peer identity. Saving a connection does not establish
+a successful remote connection; System shows connection state, pending count, last confirmation and
 errors, with manual retry. A rejected note remains pending and identifies the
 affected note in System while other notes continue syncing. Correct it and save
 again, or use manual retry to attempt the same version again.
@@ -454,9 +499,9 @@ Older attachments without stored size/checksum metadata need a bounded read to
 seed synchronization. A legacy file larger than 512 MiB stops that scan or
 capture until it is migrated to immutable storage, replaced or removed.
 
-This implements the Agent Note client. GaoNote still needs the dedicated
-authenticated receiver described in [the v1 protocol](docs/sync/gaonote-protocol-v1.md).
-The existing anonymous socket and browser mTLS are insufficient for this channel.
+This implements the Agent Note client. The target GaoNote environment must expose
+the sync receiver described in [the v1 protocol](docs/sync/gaonote-protocol-v1.md).
+Saving a profile does not verify the receiver or its deployed raw-port configuration.
 See [the approved design](docs/superpowers/specs/2026-10-11-gaonote-sync-design.md)
 for the phase boundary and [config.example.toml](config.example.toml) for all options.
 

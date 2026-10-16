@@ -6,20 +6,35 @@ tests interoperability; it does not provide a production receiver.
 
 ## Connection and authorization
 
-Connect using WSS and a client certificate to
-`wss://admin.gsmlg.org/note-sync/websocket?vsn=2.0.0`; join `note_sync:v1`.
-The client verifies the server chain and hostname. A configured CA replaces the
-native trust store; without one the client uses native roots. There is no
-plaintext, insecure-verifier or HTTP-redirect fallback.
+The client initiates the connection and joins `note_sync:v1`; both directions of
+data use that socket. GaoNote does not initiate a connection back to Agent Note.
+The GaoNote address and connection method are configured in System:
+
+- Direct: WS for a raw endpoint, or WSS with server chain/hostname verification
+  and no client certificate.
+- SSH: a WS endpoint reached from the configured SSH host over an automatically
+  managed tunnel with explicit SSH identity and strict known_hosts verification.
+- mTLS: WSS with a client certificate, defaulting to
+  `wss://admin.gsmlg.org/note-sync/websocket?vsn=2.0.0`.
+
+A configured server CA replaces the native trust store for WSS; without one the
+client uses native roots. Legacy profiles with no method remain mTLS. These are
+explicit choices, with no automatic plaintext, insecure-verifier or HTTP-redirect
+fallback. Transport selection does not change the note wire messages below.
 
 GaoNote must mount a dedicated `NoteSyncSocket` at `/note-sync`, with Phoenix
 V2 JSON serialization and longpoll disabled. The existing anonymous `UserSocket`
-and browser authentication do not authorize synchronization. At the trusted
-ingress, require and verify client certificates, overwrite identity headers,
+and browser authentication do not authorize synchronization. For the mTLS route,
+the trusted ingress must verify client certificates, overwrite identity headers,
 and prevent direct access to the backend. Map the verified certificate fingerprint
 to a preregistered node UUID and allowed selectors. Bind subscriptions, inbound
 changes, inventories and attachments to that authenticated peer. Never derive an
-actor from a client-supplied user ID.
+actor from a client-supplied user ID. GaoNote's independent `NoteSyncSSHEndpoint`
+accepts certificate-free SSH peers on its loopback listener (default port `4114`),
+enabled separately with `ssh_enabled` and provisioned with `register_ssh_peer/1`.
+Direct/SSH client modes do not synthesize certificate-verification headers. See
+[SSH setup](ssh-tunnel.md); production interoperability must be verified against
+the actual target environment.
 
 The `phx_join` payload and its successful reply `response` have the same shape:
 
@@ -217,7 +232,9 @@ transaction. Stage files first, then lock/version-check/reconcile in the final
 transaction; clean losing/rolled-back staging. Local revision and embedding work
 advance only when content actually applies. Preserve the source winning HLC.
 
-Acceptance needs live ingress mTLS authorization, positive and negative certificate
-tests, initial two-way UUID merge, both-direction labels/attachments/trash/restore/
-purge, offline reentry and stale ACKs, crash/reconnect and backup/restart evidence.
+Acceptance needs authorization for the selected transport: live ingress and
+positive/negative certificate tests for mTLS, or SSH authentication and host-key
+checks for SSH. Also verify initial two-way UUID merge, both-direction labels,
+attachments, trash/restore/purge, offline reentry and stale ACKs, crash/reconnect
+and backup/restart evidence.
 Phase 1 has no production connection, receiver deployment or production acceptance.

@@ -39,6 +39,7 @@ pub fn system_page() -> Html {
     let labels_error = use_state(|| None::<String>);
     let loading = use_state(|| true);
     let saving = use_state(|| false);
+    let sync_editor_open = use_state(|| false);
     let error = use_state(|| None::<String>);
     let saved = use_state(|| false);
     let minimum_score_draft = use_state(String::new);
@@ -204,7 +205,11 @@ pub fn system_page() -> Html {
         let saved = saved.clone();
         let minimum_score_draft = minimum_score_draft.clone();
         let minimum_score_error = minimum_score_error.clone();
+        let sync_editor_open = sync_editor_open.clone();
         Callback::from(move |_| {
+            if *sync_editor_open {
+                return;
+            }
             let minimum_score = match parse_minimum_score(&minimum_score_draft) {
                 Ok(minimum_score) => minimum_score,
                 Err(message) => {
@@ -303,7 +308,10 @@ pub fn system_page() -> Html {
                 <p class="loading">{ "Loading..." }</p>
             } else if let Some(current) = &*config {
 
-                <SystemSync value={current.sync.clone()} saving={*saving} onchange={{
+                <SystemSync value={current.sync.clone()} saving={*saving} oneditorchange={{
+                    let sync_editor_open = sync_editor_open.clone();
+                    Callback::from(move |open| sync_editor_open.set(open))
+                }} onchange={{
                     let config = config.clone();
                     let saved = saved.clone();
                     Callback::from(move |sync| {
@@ -505,7 +513,7 @@ pub fn system_page() -> Html {
                         type="button"
                         class="btn btn-primary"
                         onclick={on_save}
-                        disabled={*saving || minimum_score_invalid || sync_config_error(&current.sync).is_some()}
+                        disabled={*saving || *sync_editor_open || minimum_score_invalid || sync_config_error(&current.sync).is_some()}
                     >
                         { if *saving { "Saving..." } else { "Save settings" } }
                     </button>

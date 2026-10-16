@@ -75,6 +75,8 @@ fn certificates_with_expiry(expired: bool) -> Certificates {
     );
     let profile = SyncConnection {
         id: "local".into(),
+        mode: ConnectionMode::Mtls,
+        ssh: None,
         url: "wss://localhost:0/note-sync/websocket?vsn=2.0.0".into(),
         client_cert: dir.path().join("client.pem"),
         client_key: dir.path().join("client.key"),
@@ -317,12 +319,7 @@ async fn real_phoenix_mtls_inventory_transfers_and_durable_ack() {
     drop(direct);
     let runtime = SyncRuntime::new(&[certs.profile.clone()]);
     let (stop, shutdown) = tokio::sync::watch::channel(false);
-    let worker = tokio::spawn(run(
-        ctx.clone(),
-        vec![certs.profile.clone()],
-        runtime.clone(),
-        shutdown,
-    ));
+    let worker = tokio::spawn(run(ctx.clone(), runtime.clone(), shutdown));
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let mut retried = false;
         let mut changed_scope = false;
@@ -492,12 +489,7 @@ async fn real_phoenix_mtls_inventory_transfers_and_durable_ack() {
     .unwrap()
     .unwrap();
     let (stop, shutdown) = tokio::sync::watch::channel(false);
-    let worker = tokio::spawn(run(
-        ctx.clone(),
-        vec![certs.profile.clone()],
-        runtime.clone(),
-        shutdown,
-    ));
+    let worker = tokio::spawn(run(ctx.clone(), runtime.clone(), shutdown));
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while !pause_begin.exists() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -636,7 +628,7 @@ async fn missing_credentials_report_worker_error_while_notes_and_queue_remain_us
     profile.client_key = certs.dir.path().join("secret-path.key");
     let runtime = SyncRuntime::new(&[profile.clone()]);
     let (stop, shutdown) = tokio::sync::watch::channel(false);
-    let worker = tokio::spawn(run(ctx.clone(), vec![profile], runtime.clone(), shutdown));
+    let worker = tokio::spawn(run(ctx.clone(), runtime.clone(), shutdown));
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             if runtime.status(&ctx).await.unwrap().state == "error" {
@@ -807,12 +799,7 @@ async fn real_phoenix_rejected_note_does_not_starve_inventory_across_reconnect()
     .await;
     let runtime = SyncRuntime::new(&[certs.profile.clone()]);
     let (stop, shutdown) = tokio::sync::watch::channel(false);
-    let worker = tokio::spawn(run(
-        ctx.clone(),
-        vec![certs.profile.clone()],
-        runtime.clone(),
-        shutdown,
-    ));
+    let worker = tokio::spawn(run(ctx.clone(), runtime.clone(), shutdown));
     let accepted_path = certs.dir.path().join(format!("committed.{}", accepted.id));
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
@@ -940,4 +927,103 @@ async fn real_phoenix_rejected_note_does_not_starve_inventory_across_reconnect()
     );
     stop.send(true).unwrap();
     worker.await.unwrap();
+}
+
+#[test]
+fn connection_modes_are_explicit_and_legacy_profiles_stay_mtls() {
+    let mut old = serde_json::to_value(certificates().profile).unwrap();
+    old.as_object_mut().unwrap().remove("mode");
+    old.as_object_mut().unwrap().remove("ssh");
+    let profile: SyncConnection = serde_json::from_value(old).unwrap();
+    assert_eq!(serde_json::to_value(profile).unwrap()["mode"], "mtls");
+    let direct: SyncConnection = serde_json::from_value(serde_json::json!({
+        "id":"test", "url":"ws://localhost:6222/note-sync/websocket?vsn=2.0.0", "mode":"direct"
+    }))
+    .unwrap();
+    direct.validate().unwrap();
+    let mut ssh = serde_json::to_value(direct).unwrap();
+    ssh["mode"] = "ssh".into();
+    let incomplete: SyncConnection = serde_json::from_value(ssh).unwrap();
+    assert!(incomplete.validate().is_err());
+}
+
+#[tokio::test]
+async fn direct_plaintext_websocket_needs_no_certificate() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let profile: SyncConnection = serde_json::from_value(serde_json::json!({
+        "id":"test", "url":format!("ws://127.0.0.1:{port}/note-sync/websocket?vsn=2.0.0"), "mode":"direct"
+    })).unwrap();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let message = socket.next().await.unwrap().unwrap();
+        socket.send(message).await.unwrap();
+    });
+    let mut socket = connect_socket(&profile).await.unwrap();
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            "direct".into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        socket.next().await.unwrap().unwrap().into_text().unwrap(),
+        "direct"
+    );
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_wss_verifies_server_without_sending_client_certificate() {
+    let mut certs = certificates();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let chain = rustls_pemfile::certs(&mut std::io::BufReader::new(
+        std::fs::File::open(certs.dir.path().join("server.pem")).unwrap(),
+    ))
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        std::fs::File::open(certs.dir.path().join("server.key")).unwrap(),
+    ))
+    .unwrap()
+    .unwrap();
+    let server = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut profile = serde_json::to_value(&certs.profile).unwrap();
+    profile["mode"] = "direct".into();
+    profile["client_cert"] = "".into();
+    profile["client_key"] = "".into();
+    certs.profile = serde_json::from_value(profile).unwrap();
+    certs.profile.url = format!("wss://localhost:{port}/note-sync/websocket?vsn=2.0.0");
+    let peer = tokio::spawn(async move {
+        let acceptor = TlsAcceptor::from(Arc::new(server));
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            if let Ok(tls) = acceptor.accept(stream).await {
+                assert!(tls.get_ref().1.peer_certificates().is_none());
+                let mut socket = tokio_tungstenite::accept_async(tls).await.unwrap();
+                let message = socket.next().await.unwrap().unwrap();
+                socket.send(message).await.unwrap();
+            }
+        }
+    });
+    let mut socket = connect_socket(&certs.profile).await.unwrap();
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text("tls".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        socket.next().await.unwrap().unwrap().into_text().unwrap(),
+        "tls"
+    );
+    certs.profile.url = certs.profile.url.replace("localhost", "127.0.0.1");
+    assert!(connect_socket(&certs.profile).await.is_err());
+    peer.await.unwrap();
 }

@@ -1,9 +1,10 @@
-//! mTLS Phoenix socket runtime. Durability and convergence remain in pipelines.
+//! Phoenix socket runtime. Durability and convergence remain in pipelines.
 use super::{
+    connections::Connections,
     phoenix::{Frame, FRAME_BYTES},
     tls,
     transfer::{encode_metadata, StagedBlob},
-    SyncConnection, SyncProfile,
+    ConnectionInput, ConnectionMode, ConnectionSummary, SaveError, SyncConnection, SyncProfile,
 };
 use anyhow::{bail, Context as _, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -15,6 +16,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -33,7 +35,9 @@ const TOPIC: &str = "note_sync:v1";
 const CHUNK: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(10);
 const HEARTBEAT: Duration = Duration::from_secs(30);
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Transport for T {}
+type Socket = WebSocketStream<MaybeTlsStream<Box<dyn Transport>>>;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SyncBlockedNote {
@@ -71,27 +75,56 @@ impl Default for SyncRuntimeStatus {
 }
 #[derive(Default)]
 pub struct SyncRuntime {
+    connections: Arc<Connections>,
     status: RwLock<SyncRuntimeStatus>,
     wake: Notify,
     blocked: std::sync::Mutex<BTreeMap<String, SyncBlockedNote>>,
 }
 impl SyncRuntime {
     pub fn new(profiles: &[SyncConnection]) -> Arc<Self> {
+        Self::with_connections(Connections::memory(profiles))
+    }
+    pub fn open(
+        profiles: &[SyncConnection],
+        path: PathBuf,
+        config_base: PathBuf,
+    ) -> Result<Arc<Self>> {
+        Ok(Self::with_connections(Connections::open(
+            profiles,
+            path,
+            config_base,
+        )?))
+    }
+    fn with_connections(connections: Connections) -> Arc<Self> {
         Arc::new(Self {
-            status: RwLock::new(SyncRuntimeStatus {
-                profiles: profiles
-                    .iter()
-                    .map(SyncConnection::public_profile)
-                    .collect(),
-                ..Default::default()
-            }),
+            connections: Arc::new(connections),
+            status: RwLock::new(SyncRuntimeStatus::default()),
             wake: Notify::new(),
             blocked: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
+    pub fn connections(&self) -> Vec<ConnectionSummary> {
+        self.connections
+            .snapshot()
+            .iter()
+            .map(ConnectionSummary::from)
+            .collect()
+    }
+    pub async fn save_connection(
+        &self,
+        input: ConnectionInput,
+    ) -> Result<ConnectionSummary, SaveError> {
+        self.connections.update(input).await
+    }
     pub async fn status(&self, ctx: &Context) -> Result<SyncRuntimeStatus> {
         let durable = sync::sync_status(ctx).await?;
         let mut state = self.status.read().await.clone();
+        state.profiles = self
+            .connections
+            .snapshot()
+            .iter()
+            .map(SyncConnection::public_profile)
+            .collect();
         state.blocked_notes = self
             .blocked
             .lock()
@@ -154,31 +187,53 @@ impl SyncRuntime {
 }
 
 pub async fn connect_socket(profile: &SyncConnection) -> Result<Socket> {
-    let tls = tls::client_config(profile)?;
+    profile.validate()?;
+    let url = reqwest::Url::parse(&profile.url).context("invalid sync URL")?;
+    let tls = if url.scheme() == "wss" {
+        Some(tls::client_config(profile)?)
+    } else {
+        None
+    };
     let config = WebSocketConfig::default()
         .max_message_size(Some(FRAME_BYTES))
         .max_frame_size(Some(FRAME_BYTES))
         .write_buffer_size(0)
         .max_write_buffer_size(FRAME_BYTES * 2);
-    let result = timeout(
-        DEADLINE,
-        tokio_tungstenite::connect_async_tls_with_config(
-            &profile.url,
-            Some(config),
-            true,
-            Some(tokio_tungstenite::Connector::Rustls(tls)),
-        ),
-    )
-    .await
-    .context("sync WSS connection timed out")?;
-    // connect_async does not follow HTTP redirects. All TLS errors are fail closed.
-    result.map(|(socket,_)|socket).map_err(|_|anyhow::anyhow!("sync WSS connection failed; verify peer availability, CA, hostname and client certificate"))
+    let connect = async {
+        let stream: Box<dyn Transport> = if profile.mode == ConnectionMode::Ssh {
+            Box::new(super::ssh::SshStream::connect(
+                profile.ssh.as_ref().unwrap(),
+                &url,
+            )?)
+        } else {
+            let stream = TcpStream::connect((
+                url.host_str().unwrap().trim_matches(['[', ']']),
+                url.port_or_known_default().unwrap(),
+            ))
+            .await
+            .context("sync TCP connection failed; verify the GaoNote address and availability")?;
+            stream
+                .set_nodelay(true)
+                .context("sync TCP connection setup failed")?;
+            Box::new(stream)
+        };
+        tokio_tungstenite::client_async_tls_with_config(
+            url.as_str(), stream, Some(config), tls.map(tokio_tungstenite::Connector::Rustls),
+        ).await.map(|(socket, _)|socket).map_err(|_| anyhow::anyhow!(
+            if profile.mode == ConnectionMode::Ssh {
+                "sync SSH/WebSocket connection failed; verify host key, identity, SSH forwarding and GaoNote address"
+            } else {
+                "sync WebSocket connection failed; verify GaoNote availability, CA, hostname and client certificate when using mTLS"
+            }))
+    };
+    timeout(DEADLINE, connect)
+        .await
+        .context("sync connection startup timed out")?
 }
 
 /// The worker polls durable state; process termination never acknowledges pending work.
 pub async fn run(
     ctx: Arc<Context>,
-    profiles: Vec<SyncConnection>,
     runtime: Arc<SyncRuntime>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -187,15 +242,26 @@ pub async fn run(
         return;
     }
     let mut failures = 0u32;
+    // Subscribe before taking a snapshot. A replacement between snapshot and
+    // select stays pending on this receiver and cancels the obsolete session.
+    let mut profiles = runtime.connections.subscribe();
     loop {
         if *shutdown.borrow() {
             break;
         }
+        let snapshot = profiles.borrow_and_update().clone();
         let config = match note_pipelines::get_system_config(&ctx).await {
             Ok(config) => config.sync,
             Err(error) => {
                 runtime.error(&error).await;
-                if pause(&runtime, &mut shutdown, Duration::from_secs(2)).await {
+                if pause(
+                    &runtime,
+                    &mut shutdown,
+                    &mut profiles,
+                    Duration::from_secs(2),
+                )
+                .await
+                {
                     break;
                 }
                 continue;
@@ -203,12 +269,19 @@ pub async fn run(
         };
         if !config.enabled {
             runtime.status.write().await.state = "disabled".into();
-            if pause(&runtime, &mut shutdown, Duration::from_secs(1)).await {
+            if pause(
+                &runtime,
+                &mut shutdown,
+                &mut profiles,
+                Duration::from_secs(1),
+            )
+            .await
+            {
                 break;
             }
             continue;
         }
-        let profile = profiles
+        let profile = snapshot
             .iter()
             .find(|p| Some(&p.id) == config.connection_profile.as_ref());
         let result = if let Some(profile) = profile {
@@ -216,13 +289,14 @@ pub async fn run(
             tokio::select! {
                 biased;
                 _=shutdown.changed()=>break,
+                _=profiles.changed()=>Ok(()),
                 result=watch_config(&ctx,&config)=>result,
                 _=runtime.wake.notified()=>Ok(()),
                 result=session(&ctx,profile,&config,&runtime)=>result,
             }
         } else {
             Err(anyhow::anyhow!(
-                "selected sync connection profile is unavailable; provision it in server TOML"
+                "selected sync connection profile is unavailable; add it in System settings"
             ))
         };
         // The sole worker has dropped the entire old session before reclaiming
@@ -246,6 +320,7 @@ pub async fn run(
         if pause(
             &runtime,
             &mut shutdown,
+            &mut profiles,
             Duration::from_millis((base * 1000 + jitter).min(60_000)),
         )
         .await
@@ -273,9 +348,10 @@ async fn watch_config(ctx: &Context, initial: &note_core::sync::SyncConfig) -> R
 async fn pause(
     runtime: &SyncRuntime,
     shutdown: &mut watch::Receiver<bool>,
+    profiles: &mut watch::Receiver<Vec<SyncConnection>>,
     delay: Duration,
 ) -> bool {
-    tokio::select! { _=shutdown.changed()=>true,_=runtime.wake.notified()=>false,_=tokio::time::sleep(delay)=>false }
+    tokio::select! { _=shutdown.changed()=>true,_=profiles.changed()=>false,_=runtime.wake.notified()=>false,_=tokio::time::sleep(delay)=>false }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -977,11 +1053,140 @@ fn number(payload: &Value, name: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync_client::tests::certificates;
+    use crate::sync_client::{tests::certificates, DEFAULT_MAX_BLOB_BYTES};
     use note_attachments::FilesystemAttachmentStore;
     use note_embedding::StubEmbedder;
     use note_storage_turso::TursoStorage;
     use tokio_rustls::TlsAcceptor;
+
+    #[tokio::test]
+    async fn replacing_a_profile_cancels_a_blocked_join_and_preserves_pending_notes() {
+        let mut certs = certificates();
+        let old_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        certs.profile.url = format!(
+            "wss://localhost:{}/note-sync/websocket?vsn=2.0.0",
+            old_listener.local_addr().unwrap().port()
+        );
+        let (old_ready, old_join) = tokio::sync::oneshot::channel();
+        let acceptor = TlsAcceptor::from(certs.server.clone());
+        let old_server = tokio::spawn(async move {
+            let (stream, _) = old_listener.accept().await.unwrap();
+            let mut socket =
+                tokio_tungstenite::accept_async(acceptor.accept(stream).await.unwrap())
+                    .await
+                    .unwrap();
+            let request =
+                Frame::decode(&socket.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            assert_eq!(request.event, "phx_join");
+            old_ready.send(()).unwrap();
+            assert!(!matches!(
+                timeout(Duration::from_secs(3), socket.next())
+                    .await
+                    .unwrap(),
+                Some(Ok(_))
+            ));
+        });
+        let storage = Arc::new(
+            TursoStorage::open(certs.dir.path().join("hot-update.db"))
+                .await
+                .unwrap(),
+        );
+        let ctx = Arc::new(Context::new(
+            storage,
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(
+                certs.dir.path().join("attachments"),
+            )),
+        ));
+        note_pipelines::save_note(
+            &ctx,
+            note_pipelines::SaveNoteInput {
+                title: "pending".into(),
+                content: "retained through reconnect".into(),
+                labels: vec![("project".into(), "bear_note".into())],
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        note_pipelines::update_system_config(
+            &ctx,
+            &note_core::SystemConfig {
+                sync: note_core::sync::SyncConfig {
+                    enabled: true,
+                    connection_profile: Some("local".into()),
+                    rules: vec![note_core::sync::SyncRule {
+                        id: "scope".into(),
+                        enabled: true,
+                        selector: "project=bear_note".into(),
+                    }],
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let runtime = SyncRuntime::open(
+            &[certs.profile.clone()],
+            certs.dir.path().join("connections.json"),
+            certs.dir.path().into(),
+        )
+        .unwrap();
+        let pending = sync::sync_status(&ctx).await.unwrap().pending_notes;
+        assert_eq!(pending, 1);
+        let (stop, shutdown) = watch::channel(false);
+        let worker = tokio::spawn(run(ctx.clone(), runtime.clone(), shutdown));
+        timeout(Duration::from_secs(3), old_join)
+            .await
+            .unwrap()
+            .unwrap();
+        let new_url = format!(
+            "wss://localhost:{}/note-sync/websocket?vsn=2.0.0",
+            new_listener.local_addr().unwrap().port()
+        );
+        runtime
+            .save_connection(ConnectionInput {
+                id: "local".into(),
+                mode: None,
+                ssh: None,
+                url: new_url,
+                client_cert: None,
+                client_key: None,
+                ca_cert: None,
+                max_blob_bytes: DEFAULT_MAX_BLOB_BYTES,
+            })
+            .await
+            .unwrap();
+        let acceptor = TlsAcceptor::from(certs.server.clone());
+        let mut new_socket = timeout(Duration::from_secs(3), async {
+            let (stream, _) = new_listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(acceptor.accept(stream).await.unwrap())
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let request = timeout(Duration::from_secs(3), new_socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Frame::decode(&request.into_text().unwrap()).unwrap().event,
+            "phx_join"
+        );
+        old_server.await.unwrap();
+        stop.send(true).unwrap();
+        timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sync::sync_status(&ctx).await.unwrap().pending_notes,
+            pending
+        );
+    }
 
     #[tokio::test]
     async fn live_session_checks_reply_identity_rejection_status_and_heartbeat_deadline() {

@@ -1487,6 +1487,25 @@ a.dashboard-metric-detail:hover {
     gap: 0.35rem;
 }
 
+.sync-connection-editor {
+    display: grid;
+    gap: 0.75rem;
+    padding: 1rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.5rem;
+}
+
+.sync-connection-editor h4 {
+    margin: 0;
+}
+
+.sync-connection-editor .input,
+.sync-connection-editor .select {
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+}
+
 .system-score-field {
     max-width: 18rem;
 }

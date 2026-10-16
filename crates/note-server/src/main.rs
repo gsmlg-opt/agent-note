@@ -562,10 +562,17 @@ async fn main() -> anyhow::Result<()> {
         scheduler_shutdown_rx.clone(),
     ));
 
-    let sync_runtime = note_server::sync_client::SyncRuntime::new(&config.sync_connections);
+    let sync_runtime = note_server::sync_client::SyncRuntime::open(
+        &config.sync_connections,
+        config.sync_profiles_path.clone(),
+        config
+            .config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .into(),
+    )?;
     let sync_worker = tokio::spawn(note_server::sync_client::run(
         ctx.clone(),
-        config.sync_connections.clone(),
         sync_runtime.clone(),
         scheduler_shutdown_rx,
     ));
@@ -763,8 +770,13 @@ mod tests {
             })
             .sum::<usize>();
 
-        assert_eq!(paths.len(), 59);
-        assert_eq!(operation_count, 70);
+        assert_eq!(paths.len(), 60);
+        assert_eq!(operation_count, 72);
+        let connections = paths["/api/system/sync/connections"]
+            .as_object()
+            .expect("sync connection configuration path");
+        assert!(connections.contains_key("get"));
+        assert!(connections.contains_key("put"));
         assert!(!paths.keys().any(|path| path.starts_with("/mcp")));
         assert!(!paths.keys().any(|path| path.starts_with("/org/mcp")));
         assert!(document["tags"]
@@ -1119,6 +1131,7 @@ mod tests {
             },
             pdf_export: note_server::config::PdfExportConfig::default(),
             sync_connections: vec![],
+            sync_profiles_path: "/tmp/sync-connections.json".into(),
         };
 
         ensure_data_directories(&local).unwrap();
@@ -1151,6 +1164,7 @@ mod tests {
             },
             pdf_export: note_server::config::PdfExportConfig::default(),
             sync_connections: vec![],
+            sync_profiles_path: "/tmp/sync-connections.json".into(),
         };
 
         ensure_data_directories(&external).unwrap();
@@ -1174,6 +1188,7 @@ mod tests {
             },
             pdf_export: note_server::config::PdfExportConfig::default(),
             sync_connections: vec![],
+            sync_profiles_path: "/tmp/sync-connections.json".into(),
         };
 
         ensure_data_directories(&config).unwrap();

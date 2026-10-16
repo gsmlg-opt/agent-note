@@ -57,7 +57,7 @@ RUN sed -i \
         -e 's|http://deb.debian.org/debian|http://mirrors.tuna.tsinghua.edu.cn/debian|g' \
         /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update \
-    && apt-get install -y --no-install-recommends ca-certificates fonts-dejavu-core \
+    && apt-get install -y --no-install-recommends ca-certificates fonts-dejavu-core openssh-client \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=backend /build/target/release/note-server /usr/local/bin/note-server

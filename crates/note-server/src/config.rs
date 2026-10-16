@@ -40,6 +40,7 @@ struct FileConfig {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileSyncConfig {
+    profiles_path: Option<PathBuf>,
     #[serde(default)]
     connections: Vec<crate::sync_client::SyncConnection>,
 }
@@ -211,6 +212,7 @@ pub struct RuntimeConfig {
     pub attachments: AttachmentConfig,
     pub pdf_export: PdfExportConfig,
     pub sync_connections: Vec<crate::sync_client::SyncConnection>,
+    pub sync_profiles_path: PathBuf,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -262,6 +264,7 @@ impl std::fmt::Debug for PdfExportConfig {
 #[derive(Default)]
 struct EnvValues {
     config_path: Option<PathBuf>,
+    sync_profiles_path: Option<PathBuf>,
     bind_addr: Option<String>,
     database_engine: Option<String>,
     database_path: Option<PathBuf>,
@@ -287,6 +290,7 @@ pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     let cwd = std::env::current_dir().context("resolve current working directory")?;
     let env = EnvValues {
         config_path: std::env::var_os("NOTE_CONFIG_PATH").map(PathBuf::from),
+        sync_profiles_path: std::env::var_os("NOTE_SYNC_PROFILES_PATH").map(PathBuf::from),
         bind_addr: read_string_env("NOTE_BIND_ADDR")?,
         database_engine: read_string_env("NOTE_DB_ENGINE")?,
         database_path: std::env::var_os("NOTE_DB_PATH").map(PathBuf::from),
@@ -349,19 +353,26 @@ fn resolve_runtime_config(
     let embedding = resolve_embedding(file_embedding, &env, config_base)?;
     let attachments = resolve_attachments(file_attachments, &env, config_base)?;
     let pdf_export = resolve_pdf_export(file_pdf_export)?;
-    let mut sync_connections = file.sync.unwrap_or_default().connections;
-    let mut sync_ids = std::collections::HashSet::new();
+    let file_sync = file.sync.unwrap_or_default();
+    let sync_profiles_path = file_sync
+        .profiles_path
+        .or_else(|| env.sync_profiles_path.clone())
+        .map(|path| resolve_path(config_base, path))
+        .unwrap_or_else(|| {
+            let parent = match &database {
+                DatabaseConfig::Embed { path } => path.parent(),
+                DatabaseConfig::Pg { .. } => match &attachments {
+                    AttachmentConfig::Filesystem { path } => path.parent(),
+                    AttachmentConfig::S3 { .. } => None,
+                },
+            }
+            .unwrap_or(config_base);
+            parent.join("sync-connections.json")
+        });
+    let mut sync_connections = file_sync.connections;
+    // Runtime validates seeds only when no authoritative saved catalog is read.
     for connection in &mut sync_connections {
-        connection.validate()?;
-        if !sync_ids.insert(connection.id.clone()) {
-            anyhow::bail!("sync connection IDs must be unique");
-        }
-        connection.client_cert = resolve_path(config_base, connection.client_cert.clone());
-        connection.client_key = resolve_path(config_base, connection.client_key.clone());
-        connection.ca_cert = connection
-            .ca_cert
-            .take()
-            .map(|path| resolve_path(config_base, path));
+        connection.resolve_paths(config_base);
     }
     persist_missing_bind_addr(&config_path, &bind_addr)?;
 
@@ -373,6 +384,7 @@ fn resolve_runtime_config(
         attachments,
         pdf_export,
         sync_connections,
+        sync_profiles_path,
     })
 }
 
@@ -791,6 +803,112 @@ fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn sync_sidecar_overrides_stale_seed_semantics_and_revalidates_missing_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let sidecar = dir.path().join("sync-connections.json");
+        let seed = r#"[[sync.connections]]
+id = "stale"
+url = "wss://admin.gsmlg.org/note-sync/websocket?vsn=2.0.0"
+client_cert = "certs/client.pem"
+client_key = "certs/client.key"
+"#;
+        for stale_seed in [format!("{seed}max_blob_bytes = 0\n"), seed.repeat(2)] {
+            std::fs::write(
+                &path,
+                format!("[server]\nbind_addr = \"127.0.0.1:6222\"\n{stale_seed}"),
+            )
+            .unwrap();
+            std::fs::write(&sidecar, "[]").unwrap();
+            let config = resolve_runtime_config(
+                dir.path(),
+                EnvValues {
+                    config_path: Some(path.clone()),
+                    ..Default::default()
+                },
+                false,
+            )
+            .expect("authoritative sidecar must override stale seed semantics");
+            let open = || {
+                crate::sync_client::SyncRuntime::open(
+                    &config.sync_connections,
+                    config.sync_profiles_path.clone(),
+                    dir.path().into(),
+                )
+            };
+            assert!(open().unwrap().connections().is_empty());
+            // The sidecar can disappear after parsing config but before opening runtime.
+            std::fs::remove_file(&sidecar).unwrap();
+            assert!(open().is_err(), "a used fallback must still be validated");
+        }
+    }
+
+    #[test]
+    fn sync_sidecar_does_not_relax_seed_toml_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(dir.path().join("sync-connections.json"), "[]").unwrap();
+        std::fs::write(&path, "[sync]\nconnections = \"invalid type\"\n").unwrap();
+        assert!(resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some(path),
+                ..Default::default()
+            },
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sync_sidecar_path_uses_file_then_environment_then_durable_storage_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let base =
+            "[server]\nbind_addr = \"127.0.0.1:6222\"\n[database]\npath = \"store/notes.db\"\n";
+        std::fs::write(&path, base).unwrap();
+        let resolve = |override_path| {
+            resolve_runtime_config(
+                dir.path(),
+                EnvValues {
+                    config_path: Some(path.clone()),
+                    sync_profiles_path: override_path,
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            resolve(None).sync_profiles_path,
+            dir.path().join("store/sync-connections.json")
+        );
+        assert_eq!(
+            resolve(Some("env/connections.json".into())).sync_profiles_path,
+            dir.path().join("env/connections.json")
+        );
+        std::fs::write(
+            &path,
+            format!("{base}[sync]\nprofiles_path = \"file/connections.json\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(Some("env/connections.json".into())).sync_profiles_path,
+            dir.path().join("file/connections.json")
+        );
+        std::fs::write(&path, "[server]\nbind_addr=\"127.0.0.1:6222\"\n[database]\nengine=\"pg\"\nurl=\"postgresql://localhost/notes\"\n[attachments]\nengine=\"filesystem\"\npath=\"data/attachments\"\n").unwrap();
+        assert_eq!(
+            resolve(None).sync_profiles_path,
+            dir.path().join("data/sync-connections.json")
+        );
+        std::fs::write(&path, "[server]\nbind_addr=\"127.0.0.1:6222\"\n[database]\nengine=\"pg\"\nurl=\"postgresql://localhost/notes\"\n[attachments]\nengine=\"s3\"\nbucket=\"notes\"\n").unwrap();
+        assert_eq!(
+            resolve(None).sync_profiles_path,
+            dir.path().join("sync-connections.json")
+        );
+    }
 
     #[test]
     fn sync_profiles_resolve_private_paths_against_config_directory() {
@@ -1463,6 +1581,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
             },
             pdf_export: PdfExportConfig::default(),
             sync_connections: vec![],
+            sync_profiles_path: "/tmp/sync-connections.json".into(),
         };
 
         for rendered in [format!("{:?}", config.database), format!("{config:?}")] {
@@ -1493,6 +1612,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
             },
             pdf_export: PdfExportConfig::default(),
             sync_connections: vec![],
+            sync_profiles_path: "/tmp/sync-connections.json".into(),
         };
 
         let rendered = format!("{config:?}");
@@ -1525,6 +1645,7 @@ url = "postgresql://agent:{PASSWORD}@database/notes
             },
             pdf_export: PdfExportConfig::default(),
             sync_connections: vec![],
+            sync_profiles_path: "/tmp/sync-connections.json".into(),
         };
 
         for rendered in [format!("{:?}", config.attachments), format!("{config:?}")] {
@@ -1962,5 +2083,43 @@ max_pdf_bytes = 8192
             },
             false,
         )
+    }
+    #[test]
+    fn sync_modes_resolve_ssh_paths_without_populating_empty_certificate_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[server]
+bind_addr = "127.0.0.1:6222"
+[[sync.connections]]
+id = "test"
+mode = "ssh"
+url = "ws://127.0.0.1:4000/note-sync/websocket?vsn=2.0.0"
+[sync.connections.ssh]
+host = "test.internal"
+username = "gao"
+identity_file = "keys/id"
+known_hosts_file = "keys/known hosts"
+"#,
+        )
+        .unwrap();
+        let config = resolve_runtime_config(
+            dir.path(),
+            EnvValues {
+                config_path: Some(path),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        let connection = &config.sync_connections[0];
+        connection.validate().unwrap();
+        assert!(connection.client_cert.as_os_str().is_empty());
+        assert!(connection.client_key.as_os_str().is_empty());
+        let ssh = connection.ssh.as_ref().unwrap();
+        assert_eq!(ssh.port, 22);
+        assert_eq!(ssh.identity_file, dir.path().join("keys/id"));
+        assert_eq!(ssh.known_hosts_file, dir.path().join("keys/known hosts"));
     }
 }

@@ -101,9 +101,20 @@ enabled = false
 # Optional GaoNote sync connection. Credentials are provisioned on the server;
 # select this profile and enable label rules on the System page after the
 # receiving service has implemented the synchronization protocol.
+# Connections can be created or edited in System: direct, automatic SSH, or mTLS.
+# Credential fields refer to files provisioned on the Agent Note server.
+# UI changes are stored separately from the note database and this runtime TOML.
+# [sync]
+# profiles_path = "sync-connections.json"
+# NOTE_SYNC_PROFILES_PATH is the fallback override; relative paths use this TOML directory.
+# Otherwise the sidecar lives beside the embedded database, beside the filesystem
+# attachments directory with PostgreSQL, or beside this TOML for PostgreSQL + S3.
+# Its parent directory must already exist and be writable by the server.
+# When present, the sidecar replaces the complete TOML connection catalog.
 #
 # [[sync.connections]]
 # id = "gaonote"
+# mode = "mtls" # Default when omitted; requires wss and client certificate/key.
 # url = "wss://admin.gsmlg.org/note-sync/websocket?vsn=2.0.0"
 # client_cert = "/run/credentials/agent-note/client-chain.pem"
 # client_key = "/run/credentials/agent-note/client-key.pem"
@@ -116,3 +127,25 @@ enabled = false
 # Transfer chunks are bounded; max_blob_bytes limits each staged/read object
 # and defaults to 512 MiB. Existing object stores use bounded whole-object I/O
 # at final apply, even though WebSocket transfer and staging are chunked.
+
+# Direct test connections support ws or verified wss without a client certificate:
+# [[sync.connections]]
+# id = "gaonote-test"
+# mode = "direct"
+# url = "ws://test.internal:4000/note-sync/websocket?vsn=2.0.0"
+#
+# Automatic SSH uses OpenSSH on the Agent Note server. The ws URL is reached FROM
+# the SSH host, with the original GaoNote host/path used for the WebSocket handshake.
+# No local forwarded port is opened. SSH identity/known_hosts files must already exist;
+# host keys are checked strictly and interactive/password authentication is disabled.
+# [[sync.connections]]
+# id = "gaonote-ssh"
+# mode = "ssh"
+# url = "ws://127.0.0.1:4114/note-sync/websocket?vsn=2.0.0"
+# [sync.connections.ssh]
+# host = "test.internal"
+# port = 22
+# username = "gao"
+# identity_file = "/run/credentials/agent-note/ssh-identity"
+# known_hosts_file = "/run/credentials/agent-note/known_hosts"
+# SSH credential paths cannot contain percent/dollar expansion tokens.
