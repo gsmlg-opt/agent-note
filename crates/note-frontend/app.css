@@ -1361,6 +1361,104 @@ a.dashboard-metric-detail:hover {
 }
 
 /* --- System settings --- */
+.system-layout {
+    display: grid;
+    grid-template-columns: 13rem minmax(0, 1fr);
+    gap: 2rem;
+    align-items: start;
+}
+
+.system-navigation {
+    position: sticky;
+    top: 5rem;
+    padding: 0.75rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.75rem;
+    background: var(--color-surface-container-low, #f3f0f9);
+}
+
+.system-navigation-title {
+    margin: 0 0 0.5rem;
+    padding: 0.4rem 0.65rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.system-navigation-list {
+    display: grid;
+    gap: 0.25rem;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.system-navigation-link {
+    display: flex;
+    align-items: center;
+    min-height: 2.75rem;
+    box-sizing: border-box;
+    padding: 0.55rem 0.65rem;
+    border-radius: 0.45rem;
+    color: var(--color-on-surface-variant, #46464f);
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-decoration: none;
+    overflow-wrap: anywhere;
+}
+
+.system-navigation-link:hover {
+    background: var(--color-surface-container-high, #ece7f2);
+}
+
+.system-navigation-link.is-active {
+    background: var(--color-secondary-container, #e8def8);
+    color: var(--color-on-secondary-container, #1d192b);
+}
+
+.system-navigation-link:focus-visible {
+    outline: 2px solid var(--color-primary, #6750a4);
+    outline-offset: 2px;
+}
+
+.system-content {
+    display: grid;
+    gap: 1.5rem;
+    min-width: 0;
+}
+
+.system-content > .system-section,
+.system-content > div > .system-section {
+    padding-top: 0;
+    border-top: 0;
+}
+
+@media (max-width: 720px) {
+    .system-layout {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 1.5rem;
+    }
+
+    .system-navigation {
+        position: static;
+        padding: 0.5rem;
+    }
+
+    .system-navigation-title {
+        margin-bottom: 0.25rem;
+    }
+
+    .system-navigation-list {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .system-navigation-link {
+        font-size: 0.8rem;
+    }
+}
+
 .system-section {
     display: grid;
     gap: 1rem;
@@ -1654,7 +1752,7 @@ a.dashboard-metric-detail:hover {
     }
 }
 
-@media (max-width: 48rem) {
+@media (max-width: 64rem) {
     .category-label-editor {
         grid-template-columns: minmax(0, 1fr);
         align-items: stretch;

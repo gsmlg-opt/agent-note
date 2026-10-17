@@ -9,6 +9,60 @@ use crate::pages::{
 
 pub const DEFAULT_NOTES_PAGE_SIZE: usize = 10;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemSection {
+    Appearance,
+    Sync,
+    Categories,
+    Search,
+    Duplicates,
+    Storage,
+    Backup,
+}
+
+impl SystemSection {
+    pub const ALL: [Self; 7] = [
+        Self::Appearance,
+        Self::Sync,
+        Self::Categories,
+        Self::Search,
+        Self::Duplicates,
+        Self::Storage,
+        Self::Backup,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Sync => "GaoNote sync",
+            Self::Categories => "Category labels",
+            Self::Search => "Note search",
+            Self::Duplicates => "Duplicate note check",
+            Self::Storage => "Storage",
+            Self::Backup => "Backup",
+        }
+    }
+
+    pub fn route(self) -> Route {
+        match self {
+            Self::Appearance => Route::SystemAppearance,
+            Self::Sync => Route::SystemSync,
+            Self::Categories => Route::SystemCategories,
+            Self::Search => Route::SystemSearch,
+            Self::Duplicates => Route::SystemDuplicates,
+            Self::Storage => Route::SystemStorage,
+            Self::Backup => Route::SystemBackup,
+        }
+    }
+
+    pub fn saves_config(self) -> bool {
+        matches!(
+            self,
+            Self::Sync | Self::Categories | Self::Search | Self::Duplicates
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct NotesQueryParams {
     pub current: usize,
@@ -58,12 +112,39 @@ pub enum Route {
     Trash,
     #[at("/system")]
     System,
+    #[at("/system/appearance")]
+    SystemAppearance,
+    #[at("/system/sync")]
+    SystemSync,
+    #[at("/system/categories")]
+    SystemCategories,
+    #[at("/system/search")]
+    SystemSearch,
+    #[at("/system/duplicates")]
+    SystemDuplicates,
+    #[at("/system/storage")]
+    SystemStorage,
+    #[at("/system/backup")]
+    SystemBackup,
     #[not_found]
     #[at("/404")]
     NotFound,
 }
 
 impl Route {
+    pub fn system_section(&self) -> Option<SystemSection> {
+        match self {
+            Self::System | Self::SystemAppearance => Some(SystemSection::Appearance),
+            Self::SystemSync => Some(SystemSection::Sync),
+            Self::SystemCategories => Some(SystemSection::Categories),
+            Self::SystemSearch => Some(SystemSection::Search),
+            Self::SystemDuplicates => Some(SystemSection::Duplicates),
+            Self::SystemStorage => Some(SystemSection::Storage),
+            Self::SystemBackup => Some(SystemSection::Backup),
+            _ => None,
+        }
+    }
+
     pub fn document_title(&self) -> String {
         match self {
             Self::Home => "Home | agent-note".to_owned(),
@@ -86,9 +167,38 @@ impl Route {
             Self::Labels => "Labels | agent-note".to_owned(),
             Self::Trash => "Trash | agent-note".to_owned(),
             Self::System => "System | agent-note".to_owned(),
+            Self::SystemAppearance => "Appearance | System | agent-note".to_owned(),
+            Self::SystemSync => "GaoNote sync | System | agent-note".to_owned(),
+            Self::SystemCategories => "Category labels | System | agent-note".to_owned(),
+            Self::SystemSearch => "Note search | System | agent-note".to_owned(),
+            Self::SystemDuplicates => "Duplicate note check | System | agent-note".to_owned(),
+            Self::SystemStorage => "Storage | System | agent-note".to_owned(),
+            Self::SystemBackup => "Backup | System | agent-note".to_owned(),
             Self::NotFound => "Page not found | agent-note".to_owned(),
         }
     }
+}
+
+#[derive(Properties, PartialEq)]
+struct SystemRouteProps {
+    section: SystemSection,
+    #[prop_or_default]
+    legacy: bool,
+}
+
+#[function_component(SystemRoute)]
+fn system_route(props: &SystemRouteProps) -> Html {
+    let navigator = use_navigator();
+    use_effect_with((props.legacy, navigator), |(legacy, navigator)| {
+        if *legacy {
+            if let Some(navigator) = navigator {
+                navigator.replace(&Route::SystemAppearance);
+            }
+        }
+        || ()
+    });
+
+    html! { <SystemPage section={props.section} /> }
 }
 
 pub fn switch(route: Route) -> Html {
@@ -115,7 +225,16 @@ pub fn switch(route: Route) -> Html {
         Route::NoteEdit { id } => html! { <NoteEditPage {id} /> },
         Route::Labels => html! { <LabelsPage /> },
         Route::Trash => html! { <TrashPage /> },
-        Route::System => html! { <SystemPage /> },
+        Route::System => {
+            html! { <SystemRoute section={SystemSection::Appearance} legacy={true} /> }
+        }
+        Route::SystemAppearance => html! { <SystemRoute section={SystemSection::Appearance} /> },
+        Route::SystemSync => html! { <SystemRoute section={SystemSection::Sync} /> },
+        Route::SystemCategories => html! { <SystemRoute section={SystemSection::Categories} /> },
+        Route::SystemSearch => html! { <SystemRoute section={SystemSection::Search} /> },
+        Route::SystemDuplicates => html! { <SystemRoute section={SystemSection::Duplicates} /> },
+        Route::SystemStorage => html! { <SystemRoute section={SystemSection::Storage} /> },
+        Route::SystemBackup => html! { <SystemRoute section={SystemSection::Backup} /> },
         Route::NotFound => html! { <p class="empty">{ "Page not found." }</p> },
     }
 }
@@ -124,6 +243,26 @@ pub fn switch(route: Route) -> Html {
 mod tests {
     use super::{NotesQueryParams, Route, DEFAULT_NOTES_PAGE_SIZE};
     use yew_router::Routable;
+
+    #[test]
+    fn system_modules_have_distinct_bookmarkable_routes_and_titles() {
+        for (path, label) in [
+            ("/system/appearance", "Appearance"),
+            ("/system/sync", "GaoNote sync"),
+            ("/system/categories", "Category labels"),
+            ("/system/search", "Note search"),
+            ("/system/duplicates", "Duplicate note check"),
+            ("/system/storage", "Storage"),
+            ("/system/backup", "Backup"),
+        ] {
+            let route = Route::recognize(path).expect("system module route must be recognized");
+            assert_eq!(route.to_path(), path);
+            assert_eq!(
+                route.document_title(),
+                format!("{label} | System | agent-note")
+            );
+        }
+    }
 
     #[test]
     fn recognizes_org_directory_as_a_first_class_route() {

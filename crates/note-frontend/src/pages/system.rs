@@ -5,7 +5,9 @@ use yew_duskmoon::Alert;
 
 use crate::api;
 use crate::components::icons;
+use crate::components::system_navigation::SystemNavigation;
 use crate::components::system_sync::{sync_config_error, SystemSync};
+use crate::routes::SystemSection;
 use crate::state::{DuplicateCheckRule, DuplicateCheckTerm, LabelKey, SystemConfig, SystemInfo};
 use crate::theme::{apply_theme, get_saved_theme, ThemeMode};
 
@@ -16,13 +18,6 @@ enum CategoryLabelMode {
 }
 
 impl CategoryLabelMode {
-    fn value(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Exact => "exact",
-        }
-    }
-
     fn from_value(value: &str) -> Self {
         match value {
             "exact" => Self::Exact,
@@ -31,10 +26,16 @@ impl CategoryLabelMode {
     }
 }
 
+#[derive(Properties, PartialEq)]
+pub struct SystemPageProps {
+    pub section: SystemSection,
+}
+
 #[function_component(SystemPage)]
-pub fn system_page() -> Html {
+pub fn system_page(props: &SystemPageProps) -> Html {
     let config = use_state(|| None::<SystemConfig>);
     let info = use_state(|| None::<SystemInfo>);
+    let info_error = use_state(|| None::<String>);
     let labels = use_state(Vec::<LabelKey>::new);
     let labels_error = use_state(|| None::<String>);
     let loading = use_state(|| true);
@@ -42,6 +43,7 @@ pub fn system_page() -> Html {
     let sync_editor_open = use_state(|| false);
     let error = use_state(|| None::<String>);
     let saved = use_state(|| false);
+    let feedback_section = use_state(|| None::<SystemSection>);
     let minimum_score_draft = use_state(String::new);
     let minimum_score_error = use_state(|| None::<String>);
     let category_key_draft = use_state(String::new);
@@ -52,9 +54,6 @@ pub fn system_page() -> Html {
 
     {
         let config = config.clone();
-        let info = info.clone();
-        let labels = labels.clone();
-        let labels_error = labels_error.clone();
         let loading = loading.clone();
         let error = error.clone();
         let minimum_score_draft = minimum_score_draft.clone();
@@ -69,19 +68,50 @@ pub fn system_page() -> Html {
                     }
                     Err(message) => error.set(Some(message)),
                 }
-                match api::get_system_info().await {
-                    Ok(next) => info.set(Some(next)),
-                    Err(message) => error.set(Some(message)),
-                }
-                match api::list_labels().await {
-                    Ok(next) => {
-                        labels.set(next);
-                        labels_error.set(None);
-                    }
-                    Err(message) => labels_error.set(Some(message)),
-                }
                 loading.set(false);
             });
+            || ()
+        });
+    }
+
+    {
+        let info = info.clone();
+        let info_error = info_error.clone();
+        use_effect_with(props.section == SystemSection::Storage, move |selected| {
+            if *selected {
+                wasm_bindgen_futures::spawn_local(async move {
+                    match api::get_system_info().await {
+                        Ok(next) => {
+                            info.set(Some(next));
+                            info_error.set(None);
+                        }
+                        Err(message) => info_error.set(Some(message)),
+                    }
+                });
+            }
+            || ()
+        });
+    }
+
+    {
+        let labels = labels.clone();
+        let labels_error = labels_error.clone();
+        let needs_labels = matches!(
+            props.section,
+            SystemSection::Categories | SystemSection::Duplicates
+        );
+        use_effect_with(needs_labels, move |selected| {
+            if *selected {
+                wasm_bindgen_futures::spawn_local(async move {
+                    match api::list_labels().await {
+                        Ok(next) => {
+                            labels.set(next);
+                            labels_error.set(None);
+                        }
+                        Err(message) => labels_error.set(Some(message)),
+                    }
+                });
+            }
             || ()
         });
     }
@@ -206,35 +236,52 @@ pub fn system_page() -> Html {
         let minimum_score_draft = minimum_score_draft.clone();
         let minimum_score_error = minimum_score_error.clone();
         let sync_editor_open = sync_editor_open.clone();
+        let feedback_section = feedback_section.clone();
+        let section = props.section;
         Callback::from(move |_| {
-            if *sync_editor_open {
+            if *saving || !section.saves_config() {
                 return;
             }
-            let minimum_score = match parse_minimum_score(&minimum_score_draft) {
-                Ok(minimum_score) => minimum_score,
-                Err(message) => {
-                    minimum_score_error.set(Some(message.to_string()));
-                    saved.set(false);
-                    return;
-                }
-            };
             let Some(mut next) = (*config).clone() else {
                 return;
             };
-            next.search.minimum_score = minimum_score;
-            if let Some(message) = sync_config_error(&next.sync) {
-                error.set(Some(message));
-                saved.set(false);
-                return;
+            if section == SystemSection::Search {
+                match parse_minimum_score(&minimum_score_draft) {
+                    Ok(minimum_score) => next.search.minimum_score = minimum_score,
+                    Err(message) => {
+                        minimum_score_error.set(Some(message.to_string()));
+                        saved.set(false);
+                        return;
+                    }
+                }
+            }
+            if section == SystemSection::Sync {
+                if *sync_editor_open {
+                    return;
+                }
+                if let Some(message) = sync_config_error(&next.sync) {
+                    feedback_section.set(Some(section));
+                    error.set(Some(message));
+                    saved.set(false);
+                    return;
+                }
             }
             saving.set(true);
             error.set(None);
             saved.set(false);
+            feedback_section.set(Some(section));
             let saving = saving.clone();
             let error = error.clone();
             let saved = saved.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                match api::update_system_config(&next).await {
+                let result = match api::get_system_config().await {
+                    Ok(latest) => {
+                        let next = merge_section_config(latest, &next, section);
+                        api::update_system_config(&next).await
+                    }
+                    Err(message) => Err(message),
+                };
+                match result {
                     Ok(()) => saved.set(true),
                     Err(message) => error.set(Some(message)),
                 }
@@ -245,11 +292,12 @@ pub fn system_page() -> Html {
 
     let minimum_score_invalid = parse_minimum_score(&minimum_score_draft).is_err();
     let save_disabled = *saving
-        || *sync_editor_open
-        || minimum_score_invalid
-        || config
-            .as_ref()
-            .is_some_and(|current| sync_config_error(&current.sync).is_some());
+        || (props.section == SystemSection::Search && minimum_score_invalid)
+        || (props.section == SystemSection::Sync
+            && (*sync_editor_open
+                || config
+                    .as_ref()
+                    .is_some_and(|current| sync_config_error(&current.sync).is_some())));
 
     html! {
         <section class="stack system-page">
@@ -260,13 +308,22 @@ pub fn system_page() -> Html {
                 </div>
             </div>
 
-            if let Some(message) = &*error {
-                <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
-            }
-            if *saved {
-                <Alert variant={Some("success".to_string())}><span>{ "System settings saved." }</span></Alert>
+            <div class="system-layout">
+                <SystemNavigation section={props.section} />
+                <div class="system-content">
+            if props.section.saves_config()
+                && (feedback_section.is_none() || *feedback_section == Some(props.section)) {
+                if let Some(message) = &*error {
+                    <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
+                }
+                if *saved {
+                    <Alert variant={Some("success".to_string())}>
+                        <span>{ format!("{} settings saved.", props.section.label()) }</span>
+                    </Alert>
+                }
             }
 
+            if props.section == SystemSection::Appearance {
             <section class="system-section" aria-labelledby="appearance-title">
                 <div class="system-section-head">
                     <div>
@@ -308,13 +365,18 @@ pub fn system_page() -> Html {
                         }) }
                     </div>
                 </div>
+                <p class="page-hint">{ "Saved automatically in this browser." }</p>
             </section>
+            }
 
-            if *loading {
+            if *loading && props.section.saves_config() {
                 <p class="loading">{ "Loading..." }</p>
-            } else if let Some(current) = &*config {
+            }
+            if let Some(current) = &*config {
 
+                <div hidden={props.section != SystemSection::Sync}>
                 <SystemSync value={current.sync.clone()} saving={*saving}
+                    active={props.section == SystemSection::Sync}
                     onsave={on_save.clone()} save_disabled={save_disabled} oneditorchange={{
                     let sync_editor_open = sync_editor_open.clone();
                     Callback::from(move |open| sync_editor_open.set(open))
@@ -329,7 +391,9 @@ pub fn system_page() -> Html {
                         }
                     })
                 }} />
+                </div>
 
+                if props.section == SystemSection::Categories {
                 <section class="system-section" aria-labelledby="category-labels-title">
                     <div class="system-section-head">
                         <div>
@@ -352,14 +416,13 @@ pub fn system_page() -> Html {
                                 <span>{ "Label name" }</span>
                                 <select
                                     class="select category-label-select"
-                                    value={(*category_key_draft).clone()}
                                     disabled={category_label_select_disabled((*labels_error).is_some(), *saving, &*labels, &current.category_labels, *category_mode_draft)}
                                     onchange={on_category_key}
                                 >
-                                    <option value="">{ "Choose a label" }</option>
+                                    <option value="" selected={category_key_draft.is_empty()}>{ "Choose a label" }</option>
                                     { for labels.iter()
                                         .filter(|label| category_label_key_available(&label.key, *category_mode_draft, &current.category_labels))
-                                        .map(|label| html! { <option value={label.key.clone()}>{ label.key.clone() }</option> })
+                                        .map(|label| html! { <option value={label.key.clone()} selected={*category_key_draft == label.key}>{ label.key.clone() }</option> })
                                     }
                                 </select>
                             </label>
@@ -368,12 +431,11 @@ pub fn system_page() -> Html {
                                 <span>{ "Values" }</span>
                                 <select
                                     class="select"
-                                    value={category_mode_draft.value()}
                                     disabled={category_label_controls_disabled((*labels_error).is_some(), *saving, &*labels)}
                                     onchange={on_category_mode}
                                 >
-                                    <option value="all">{ "All values" }</option>
-                                    <option value="exact">{ "Exact value" }</option>
+                                    <option value="all" selected={*category_mode_draft == CategoryLabelMode::All}>{ "All values" }</option>
+                                    <option value="exact" selected={*category_mode_draft == CategoryLabelMode::Exact}>{ "Exact value" }</option>
                                 </select>
                             </label>
 
@@ -440,7 +502,9 @@ pub fn system_page() -> Html {
                         </div>
                     </div>
                 </section>
+                }
 
+                if props.section == SystemSection::Search {
                 <section class="system-section" aria-labelledby="note-search-title">
                     <div class="system-section-head">
                         <div>
@@ -472,7 +536,9 @@ pub fn system_page() -> Html {
                         }
                     </label>
                 </section>
+                }
 
+                if props.section == SystemSection::Duplicates {
                 <section class="system-section" aria-labelledby="duplicate-check-title">
                     <div class="system-section-head">
                         <div>
@@ -514,7 +580,9 @@ pub fn system_page() -> Html {
                         </button>
                     </div>
                 </section>
+                }
 
+                if props.section.saves_config() && props.section != SystemSection::Sync {
                 <div class="system-section-actions">
                     <button
                         type="button"
@@ -525,8 +593,13 @@ pub fn system_page() -> Html {
                         { if *saving { "Saving..." } else { "Save settings" } }
                     </button>
                 </div>
+                }
             }
 
+            if props.section == SystemSection::Storage {
+            if let Some(message) = &*info_error {
+                <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
+            }
             if let Some(info) = &*info {
                 <section class="system-section" aria-labelledby="storage-info-title">
                     <div class="system-section-head">
@@ -576,8 +649,12 @@ pub fn system_page() -> Html {
                         </div>
                     </dl>
                 </section>
+            } else if info_error.is_none() {
+                <p class="loading">{ "Loading..." }</p>
+            }
             }
 
+            if props.section == SystemSection::Backup {
             <section class="system-section" aria-labelledby="backup-title">
                 <div class="system-section-head">
                     <div>
@@ -590,8 +667,26 @@ pub fn system_page() -> Html {
                     </a>
                 </div>
             </section>
+            }
+                </div>
+            </div>
         </section>
     }
+}
+
+fn merge_section_config(
+    mut latest: SystemConfig,
+    draft: &SystemConfig,
+    section: SystemSection,
+) -> SystemConfig {
+    match section {
+        SystemSection::Sync => latest.sync = draft.sync.clone(),
+        SystemSection::Categories => latest.category_labels = draft.category_labels.clone(),
+        SystemSection::Search => latest.search = draft.search.clone(),
+        SystemSection::Duplicates => latest.duplicate_check = draft.duplicate_check.clone(),
+        SystemSection::Appearance | SystemSection::Storage | SystemSection::Backup => {}
+    }
+    latest
 }
 
 fn rule_view(
@@ -926,6 +1021,81 @@ fn transition_minimum_score(previous_minimum_score: f32, draft: String) -> Minim
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_categories_preserves_latest_server_settings_and_ignores_other_drafts() {
+        let mut latest = SystemConfig::default();
+        latest.search.minimum_score = 0.25;
+        latest.duplicate_check.enabled = true;
+        latest.sync.connection_profile = Some("server-profile".into());
+        let mut draft = SystemConfig::default();
+        draft.category_labels = vec!["project=bear_note".into()];
+        draft.sync.connection_profile = Some("unsaved-profile".into());
+
+        let saved = merge_section_config(latest.clone(), &draft, SystemSection::Categories);
+
+        assert_eq!(saved.category_labels, draft.category_labels);
+        assert_eq!(saved.search, latest.search);
+        assert_eq!(saved.duplicate_check, latest.duplicate_check);
+        assert_eq!(saved.sync, latest.sync);
+    }
+
+    #[test]
+    fn saving_search_excludes_an_invalid_hidden_sync_draft() {
+        let mut latest = SystemConfig::default();
+        latest.category_labels = vec!["project".into()];
+        let mut draft = SystemConfig::default();
+        draft.search.minimum_score = 0.125;
+        draft.sync.enabled = true;
+        assert!(sync_config_error(&draft.sync).is_some());
+
+        let saved = merge_section_config(latest.clone(), &draft, SystemSection::Search);
+
+        assert_eq!(saved.search, draft.search);
+        assert_eq!(saved.sync, latest.sync);
+        assert_eq!(saved.category_labels, latest.category_labels);
+        assert_eq!(saved.duplicate_check, latest.duplicate_check);
+    }
+
+    #[test]
+    fn saving_sync_preserves_latest_search_categories_and_duplicate_rules() {
+        let mut latest = SystemConfig::default();
+        latest.search.minimum_score = 0.25;
+        latest.category_labels = vec!["team".into()];
+        latest.duplicate_check.enabled = true;
+        let mut draft = SystemConfig::default();
+        draft.sync.connection_profile = Some("selected-profile".into());
+
+        let saved = merge_section_config(latest.clone(), &draft, SystemSection::Sync);
+
+        assert_eq!(saved.sync, draft.sync);
+        assert_eq!(saved.search, latest.search);
+        assert_eq!(saved.category_labels, latest.category_labels);
+        assert_eq!(saved.duplicate_check, latest.duplicate_check);
+    }
+
+    #[test]
+    fn saving_duplicate_rules_does_not_commit_other_section_drafts() {
+        let mut latest = SystemConfig::default();
+        latest.sync.connection_profile = Some("server-profile".into());
+        latest.search.minimum_score = 0.25;
+        let mut draft = SystemConfig::default();
+        draft.category_labels = vec!["unsaved-category".into()];
+        draft.duplicate_check.enabled = true;
+        draft.duplicate_check.rules.push(DuplicateCheckRule {
+            terms: vec![DuplicateCheckTerm {
+                key: "bear_id".into(),
+                value: None,
+            }],
+        });
+
+        let saved = merge_section_config(latest.clone(), &draft, SystemSection::Duplicates);
+
+        assert_eq!(saved.duplicate_check, draft.duplicate_check);
+        assert_eq!(saved.sync, latest.sync);
+        assert_eq!(saved.search, latest.search);
+        assert_eq!(saved.category_labels, latest.category_labels);
+    }
 
     #[test]
     fn formats_rule_expression_and_bytes() {

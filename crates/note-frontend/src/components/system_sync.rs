@@ -11,6 +11,7 @@ use crate::api::{self, SyncConnectionSummary, SyncProfile, SyncStatus};
 
 #[derive(Properties, PartialEq)]
 pub struct SystemSyncProps {
+    pub active: bool,
     pub value: SyncConfig,
     pub onchange: Callback<SyncConfig>,
     pub saving: bool,
@@ -36,6 +37,10 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
     let active = use_mut_ref(|| true);
     let editor = use_state(|| None::<Option<String>>);
     let connection_saved = use_state(|| false);
+    {
+        let active = active.clone();
+        use_effect_with((), move |_| move || *active.borrow_mut() = false);
+    }
     {
         let oneditorchange = props.oneditorchange.clone();
         use_effect_with(editor.is_some(), move |open| {
@@ -121,7 +126,7 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
         let status = status.clone();
         let error = error.clone();
         let active = active.clone();
-        use_effect_with((), move |_| {
+        use_effect_with(props.active, move |selected| {
             let in_flight = Rc::new(Cell::new(false));
             let fetch = {
                 let active = active.clone();
@@ -149,12 +154,11 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                     });
                 })
             };
-            fetch.emit(());
-            let timer = Interval::new(5_000, move || fetch.emit(()));
-            move || {
-                *active.borrow_mut() = false;
-                drop(timer);
-            }
+            let timer = selected.then(|| {
+                fetch.emit(());
+                Interval::new(5_000, move || fetch.emit(()))
+            });
+            move || drop(timer)
         });
     }
 

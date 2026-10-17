@@ -16,7 +16,7 @@ pub fn app_bar() -> Html {
     let org_active = is_org_route(&route);
     let labels_active = route == Route::Labels;
     let trash_active = route == Route::Trash;
-    let system_active = route == Route::System;
+    let system_active = is_system_route(&route);
 
     {
         let document_title = route.document_title();
@@ -47,7 +47,7 @@ pub fn app_bar() -> Html {
                         { nav_link(Route::Labels, "", PRIMARY_NAV_LABELS[3], labels_active, navigator.clone()) }
                         { nav_link(Route::Trash, "", PRIMARY_NAV_LABELS[4], trash_active, navigator.clone()) }
                     </div>
-                    { nav_link(Route::System, "nav-link-system", PRIMARY_NAV_LABELS[5], system_active, navigator) }
+                    { nav_link(Route::SystemAppearance, "nav-link-system", PRIMARY_NAV_LABELS[5], system_active, navigator) }
                 </nav>
             </div>
         </header>
@@ -59,6 +59,10 @@ fn is_notes_route(route: &Route) -> bool {
         route,
         Route::Notes | Route::NoteShow { .. } | Route::NoteEdit { .. } | Route::NewNote
     )
+}
+
+fn is_system_route(route: &Route) -> bool {
+    route.system_section().is_some()
 }
 
 fn is_org_route(route: &Route) -> bool {
@@ -104,7 +108,7 @@ fn nav_link(
             }
         }
     });
-    let content = if destination == Route::System {
+    let content = if is_system_route(&destination) {
         html! { <>{ icons::settings() }<span>{ label }</span></> }
     } else {
         html! { label }
@@ -135,8 +139,33 @@ fn nav_classes_with(active: bool, extra: &'static str) -> Classes {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_notes_route, is_org_route, nav_aria_current, PRIMARY_NAV_LABELS};
+    use super::{
+        is_notes_route, is_org_route, is_system_route, nav_aria_current, PRIMARY_NAV_LABELS,
+    };
     use crate::routes::Route;
+    use yew_router::Routable;
+
+    #[test]
+    fn system_navigation_stays_active_for_every_module_route() {
+        for path in [
+            "/system",
+            "/system/appearance",
+            "/system/sync",
+            "/system/categories",
+            "/system/search",
+            "/system/duplicates",
+            "/system/storage",
+            "/system/backup",
+        ] {
+            let route = Route::recognize(path).expect("system route must be recognized");
+            assert!(
+                is_system_route(&route),
+                "System navigation must be active on {path}"
+            );
+        }
+        assert!(!is_system_route(&Route::Notes));
+        assert!(!is_system_route(&Route::NotFound));
+    }
 
     #[test]
     fn notes_navigation_includes_new_note_and_excludes_other_top_level_routes() {

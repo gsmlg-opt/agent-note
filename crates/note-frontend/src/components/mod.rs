@@ -7,6 +7,7 @@ pub mod org_event_table;
 pub mod org_table;
 pub mod org_workspace_form;
 mod sync_connection_editor;
+pub mod system_navigation;
 pub mod system_sync;
 
 pub use app_bar::AppBar;
@@ -14,3 +15,4 @@ pub use modal::Modal;
 pub use note_editor::NoteEditor;
 pub use org_document_table::OrgDocumentTable;
 pub use org_workspace_form::OrgWorkspaceForm;
+pub use system_navigation::SystemNavigation;
