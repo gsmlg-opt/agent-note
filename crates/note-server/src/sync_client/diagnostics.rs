@@ -75,7 +75,7 @@ impl Failure {
             WsError::Http(response) => {
                 let status = response.status().as_u16();
                 let hint = match status {
-                    401 | 403 => "verify the receiver's transport authorization and trusted client identity; Direct/SSH forwarding does not supply mTLS identity.",
+                    401 | 403 => "check the GaoNote receiver logs for the rejection reason.",
                     404 => "verify the WebSocket path and reverse proxy route for /note-sync/websocket.",
                     301 | 302 | 307 | 308 => "use the final WebSocket endpoint; verify ws/wss and the reverse proxy route.",
                     400 | 426 => "verify the WebSocket upgrade proxy configuration and Phoenix vsn=2.0.0.",

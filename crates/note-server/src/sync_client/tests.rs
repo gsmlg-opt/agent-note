@@ -1032,7 +1032,7 @@ async fn direct_wss_verifies_server_without_sending_client_certificate() {
 #[tokio::test]
 async fn websocket_http_rejection_preserves_status_and_hints_without_peer_secrets() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    for status in [403, 404] {
+    for status in [401, 403, 404] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let peer = tokio::spawn(async move {
@@ -1048,9 +1048,18 @@ async fn websocket_http_rejection_preserves_status_and_hints_without_peer_secret
         let message = format!("{error:#}");
         assert!(message.contains(&format!("HTTP {status}")), "{message}");
         assert!(
-            message.contains(if status == 403 { "identity" } else { "path" }),
+            message.contains(if status == 404 {
+                "path"
+            } else {
+                "receiver logs"
+            }),
             "{message}"
         );
+        if status == 401 || status == 403 {
+            let lower = message.to_ascii_lowercase();
+            assert!(!lower.contains("mtls"), "{message}");
+            assert!(!lower.contains("certificate"), "{message}");
+        }
         for secret in ["header-secret", "body-secret", "query-secret", "127.0.0.1"] {
             assert!(!message.contains(secret));
         }
