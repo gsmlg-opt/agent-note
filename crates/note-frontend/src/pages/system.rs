@@ -244,6 +244,12 @@ pub fn system_page() -> Html {
     };
 
     let minimum_score_invalid = parse_minimum_score(&minimum_score_draft).is_err();
+    let save_disabled = *saving
+        || *sync_editor_open
+        || minimum_score_invalid
+        || config
+            .as_ref()
+            .is_some_and(|current| sync_config_error(&current.sync).is_some());
 
     html! {
         <section class="stack system-page">
@@ -308,7 +314,8 @@ pub fn system_page() -> Html {
                 <p class="loading">{ "Loading..." }</p>
             } else if let Some(current) = &*config {
 
-                <SystemSync value={current.sync.clone()} saving={*saving} oneditorchange={{
+                <SystemSync value={current.sync.clone()} saving={*saving}
+                    onsave={on_save.clone()} save_disabled={save_disabled} oneditorchange={{
                     let sync_editor_open = sync_editor_open.clone();
                     Callback::from(move |open| sync_editor_open.set(open))
                 }} onchange={{
@@ -513,7 +520,7 @@ pub fn system_page() -> Html {
                         type="button"
                         class="btn btn-primary"
                         onclick={on_save}
-                        disabled={*saving || *sync_editor_open || minimum_score_invalid || sync_config_error(&current.sync).is_some()}
+                        disabled={save_disabled}
                     >
                         { if *saving { "Saving..." } else { "Save settings" } }
                     </button>

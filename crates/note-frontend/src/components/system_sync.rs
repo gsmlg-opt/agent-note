@@ -14,6 +14,8 @@ pub struct SystemSyncProps {
     pub value: SyncConfig,
     pub onchange: Callback<SyncConfig>,
     pub saving: bool,
+    pub onsave: Callback<MouseEvent>,
+    pub save_disabled: bool,
     pub oneditorchange: Callback<bool>,
 }
 
@@ -365,14 +367,20 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                         <p>{ "Correct the note or its labels, then save it or retry sync." }</p>
                     </div>
                 }
-                <div class="system-section-actions">
-                    <button type="button" class="btn btn-outline" disabled={*retrying || controls_disabled || current.state == "disabled"}
-                        onclick={on_retry}>{ if *retrying { "Retrying..." } else { "Retry sync" } }</button>
-                </div>
             }
             if let Some(message) = &*error {
                 <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
             }
+            <div class="system-section-actions">
+                if let Some(current) = &*status {
+                    <button type="button" class="btn btn-outline" disabled={*retrying || controls_disabled || current.state == "disabled"}
+                        onclick={on_retry}>{ if *retrying { "Retrying..." } else { "Retry sync" } }</button>
+                }
+                <button type="button" class="btn btn-primary" onclick={props.onsave.clone()}
+                    disabled={controls_disabled || props.save_disabled}>
+                    { if props.saving { "Saving..." } else { "Save settings" } }
+                </button>
+            </div>
         </section>
     }
 }
