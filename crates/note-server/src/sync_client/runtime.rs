@@ -1,6 +1,7 @@
 //! Phoenix socket runtime. Durability and convergence remain in pipelines.
 use super::{
     connections::Connections,
+    diagnostics::{Failure, SyncDiagnostic},
     phoenix::{Frame, FRAME_BYTES},
     tls,
     transfer::{encode_metadata, StagedBlob},
@@ -52,6 +53,9 @@ pub struct SyncRuntimeStatus {
     pub state: String,
     pub last_error: Option<String>,
     pub last_success_at: Option<i64>,
+    pub last_attempt_at: Option<i64>,
+    pub next_retry_at: Option<i64>,
+    pub diagnostics: Vec<SyncDiagnostic>,
     pub pending_notes: usize,
     pub initializing: bool,
     pub node_id: Option<String>,
@@ -65,6 +69,9 @@ impl Default for SyncRuntimeStatus {
             state: "disabled".into(),
             last_error: None,
             last_success_at: None,
+            last_attempt_at: None,
+            next_retry_at: None,
+            diagnostics: vec![],
             pending_notes: 0,
             initializing: false,
             node_id: None,
@@ -143,6 +150,7 @@ impl SyncRuntime {
         state.node_id = (!durable.node_id.is_empty()).then_some(durable.node_id);
         if !durable.enabled {
             state.state = "disabled".into();
+            state.next_retry_at = None;
         }
         Ok(state)
     }
@@ -178,19 +186,53 @@ impl SyncRuntime {
         self.status.write().await.last_error =
             Some(format!("Note {} cannot sync: {}", event.note_id, reason));
     }
+    fn record(status: &mut SyncRuntimeStatus, diagnostic: SyncDiagnostic) {
+        eprintln!(
+            "{}",
+            json!({"event": "note_sync", "diagnostic": &diagnostic})
+        );
+        status.diagnostics.push(diagnostic);
+        if status.diagnostics.len() > 20 {
+            status.diagnostics.remove(0);
+        }
+    }
+    async fn begin_attempt(&self) {
+        let mut status = self.status.write().await;
+        status.state = "connecting".into();
+        status.last_attempt_at = Some(chrono::Utc::now().timestamp_millis());
+        status.next_retry_at = None;
+    }
+    async fn connected(&self, peer_node_id: String) {
+        let mut status = self.status.write().await;
+        status.state = "connected".into();
+        status.next_retry_at = None;
+        status.last_error = None;
+        status.peer_node_id = Some(peer_node_id);
+        Self::record(
+            &mut status,
+            Failure::new(
+                "sync",
+                "connected",
+                "Connected to GaoNote; Phoenix channel identity and selectors verified.",
+            )
+            .event("info"),
+        );
+    }
     async fn error(&self, error: &anyhow::Error) {
         let mut status = self.status.write().await;
         status.state = "error".into();
-        // Errors constructed by this module never include credential paths, URLs or payloads.
-        status.last_error = Some(error.to_string());
+        let failure = Failure::safe(error);
+        status.last_error = Some(failure.message.clone());
+        status.next_retry_at = None;
+        Self::record(&mut status, failure.event("error"));
     }
 }
 
 pub async fn connect_socket(profile: &SyncConnection) -> Result<Socket> {
-    profile.validate()?;
+    profile.validate().map_err(|_| Failure::new("config", "invalid_configuration", "Invalid sync connection configuration; verify mode, endpoint and required credentials."))?;
     let url = reqwest::Url::parse(&profile.url).context("invalid sync URL")?;
     let tls = if url.scheme() == "wss" {
-        Some(tls::client_config(profile)?)
+        Some(tls::client_config(profile).map_err(|error| Failure::safe(&error))?)
     } else {
         None
     };
@@ -201,30 +243,31 @@ pub async fn connect_socket(profile: &SyncConnection) -> Result<Socket> {
         .max_write_buffer_size(FRAME_BYTES * 2);
     let connect = async {
         let stream: Box<dyn Transport> = if profile.mode == ConnectionMode::Ssh {
-            Box::new(super::ssh::SshStream::connect(
-                profile.ssh.as_ref().unwrap(),
-                &url,
-            )?)
+            Box::new(
+                super::ssh::SshStream::connect(profile.ssh.as_ref().unwrap(), &url)
+                    .map_err(|error| Failure::safe(&error))?,
+            )
         } else {
             let stream = TcpStream::connect((
                 url.host_str().unwrap().trim_matches(['[', ']']),
                 url.port_or_known_default().unwrap(),
             ))
             .await
-            .context("sync TCP connection failed; verify the GaoNote address and availability")?;
+            .map_err(|error| Failure::io(&error, "tcp"))?;
             stream
                 .set_nodelay(true)
                 .context("sync TCP connection setup failed")?;
             Box::new(stream)
         };
         tokio_tungstenite::client_async_tls_with_config(
-            url.as_str(), stream, Some(config), tls.map(tokio_tungstenite::Connector::Rustls),
-        ).await.map(|(socket, _)|socket).map_err(|_| anyhow::anyhow!(
-            if profile.mode == ConnectionMode::Ssh {
-                "sync SSH/WebSocket connection failed; verify host key, identity, SSH forwarding and GaoNote address"
-            } else {
-                "sync WebSocket connection failed; verify GaoNote availability, CA, hostname and client certificate when using mTLS"
-            }))
+            url.as_str(),
+            stream,
+            Some(config),
+            tls.map(tokio_tungstenite::Connector::Rustls),
+        )
+        .await
+        .map(|(socket, _)| socket)
+        .map_err(|error| Failure::websocket(&error).into())
     };
     timeout(DEADLINE, connect)
         .await
@@ -268,7 +311,11 @@ pub async fn run(
             }
         };
         if !config.enabled {
-            runtime.status.write().await.state = "disabled".into();
+            {
+                let mut status = runtime.status.write().await;
+                status.state = "disabled".into();
+                status.next_retry_at = None;
+            }
             if pause(
                 &runtime,
                 &mut shutdown,
@@ -284,8 +331,8 @@ pub async fn run(
         let profile = snapshot
             .iter()
             .find(|p| Some(&p.id) == config.connection_profile.as_ref());
+        runtime.begin_attempt().await;
         let result = if let Some(profile) = profile {
-            runtime.status.write().await.state = "connecting".into();
             tokio::select! {
                 biased;
                 _=shutdown.changed()=>break,
@@ -317,14 +364,10 @@ pub async fn run(
         }
         let base = 1u64 << failures.min(5);
         let jitter = (uuid::Uuid::new_v4().as_u128() % 1000) as u64;
-        if pause(
-            &runtime,
-            &mut shutdown,
-            &mut profiles,
-            Duration::from_millis((base * 1000 + jitter).min(60_000)),
-        )
-        .await
-        {
+        let delay = Duration::from_millis((base * 1000 + jitter).min(60_000));
+        runtime.status.write().await.next_retry_at =
+            Some(chrono::Utc::now().timestamp_millis() + delay.as_millis() as i64);
+        if pause(&runtime, &mut shutdown, &mut profiles, delay).await {
             break;
         }
     }
@@ -430,18 +473,7 @@ async fn session(
     }
     client.limit = profile.max_blob_bytes.min(peer.max_blob_bytes);
     sync::pin_sync_peer(ctx, &profile.id, &peer.node_id).await?;
-    {
-        let mut state = runtime.status.write().await;
-        state.state = "connected".into();
-        state.last_error = runtime
-            .blocked
-            .lock()
-            .expect("sync rejection mutex poisoned")
-            .values()
-            .next()
-            .map(|note| format!("Note {} cannot sync: {}", note.note_id, note.reason));
-        state.peer_node_id = Some(peer.node_id);
-    }
+    runtime.connected(peer.node_id).await;
     // Ask the server to stream its inventory; page boundaries never encode large snapshots.
     client.request("inventory_start", json!({})).await?;
     let mut cursor = None;
@@ -561,6 +593,9 @@ impl Session<'_> {
                                     return Err(rejection.into());
                                 }
                             }
+                        }
+                        if event == "phx_join" {
+                            return Err(Failure::new("phoenix", "phoenix_join_rejected", "GaoNote rejected the Phoenix channel join; verify the registered Agent Note node, trusted transport identity and authorized label selectors.").into());
                         }
                         bail!("sync peer rejected channel request");
                     }
@@ -1322,6 +1357,162 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("heartbeat reply timed out"));
+        peer.await.unwrap();
+    }
+    #[tokio::test]
+    async fn diagnostic_history_is_bounded_and_redacts_unknown_errors() {
+        let runtime = SyncRuntime::new(&[]);
+        for _ in 0..25 {
+            runtime
+                .error(&anyhow::anyhow!(
+                    "peer-secret /private/path?token=credential"
+                ))
+                .await;
+        }
+        let value = serde_json::to_value(&*runtime.status.read().await).unwrap();
+        assert!(!value.to_string().contains("peer-secret"));
+        assert_eq!(value["diagnostics"].as_array().unwrap().len(), 20);
+        assert_eq!(value["diagnostics"][0]["level"], "error");
+        assert!(value["diagnostics"][0]["timestamp"].as_i64().unwrap() > 0);
+    }
+    #[tokio::test]
+    async fn attempts_retry_and_recovery_preserve_recent_diagnostics() {
+        let runtime = SyncRuntime::new(&[]);
+        runtime.begin_attempt().await;
+        let first_attempt = runtime.status.read().await.last_attempt_at.unwrap();
+        runtime
+            .error(
+                &Failure::new(
+                    "websocket",
+                    "websocket_http_403",
+                    "HTTP 403; verify identity.",
+                )
+                .into(),
+            )
+            .await;
+        runtime.status.write().await.next_retry_at = Some(first_attempt + 5000);
+        runtime.retry();
+        runtime.begin_attempt().await;
+        {
+            let status = runtime.status.read().await;
+            assert_eq!(status.state, "connecting");
+            assert!(status.last_attempt_at.unwrap() >= first_attempt);
+            assert!(status.next_retry_at.is_none());
+            assert_eq!(status.diagnostics.len(), 1);
+        }
+        runtime.connected("peer".into()).await;
+        let status = runtime.status.read().await;
+        assert_eq!(status.state, "connected");
+        assert!(status.last_error.is_none());
+        assert!(status.next_retry_at.is_none());
+        assert_eq!(status.diagnostics.len(), 2);
+        assert_eq!(status.diagnostics[0].code, "websocket_http_403");
+        assert_eq!(status.diagnostics[1].level, "info");
+    }
+    #[tokio::test]
+    async fn failed_worker_exposes_safe_http_reason_and_scheduled_retry_via_status_api() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use note_pipelines::org::{OrgContext, SystemOrgClock};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt;
+        let certs = certificates();
+        let storage = Arc::new(
+            TursoStorage::open(certs.dir.path().join("http-diagnostics.db"))
+                .await
+                .unwrap(),
+        );
+        let ctx = Arc::new(Context::new(
+            storage.clone(),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(
+                certs.dir.path().join("attachments"),
+            )),
+        ));
+        note_pipelines::update_system_config(
+            &ctx,
+            &note_core::SystemConfig {
+                sync: note_core::sync::SyncConfig {
+                    enabled: true,
+                    connection_profile: Some("local".into()),
+                    rules: vec![note_core::sync::SyncRule {
+                        id: "project".into(),
+                        enabled: true,
+                        selector: "project=bear_note".into(),
+                    }],
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut profile = certs.profile.clone();
+        profile.mode = ConnectionMode::Direct;
+        profile.url = format!(
+            "ws://127.0.0.1:{}/note-sync/websocket?vsn=2.0.0",
+            listener.local_addr().unwrap().port()
+        );
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            stream.read(&mut bytes).await.unwrap();
+            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nX-Secret: header-secret\r\nContent-Length: 11\r\n\r\nbody-secret").await.unwrap();
+        });
+        let runtime = SyncRuntime::new(&[profile]);
+        let (stop, shutdown) = watch::channel(false);
+        let worker = tokio::spawn(run(ctx.clone(), runtime.clone(), shutdown));
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if runtime.status.read().await.next_retry_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let app_state = crate::AppState::new(
+            ctx.clone(),
+            Arc::new(OrgContext::new(storage, Arc::new(SystemOrgClock))),
+        )
+        .with_sync(runtime.clone());
+        let (app, _) = super::super::api::router().split_for_parts();
+        let response = app
+            .with_state(app_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system/sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status["state"], "error");
+        assert_eq!(status["diagnostics"][0]["code"], "websocket_http_403");
+        assert_eq!(status["diagnostics"][0]["stage"], "websocket");
+        assert!(status["last_error"].as_str().unwrap().contains("HTTP 403"));
+        assert!(status["last_attempt_at"].as_i64().unwrap() > 0);
+        assert!(
+            status["next_retry_at"].as_i64().unwrap() > status["last_attempt_at"].as_i64().unwrap()
+        );
+        for secret in ["header-secret", "body-secret", "client.key", "client.pem"] {
+            assert!(!status.to_string().contains(secret));
+        }
+        let mut config = note_pipelines::get_system_config(&ctx).await.unwrap();
+        config.sync.enabled = false;
+        note_pipelines::update_system_config(&ctx, &config)
+            .await
+            .unwrap();
+        let disabled = runtime.status(&ctx).await.unwrap();
+        assert_eq!(disabled.state, "disabled");
+        assert!(disabled.next_retry_at.is_none());
+        assert_eq!(disabled.diagnostics.len(), 1);
+        stop.send(true).unwrap();
+        worker.await.unwrap();
         peer.await.unwrap();
     }
 }

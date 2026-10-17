@@ -1,4 +1,4 @@
-# Note export browser checks
+# Frontend browser checks
 
 The browser checks run against the Trunk development server and mock every `/api/` response in the browser. They do not require a database or Gotenberg.
 
@@ -35,3 +35,11 @@ The Safari API fixture itself is portable and can be checked without Selenium:
 ```sh
 python browser-tests/test_safari_smoke_fixture.py
 ```
+
+Sync diagnostics checks use the same frontend server and mock every API call. They cover failure details, retry and recovery history, status outages, older API responses, and a scrollable keyboard-accessible history at mobile widths:
+
+```sh
+uv run --no-project --with playwright==1.59.0 python browser-tests/test_sync_diagnostics.py
+```
+
+Use `--base-url` for a different local port and `--executable` for a system Chromium installation. Screenshots and results default to `/tmp/agent-note-sync-diagnostics-browser`.

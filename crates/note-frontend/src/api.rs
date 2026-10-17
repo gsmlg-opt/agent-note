@@ -255,11 +255,24 @@ pub struct SyncBlockedNote {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncDiagnostic {
+    pub timestamp: i64,
+    pub level: String,
+    pub stage: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SyncStatus {
     pub profiles: Vec<SyncProfile>,
     pub state: String,
     pub last_error: Option<String>,
     pub last_success_at: Option<i64>,
+    pub last_attempt_at: Option<i64>,
+    pub next_retry_at: Option<i64>,
+    #[serde(default)]
+    pub diagnostics: Vec<SyncDiagnostic>,
     pub pending_notes: u64,
     pub initializing: bool,
     pub node_id: Option<String>,
@@ -1029,6 +1042,63 @@ pub async fn delete_label(key: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_status_rejects_malformed_connection_diagnostics() {
+        let response = serde_json::json!({
+            "profiles": [],
+            "state": "disconnected",
+            "last_error": null,
+            "last_success_at": null,
+            "pending_notes": 1,
+            "initializing": false,
+            "node_id": null,
+            "peer_node_id": null,
+            "diagnostics": [{ "timestamp": "invalid" }]
+        });
+        assert!(serde_json::from_value::<SyncStatus>(response).is_err());
+    }
+
+    #[test]
+    fn sync_status_reads_diagnostics_and_accepts_legacy_responses() {
+        let mut response = serde_json::json!({
+            "profiles": [],
+            "state": "error",
+            "last_error": "WebSocket upgrade rejected with HTTP 403.",
+            "last_success_at": null,
+            "pending_notes": 1,
+            "initializing": false,
+            "node_id": null,
+            "peer_node_id": null
+        });
+        let legacy: SyncStatus = serde_json::from_value(response.clone()).unwrap();
+        assert!(legacy.diagnostics.is_empty());
+        assert_eq!(legacy.last_attempt_at, None);
+        assert_eq!(legacy.next_retry_at, None);
+
+        response["last_attempt_at"] = serde_json::json!(1_700_000_000_000_i64);
+        response["next_retry_at"] = serde_json::json!(1_700_000_005_000_i64);
+        response["diagnostics"] = serde_json::json!([{
+            "timestamp": 1_700_000_000_100_i64,
+            "level": "error",
+            "stage": "websocket",
+            "code": "websocket_upgrade_rejected",
+            "message": "WebSocket upgrade rejected with HTTP 403."
+        }]);
+        let current: SyncStatus = serde_json::from_value(response).unwrap();
+        assert_eq!(current.last_attempt_at, Some(1_700_000_000_000));
+        assert_eq!(current.next_retry_at, Some(1_700_000_005_000));
+        assert_eq!(
+            current.diagnostics,
+            vec![SyncDiagnostic {
+                timestamp: 1_700_000_000_100,
+                level: "error".into(),
+                stage: "websocket".into(),
+                code: "websocket_upgrade_rejected".into(),
+                message: "WebSocket upgrade rejected with HTTP 403.".into(),
+            }]
+        );
+    }
 
     fn attachment(content: AttachmentContent) -> NoteAttachment {
         NoteAttachment {

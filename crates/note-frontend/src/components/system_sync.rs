@@ -33,6 +33,15 @@ pub fn sync_config_error(value: &SyncConfig) -> Option<String> {
     .map(|error| error.to_string())
 }
 
+fn sync_timestamp(timestamp: i64) -> Html {
+    match chrono::DateTime::from_timestamp_millis(timestamp) {
+        Some(time) => html! {
+            <time datetime={time.to_rfc3339()}>{ time.format("%Y-%m-%d %H:%M:%S UTC").to_string() }</time>
+        },
+        None => html! { <span>{ "Unknown time" }</span> },
+    }
+}
+
 #[function_component(SystemSync)]
 pub fn system_sync(props: &SystemSyncProps) -> Html {
     let status = use_state(|| None::<SyncStatus>);
@@ -245,7 +254,7 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
     });
 
     html! {
-        <section class="system-section" aria-labelledby="sync-title">
+        <section class="system-section system-sync" aria-labelledby="sync-title">
             <div class="system-section-head">
                 <div>
                     <h3 id="sync-title">{ "GaoNote sync" }</h3>
@@ -373,6 +382,12 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                 <dl class="system-info" aria-live="polite">
                     <div><dt>{ "Status" }</dt><dd>{ if current.initializing { "Preparing existing notes".to_string() } else { current.state.clone() } }</dd></div>
                     <div><dt>{ "Pending notes" }</dt><dd>{ current.pending_notes }</dd></div>
+                    if let Some(timestamp) = current.last_attempt_at {
+                        <div><dt>{ "Last connection attempt" }</dt><dd>{ sync_timestamp(timestamp) }</dd></div>
+                    }
+                    if let Some(timestamp) = current.next_retry_at {
+                        <div><dt>{ "Next automatic retry" }</dt><dd>{ sync_timestamp(timestamp) }</dd></div>
+                    }
                     if let Some(node_id) = &current.node_id {
                         <div><dt>{ "Local node ID" }</dt><dd>{ node_id }</dd></div>
                     }
@@ -386,6 +401,26 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                 if let Some(message) = &current.last_error {
                     <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
                 }
+                <section class="sync-diagnostics" aria-label="Connection diagnostics">
+                    <h4>{ "Connection diagnostics" }</h4>
+                    <p class="system-score-help">{ "Recent connection events from this server session, newest first. History resets when Agent Note restarts." }</p>
+                    if current.diagnostics.is_empty() {
+                        <p class="empty compact">{ "No connection diagnostics recorded in this server session yet." }</p>
+                    } else {
+                        <ol class="sync-diagnostics-list" tabindex="0" aria-label="Recent connection events">
+                            { for current.diagnostics.iter().rev().map(|entry| html! {
+                                <li class={classes!("sync-diagnostic", (entry.level == "error").then_some("sync-diagnostic-error"))}>
+                                    <div class="sync-diagnostic-meta">
+                                        { sync_timestamp(entry.timestamp) }
+                                        <span>{ format!("{} · {}", entry.level, entry.stage) }</span>
+                                        <code>{ &entry.code }</code>
+                                    </div>
+                                    <p>{ &entry.message }</p>
+                                </li>
+                            }) }
+                        </ol>
+                    }
+                </section>
                 if !current.blocked_notes.is_empty() {
                     <div class="system-score-error" role="status">
                         <p>{ "These notes need attention. Other notes can continue syncing." }</p>

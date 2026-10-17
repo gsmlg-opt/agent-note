@@ -1,5 +1,7 @@
 pub mod api;
 mod connections;
+mod diagnostics;
+pub use diagnostics::SyncDiagnostic;
 pub mod phoenix;
 mod runtime;
 mod ssh;

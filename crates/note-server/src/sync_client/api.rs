@@ -278,6 +278,9 @@ mod tests {
         assert!(!text.contains("private-cert"));
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(json["state"], "disabled");
+        assert_eq!(json.get("last_attempt_at"), Some(&serde_json::Value::Null));
+        assert_eq!(json.get("next_retry_at"), Some(&serde_json::Value::Null));
+        assert_eq!(json.get("diagnostics"), Some(&serde_json::json!([])));
         assert_eq!(json["profiles"][0].as_object().unwrap().len(), 2);
         let response = app
             .clone()

@@ -120,7 +120,8 @@ async fn mtls_socket_verifies_client_certificate_server_chain_and_hostname() {
         "probe"
     );
     certs.profile.url = certs.profile.url.replace("localhost", "127.0.0.1");
-    assert!(connect_socket(&certs.profile).await.is_err());
+    let error = connect_socket(&certs.profile).await.err().unwrap();
+    assert!(error.to_string().contains("hostname"), "{error}");
     peer.await.unwrap();
     assert!(certs.dir.path().exists());
 }
@@ -1026,4 +1027,41 @@ async fn direct_wss_verifies_server_without_sending_client_certificate() {
     certs.profile.url = certs.profile.url.replace("localhost", "127.0.0.1");
     assert!(connect_socket(&certs.profile).await.is_err());
     peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_http_rejection_preserves_status_and_hints_without_peer_secrets() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for status in [403, 404] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 {status} Rejected\r\nX-Secret: header-secret\r\nContent-Length: 11\r\n\r\nbody-secret").as_bytes()).await.unwrap();
+        });
+        let mut profile = certificates().profile;
+        profile.mode = ConnectionMode::Direct;
+        profile.url = format!("ws://127.0.0.1:{port}/socket?vsn=2.0.0&token=query-secret");
+        let error = connect_socket(&profile).await.err().unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains(&format!("HTTP {status}")), "{message}");
+        assert!(
+            message.contains(if status == 403 { "identity" } else { "path" }),
+            "{message}"
+        );
+        for secret in ["header-secret", "body-secret", "query-secret", "127.0.0.1"] {
+            assert!(!message.contains(secret));
+        }
+        peer.await.unwrap();
+    }
+}
+
+#[test]
+fn status_serializes_diagnostics_and_retry_timestamps() {
+    let value = serde_json::to_value(SyncRuntimeStatus::default()).unwrap();
+    assert_eq!(value.get("last_attempt_at"), Some(&serde_json::Value::Null));
+    assert_eq!(value.get("next_retry_at"), Some(&serde_json::Value::Null));
+    assert_eq!(value.get("diagnostics"), Some(&serde_json::json!([])));
 }

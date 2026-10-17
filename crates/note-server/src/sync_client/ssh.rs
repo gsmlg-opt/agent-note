@@ -1,6 +1,7 @@
 //! OpenSSH owns authentication and remote forwarding; no local listener is opened.
-use super::SshConnection;
+use super::{diagnostics::Failure, SshConnection};
 use anyhow::{Context, Result};
+use std::future::Future;
 use std::{
     io,
     pin::Pin,
@@ -17,6 +18,8 @@ pub(super) struct SshStream {
     child: Child,
     input: ChildStdin,
     output: ChildStdout,
+    stderr: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    closed: Option<Failure>,
 }
 
 impl SshStream {
@@ -89,18 +92,43 @@ impl SshStream {
             .arg(&settings.host)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command
             .spawn()
-            .context("cannot start SSH; install the OpenSSH client on the Agent Note server")?;
+            .map_err(|_| Failure::new("ssh", "ssh_start_failed", "Cannot start SSH; install the OpenSSH client on the Agent Note server and verify executable permissions."))?;
         let input = child.stdin.take().context("cannot open SSH input")?;
         let output = child.stdout.take().context("cannot open SSH output")?;
+        let stderr = child.stderr.take().context("cannot open SSH diagnostics")?;
+        let stderr = tokio::spawn(capture_stderr(stderr));
         Ok(Self {
             child,
             input,
             output,
+            stderr: Some(stderr),
+            closed: None,
         })
+    }
+
+    fn poll_failure(&mut self, cx: &mut TaskContext<'_>) -> Poll<Failure> {
+        if let Some(failure) = &self.closed {
+            return Poll::Ready(failure.clone());
+        }
+        let stderr = match Pin::new(
+            self.stderr
+                .as_mut()
+                .expect("SSH stderr task present until EOF"),
+        )
+        .poll(cx)
+        {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => result.unwrap_or_default(),
+        };
+        self.stderr = None;
+        let exit = self.child.try_wait().ok().flatten().and_then(|s| s.code());
+        let failure = Failure::ssh(&stderr, exit);
+        self.closed = Some(failure.clone());
+        Poll::Ready(failure)
     }
 
     #[cfg(test)]
@@ -109,9 +137,27 @@ impl SshStream {
     }
 }
 
+async fn capture_stderr(mut stderr: impl AsyncRead + Unpin) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut captured = Vec::new();
+    let mut chunk = [0; 1024];
+    while let Ok(count) = stderr.read(&mut chunk).await {
+        if count == 0 {
+            break;
+        }
+        let retained = count.min(8192usize.saturating_sub(captured.len()));
+        captured.extend_from_slice(&chunk[..retained]);
+        // Continue draining after the capture cap to avoid blocking SSH.
+    }
+    captured
+}
+
 impl Drop for SshStream {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        if let Some(stderr) = &self.stderr {
+            stderr.abort();
+        }
         // Tokio's child drop performs best-effort reaping after kill_on_drop.
     }
 }
@@ -121,7 +167,22 @@ impl AsyncRead for SshStream {
         cx: &mut TaskContext<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.output).poll_read(cx, buffer)
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(failure) = &self.closed {
+            return Poll::Ready(Err(io::Error::other(failure.clone())));
+        }
+        let before = buffer.filled().len();
+        match Pin::new(&mut self.output).poll_read(cx, buffer) {
+            Poll::Ready(Ok(())) if buffer.filled().len() == before && buffer.remaining() > 0 => {
+                // OpenSSH closes stdout on failed authentication/forwarding. Wait
+                // for stderr EOF so classification cannot race the drain task.
+                self.poll_failure(cx)
+                    .map(|failure| Err(io::Error::other(failure)))
+            }
+            result => result,
+        }
     }
 }
 impl AsyncWrite for SshStream {
@@ -130,10 +191,26 @@ impl AsyncWrite for SshStream {
         cx: &mut TaskContext<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.input).poll_write(cx, bytes)
+        if let Some(failure) = &self.closed {
+            return Poll::Ready(Err(io::Error::other(failure.clone())));
+        }
+        match Pin::new(&mut self.input).poll_write(cx, bytes) {
+            Poll::Ready(Err(_)) => self
+                .poll_failure(cx)
+                .map(|failure| Err(io::Error::other(failure))),
+            result => result,
+        }
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.input).poll_flush(cx)
+        if let Some(failure) = &self.closed {
+            return Poll::Ready(Err(io::Error::other(failure.clone())));
+        }
+        match Pin::new(&mut self.input).poll_flush(cx) {
+            Poll::Ready(Err(_)) => self
+                .poll_failure(cx)
+                .map(|failure| Err(io::Error::other(failure))),
+            result => result,
+        }
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.input).poll_shutdown(cx)
@@ -195,7 +272,7 @@ mod tests {
             let port = listener.local_addr().unwrap().port();
             drop(listener);
             let config = base.join("sshd_config");
-            std::fs::write(&config, format!("Port {port}\nListenAddress 127.0.0.1\nHostKey \"{}/host\"\nPidFile \"{}/sshd.pid\"\nAuthorizedKeysFile \"{}/identity.pub\"\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nAllowUsers {username}\nAllowTcpForwarding yes\nPermitTTY no\nX11Forwarding no\nLogLevel ERROR\n", base.display(), base.display(), base.display())).unwrap();
+            std::fs::write(&config, format!("Port {port}\nListenAddress 127.0.0.1\nHostKey \"{}/host\"\nPidFile \"{}/sshd.pid\"\nAuthorizedKeysFile \"{}/identity.pub\"\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nAllowUsers {username}\nAllowTcpForwarding yes\nPermitTTY no\nX11Forwarding no\nPerSourcePenalties no\nLogLevel ERROR\n", base.display(), base.display(), base.display())).unwrap();
             let known_hosts_file = base.join("known hosts");
             std::fs::write(
                 &known_hosts_file,
@@ -277,6 +354,48 @@ mod tests {
         .expect("owned SSH child must be killed and reaped");
     }
 
+    #[tokio::test]
+    async fn stderr_capture_is_bounded_and_drains_past_the_limit() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let capture = tokio::spawn(capture_stderr(reader));
+        timeout(Duration::from_secs(2), writer.write_all(&vec![b'x'; 32768]))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(writer);
+        let captured = capture.await.unwrap();
+        assert_eq!(captured, vec![b'x'; 8192]);
+    }
+
+    #[test]
+    fn ssh_failures_classify_without_exposing_stderr() {
+        for (stderr, code) in [
+            (
+                "Host key verification failed. /private-secret",
+                "ssh_host_key",
+            ),
+            (
+                "Permission denied (publickey) user-secret",
+                "ssh_authentication",
+            ),
+            ("Could not resolve hostname secret.invalid", "ssh_dns"),
+            (
+                "channel 0: open failed: administratively prohibited: target-secret",
+                "ssh_forwarding",
+            ),
+            (
+                "connect to host secret: Connection refused",
+                "ssh_connection_refused",
+            ),
+            ("Connection timed out secret", "ssh_timeout"),
+        ] {
+            let failure = Failure::ssh(stderr.as_bytes(), Some(255));
+            assert_eq!(failure.code, code);
+            assert!(!failure.message.contains("secret"));
+            assert!(failure.message.contains("255"));
+        }
+    }
     #[test]
     fn rejects_ssh_option_control_and_expansion_injection() {
         let mut settings = SshConnection {
@@ -408,6 +527,60 @@ mod tests {
             .await
             .unwrap()
             .is_err());
+            reaped(pid).await;
+            let mut invalid = profile.clone();
+            invalid.ssh = Some(settings);
+            let error = connect_socket(&invalid).await.err().unwrap();
+            let text = format!("{error:#}");
+            assert!(
+                text.contains(if wrong_host {
+                    "host key"
+                } else {
+                    "authentication"
+                }),
+                "{text}"
+            );
+            assert!(!text.contains(fixture.directory.path().to_str().unwrap()));
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = SshStream::connect(invalid.ssh.as_ref().unwrap(), &target).unwrap();
+            let pid = stream.process_id();
+            let mut byte = [0];
+            let first = timeout(Duration::from_secs(5), stream.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string();
+            let second = stream.read(&mut byte).await.unwrap_err().to_string();
+            assert_eq!(
+                first, second,
+                "repeated EOF must not repoll a completed task"
+            );
+            assert_eq!(
+                stream.write_all(b"probe").await.unwrap_err().to_string(),
+                first
+            );
+            drop(stream);
+            reaped(pid).await;
+
+            let mut stream = SshStream::connect(invalid.ssh.as_ref().unwrap(), &target).unwrap();
+            let pid = stream.process_id();
+            timeout(Duration::from_secs(5), async {
+                while stream.child.try_wait().unwrap().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let write_error = stream.write_all(b"probe").await.unwrap_err().to_string();
+            assert!(
+                write_error.contains(if wrong_host {
+                    "host key"
+                } else {
+                    "authentication"
+                }),
+                "{write_error}"
+            );
+            drop(stream);
             reaped(pid).await;
         }
         peer.abort();
