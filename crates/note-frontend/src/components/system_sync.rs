@@ -1,4 +1,4 @@
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, collections::HashSet, rc::Rc};
 
 use gloo_timers::callback::Interval;
 use note_core::sync::{SyncConfig, SyncRule};
@@ -7,7 +7,9 @@ use yew::prelude::*;
 use yew_duskmoon::Alert;
 
 use super::sync_connection_editor::SyncConnectionEditor;
+use super::sync_rule_labels::SyncRuleLabels;
 use crate::api::{self, SyncConnectionSummary, SyncProfile, SyncStatus};
+use crate::state::LabelKey;
 
 #[derive(Properties, PartialEq)]
 pub struct SystemSyncProps {
@@ -18,6 +20,8 @@ pub struct SystemSyncProps {
     pub onsave: Callback<MouseEvent>,
     pub save_disabled: bool,
     pub oneditorchange: Callback<bool>,
+    pub labels: Vec<LabelKey>,
+    pub labels_error: Option<String>,
 }
 
 pub fn sync_config_error(value: &SyncConfig) -> Option<String> {
@@ -37,16 +41,21 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
     let active = use_mut_ref(|| true);
     let editor = use_state(|| None::<Option<String>>);
     let connection_saved = use_state(|| false);
+    let label_drafts = use_mut_ref(HashSet::<String>::new);
+    let has_label_drafts = use_state(|| false);
     {
         let active = active.clone();
         use_effect_with((), move |_| move || *active.borrow_mut() = false);
     }
     {
         let oneditorchange = props.oneditorchange.clone();
-        use_effect_with(editor.is_some(), move |open| {
-            oneditorchange.emit(*open);
-            || ()
-        });
+        use_effect_with(
+            (editor.is_some(), *has_label_drafts),
+            move |(editor_open, labels_pending)| {
+                oneditorchange.emit(*editor_open || *labels_pending);
+                || ()
+            },
+        );
     }
     let on_add_connection = {
         let editor = editor.clone();
@@ -285,11 +294,24 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                     let on_selector = {
                         let value = props.value.clone();
                         let onchange = props.onchange.clone();
-                        Callback::from(move |event: InputEvent| {
-                            let input: HtmlInputElement = event.target_unchecked_into();
+                        Callback::from(move |selector: String| {
                             let mut next = value.clone();
-                            next.rules[index].selector = input.value();
+                            next.rules[index].selector = selector;
                             onchange.emit(next);
+                        })
+                    };
+                    let on_label_draft = {
+                        let label_drafts = label_drafts.clone();
+                        let has_label_drafts = has_label_drafts.clone();
+                        let id = rule.id.clone();
+                        Callback::from(move |pending| {
+                            let mut drafts = label_drafts.borrow_mut();
+                            if pending {
+                                drafts.insert(id.clone());
+                            } else {
+                                drafts.remove(&id);
+                            }
+                            has_label_drafts.set(!drafts.is_empty());
                         })
                     };
                     let on_rule_enabled = {
@@ -305,7 +327,13 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                     let on_remove = {
                         let value = props.value.clone();
                         let onchange = props.onchange.clone();
+                        let label_drafts = label_drafts.clone();
+                        let has_label_drafts = has_label_drafts.clone();
+                        let id = rule.id.clone();
                         Callback::from(move |_| {
+                            let mut drafts = label_drafts.borrow_mut();
+                            drafts.remove(&id);
+                            has_label_drafts.set(!drafts.is_empty());
                             let mut next = value.clone();
                             next.rules.remove(index);
                             onchange.emit(next);
@@ -321,16 +349,20 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                                 <button type="button" class="btn btn-outline" disabled={controls_disabled} onclick={on_remove}
                                     aria-label={format!("Remove sync rule {}", index + 1)}>{ "Remove" }</button>
                             </div>
-                            <label class="field">
-                                <span>{ "Label selector" }</span>
-                                <input type="text" class="input" value={rule.selector.clone()} placeholder="project=bear_note"
-                                    disabled={controls_disabled} oninput={on_selector} />
-                            </label>
+                            <SyncRuleLabels id={rule.id.clone()} selector={rule.selector.clone()}
+                                labels={props.labels.clone()} disabled={controls_disabled}
+                                onchange={on_selector} ondraftchange={on_label_draft} />
                         </div>
                     }
                 }) }
             </div>
-            <p class="system-score-help">{ "Rules match any selected group. Removing a matching label keeps both copies and stops their sync. Save settings to apply changes." }</p>
+            if props.value.rules.is_empty() {
+                <p class="empty compact">{ "No sync rules. Add a rule and choose labels to select which notes sync to GaoNote." }</p>
+            }
+            <p class="system-score-help">{ "Only notes matching an enabled rule sync to GaoNote. All label conditions in a rule must match; any enabled rule can match. Removing a matching label keeps both copies and stops their sync. Save settings to apply changes." }</p>
+            if props.labels_error.is_some() {
+                <p class="system-score-help" role="status">{ "Label suggestions could not be loaded. You can still enter label keys and values." }</p>
+            }
             if let Some(message) = validation_error {
                 <p role="alert" class="system-score-error">{ message }</p>
             }
@@ -381,7 +413,7 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                         onclick={on_retry}>{ if *retrying { "Retrying..." } else { "Retry sync" } }</button>
                 }
                 <button type="button" class="btn btn-primary" onclick={props.onsave.clone()}
-                    disabled={controls_disabled || props.save_disabled}>
+                    disabled={controls_disabled || props.save_disabled || *has_label_drafts}>
                     { if props.saving { "Saving..." } else { "Save settings" } }
                 </button>
             </div>

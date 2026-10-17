@@ -1528,6 +1528,86 @@ a.dashboard-metric-detail:hover {
     min-width: 0;
 }
 
+.sync-label-picker {
+    display: grid;
+    gap: 0.75rem;
+    min-width: 0;
+}
+
+.sync-label-picker .label-picker-row {
+    align-items: flex-end;
+    flex-wrap: wrap;
+}
+
+.sync-label-picker .label-picker-row .field {
+    margin: 0;
+    flex-basis: 10rem;
+}
+
+.sync-label-picker > p {
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--color-on-surface-variant, #46464f);
+}
+
+.sync-label-picker .label-eq {
+    margin-bottom: 0.85rem;
+}
+
+.sync-label-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0;
+    margin: 0;
+    list-style: none;
+}
+
+.sync-label-chip {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    max-width: 100%;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.4rem;
+    background: var(--color-surface, #faf8ff);
+}
+
+.sync-label-chip code {
+    min-width: 0;
+    font-family: inherit;
+    font-size: 0.85rem;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.sync-label-picker summary {
+    width: fit-content;
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--color-on-surface-variant, #46464f);
+}
+
+.sync-label-picker details > .field {
+    margin: 0.75rem 0 0;
+}
+
+@media (max-width: 720px) {
+    .sync-label-picker .label-picker-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .sync-label-picker .label-eq {
+        display: none;
+    }
+
+    .sync-label-picker .input {
+        width: 100%;
+    }
+}
+
 .duplicate-rule-head h4 {
     font-size: 0.9rem;
 }

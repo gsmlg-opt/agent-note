@@ -98,7 +98,7 @@ pub fn system_page(props: &SystemPageProps) -> Html {
         let labels_error = labels_error.clone();
         let needs_labels = matches!(
             props.section,
-            SystemSection::Categories | SystemSection::Duplicates
+            SystemSection::Sync | SystemSection::Categories | SystemSection::Duplicates
         );
         use_effect_with(needs_labels, move |selected| {
             if *selected {
@@ -376,6 +376,7 @@ pub fn system_page(props: &SystemPageProps) -> Html {
 
                 <div hidden={props.section != SystemSection::Sync}>
                 <SystemSync value={current.sync.clone()} saving={*saving}
+                    labels={(*labels).clone()} labels_error={(*labels_error).clone()}
                     active={props.section == SystemSection::Sync}
                     onsave={on_save.clone()} save_disabled={save_disabled} oneditorchange={{
                     let sync_editor_open = sync_editor_open.clone();

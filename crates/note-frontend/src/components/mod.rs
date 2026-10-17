@@ -7,6 +7,7 @@ pub mod org_event_table;
 pub mod org_table;
 pub mod org_workspace_form;
 mod sync_connection_editor;
+pub mod sync_rule_labels;
 pub mod system_navigation;
 pub mod system_sync;
 
