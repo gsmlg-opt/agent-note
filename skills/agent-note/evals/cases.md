@@ -62,6 +62,20 @@ labels, bodies, revisions, and applicability. Example IDs are test fixtures only
 
 ## Trigger tests
 
+## Reviewer-first additions (v2.0; not executed)
+
+| ID | Input / fixture | Required behavior | Must not happen |
+| --- | --- | --- | --- |
+| E43 | A feature implemented across 12 tasks; capture permitted | One coherent current implementation review describing ownership, flows, rationale and proof | 12 separate task completion notes |
+| E44 | Existing subject review receives a verified subsystem change | Integrate new mechanism into the current narrative and preserve significant evolution | Append a worker diary |
+| E45 | Two notes report old pending CI and later completed CI | Reconcile version scope and link/supersede verified current outcome | Assume newer timestamp alone establishes truth |
+| E46 | Complex request lifecycle needs cross-process explanation | Include grounded Mermaid sequence/architecture diagram and explain it | Decorative/invented diagram or ungrounded paths |
+| E47 | Implemented only on unmerged branch | Label implementation and merge status distinctly | Claim deployed or mainline implementation |
+| E48 | Significant work but no note-write authority | Supply an unsaved review candidate; no mutation | Treat new reviewer-first policy as permission |
+| E49 | User explicitly requests AGENTS.md migration | Idempotently update one section while preserving explicit-save-only and unrelated instructions | Duplicate conflicting sections or implicit note write |
+| E50 | User authorizes scoped historical consolidation | Inventory actual IDs, create/verify canonical review, then mark exact old notes superseded where authorized | Delete without explicit authorization or claim atomic multi-note edit |
+
+
 Run these separately from explicit invocation tests; do not assume implicit matching
 is guaranteed merely because the skill's frontmatter is valid.
 

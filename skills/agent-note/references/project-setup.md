@@ -30,6 +30,14 @@ Do not insert a guessed value or leave a placeholder in the real instruction fil
 
 ## Apply the template, not the entire skill
 
+The canonical snippet now declares the **reviewer-first** knowledge objective.
+During an explicitly authorized setup/migration, replace obsolete “save after each
+fix” wording in the existing Agent Note section rather than appending a competing
+policy. Retain explicit-save-only/read-only constraints and any applicable
+repository-specific rules. A skill change alone does not authorize editing
+`AGENTS.md`; use the normal setup boundaries and idempotent diff/readback checks.
+
+
 Read [the canonical project entry point](../assets/AGENTS.snippet.md). Substitute
 `<exact-project-label>` with the resolved value. Preserve the target document's
 language and formatting; keep the declaration syntax and exact project value intact.

@@ -8,12 +8,15 @@ description: >-
   boundaries to evaluate reusable findings. Search before creating, prefer scoped
   updates, and skip routine progress. Reviews are read-only unless writes are requested.
 metadata:
-  version: "1.2.0"
+  version: "2.0.0"
 ---
 
 # Agent Note
 
-Maintain knowledge that helps the next agent make a better decision. Do not turn
+Maintain project knowledge primarily for **human engineering review**: document why
+a system exists, how it works, why key design decisions were made, what was
+implemented, and which conclusions have evidence. Keep actionable guidance for
+subsequent agents as a secondary purpose. Do not turn
 successful tasks into a stream of completion reports. **No note is a valid outcome.**
 This skill manages Markdown notes and an explicitly requested project entry point,
 not task execution, Org leases, or scheduling.
@@ -53,7 +56,7 @@ defines where, when, and how to apply it safely.
 | --- | --- | --- |
 | Setup | Explicit request to configure project memory or its AGENTS.md section | Scoped file edit, or a proposed diff without editing access |
 | Recall | Relevant prior decisions, troubleshooting knowledge, or a note lookup | Read-only findings with scope and sources |
-| Capture | Explicit save request, accepted decision, validated work slice, or reproducible blocker handoff | Skip, create, or update a focused note |
+| Capture | Explicit save request, accepted decision, a meaningful independently reviewable implementation boundary, or reproducible blocker handoff | Skip, revise a topic note, or create an implementation review |
 | Curate | Requested audit, consolidation, or correction of existing notes | Read-only proposal unless changes are authorized |
 
 Do not capture after every patch, commit, test, review round, or subagent response.
@@ -117,6 +120,37 @@ remain valid; a newer timestamp alone does not make the older one obsolete.
 
 ## 5. Write for future use
 
+**Select the correct document class before writing.** A reusable operational lesson
+captures one invariant or failure boundary and may use the compact note template.
+An **implementation review** explains a coherent user-facing feature, subsystem,
+or architectural change to a human reviewer. The latter is the default durable
+output for significant implementation work when scoped capture is authorized.
+
+For implementation reviews, establish a stable topic/title and organize by:
+background and problem; goals/non-goals; implemented architecture and ownership;
+normal, failure, cancellation, and recovery flows; design principles, alternatives,
+and tradeoffs; actual implementation stages and important corrections; public
+contracts, persistence/migrations and compatibility; verification and evidence;
+remaining limitations; source/version/supersession relationships. Only include
+sections applicable to the work. Prefer actual implementation over a speculative
+plan; distinguish proposed, implemented, tested, released, and deployed states.
+
+Explain mechanisms, not only changed files. Include Mermaid diagrams **when they
+materially clarify** module boundaries, sequence, state machines, or data models.
+Use one canonical current review per coherent subject and scope. Reconcile worker
+reports before publishing. Revise the integrated explanation instead of appending
+chronological subagent notes, test logs, ephemeral authorizations or status updates.
+Preserve important decisions and design evolution in a concise history with links.
+Raw CI logs/hashes/live diagnostic traces belong in referenced evidence, not the
+main explanatory narrative. Respect exact user-requested documents and language.
+
+**Human review gate:** Can a new engineer, without the conversation, explain the
+problem, architectural ownership, core flow and failure handling, rationale,
+implemented behavior, verification coverage, limitations and where to inspect code?
+If not, the implementation review is incomplete; improve it or explicitly identify
+missing evidence rather than claiming completion.
+
+
 For a knowledge note, put the conclusion first, followed by only the context needed
 to apply it. Use [the note template](assets/note-template.md) when helpful.
 
@@ -130,8 +164,11 @@ issues, or ADRs. Separate checks you performed from reports by others.
 Use the user's requested language; otherwise follow project documentation for new
 notes and preserve an existing note's language. Title the actual boundary, symptom,
 or decision so it is searchable. Avoid vague titles such as "hardening" or "Task 3".
-Keep knowledge notes short (often 150–350 words), with no required minimum or quota.
-Do not pad them with test counts, commit diaries, or boilerplate reassurance.
+Keep small operational lessons concise, without a length quota. **Do not impose the
+short-lesson target on implementation reviews.** An implementation review should be
+self-contained and as detailed as the architecture and evidence require; do not pad
+with test counts, commit diaries, or boilerplate reassurance. For complex systems,
+use [the implementation review template](assets/implementation-review-template.md).
 
 When updating, revise the current explanation instead of appending another task
 report. Retain important rationale and still-valid scopes. Mark superseded guidance
@@ -178,6 +215,16 @@ before marking old guidance superseded, then verify each old note. Report partia
 completion; never delete notes as compensation for an interrupted operation.
 
 ## 7. Curate only the authorized scope
+
+For a requested project-knowledge cleanup, first inventory scoped note IDs and
+read candidate bodies. Classify as canonical implementation review, independent
+operational lesson, historical evidence, proposal, or duplicate/obsolete record.
+Build or update verified canonical reviews from repository source, accepted design,
+and relevant notes; map task fragments to their topic. Preserve provenance and
+historical context by linking or marking supersession only after the replacement is
+verified. Do not delete, relabel, or move records without explicit authorization.
+The resulting review must be understandable without opening every task fragment.
+
 
 For an audit, collect bounded project-scoped pages, read the relevant bodies, and
 propose keep/update/consolidate/supersede actions with IDs and reasons. Report the

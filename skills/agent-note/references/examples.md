@@ -1,5 +1,16 @@
 # Capture and curation examples
 
+## Human-review implementation example
+
+A set of workers completes a memory protocol across twelve tasks. Do **not**
+create twelve `Task N completed` notes. Read final sources and accepted decisions,
+then maintain one topic-level document explaining the authority model, state
+ownership, protocol flows, failure/recovery rules, migrations and verified limits.
+Link PRs and task reports as evidence. If evidence is incomplete, mark the exact
+unsupported portion instead of asserting final acceptance. Keep independently
+reusable failure lessons separate only when they have distinct future applicability.
+
+
 These are synthetic decision examples, not facts about an actual checkout. Do not save
 their text as project evidence, invent commits, or report their checks as executed.
 

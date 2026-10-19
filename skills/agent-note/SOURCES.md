@@ -1,5 +1,16 @@
 # Review basis and provenance
 
+## Reviewer-first v2.0 overlay (2026-10-19)
+
+This is a **documentation-only additive policy revision**, built on the repository
+v1.2.0 source at `gsmlg-opt/agent-note` (default-branch snapshot retrieved
+2026-10-19). It does not supersede or revalidate the original MCP implementation
+analysis below. The new human-review policy is motivated by an inspection of
+Backplane's project notes and its `AGENTS.md`, including fragmented Memory V2
+Task notes and an append-only audio lifecycle note. No underlying service/API
+behavior was changed or freshly verified for this policy edit.
+
+
 Prepared 2026-09-21 in the local `gsmlg-opt/agent-note` feature checkout on branch
 `codex/mcp-replace-patch`, reviewed against base
 `39106fe18d0fd79922c6ba6f57f6d26ddbbfaca9`. Version 1.2.0 updates the repository-owned

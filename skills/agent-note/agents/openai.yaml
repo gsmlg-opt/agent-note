@@ -1,8 +1,8 @@
 interface:
   display_name: Agent Note
-  short_description: Set up and maintain project knowledge
+  short_description: Reviewer-first project engineering knowledge
   default_prompt: Use $agent-note to set up the project AGENTS.md entry point when
-    explicitly requested, or recall relevant knowledge and evaluate durable findings.
+    explicitly requested, or recall relevant knowledge and maintain human-reviewable implementation explanations.
     Respect project scope and write authorization; skip routine progress.
 policy:
   allow_implicit_invocation: true

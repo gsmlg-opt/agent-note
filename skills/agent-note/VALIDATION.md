@@ -1,5 +1,22 @@
 # Validation report — version 1.2.0
 
+## v2.0 validation status (2026-10-19)
+
+The original v1.2.0 checks below are retained as **historical results only**.
+The v2.0 overlay adds static and behavior fixtures; running this patch does not
+imply that model evaluations, MCP integration tests, or installation succeeded.
+Validate the final source tree with the repository's existing skill validator and
+with the original E01–E42 plus new E43–E50 cases. Record actual results here
+separately rather than inheriting the prior green status.
+
+## Executed v2.0 static checks (2026-10-19)
+
+- `uv run --no-project --with pyyaml python /Users/gao/.codex/skills/.system/skill-creator/scripts/quick_validate.py skills/agent-note` passed with `Skill is valid!`.
+- A Python source check confirmed all 11 Markdown files decode as UTF-8, use LF-only text, end with a newline, and contain no trailing whitespace; all 9 relative Markdown links resolve.
+- The evaluation inventory contains 50 unique sequential IDs (`E01`–`E50`). This checks fixture numbering only; the behavioral cases were not executed.
+- `git diff --check` and `git diff --cached --check` passed with no output.
+
+
 Date: 2026-09-21
 
 ## Executed static checks

@@ -1,5 +1,8 @@
 # <Searchable conclusion, boundary, or failure cause>
 
+> This compact template is for operational lessons. Use
+> `assets/implementation-review-template.md` for complete implementation reviews.
+
 <Put the actionable conclusion in one or two sentences.>
 
 ## Context and rationale

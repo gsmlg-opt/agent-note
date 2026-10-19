@@ -1,6 +1,11 @@
 # Agent Note — shared project knowledge skill
 
-Version 1.2.0 is the repository-owned Agent Note instruction package. It supports
+**v2.0 reviewer-first overlay:** retain the v1.2 MCP contract, setup authority,
+conflict/revision safeguards and original evaluation fixtures. Significant
+implementations are documented for human review; short operational knowledge
+continues to be supported. See `assets/implementation-review-template.md`.
+
+Version 2.0.0 is the repository-owned Agent Note instruction package. It supports
 setup, recall, qualified capture, and authorized curation of project-scoped knowledge.
 It is instruction-only: it neither packages/installs itself nor changes the MCP server,
 even though this repository contains the server contract it teaches.
@@ -13,7 +18,7 @@ even though this repository contains the server contract it teaches.
 - `references/mcp-contract.md`: current HTTP MCP replacement/patch contract.
 - `references/examples.md`: capture, curation, patch, replacement, and conflict examples.
 - `assets/`: optional note template and project entry-point snippet.
-- `evals/cases.md`: 42 expected-behavior fixtures, not executed results.
+- `evals/cases.md`: 50 expected-behavior fixtures, not executed results.
 - `SOURCES.md` and `VALIDATION.md`: local review basis and recorded checks.
 
 Keep the source package under `skills/agent-note/`. Do not edit an installed copy as
