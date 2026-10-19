@@ -1,6 +1,7 @@
 pub mod api;
 mod connections;
 mod diagnostics;
+mod progress;
 pub use diagnostics::SyncDiagnostic;
 pub mod phoenix;
 mod runtime;

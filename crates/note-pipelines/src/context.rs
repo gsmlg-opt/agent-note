@@ -13,6 +13,7 @@ pub trait NoteMutationNotifier: Send + Sync {
 
 /// Shared storage and embedding dependencies constructed at the application composition root.
 /// Passed explicitly through pipeline and transport layers; no globals.
+#[derive(Clone)]
 pub struct Context {
     storage: Arc<dyn StorageBackend>,
     pub embedder: Arc<dyn Embedder>,

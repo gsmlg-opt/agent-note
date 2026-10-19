@@ -8,7 +8,7 @@ use yew_duskmoon::Alert;
 
 use super::sync_connection_editor::SyncConnectionEditor;
 use super::sync_rule_labels::SyncRuleLabels;
-use crate::api::{self, SyncConnectionSummary, SyncProfile, SyncStatus};
+use crate::api::{self, SyncConnectionSummary, SyncDirectionProgress, SyncProfile, SyncStatus};
 use crate::state::LabelKey;
 
 #[derive(Properties, PartialEq)]
@@ -39,6 +39,107 @@ fn sync_timestamp(timestamp: i64) -> Html {
             <time datetime={time.to_rfc3339()}>{ time.format("%Y-%m-%d %H:%M:%S UTC").to_string() }</time>
         },
         None => html! { <span>{ "Unknown time" }</span> },
+    }
+}
+
+fn direction_phase(progress: &SyncDirectionProgress) -> &str {
+    match progress.phase.as_str() {
+        "checking" => "Checking notes",
+        "transferring" => "Transferring notes",
+        "blocked" => "Needs attention",
+        "reconnecting" => "Reconnecting",
+        "paused" => "Paused",
+        "idle" if progress.notes_remaining == Some(0) && progress.blocked_notes == 0 => {
+            "Round complete"
+        }
+        "idle" => "Waiting for notes",
+        _ => "Waiting for progress",
+    }
+}
+
+fn note_phase(phase: &str) -> &str {
+    match phase {
+        "preparing" => "Preparing note",
+        "metadata" => "Transferring note content",
+        "attachments" => "Transferring attachments",
+        "applying" => "Applying note",
+        "awaiting_commit" => "Awaiting confirmation",
+        _ => "Processing note",
+    }
+}
+
+fn direction_progress(title: &str, progress: &SyncDirectionProgress, connected: bool) -> Html {
+    let checking = progress.phase == "checking";
+    let resolved = progress
+        .notes_equal
+        .saturating_add(progress.notes_completed)
+        .saturating_add(progress.notes_superseded);
+    let value = if checking {
+        progress.notes_checked
+    } else {
+        resolved
+    };
+    // A known zero-work round is complete; native progress requires a positive max.
+    let maximum = progress.notes_total.map(|total| total.max(1));
+    let value = progress.notes_total.map(|total| {
+        if total == 0 && progress.phase == "idle" {
+            1
+        } else {
+            value.min(total)
+        }
+    });
+    let current_note = progress
+        .current_note
+        .as_ref()
+        .filter(|_| connected && progress.phase == "transferring");
+    html! {
+        <section class="sync-progress-direction" aria-label={title.to_string()}>
+            <h4>{ title }</h4>
+            <p class="sync-progress-phase" role="status">{ direction_phase(progress) }</p>
+            <p class="system-score-help">{
+                match progress.basis.as_str() {
+                    "remote_verified" => "Compared with GaoNote in this round",
+                    "legacy_replay" => "Legacy replay; remote totals unavailable",
+                    _ => "Local queue; remote state not verified",
+                }
+            }</p>
+            <progress aria-label={format!("{title} round progress")}
+                max={maximum.map(|value| value.to_string())} value={value.map(|value| value.to_string())} />
+            <p>{ match progress.notes_total {
+                Some(total) if checking => format!("{} of {total} checked", progress.notes_checked),
+                Some(total) => format!("{total} notes in this round"),
+                None => format!("Total unknown · {} checked", progress.notes_checked),
+            } }</p>
+            <ul class="sync-progress-counts">
+                <li>{ format!("{} already equal", progress.notes_equal) }</li>
+                <li>{ format!("{} planned", progress.notes_planned) }</li>
+                <li>{ format!("{} delivered", progress.notes_completed) }</li>
+                <li>{ format!("{} superseded", progress.notes_superseded) }</li>
+                <li>{ match progress.notes_remaining {
+                    Some(remaining) => format!("{remaining} remaining"),
+                    None if checking => "Remaining being checked".to_string(),
+                    None => "Remaining unknown".to_string(),
+                } }</li>
+                <li>{ format!("{} blocked", progress.blocked_notes) }</li>
+            </ul>
+            if let Some(note) = current_note {
+                <div class="sync-progress-note">
+                    <p class="sync-progress-phase" role="status">{ note_phase(&note.phase) }</p>
+                    if let Some(title) = &note.title {
+                        <p class="sync-progress-note-title">{ title.chars().take(240).collect::<String>() }</p>
+                    }
+                    <p><code>{ &note.id }</code></p>
+                    <p>{ format!("{} / {} attachments · {} / {} bytes", note.attachments_completed,
+                        note.attachments_total, note.attachment_bytes_done, note.attachment_bytes_total) }</p>
+                    if note.attachments_total > 0 {
+                        <progress aria-label={format!("{title} attachment bytes")}
+                            max={note.attachment_bytes_total.max(1).to_string()}
+                            value={note.attachment_bytes_done.min(note.attachment_bytes_total).to_string()} />
+                    }
+                </div>
+            }
+            <details class="sync-progress-round"><summary>{ "Round details" }</summary><code>{ &progress.run_id }</code></details>
+        </section>
     }
 }
 
@@ -174,7 +275,7 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
             };
             let timer = selected.then(|| {
                 fetch.emit(());
-                Interval::new(5_000, move || fetch.emit(()))
+                Interval::new(2_000, move || fetch.emit(()))
             });
             move || drop(timer)
         });
@@ -401,6 +502,19 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                 if let Some(message) = &current.last_error {
                     <Alert variant={Some("error".to_string())}><span>{ message.clone() }</span></Alert>
                 }
+                if let Some(progress) = &current.progress {
+                    <div class="sync-progress">
+                        <p class="system-score-help">{ "Last progress sample: " }{ sync_timestamp(progress.updated_at) }</p>
+                        if let Some(total) = progress.tracked_notes {
+                            <p class="system-score-help">{ format!("Locally tracked at last full check: {total} notes") }</p>
+                        }
+                        <div class="sync-progress-directions">
+                            { direction_progress("Sending to GaoNote", &progress.upload, current.state == "connected") }
+                            { direction_progress("Receiving from GaoNote", &progress.download, current.state == "connected") }
+                        </div>
+                        <p class="system-score-help">{ "Counts belong to each current round. Delivered means processing was confirmed; a newer version may still win." }</p>
+                    </div>
+                }
                 <section class="sync-diagnostics" aria-label="Connection diagnostics">
                     <h4>{ "Connection diagnostics" }</h4>
                     <p class="system-score-help">{ "Recent connection events from this server session, newest first. History resets when Agent Note restarts." }</p>
@@ -453,5 +567,60 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                 </button>
             </div>
         </section>
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    fn progress(phase: &str, remaining: Option<u64>) -> SyncDirectionProgress {
+        SyncDirectionProgress {
+            run_id: "round-1".into(),
+            phase: phase.into(),
+            basis: "remote_verified".into(),
+            notes_total: None,
+            notes_checked: 0,
+            notes_equal: 0,
+            notes_planned: 0,
+            notes_completed: 0,
+            notes_superseded: 0,
+            notes_remaining: remaining,
+            blocked_notes: 0,
+            current_note: None,
+        }
+    }
+
+    #[test]
+    fn unknown_remaining_is_never_reported_as_complete() {
+        assert_eq!(
+            direction_phase(&progress("idle", None)),
+            "Waiting for notes"
+        );
+        assert_eq!(
+            direction_phase(&progress("checking", None)),
+            "Checking notes"
+        );
+    }
+
+    #[test]
+    fn completion_requires_resolved_and_unblocked_work() {
+        assert_eq!(
+            direction_phase(&progress("idle", Some(0))),
+            "Round complete"
+        );
+        let mut blocked = progress("idle", Some(0));
+        blocked.blocked_notes = 1;
+        assert_ne!(direction_phase(&blocked), "Round complete");
+        assert_ne!(
+            direction_phase(&progress("idle", Some(1))),
+            "Round complete"
+        );
+    }
+
+    #[test]
+    fn awaiting_commit_is_distinct_from_attachment_transfer() {
+        assert_eq!(note_phase("awaiting_commit"), "Awaiting confirmation");
+        assert_eq!(note_phase("attachments"), "Transferring attachments");
     }
 }

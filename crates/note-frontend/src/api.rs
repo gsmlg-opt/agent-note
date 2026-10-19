@@ -264,6 +264,41 @@ pub struct SyncDiagnostic {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncCurrentNote {
+    pub id: String,
+    pub title: Option<String>,
+    pub phase: String,
+    pub attachments_total: u64,
+    pub attachments_completed: u64,
+    pub attachment_bytes_total: u64,
+    pub attachment_bytes_done: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncDirectionProgress {
+    pub run_id: String,
+    pub phase: String,
+    pub basis: String,
+    pub notes_total: Option<u64>,
+    pub notes_checked: u64,
+    pub notes_equal: u64,
+    pub notes_planned: u64,
+    pub notes_completed: u64,
+    pub notes_superseded: u64,
+    pub notes_remaining: Option<u64>,
+    pub blocked_notes: u64,
+    pub current_note: Option<SyncCurrentNote>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncProgress {
+    pub updated_at: i64,
+    pub tracked_notes: Option<u64>,
+    pub upload: SyncDirectionProgress,
+    pub download: SyncDirectionProgress,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SyncStatus {
     pub profiles: Vec<SyncProfile>,
     pub state: String,
@@ -279,6 +314,8 @@ pub struct SyncStatus {
     pub peer_node_id: Option<String>,
     #[serde(default)]
     pub blocked_notes: Vec<SyncBlockedNote>,
+    #[serde(default)]
+    pub progress: Option<SyncProgress>,
 }
 
 pub async fn get_sync_status() -> Result<SyncStatus, String> {
@@ -1044,6 +1081,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sync_progress_preserves_independent_rounds_and_unknown_totals() {
+        let direction = serde_json::json!({
+            "run_id": "upload-1", "phase": "transferring", "basis": "remote_verified",
+            "notes_total": 4, "notes_checked": 4, "notes_equal": 2,
+            "notes_planned": 2, "notes_completed": 1, "notes_superseded": 0,
+            "notes_remaining": 1, "blocked_notes": 0,
+            "current_note": {"id": "note-1", "title": "<script>Title</script>",
+                "phase": "awaiting_commit", "attachments_total": 1,
+                "attachments_completed": 1, "attachment_bytes_total": 100,
+                "attachment_bytes_done": 100}
+        });
+        let mut download = direction.clone();
+        download["run_id"] = serde_json::json!("download-1");
+        download["notes_total"] = serde_json::Value::Null;
+        download["notes_remaining"] = serde_json::Value::Null;
+        download["current_note"] = serde_json::Value::Null;
+        let progress: SyncProgress = serde_json::from_value(serde_json::json!({
+            "updated_at": 1_700_000_000_000_i64, "tracked_notes": 1761,
+            "upload": direction, "download": download
+        }))
+        .unwrap();
+        assert_eq!(progress.upload.notes_completed, 1);
+        assert_eq!(progress.tracked_notes, Some(1761));
+        assert_eq!(
+            progress.upload.current_note.unwrap().phase,
+            "awaiting_commit"
+        );
+        assert_eq!(progress.download.notes_total, None);
+        assert_eq!(progress.download.notes_remaining, None);
+        assert_eq!(progress.download.run_id, "download-1");
+    }
+
+    #[test]
+    fn sync_status_rejects_malformed_progress_instead_of_silently_discarding_it() {
+        let response = serde_json::json!({
+            "profiles": [], "state": "connected", "last_error": null,
+            "last_success_at": null, "pending_notes": 0, "initializing": false,
+            "node_id": null, "peer_node_id": null,
+            "progress": { "updated_at": "invalid", "upload": {}, "download": {} }
+        });
+        assert!(serde_json::from_value::<SyncStatus>(response).is_err());
+    }
+
+    #[test]
     fn sync_status_rejects_malformed_connection_diagnostics() {
         let response = serde_json::json!({
             "profiles": [],
@@ -1073,6 +1154,7 @@ mod tests {
         });
         let legacy: SyncStatus = serde_json::from_value(response.clone()).unwrap();
         assert!(legacy.diagnostics.is_empty());
+        assert!(legacy.progress.is_none());
         assert_eq!(legacy.last_attempt_at, None);
         assert_eq!(legacy.next_retry_at, None);
 

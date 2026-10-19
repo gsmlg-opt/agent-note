@@ -1807,6 +1807,60 @@ a.dashboard-metric-detail:hover {
     overflow-wrap: anywhere;
 }
 
+.sync-progress-directions {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
+    gap: 1rem;
+}
+
+.sync-progress-direction {
+    min-width: 0;
+    padding: 0.85rem;
+    border: 1px solid var(--color-outline-variant, #c7c5d0);
+    border-radius: 0.5rem;
+    overflow-wrap: anywhere;
+}
+
+.sync-progress-direction h4,
+.sync-progress-direction p {
+    margin: 0 0 0.6rem;
+}
+
+.sync-progress-direction progress {
+    display: block;
+    width: 100%;
+    height: 0.65rem;
+    margin-bottom: 0.6rem;
+    accent-color: var(--color-primary, #6750a4);
+}
+
+.sync-progress-phase,
+.sync-progress-note-title {
+    font-weight: 700;
+}
+
+.sync-progress-counts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 1rem;
+    padding: 0;
+    margin: 0.75rem 0;
+    list-style: none;
+    font-size: 0.85rem;
+}
+
+.sync-progress-note {
+    border-top: 1px solid var(--color-outline-variant, #c7c5d0);
+    padding-top: 0.75rem;
+    margin-top: 0.75rem;
+    font-size: 0.85rem;
+}
+
+.sync-progress-round {
+    font-size: 0.75rem;
+    color: var(--color-on-surface-variant, #46464f);
+}
+
 .sync-diagnostics {
     min-width: 0;
     margin-top: 1.25rem;

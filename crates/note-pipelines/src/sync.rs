@@ -561,6 +561,297 @@ pub async fn sync_inventory(
         next_cursor,
     })
 }
+
+/// A round captures only descriptors, never complete note bodies or file bytes.
+#[derive(Debug, Clone)]
+pub struct SyncCandidate {
+    pub descriptor: SyncAck,
+    pub pending: bool,
+}
+async fn sync_candidate_page(
+    session: &dyn StorageSession,
+    after: Option<&str>,
+    limit: usize,
+    pending_only: bool,
+) -> anyhow::Result<Vec<SyncCandidate>> {
+    let rows = session
+        .list_sync_records(
+            if pending_only { "pending" } else { "member" },
+            after,
+            limit.clamp(1, 1000),
+        )
+        .await?;
+    let mut result = Vec::with_capacity(rows.len());
+    for (id, value) in rows {
+        if pending_only {
+            let pending: Pending = serde_json::from_value(value)?;
+            result.push(SyncCandidate {
+                descriptor: pending.event.acknowledgement(),
+                pending: true,
+            });
+        } else {
+            let member: Member = serde_json::from_value(value)?;
+            let pending = get::<Pending>(session, "pending", &id).await?;
+            result.push(SyncCandidate {
+                pending: pending.is_some_and(|pending| pending.event == member.event),
+                descriptor: member.event.acknowledgement(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// Captures a finite round of lightweight descriptors from one database snapshot.
+pub async fn sync_round_candidates(
+    ctx: &Context,
+    pending_only: bool,
+) -> anyhow::Result<Vec<SyncCandidate>> {
+    let tx = ctx.storage().begin(TransactionMode::Snapshot).await?;
+    let result = async {
+        let mut candidates = Vec::new();
+        let mut after = None;
+        loop {
+            let page =
+                sync_candidate_page(tx.as_ref(), after.as_deref(), PAGE, pending_only).await?;
+            if page.is_empty() {
+                break;
+            }
+            after = page
+                .last()
+                .map(|candidate| candidate.descriptor.note_id.clone());
+            candidates.extend(page);
+        }
+        Ok(candidates)
+    }
+    .await;
+    finish_transaction(tx, result).await
+}
+
+pub async fn sync_candidates(
+    ctx: &Context,
+    after: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<SyncCandidate>> {
+    let tx = ctx.storage().begin(TransactionMode::Snapshot).await?;
+    let result = sync_candidate_page(tx.as_ref(), after, limit, false).await;
+    finish_transaction(tx, result).await
+}
+pub async fn sync_candidate_current(
+    ctx: &Context,
+    descriptor: &SyncAck,
+    require_nonpending: bool,
+) -> anyhow::Result<bool> {
+    let tx = ctx.storage().begin(TransactionMode::Snapshot).await?;
+    let result = async {
+        Ok(get::<Member>(tx.as_ref(), "member", &descriptor.note_id)
+            .await?
+            .is_some_and(|m| m.event.acknowledgement() == *descriptor)
+            && (!require_nonpending
+                || get::<Pending>(tx.as_ref(), "pending", &descriptor.note_id)
+                    .await?
+                    .is_none()))
+    }
+    .await;
+    finish_transaction(tx, result).await
+}
+pub async fn sync_pending_candidates(
+    ctx: &Context,
+    after: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<SyncCandidate>> {
+    let s = ctx.storage().session().await?;
+    sync_candidate_page(s.as_ref(), after, limit, true).await
+}
+pub async fn sync_current_candidate(
+    ctx: &Context,
+    note_id: &str,
+) -> anyhow::Result<Option<SyncCandidate>> {
+    let tx = ctx.storage().begin(TransactionMode::Snapshot).await?;
+    let result = async {
+        let Some(member) = get::<Member>(tx.as_ref(), "member", note_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(SyncCandidate {
+            descriptor: member.event.acknowledgement(),
+            pending: get::<Pending>(tx.as_ref(), "pending", note_id)
+                .await?
+                .is_some(),
+        }))
+    }
+    .await;
+    finish_transaction(tx, result).await
+}
+pub async fn sync_candidate_event(
+    ctx: &Context,
+    descriptor: &SyncAck,
+) -> anyhow::Result<Option<SyncEvent>> {
+    let s = ctx.storage().session().await?;
+    Ok(get::<Member>(s.as_ref(), "member", &descriptor.note_id)
+        .await?
+        .filter(|m| m.event.acknowledgement() == *descriptor)
+        .map(|m| m.event))
+}
+/// Restore a missing association without advancing its generation or overriding fences.
+pub async fn recover_missing_sync_association(
+    ctx: &Context,
+    descriptor: &SyncAck,
+) -> anyhow::Result<bool> {
+    let tx = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let result = async {
+        if !tx.get_system_config().await?.sync.enabled {
+            return Ok(false);
+        }
+        let Some(mut member) = get::<Member>(tx.as_ref(), "member", &descriptor.note_id).await?
+        else {
+            return Ok(false);
+        };
+        if !member.attached
+            || member.event.kind != SyncEventKind::Snapshot
+            || member.event.acknowledgement() != *descriptor
+            || get::<Pending>(tx.as_ref(), "pending", &descriptor.note_id)
+                .await?
+                .is_some_and(|p| p.event.acknowledgement() != *descriptor)
+        {
+            return Ok(false);
+        }
+        member.event.kind = SyncEventKind::Attach;
+        member.event.event_id = uuid::Uuid::new_v4().to_string();
+        put(
+            tx.as_ref(),
+            "pending",
+            &descriptor.note_id,
+            &Pending {
+                event: member.event.clone(),
+                attachments: member.attachments.clone(),
+            },
+        )
+        .await?;
+        put(tx.as_ref(), "member", &descriptor.note_id, &member).await?;
+        Ok(true)
+    }
+    .await;
+    finish_transaction(tx, result).await
+}
+
+pub fn validate_sync_state_query(query: &SyncStateQuery) -> anyhow::Result<()> {
+    uuid::Uuid::parse_str(&query.query_id)?;
+    anyhow::ensure!(
+        !query.items.is_empty() && query.items.len() <= 32,
+        "sync state query requires 1..32 descriptors"
+    );
+    let mut ids = HashSet::new();
+    let mut event_ids = HashSet::new();
+    for item in &query.items {
+        uuid::Uuid::parse_str(&item.note_id)?;
+        uuid::Uuid::parse_str(&item.event_id)?;
+        anyhow::ensure!(ids.insert(&item.note_id), "duplicate sync state descriptor");
+        anyhow::ensure!(
+            event_ids.insert(&item.event_id),
+            "duplicate sync state event ID"
+        );
+        for stamp in [&item.generation, &item.control, &item.version] {
+            uuid::Uuid::parse_str(&stamp.node_id)?;
+            anyhow::ensure!(stamp.millis >= 0, "invalid sync state clock");
+        }
+        anyhow::ensure!(
+            item.control >= item.generation,
+            "invalid sync state control"
+        );
+        anyhow::ensure!(
+            !matches!(item.kind, SyncEventKind::Detach | SyncEventKind::Fence)
+                || item.control > item.generation,
+            "closure control must follow association generation"
+        );
+        anyhow::ensure!(
+            item.snapshot_hash.len() == 64
+                && item
+                    .snapshot_hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid sync state hash"
+        );
+    }
+    Ok(())
+}
+
+/// Reads a coherent head/member snapshot. Queries do not mutate receipts or leases.
+pub async fn query_sync_state(
+    ctx: &Context,
+    query: &SyncStateQuery,
+) -> anyhow::Result<SyncStateResponse> {
+    validate_sync_state_query(query)?;
+    let tx = ctx.storage().begin(TransactionMode::Snapshot).await?;
+    let result = async {
+        anyhow::ensure!(tx.get_system_config().await?.sync.enabled, "sync is paused");
+        let mut items = Vec::with_capacity(query.items.len());
+        for requested in &query.items {
+            let member = get::<Member>(tx.as_ref(), "member", &requested.note_id).await?;
+            // Detached members retain a frozen closure while subsequent head edits
+            // belong only to the independent local copy.
+            let head = if member.as_ref().is_some_and(|member| member.attached) {
+                get::<Head>(tx.as_ref(), "head", &requested.note_id).await?
+            } else {
+                None
+            };
+            let mut available = Some(true);
+            if let Some(head) = &head {
+                if let Some(snapshot) = &head.snapshot {
+                    for descriptor in &snapshot.attachments {
+                        let Some(attachment) =
+                            head.attachments.iter().find(|a| a.id == descriptor.id)
+                        else {
+                            available = Some(false);
+                            break;
+                        };
+                        let Some(storage) = &attachment.storage else {
+                            available = None;
+                            break;
+                        };
+                        if storage.size_bytes != descriptor.size_bytes
+                            || storage.checksum_sha256 != descriptor.checksum_sha256
+                        {
+                            available = Some(false);
+                            break;
+                        }
+                        match ctx.attachments().head_object(&storage.object_key).await {
+                            Ok(actual)
+                                if actual.size_bytes == descriptor.size_bytes
+                                    && actual.checksum_sha256 == descriptor.checksum_sha256 => {}
+                            Ok(_) => {
+                                available = Some(false);
+                                break;
+                            }
+                            Err(_) => {
+                                available = None;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            items.push(SyncStateItem {
+                requested: requested.clone(),
+                association: match &member {
+                    None => SyncAssociation::Missing,
+                    Some(m) if m.attached => SyncAssociation::Attached,
+                    Some(_) => SyncAssociation::Detached,
+                },
+                member: member.map(|m| m.event.acknowledgement()),
+                head: head.map(|h| SyncStateHead {
+                    version: h.version,
+                    snapshot_hash: h.hash,
+                    attachments_available: available,
+                }),
+            });
+        }
+        Ok(SyncStateResponse {
+            query_id: query.query_id.clone(),
+            items,
+        })
+    }
+    .await;
+    finish_transaction(tx, result).await
+}
 pub async fn next_sync_event(ctx: &Context) -> anyhow::Result<Option<SyncEvent>> {
     let tx = ctx.storage().begin(TransactionMode::Immediate).await?;
     let result = async {
@@ -1045,6 +1336,17 @@ pub async fn apply_sync_event(
         }
         if !winning && head.as_ref().is_some_and(|h| h.version == event.version) {
             member.attachments = head.as_ref().unwrap().attachments.clone();
+        }
+        if member.event.kind == SyncEventKind::Attach
+            && member.event.event_id == event.event_id
+            && get::<Pending>(tx.as_ref(), "pending", &event.note_id)
+                .await?
+                .is_none()
+        {
+            // The inbound association is already durable. Its exact wire event
+            // remains in received for retries; outbound audit may compare content.
+            member.event.kind = SyncEventKind::Snapshot;
+            member.event.event_id = uuid::Uuid::new_v4().to_string();
         }
         put(tx.as_ref(), "member", &event.note_id, &member).await?;
         put(tx.as_ref(), "received", &event.event_id, event).await?;

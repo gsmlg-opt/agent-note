@@ -49,6 +49,708 @@ fn remote(mut event: SyncEvent, kind: SyncEventKind, content: &str) -> SyncEvent
     event
 }
 
+#[tokio::test]
+async fn state_probe_is_read_only_and_missing_association_recovery_is_conditional() {
+    let (ctx, _backend, _dir) = support::test_context().await;
+    enabled(&ctx).await;
+    let note = save_note(&ctx, input("probe source")).await.unwrap();
+    let original = next_sync_event(&ctx).await.unwrap().unwrap();
+    let query = SyncStateQuery {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        items: vec![original.acknowledgement()],
+    };
+    let response = query_sync_state(&ctx, &query).await.unwrap();
+    assert!(response.matches_query(&query));
+    assert_eq!(response.items[0].association, SyncAssociation::Attached);
+    assert_eq!(
+        response.items[0]
+            .head
+            .as_ref()
+            .unwrap()
+            .attachments_available,
+        Some(true)
+    );
+    assert_eq!(
+        sync_status(&ctx).await.unwrap().pending_notes,
+        1,
+        "probe cannot ACK pending work"
+    );
+    acknowledge_sync_event(&ctx, &original.acknowledgement())
+        .await
+        .unwrap();
+    let page = sync_candidates(&ctx, None, 32).await.unwrap();
+    assert_eq!(page.len(), 1);
+    assert!(!page[0].pending);
+    let normalized = page[0].descriptor.clone();
+    assert_eq!(normalized.kind, SyncEventKind::Snapshot);
+    assert_ne!(normalized.event_id, original.event_id);
+    assert!(sync_candidate_current(&ctx, &normalized, true)
+        .await
+        .unwrap());
+    assert!(recover_missing_sync_association(&ctx, &normalized)
+        .await
+        .unwrap());
+    assert!(!recover_missing_sync_association(&ctx, &normalized)
+        .await
+        .unwrap());
+    let recovery = next_sync_event(&ctx).await.unwrap().unwrap();
+    assert_eq!(recovery.kind, SyncEventKind::Attach);
+    assert_ne!(recovery.event_id, normalized.event_id);
+    assert_eq!(recovery.generation, normalized.generation);
+    assert_eq!(recovery.control, normalized.control);
+    assert_eq!(recovery.version, normalized.version);
+    assert_eq!(recovery.note_id, note.id);
+    // A late ACK from before recovery must not retire the replacement event.
+    acknowledge_sync_event(&ctx, &original.acknowledgement())
+        .await
+        .unwrap();
+    assert_eq!(sync_status(&ctx).await.unwrap().pending_notes, 1);
+    release_sync_event(&ctx, &recovery.event_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn probes_do_not_disclose_unassociated_heads_and_reject_duplicate_requests() {
+    let (ctx, _backend, _dir) = support::test_context().await;
+    enabled(&ctx).await;
+    let note = save_note(
+        &ctx,
+        SaveNoteInput {
+            labels: vec![],
+            ..input("private")
+        },
+    )
+    .await
+    .unwrap();
+    let source = save_note(&ctx, input("selected")).await.unwrap();
+    let mut descriptor = sync_candidates(&ctx, None, 32).await.unwrap()[0]
+        .descriptor
+        .clone();
+    assert_eq!(descriptor.note_id, source.id);
+    descriptor.note_id = note.id;
+    let mut query = SyncStateQuery {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        items: vec![descriptor.clone()],
+    };
+    let state = query_sync_state(&ctx, &query).await.unwrap();
+    assert_eq!(state.items[0].association, SyncAssociation::Missing);
+    assert!(state.items[0].member.is_none() && state.items[0].head.is_none());
+    query.items.push(descriptor);
+    assert!(query_sync_state(&ctx, &query).await.is_err());
+}
+
+#[tokio::test]
+async fn probe_checks_actual_attachment_objects_and_stale_candidates_cannot_recover() {
+    let (ctx, _backend, _dir) = support::test_context().await;
+    enabled(&ctx).await;
+    let mut value = input("immutable file");
+    value.attachments.push(NoteAttachment {
+        id: "file".into(),
+        path: "file.txt".into(),
+        mime: "text/plain".into(),
+        description: String::new(),
+        content: b"file bytes".to_vec(),
+        storage: None,
+    });
+    let note = save_note(&ctx, value).await.unwrap();
+    let event = next_sync_event(&ctx).await.unwrap().unwrap();
+    acknowledge_sync_event(&ctx, &event.acknowledgement())
+        .await
+        .unwrap();
+    let descriptor = sync_candidates(&ctx, None, 32).await.unwrap()[0]
+        .descriptor
+        .clone();
+    let query = SyncStateQuery {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        items: vec![descriptor.clone()],
+    };
+    let available = query_sync_state(&ctx, &query).await.unwrap();
+    assert!(available.items[0].matches_snapshot(&descriptor));
+    let object = note.attachments[0].storage.as_ref().unwrap();
+    ctx.attachments()
+        .delete_object(&object.object_key)
+        .await
+        .unwrap();
+    assert!(!query_sync_state(&ctx, &query).await.unwrap().items[0].matches_snapshot(&descriptor));
+    update_note_fields(
+        &ctx,
+        &note.id,
+        UpdateNoteFieldsInput {
+            expected_revision: note.revision,
+            title: note.title,
+            content: "replacement".into(),
+            labels: vec![("project".into(), "bear_note".into())],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!sync_candidate_current(&ctx, &descriptor, true)
+        .await
+        .unwrap());
+    assert!(!recover_missing_sync_association(&ctx, &descriptor)
+        .await
+        .unwrap());
+    assert_eq!(sync_status(&ctx).await.unwrap().pending_notes, 1);
+}
+
+#[tokio::test]
+async fn detached_state_probe_does_not_disclose_independent_private_edits() {
+    let (ctx, _backend, _dir) = support::test_context().await;
+    enabled(&ctx).await;
+    let note = save_note(&ctx, input("shared")).await.unwrap();
+    let attach = next_sync_event(&ctx).await.unwrap().unwrap();
+    acknowledge_sync_event(&ctx, &attach.acknowledgement())
+        .await
+        .unwrap();
+    let detached = update_note_fields(
+        &ctx,
+        &note.id,
+        UpdateNoteFieldsInput {
+            expected_revision: note.revision,
+            title: note.title,
+            content: "frozen closure".into(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let detach = next_sync_event(&ctx).await.unwrap().unwrap();
+    update_note_fields(
+        &ctx,
+        &note.id,
+        UpdateNoteFieldsInput {
+            expected_revision: detached.revision,
+            title: detached.title,
+            content: "independent private edit".into(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let query = SyncStateQuery {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        items: vec![attach.acknowledgement()],
+    };
+    for expected_kind in [SyncEventKind::Detach, SyncEventKind::Fence] {
+        let state = query_sync_state(&ctx, &query).await.unwrap();
+        assert!(state.matches_query(&query));
+        assert_eq!(state.items[0].association, SyncAssociation::Detached);
+        assert_eq!(state.items[0].member.as_ref().unwrap().kind, expected_kind);
+        assert!(
+            state.items[0].head.is_none(),
+            "private head must stay hidden"
+        );
+        assert!(
+            !recover_missing_sync_association(&ctx, &detach.acknowledgement())
+                .await
+                .unwrap()
+        );
+        acknowledge_sync_event(&ctx, &detach.acknowledgement())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn missing_receiver_membership_recovers_pending_and_nonpending_snapshots() {
+    for pending in [false, true] {
+        let (sender, _sender_backend, _sender_dir) = support::test_context().await;
+        let (receiver, _receiver_backend, _receiver_dir) = support::test_context().await;
+        enabled(&sender).await;
+        enabled(&receiver).await;
+        let note = save_note(&sender, input("initial")).await.unwrap();
+        let attach = next_sync_event(&sender).await.unwrap().unwrap();
+        acknowledge_sync_event(&sender, &attach.acknowledgement())
+            .await
+            .unwrap();
+        if pending {
+            update_note_fields(
+                &sender,
+                &note.id,
+                UpdateNoteFieldsInput {
+                    expected_revision: note.revision,
+                    title: note.title,
+                    content: "pending replacement".into(),
+                    labels: vec![("project".into(), "bear_note".into())],
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let candidate = sync_current_candidate(&sender, &note.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.pending, pending);
+        assert_eq!(candidate.descriptor.kind, SyncEventKind::Snapshot);
+        let snapshot = sync_candidate_event(&sender, &candidate.descriptor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            apply_sync_event(&receiver, &snapshot, &HashMap::new())
+                .await
+                .unwrap(),
+            SyncApplyResult::Ignored
+        );
+        let query = SyncStateQuery {
+            query_id: uuid::Uuid::new_v4().to_string(),
+            items: vec![candidate.descriptor.clone()],
+        };
+        assert_eq!(
+            query_sync_state(&receiver, &query).await.unwrap().items[0].association,
+            SyncAssociation::Missing,
+            "ignored Snapshot cannot establish membership"
+        );
+        assert!(
+            recover_missing_sync_association(&sender, &candidate.descriptor)
+                .await
+                .unwrap()
+        );
+        let recovery = next_sync_event(&sender).await.unwrap().unwrap();
+        assert_eq!(recovery.kind, SyncEventKind::Attach);
+        assert_ne!(recovery.event_id, candidate.descriptor.event_id);
+        assert_eq!(recovery.generation, snapshot.generation);
+        assert_eq!(recovery.control, snapshot.control);
+        assert_eq!(recovery.version, snapshot.version);
+        assert_eq!(recovery.snapshot, snapshot.snapshot);
+        assert_eq!(recovery.snapshot_hash, snapshot.snapshot_hash);
+        assert_eq!(
+            apply_sync_event(&receiver, &recovery, &HashMap::new())
+                .await
+                .unwrap(),
+            SyncApplyResult::Applied
+        );
+        assert!(query_sync_state(&receiver, &query).await.unwrap().items[0]
+            .matches_snapshot(&candidate.descriptor));
+        assert_eq!(
+            get_note(&receiver, &note.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            if pending {
+                "pending replacement"
+            } else {
+                "initial"
+            }
+        );
+        acknowledge_sync_event(&sender, &snapshot.acknowledgement())
+            .await
+            .unwrap();
+        assert_eq!(sync_status(&sender).await.unwrap().pending_notes, 1);
+        acknowledge_sync_event(&sender, &recovery.acknowledgement())
+            .await
+            .unwrap();
+        assert_eq!(sync_status(&sender).await.unwrap().pending_notes, 0);
+    }
+}
+
+#[tokio::test]
+async fn missing_association_recovery_cannot_override_a_newer_pending_snapshot() {
+    let (ctx, _backend, _dir) = support::test_context().await;
+    enabled(&ctx).await;
+    let note = save_note(&ctx, input("initial")).await.unwrap();
+    let attach = next_sync_event(&ctx).await.unwrap().unwrap();
+    acknowledge_sync_event(&ctx, &attach.acknowledgement())
+        .await
+        .unwrap();
+    let captured = sync_current_candidate(&ctx, &note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    update_note_fields(
+        &ctx,
+        &note.id,
+        UpdateNoteFieldsInput {
+            expected_revision: note.revision,
+            title: note.title,
+            content: "newer pending".into(),
+            labels: vec![("project".into(), "bear_note".into())],
+        },
+    )
+    .await
+    .unwrap();
+    let newer = sync_current_candidate(&ctx, &note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(newer.pending);
+    assert!(
+        !recover_missing_sync_association(&ctx, &captured.descriptor)
+            .await
+            .unwrap()
+    );
+    let preserved = next_sync_event(&ctx).await.unwrap().unwrap();
+    assert_eq!(preserved.acknowledgement(), newer.descriptor);
+    assert_eq!(preserved.kind, SyncEventKind::Snapshot);
+    assert_eq!(preserved.snapshot.unwrap().content, "newer pending");
+    release_sync_event(&ctx, &preserved.event_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_association_recovery_cannot_override_a_receiver_fence() {
+    let (sender, _sender_backend, _sender_dir) = support::test_context().await;
+    let (receiver, _receiver_backend, _receiver_dir) = support::test_context().await;
+    enabled(&sender).await;
+    enabled(&receiver).await;
+    let note = save_note(&sender, input("shared")).await.unwrap();
+    let attach = next_sync_event(&sender).await.unwrap().unwrap();
+    acknowledge_sync_event(&sender, &attach.acknowledgement())
+        .await
+        .unwrap();
+    let captured = sync_current_candidate(&sender, &note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let query = SyncStateQuery {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        items: vec![captured.descriptor.clone()],
+    };
+    assert_eq!(
+        query_sync_state(&receiver, &query).await.unwrap().items[0].association,
+        SyncAssociation::Missing
+    );
+    // A closure may arrive after the missing-state observation but before recovery.
+    apply_sync_event(&receiver, &attach, &HashMap::new())
+        .await
+        .unwrap();
+    let received = get_note(&receiver, &note.id).await.unwrap().unwrap();
+    update_note_fields(
+        &receiver,
+        &note.id,
+        UpdateNoteFieldsInput {
+            expected_revision: received.revision,
+            title: received.title,
+            content: "closed independent copy".into(),
+            labels: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    let detach = next_sync_event(&receiver).await.unwrap().unwrap();
+    acknowledge_sync_event(&receiver, &detach.acknowledgement())
+        .await
+        .unwrap();
+    let fence = sync_current_candidate(&receiver, &note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fence.descriptor.kind, SyncEventKind::Fence);
+    assert!(
+        recover_missing_sync_association(&sender, &captured.descriptor)
+            .await
+            .unwrap()
+    );
+    let recovery = next_sync_event(&sender).await.unwrap().unwrap();
+    assert_eq!(recovery.generation, attach.generation);
+    assert_eq!(recovery.control, attach.control);
+    assert_eq!(
+        apply_sync_event(&receiver, &recovery, &HashMap::new())
+            .await
+            .unwrap(),
+        SyncApplyResult::Ignored
+    );
+    let state = query_sync_state(&receiver, &query).await.unwrap();
+    assert_eq!(state.items[0].association, SyncAssociation::Detached);
+    assert_eq!(state.items[0].member.as_ref(), Some(&fence.descriptor));
+    assert!(!state.items[0].matches_snapshot(&captured.descriptor));
+    assert_eq!(
+        get_note(&receiver, &note.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "closed independent copy"
+    );
+    acknowledge_sync_event(&sender, &recovery.acknowledgement())
+        .await
+        .unwrap();
+    let state = query_sync_state(&receiver, &query).await.unwrap();
+    assert_eq!(state.items[0].association, SyncAssociation::Detached);
+    assert!(!state.items[0].matches_snapshot(&captured.descriptor));
+}
+
+#[test]
+fn state_query_rejects_nonadvancing_closures_and_reused_event_ids() {
+    let stamp = Hlc {
+        millis: 1,
+        counter: 0,
+        node_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let descriptor = SyncAck {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        note_id: uuid::Uuid::new_v4().to_string(),
+        generation: stamp.clone(),
+        control: stamp.clone(),
+        kind: SyncEventKind::Snapshot,
+        version: stamp,
+        snapshot_hash: "a".repeat(64),
+    };
+    let mut query = SyncStateQuery {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        items: vec![descriptor.clone()],
+    };
+    for kind in [SyncEventKind::Detach, SyncEventKind::Fence] {
+        query.items[0].kind = kind;
+        assert!(validate_sync_state_query(&query).is_err(), "{kind:?}");
+        query.items[0].control.counter += 1;
+        assert!(validate_sync_state_query(&query).is_ok());
+        query.items[0].control = descriptor.control.clone();
+    }
+    query.items[0] = descriptor.clone();
+    let mut duplicate = descriptor;
+    duplicate.note_id = uuid::Uuid::new_v4().to_string();
+    query.items.push(duplicate);
+    assert!(validate_sync_state_query(&query).is_err());
+    query.items[1].event_id = uuid::Uuid::new_v4().to_string();
+    assert!(validate_sync_state_query(&query).is_ok());
+}
+
+#[tokio::test]
+async fn received_attach_normalizes_without_replay_and_preserves_exact_retry_receipt() {
+    let (sender, _sender_backend, _sender_dir) = support::test_context().await;
+    let (receiver, receiver_backend, _receiver_dir) = support::test_context().await;
+    enabled(&sender).await;
+    enabled(&receiver).await;
+    let bytes = b"received attachment".to_vec();
+    let mut value = input("received snapshot");
+    value.attachments.push(NoteAttachment {
+        id: "file".into(),
+        path: "file.txt".into(),
+        mime: "text/plain".into(),
+        description: String::new(),
+        content: bytes.clone(),
+        storage: None,
+    });
+    let note = save_note(&sender, value).await.unwrap();
+    let attach = next_sync_event(&sender).await.unwrap().unwrap();
+    let attachments = HashMap::from([("file".into(), bytes)]);
+    assert_eq!(
+        apply_sync_event(&receiver, &attach, &attachments)
+            .await
+            .unwrap(),
+        SyncApplyResult::Applied
+    );
+    let normalized = sync_current_candidate(&receiver, &note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!normalized.pending);
+    assert_eq!(normalized.descriptor.kind, SyncEventKind::Snapshot);
+    assert_ne!(normalized.descriptor.event_id, attach.event_id);
+    assert_eq!(normalized.descriptor.generation, attach.generation);
+    assert_eq!(normalized.descriptor.control, attach.control);
+    assert_eq!(normalized.descriptor.version, attach.version);
+    assert_eq!(normalized.descriptor.snapshot_hash, attach.snapshot_hash);
+    let received: SyncEvent = serde_json::from_value(
+        receiver_backend
+            .session()
+            .await
+            .unwrap()
+            .get_sync_record("received", &attach.event_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(received, attach, "receipt keeps the exact wire event");
+    assert_eq!(
+        apply_sync_event(&receiver, &attach, &attachments)
+            .await
+            .unwrap(),
+        SyncApplyResult::Duplicate
+    );
+    assert_eq!(
+        sync_current_candidate(&receiver, &note.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .descriptor,
+        normalized.descriptor
+    );
+    acknowledge_sync_event(&sender, &received.acknowledgement())
+        .await
+        .unwrap();
+    assert_eq!(sync_status(&sender).await.unwrap().pending_notes, 0);
+    let query = SyncStateQuery {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        items: vec![normalized.descriptor.clone()],
+    };
+    assert!(query_sync_state(&sender, &query).await.unwrap().items[0]
+        .matches_snapshot(&normalized.descriptor));
+    assert!(
+        sync_candidate_current(&receiver, &normalized.descriptor, true)
+            .await
+            .unwrap()
+    );
+    assert!(next_sync_event(&receiver).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn losing_received_attach_keeps_its_newer_winner_attach_pending() {
+    let (ctx, _backend, _dir) = support::test_context().await;
+    enabled(&ctx).await;
+    let note = save_note(&ctx, input("local winner")).await.unwrap();
+    let original = next_sync_event(&ctx).await.unwrap().unwrap();
+    let mut older = original.clone();
+    older.event_id = uuid::Uuid::new_v4().to_string();
+    older.version.millis -= 1;
+    older.snapshot.as_mut().unwrap().content = "older remote".into();
+    older.snapshot_hash = canonical_snapshot_hash(older.snapshot.as_ref()).unwrap();
+    assert_eq!(
+        apply_sync_event(&ctx, &older, &HashMap::new())
+            .await
+            .unwrap(),
+        SyncApplyResult::Ignored
+    );
+    let winner = sync_current_candidate(&ctx, &note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(winner.pending);
+    assert_eq!(winner.descriptor.kind, SyncEventKind::Attach);
+    assert_eq!(winner.descriptor.version, original.version);
+    assert_eq!(winner.descriptor.snapshot_hash, original.snapshot_hash);
+    assert_ne!(winner.descriptor.event_id, older.event_id);
+    assert_eq!(
+        apply_sync_event(&ctx, &older, &HashMap::new())
+            .await
+            .unwrap(),
+        SyncApplyResult::Duplicate
+    );
+    acknowledge_sync_event(&ctx, &older.acknowledgement())
+        .await
+        .unwrap();
+    assert_eq!(
+        next_sync_event(&ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .acknowledgement(),
+        winner.descriptor
+    );
+    acknowledge_sync_event(&ctx, &winner.descriptor)
+        .await
+        .unwrap();
+    release_sync_event(&ctx, &original.event_id).await.unwrap();
+}
+
+struct CountSnapshotTransactions {
+    inner: Arc<dyn StorageBackend>,
+    snapshots: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for CountSnapshotTransactions {
+    async fn session(&self) -> note_storage::StorageResult<Box<dyn note_storage::StorageSession>> {
+        self.inner.session().await
+    }
+    async fn begin(
+        &self,
+        mode: TransactionMode,
+    ) -> note_storage::StorageResult<Box<dyn note_storage::StorageTransaction>> {
+        if mode == TransactionMode::Snapshot {
+            self.snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.begin(mode).await
+    }
+    async fn info(&self) -> note_storage::StorageResult<note_storage::BackendInfo> {
+        self.inner.info().await
+    }
+}
+
+#[tokio::test]
+async fn round_candidates_capture_all_pages_and_pending_under_one_snapshot_without_file_reads() {
+    let (ctx, backend, dir) = support::test_context().await;
+    enabled(&ctx).await;
+    let acknowledged = save_note(&ctx, input("acknowledged")).await.unwrap();
+    let attach = next_sync_event(&ctx).await.unwrap().unwrap();
+    acknowledge_sync_event(&ctx, &attach.acknowledgement())
+        .await
+        .unwrap();
+    let mut value = input("pending attachment");
+    value.attachments.push(NoteAttachment {
+        id: "file".into(),
+        path: "file.txt".into(),
+        mime: "text/plain".into(),
+        description: String::new(),
+        content: b"unreadable during capture".to_vec(),
+        storage: None,
+    });
+    let pending = save_note(&ctx, value).await.unwrap();
+    ctx.attachments()
+        .delete_object(&pending.attachments[0].storage.as_ref().unwrap().object_key)
+        .await
+        .unwrap();
+    // Retained control rows occupy another page even without live note rows.
+    for index in 0..130 {
+        let mut fence = attach.clone();
+        fence.event_id = uuid::Uuid::new_v4().to_string();
+        fence.note_id = format!("00000000-0000-4000-8000-{index:012}");
+        fence.kind = SyncEventKind::Fence;
+        fence.control.counter += 1;
+        fence.snapshot = None;
+        apply_sync_event(&ctx, &fence, &HashMap::new())
+            .await
+            .unwrap();
+    }
+    let snapshots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let scanning = Context::new(
+        Arc::new(CountSnapshotTransactions {
+            inner: backend,
+            snapshots: snapshots.clone(),
+        }),
+        ctx.embedder.clone(),
+        Arc::new(::note_attachments::FilesystemAttachmentStore::new(
+            dir.path().join("attachments"),
+        )),
+    );
+    let captured = sync_round_candidates(&scanning, false).await.unwrap();
+    assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(captured.len(), 132);
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|candidate| candidate.descriptor.kind == SyncEventKind::Fence)
+            .count(),
+        130
+    );
+    assert!(captured
+        .iter()
+        .any(|candidate| candidate.descriptor.note_id == acknowledged.id && !candidate.pending));
+    let pending_round = sync_round_candidates(&scanning, true).await.unwrap();
+    assert_eq!(snapshots.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(pending_round.len(), 1);
+    assert!(pending_round[0].pending);
+    assert_eq!(pending_round[0].descriptor.note_id, pending.id);
+    update_note_fields(
+        &ctx,
+        &pending.id,
+        UpdateNoteFieldsInput {
+            expected_revision: pending.revision,
+            title: pending.title,
+            content: "replacement belongs to the next round".into(),
+            labels: vec![("project".into(), "bear_note".into())],
+        },
+    )
+    .await
+    .unwrap();
+    save_note(&ctx, input("new note belongs to the next round"))
+        .await
+        .unwrap();
+    assert_eq!(captured.len(), 132);
+    assert_eq!(pending_round.len(), 1);
+    assert!(
+        !sync_candidate_current(&ctx, &pending_round[0].descriptor, false)
+            .await
+            .unwrap()
+    );
+    let next = sync_round_candidates(&scanning, false).await.unwrap();
+    assert_eq!(next.len(), 133);
+}
+
 async fn contracts(ctx: &Context, backend: &Arc<dyn StorageBackend>) {
     let tx = backend.begin(TransactionMode::Immediate).await.unwrap();
     tx.put_sync_record("sync-test", "rollback", &serde_json::json!({"value":1}))

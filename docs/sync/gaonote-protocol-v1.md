@@ -1,8 +1,7 @@
 # Agent Note ↔ GaoNote protocol v1
 
-This is the receiver contract for the Agent Note client implemented in phase 1.
-GaoNote's production receiver and ingress are phase 2. The local Phoenix fixture
-tests interoperability; it does not provide a production receiver.
+This describes the Agent Note client and GaoNote receiver/sender contract.
+Local interoperability checks and production acceptance are separate results.
 
 ## Connection and authorization
 
@@ -36,7 +35,8 @@ Direct/SSH client modes do not synthesize certificate-verification headers. See
 [SSH setup](ssh-tunnel.md); production interoperability must be verified against
 the actual target environment.
 
-The `phx_join` payload and its successful reply `response` have the same shape:
+The `phx_join` payload retains these exact four fields. Its successful reply
+`response` contains the same fields, with optional capabilities described below:
 
 ```json
 {
@@ -72,7 +72,7 @@ and WebSocket disconnect trigger reconnect.
 | `blob_end` | `transfer_id`, `blob_id` | `{}` after size/hash verification |
 | `attachment_begin` | `transfer_id`, `blob_id` | `{}` |
 | `transfer_commit` | `transfer_id` | The complete committed ACK |
-| `inventory_complete` | `{}` | `{}` |
+| `inventory_complete` | `{}` for legacy; negotiated round ID and total below | `{}` |
 | `ack` | The complete ACK | Notification after an inbound commit |
 | `note_rejected` | `code`, `event_id`, `note_id`, `reason` | Rejection notification when `transfer_commit` had no request ref |
 
@@ -106,10 +106,100 @@ objects use their stored metadata, so oversized current notes can remain pending
 and editable while transfer is blocked by the negotiated limit.
 
 Both peers must service incoming frames while sending an inventory or large blob.
-Absence from an inventory never means deletion. Reconnect restarts enumeration;
-event IDs, versions and membership fences make replay safe. ACK only after the
+Absence from an inventory never means deletion. Reconnect restarts comparison or
+legacy enumeration; event IDs, versions and membership fences make replay safe. ACK only after the
 final business transaction commits. A crash or disconnect before confirmation
 keeps the latest pending snapshot available for retry.
+
+## Optional incremental state comparison
+
+An upgraded join reply advertises `"capabilities":["state_query_v1"]`. The client
+installs its inbound query handler, requests `sync_negotiate` with that exact
+capabilities object and requires an identical successful response before sending
+`inventory_start {}`. The server originates no queries before `inventory_start`;
+the client must service queries arriving before its reply. Selection is immutable
+after inventory starts. Without the advertisement, neither peer sends extension
+events. Failed advertised negotiation is a session error.
+
+Either direction may issue `state_query` as a Phoenix request:
+
+```json
+{"query_id":"<fresh UUID>","items":["<complete SyncAck descriptor>"]}
+```
+
+The illustrative string represents a descriptor object, including `event_id`,
+`note_id`, `generation`, `control`, `kind`, `version` and `snapshot_hash`. Requests
+contain 1–32 distinct note UUIDs and must fit the 128 KiB frame limit. Each direction
+allows one outstanding query; opposite queries, transfers and heartbeats continue
+on the same socket. Queries read coherent committed state and never acknowledge
+events, alter queues, or acquire transfer leases.
+
+The successful response contains `query_id` and one item per request, in request
+order, with no omitted, duplicate or additional results:
+
+```json
+{
+  "query_id":"<same UUID>",
+  "items":[{
+    "requested":"<exact requested descriptor object>",
+    "association":"attached",
+    "member":"<current descriptor object or null>",
+    "head":{
+      "version":{"millis":1,"counter":0,"node_id":"<UUID>"},
+      "snapshot_hash":"<64 lowercase SHA256 hex characters>",
+      "attachments_available":true
+    }
+  }]
+}
+```
+
+Association is `missing`, `attached` or `detached`. Missing association returns
+null member and head. Detached associations retain the frozen control descriptor
+and return null head, so later private edits are not disclosed. An attached head
+may be null when its committed state is unavailable. Availability is true, false
+or null (unknown); true requires actual committed objects with matching metadata,
+including storage references. Old ACK records or manifests alone are insufficient.
+Validate descriptors, clocks, hashes, association coherence and exact echoes.
+Malformed responses and equal versions with conflicting hashes fail the session.
+
+Only a revalidated nonpending Snapshot can skip transfer. The remote association
+must be attached, generation/control must match, both its member and committed
+head must match the requested version/hash, and attachments must be available.
+Acknowledged Attach normalization may change event ID; this narrow comparison
+accepts Attach/Snapshot content equivalence. Pending events still require exact
+final ACKs, including after a lost ACK. Control records always retain fence rules.
+After durably accepting an Attach, the receiver also stores its nonpending
+outbound member as a fresh Snapshot with the same clocks/hash. Its receipt and
+ACK retain the original Attach descriptor. A newer local winner queued as an
+Attach must still obtain its own exact ACK before normalization.
+
+A missing receiver association for an unchanged attached Snapshot conditionally
+queues a fresh Attach event ID with its existing generation, control, version,
+hash and attachments. This also covers an unchanged pending Snapshot. Recovery
+cannot overwrite a newer pending event or invent a generation to bypass a fence.
+
+Each sender captures a finite descriptor cohort consistently before opening attachment data,
+checks it in pages, then services pending work before audit differences with an
+8:1 bound. Revalidate each slot before skipping or reserving it. Concurrent edits
+supersede that slot and remain eligible in the next round. Local preparation or
+definitive note rejection blocks that version and yields to the next note. Normal
+completion keeps the socket open; pending work is serviced while idle and a full
+audit runs every five minutes. Legacy peers use pending priority with bounded
+audit replay, without claiming freshly verified equality.
+
+For negotiated sessions, `inventory_complete` carries
+`{"inventory_id":"<sender round UUID>","total_notes":1761}`. The total is the
+distinct authorized classified cohort, including blocked and control entries.
+It proves enumeration completion, not convergence. Legacy sessions retain `{}`.
+
+The status API exposes optional dated upload/download progress: round ID, basis,
+checked/equal/planned/confirmed/superseded/remaining/blocked counts and current
+note/stage/attachment bytes. Optional `progress.tracked_notes` retains the local
+cohort size from the last full check across smaller pending-only rounds. For a known local round,
+`total = equal + confirmed + superseded + remaining`; blocked is part of remaining.
+Download remaining stays unknown when only the sender's cohort total is known.
+Attachment bytes at 100% still show awaiting confirmation until durable ACK.
+Pause/disconnect clears current activity and retains dated round counts.
 
 The receiver may push an `ack` before returning the matching `transfer_commit`
 reply. Both confirmations repeat the full descriptor and are idempotent. Validate
