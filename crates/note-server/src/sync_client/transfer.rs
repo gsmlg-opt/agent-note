@@ -67,6 +67,9 @@ impl StagedBlob {
         self.verified = true;
         Ok(())
     }
+    pub fn is_verified(&self) -> bool {
+        self.verified
+    }
     pub async fn read(&self) -> Result<Vec<u8>> {
         anyhow::ensure!(self.verified, "sync blob has not been verified");
         let mut reader = tokio::fs::File::from_std(self._temp.reopen()?);

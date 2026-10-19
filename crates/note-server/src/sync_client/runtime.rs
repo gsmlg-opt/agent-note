@@ -45,6 +45,15 @@ fn commit_wait(total_bytes: u64, attachments: usize) -> Duration {
         .min(900);
     Duration::from_secs(seconds + 30)
 }
+// Older GaoNote senders read the next attachment before announcing it. Keep
+// that preparation gap separate from chunk inactivity, with 10s for delivery.
+fn attachment_prepare_wait(size: u64) -> Duration {
+    Duration::from_secs(
+        30 + size
+            .min(super::DEFAULT_MAX_BLOB_BYTES)
+            .div_ceil(1024 * 1024),
+    ) + DEADLINE
+}
 pub trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Transport for T {}
 type Socket = WebSocketStream<MaybeTlsStream<Box<dyn Transport>>>;
@@ -418,7 +427,7 @@ struct Incoming {
     metadata: StagedBlob,
     event: Option<SyncEvent>,
     blobs: HashMap<String, StagedBlob>,
-    last_activity: Instant,
+    idle_deadline: Instant,
 }
 struct Session<'a> {
     ctx: &'a Context,
@@ -609,7 +618,7 @@ impl Session<'_> {
                 wake = *at + DEADLINE;
             }
             if let Some(incoming) = &self.incoming {
-                wake = wake.min(incoming.last_activity + DEADLINE);
+                wake = wake.min(incoming.idle_deadline);
             }
             let message = tokio::select! {
                 message = self.socket.next() => message,
@@ -671,7 +680,7 @@ impl Session<'_> {
         if self
             .incoming
             .as_ref()
-            .is_some_and(|i| now.duration_since(i.last_activity) >= DEADLINE)
+            .is_some_and(|i| now >= i.idle_deadline)
         {
             bail!("sync inbound transfer stalled");
         }
@@ -806,7 +815,7 @@ impl Session<'_> {
                     metadata,
                     event: None,
                     blobs: HashMap::new(),
-                    last_activity: Instant::now(),
+                    idle_deadline: Instant::now() + DEADLINE,
                 });
             }
             "blob_chunk" => {
@@ -818,7 +827,6 @@ impl Session<'_> {
                     field(&payload, "transfer_id")? == incoming.id,
                     "sync transfer ID mismatch"
                 );
-                incoming.last_activity = Instant::now();
                 let id = field(&payload, "blob_id")?;
                 let encoded = field(&payload, "data")?;
                 anyhow::ensure!(
@@ -838,6 +846,7 @@ impl Session<'_> {
                         .context("sync attachment has not begun")?
                 };
                 blob.append(number(&payload, "offset")?, &bytes).await?;
+                incoming.idle_deadline = Instant::now() + DEADLINE;
             }
             "blob_end" => {
                 let incoming = self
@@ -848,7 +857,6 @@ impl Session<'_> {
                     field(&payload, "transfer_id")? == incoming.id,
                     "sync transfer ID mismatch"
                 );
-                incoming.last_activity = Instant::now();
                 let id = field(&payload, "blob_id")?;
                 if id == "event" {
                     incoming.metadata.finish().await?;
@@ -878,6 +886,25 @@ impl Session<'_> {
                         .finish()
                         .await?;
                 }
+                // V1 permits any attachment order; allow the largest remaining
+                // read budget only after all begun attachments are verified.
+                // Start after local verification and flushing.
+                let next_size = incoming
+                    .event
+                    .as_ref()
+                    .filter(|_| incoming.blobs.values().all(StagedBlob::is_verified))
+                    .and_then(|event| event.snapshot.as_ref())
+                    .into_iter()
+                    .flat_map(|snapshot| &snapshot.attachments)
+                    .filter(|attachment| {
+                        !incoming
+                            .blobs
+                            .contains_key(&format!("attachment:{}", attachment.id))
+                    })
+                    .map(|attachment| attachment.size_bytes)
+                    .max();
+                incoming.idle_deadline =
+                    Instant::now() + next_size.map_or(DEADLINE, attachment_prepare_wait);
             }
             "attachment_begin" => {
                 let incoming = self
@@ -911,7 +938,7 @@ impl Session<'_> {
                         self.limit,
                     )?,
                 );
-                incoming.last_activity = Instant::now();
+                incoming.idle_deadline = Instant::now() + DEADLINE;
             }
             "transfer_commit" => {
                 let incoming = self
@@ -1154,6 +1181,336 @@ mod tests {
     use note_storage_turso::TursoStorage;
     use tokio_rustls::TlsAcceptor;
 
+    fn incoming_event(sizes: &[u64]) -> SyncEvent {
+        use note_core::sync::{SyncAttachment, SyncEventKind, SyncSnapshot};
+        SyncEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            note_id: uuid::Uuid::new_v4().to_string(),
+            generation: Default::default(),
+            control: Default::default(),
+            version: Default::default(),
+            kind: SyncEventKind::Snapshot,
+            snapshot_hash: "unused until commit".into(),
+            snapshot: Some(SyncSnapshot {
+                title: "Incoming".into(),
+                content: String::new(),
+                labels: vec![],
+                created_at: 1,
+                updated_at: 1,
+                deleted_at: None,
+                attachments: sizes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, size)| SyncAttachment {
+                        id: format!("attachment-{index}"),
+                        path: format!("{index}.txt"),
+                        mime: "text/plain".into(),
+                        description: String::new(),
+                        size_bytes: *size,
+                        checksum_sha256: format!("{:x}", Sha256::digest(vec![0; *size as usize])),
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    async fn begin_incoming(client: &mut Session<'_>, event: &SyncEvent) -> String {
+        let transfer = uuid::Uuid::new_v4().to_string();
+        let metadata = serde_json::to_vec(event).unwrap();
+        client
+            .receive(
+                "transfer_begin",
+                json!({
+                    "transfer_id":transfer,"size_bytes":metadata.len(),
+                    "checksum_sha256":format!("{:x}", Sha256::digest(&metadata)),
+                }),
+            )
+            .await
+            .unwrap();
+        client
+            .receive(
+                "blob_chunk",
+                json!({
+                    "transfer_id":transfer,"blob_id":"event","offset":0,
+                    "data":BASE64.encode(&metadata),
+                }),
+            )
+            .await
+            .unwrap();
+        transfer
+    }
+
+    async fn finish_incoming_blob(client: &mut Session<'_>, transfer: &str, blob: &str) {
+        client
+            .receive("blob_end", json!({"transfer_id":transfer,"blob_id":blob}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn attachment_preparation_waits_beyond_ten_seconds_after_each_verified_blob() {
+        for completed in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = local_context(dir.path()).await;
+            let runtime = SyncRuntime::default();
+            let (socket, mut peer) = local_sockets().await;
+            let mut client = local_session(&ctx, &runtime, socket);
+            let transfer = begin_incoming(&mut client, &incoming_event(&[0, 0])).await;
+            finish_incoming_blob(&mut client, &transfer, "event").await;
+            if completed == 1 {
+                client
+                    .receive(
+                        "attachment_begin",
+                        json!({
+                            "transfer_id":transfer,"blob_id":"attachment:attachment-0",
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                finish_incoming_blob(&mut client, &transfer, "attachment:attachment-0").await;
+            }
+            tokio::time::pause();
+            let worker = tokio::spawn(async move {
+                let request = peer_frame(&mut peer).await;
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                let begin = Frame::new(
+                    request.join_ref.as_deref(),
+                    None,
+                    TOPIC,
+                    "attachment_begin",
+                    json!({
+                        "transfer_id":transfer,
+                        "blob_id":format!("attachment:attachment-{completed}"),
+                    }),
+                );
+                peer.send(Message::Text(begin.encode().unwrap().into()))
+                    .await
+                    .unwrap();
+                peer_reply(&mut peer, &request).await;
+            });
+            let started = Instant::now();
+            let result = client.request("transfer_commit", json!({})).await;
+            let elapsed = Instant::now() - started;
+            worker.abort();
+            let _ = worker.await;
+            tokio::time::resume();
+            assert!(result.is_ok(), "after {completed} attachments: {result:?}");
+            // Tokio timers round wakeups to millisecond resolution.
+            let expected = Duration::from_secs(12);
+            assert!((expected..=expected + Duration::from_millis(1)).contains(&elapsed));
+            assert!(client
+                .incoming
+                .as_ref()
+                .unwrap()
+                .blobs
+                .contains_key(&format!("attachment:attachment-{completed}")));
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_preparation_has_a_fixed_bound_despite_unrelated_frames_and_heartbeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let transfer = begin_incoming(&mut client, &incoming_event(&[1])).await;
+        finish_incoming_blob(&mut client, &transfer, "event").await;
+        tokio::time::pause();
+        let worker = tokio::spawn(async move {
+            let request = peer_frame(&mut peer).await;
+            let unrelated = Frame::new(
+                request.join_ref.as_deref(),
+                None,
+                TOPIC,
+                "inventory_complete",
+                json!({}),
+            );
+            let mut ticks = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = ticks.tick() => peer.send(Message::Text(unrelated.encode().unwrap().into())).await.unwrap(),
+                    frame = peer.next() => {
+                        let Some(Ok(message)) = frame else { break };
+                        let frame = Frame::decode(&message.into_text().unwrap()).unwrap();
+                        assert_eq!(frame.event, "heartbeat");
+                        peer_reply(&mut peer, &frame).await;
+                    }
+                }
+            }
+        });
+        let started = Instant::now();
+        let error = client
+            .request("transfer_commit", json!({}))
+            .await
+            .unwrap_err();
+        let elapsed = Instant::now() - started;
+        worker.abort();
+        let _ = worker.await;
+        tokio::time::resume();
+        assert_eq!(error.to_string(), "sync inbound transfer stalled");
+        // Tokio timers round wakeups to millisecond resolution.
+        let expected = Duration::from_secs(41);
+        assert!((expected..=expected + Duration::from_millis(1)).contains(&elapsed));
+    }
+
+    #[tokio::test]
+    async fn attachment_preparation_does_not_extend_metadata_chunks_or_final_commit_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        for phase in ["metadata", "no_attachments", "begin", "chunk", "final_blob"] {
+            let (socket, _peer) = local_sockets().await;
+            let mut client = local_session(&ctx, &runtime, socket);
+            let sizes: &[u64] = if phase == "no_attachments" { &[] } else { &[1] };
+            let transfer = begin_incoming(&mut client, &incoming_event(sizes)).await;
+            if phase != "metadata" {
+                finish_incoming_blob(&mut client, &transfer, "event").await;
+            }
+            if matches!(phase, "begin" | "chunk" | "final_blob") {
+                client
+                    .receive(
+                        "attachment_begin",
+                        json!({
+                            "transfer_id":transfer,"blob_id":"attachment:attachment-0",
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            if matches!(phase, "chunk" | "final_blob") {
+                client
+                    .receive(
+                        "blob_chunk",
+                        json!({
+                            "transfer_id":transfer,"blob_id":"attachment:attachment-0",
+                            "offset":0,"data":BASE64.encode([0]),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            if phase == "final_blob" {
+                finish_incoming_blob(&mut client, &transfer, "attachment:attachment-0").await;
+            }
+            tokio::time::pause();
+            tokio::time::advance(DEADLINE - Duration::from_millis(1)).await;
+            client.check_liveness().await.unwrap();
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let error = client.check_liveness().await.unwrap_err();
+            tokio::time::resume();
+            assert_eq!(
+                error.to_string(),
+                "sync inbound transfer stalled",
+                "{phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn attachment_preparation_budget_rounds_and_caps_the_receiver_read_budget() {
+        assert_eq!(attachment_prepare_wait(0), Duration::from_secs(40));
+        assert_eq!(attachment_prepare_wait(1), Duration::from_secs(41));
+        assert_eq!(
+            attachment_prepare_wait(1024 * 1024),
+            Duration::from_secs(41)
+        );
+        assert_eq!(
+            attachment_prepare_wait(1024 * 1024 + 1),
+            Duration::from_secs(42)
+        );
+        assert_eq!(
+            attachment_prepare_wait(DEFAULT_MAX_BLOB_BYTES),
+            Duration::from_secs(552)
+        );
+        assert_eq!(attachment_prepare_wait(u64::MAX), Duration::from_secs(552));
+    }
+
+    #[tokio::test]
+    async fn attachment_preparation_uses_the_largest_unstarted_manifest_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let bytes = vec![0; 1024 * 1024 + 1];
+        let event = incoming_event(&[0, bytes.len() as u64]);
+        let transfer = begin_incoming(&mut client, &event).await;
+        tokio::time::pause();
+        finish_incoming_blob(&mut client, &transfer, "event").await;
+        assert_eq!(
+            client.incoming.as_ref().unwrap().idle_deadline - Instant::now(),
+            Duration::from_secs(42)
+        );
+        // Complete the larger entry first, regardless of manifest ordering.
+        client
+            .receive(
+                "attachment_begin",
+                json!({
+                    "transfer_id":transfer,"blob_id":"attachment:attachment-1",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.incoming.as_ref().unwrap().idle_deadline - Instant::now(),
+            DEADLINE
+        );
+        for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
+            client
+                .receive(
+                    "blob_chunk",
+                    json!({
+                        "transfer_id":transfer,"blob_id":"attachment:attachment-1",
+                        "offset":index * CHUNK,"data":BASE64.encode(chunk),
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        finish_incoming_blob(&mut client, &transfer, "attachment:attachment-1").await;
+        // The verified larger blob no longer extends preparation for the sole
+        // remaining zero-byte attachment.
+        assert_eq!(
+            client.incoming.as_ref().unwrap().idle_deadline - Instant::now(),
+            Duration::from_secs(40)
+        );
+        tokio::time::advance(Duration::from_secs(12)).await;
+        client.check_liveness().await.unwrap();
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn attachment_preparation_does_not_extend_an_interleaved_unfinished_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let transfer = begin_incoming(&mut client, &incoming_event(&[1, 0, 0])).await;
+        finish_incoming_blob(&mut client, &transfer, "event").await;
+        for index in [0, 1] {
+            client
+                .receive(
+                    "attachment_begin",
+                    json!({
+                        "transfer_id":transfer,"blob_id":format!("attachment:attachment-{index}"),
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::pause();
+        // B finishes with C still unstarted, but A is waiting for chunks.
+        finish_incoming_blob(&mut client, &transfer, "attachment:attachment-1").await;
+        tokio::time::advance(DEADLINE - Duration::from_millis(1)).await;
+        client.check_liveness().await.unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let error = client.check_liveness().await.unwrap_err();
+        tokio::time::resume();
+        assert_eq!(error.to_string(), "sync inbound transfer stalled");
+    }
+
     #[test]
     fn commit_budget_accounts_for_bytes_objects_and_the_hard_cap() {
         assert_eq!(commit_wait(0, 0), Duration::from_secs(90));
@@ -1318,6 +1675,162 @@ mod tests {
             .send(Message::Text(reply.encode().unwrap().into()))
             .await
             .unwrap();
+    }
+
+    fn inbound_metadata_frames() -> (SyncEvent, [Frame; 3]) {
+        let event = SyncEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            note_id: uuid::Uuid::new_v4().to_string(),
+            generation: Default::default(),
+            control: Default::default(),
+            version: Default::default(),
+            kind: note_core::sync::SyncEventKind::Fence,
+            snapshot_hash: sync::canonical_snapshot_hash(None).unwrap(),
+            snapshot: None,
+        };
+        let metadata = serde_json::to_vec(&event).unwrap();
+        let transfer = uuid::Uuid::new_v4().to_string();
+        let frame = |reference, event, payload| {
+            Frame::new(Some("local-session"), reference, TOPIC, event, payload)
+        };
+        let frames = [
+            frame(
+                Some("incoming-begin"),
+                "transfer_begin",
+                json!({"transfer_id":transfer,"size_bytes":metadata.len(),
+                    "checksum_sha256":format!("{:x}",Sha256::digest(&metadata))}),
+            ),
+            frame(
+                None,
+                "blob_chunk",
+                json!({"transfer_id":transfer,"blob_id":"event","offset":0,
+                    "data":BASE64.encode(&metadata)}),
+            ),
+            frame(
+                Some("incoming-metadata"),
+                "blob_end",
+                json!({"transfer_id":transfer,"blob_id":"event"}),
+            ),
+        ];
+        (event, frames)
+    }
+
+    async fn peer_send_metadata(
+        peer: &mut WebSocketStream<tokio::io::DuplexStream>,
+        frames: [Frame; 3],
+    ) {
+        for frame in frames {
+            peer.send(Message::Text(frame.encode().unwrap().into()))
+                .await
+                .unwrap();
+            if frame.reference.is_some() {
+                let response = peer_frame(peer).await;
+                assert_eq!(response.reference, frame.reference);
+                assert_eq!(response.payload["status"], "ok");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_transfer_accepts_slow_preflight_before_begin_with_healthy_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let (event, frames) = inbound_metadata_frames();
+        let started = Instant::now();
+        let worker = tokio::spawn(async move {
+            let ready = Instant::now() + Duration::from_secs(35);
+            let mut heartbeats = 0;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(ready) => break,
+                    frame = peer_frame(&mut peer) => {
+                        assert_eq!(frame.event, "heartbeat");
+                        peer_reply(&mut peer, &frame).await;
+                        heartbeats += 1;
+                    }
+                }
+            }
+            peer_send_metadata(&mut peer, frames).await;
+            heartbeats
+        });
+        loop {
+            if let Ok(message) = timeout(Duration::from_millis(250), client.socket.next()).await {
+                client.handle_message(message).await.unwrap();
+            }
+            client.check_liveness().await.unwrap();
+            if client.incoming.as_ref().is_some_and(|i| i.event.is_some()) {
+                break;
+            }
+            if Instant::now() - started < Duration::from_secs(35) {
+                assert!(client.incoming.is_none());
+            }
+        }
+        assert_eq!(
+            client.incoming.as_ref().unwrap().event.as_ref(),
+            Some(&event)
+        );
+        assert_eq!(Instant::now() - started, Duration::from_secs(35));
+        assert_eq!(worker.await.unwrap(), 1);
+        assert!(client.heartbeat.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_transfer_stall_after_metadata_ignores_unrelated_frames_and_healthy_heartbeat()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let (_, frames) = inbound_metadata_frames();
+        let heartbeats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeats_seen = heartbeats.clone();
+        let worker = tokio::spawn(async move {
+            peer_send_metadata(&mut peer, frames).await;
+            let unrelated = Frame::new(
+                Some("local-session"),
+                None,
+                TOPIC,
+                "inventory_complete",
+                json!({}),
+            );
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        peer.send(Message::Text(unrelated.encode().unwrap().into())).await.unwrap();
+                    }
+                    frame = peer_frame(&mut peer) => {
+                        assert_eq!(frame.event, "heartbeat");
+                        peer_reply(&mut peer, &frame).await;
+                        heartbeats_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+        while client.incoming.as_ref().is_none_or(|i| i.event.is_none()) {
+            let message = client.socket.next().await;
+            client.handle_message(message).await.unwrap();
+        }
+        let last_progress = client.incoming.as_ref().unwrap().idle_deadline - DEADLINE;
+        client.next_heartbeat = Instant::now() + Duration::from_secs(2);
+        let error = loop {
+            if let Ok(message) = timeout(Duration::from_millis(250), client.socket.next()).await {
+                client.handle_message(message).await.unwrap();
+            }
+            if let Err(error) = client.check_liveness().await {
+                break error;
+            }
+        };
+        assert_eq!(error.to_string(), "sync inbound transfer stalled");
+        assert_eq!(Instant::now() - last_progress, DEADLINE);
+        assert_eq!(heartbeats.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(client.heartbeat.is_none());
+        worker.abort();
+        let _ = worker.await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1524,7 +2037,7 @@ mod tests {
                 ),
                 blob,
             )]),
-            last_activity: Instant::now(),
+            idle_deadline: Instant::now() + DEADLINE,
         });
         let delayed_store = store.clone();
         let worker = tokio::spawn(async move {

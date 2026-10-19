@@ -84,6 +84,14 @@ from the event metadata blob. The manifest retains the unprefixed native ID. Att
 size/hash come from the manifest, not from `attachment_begin`. Send a `blob_end`
 even for a zero-byte attachment, then `transfer_commit`.
 
+Prepare and verify every source attachment before sending `transfer_begin`.
+GaoNote stages these verified bytes in session-owned temporary files, bounded
+by the negotiated aggregate limit, and sends local 64 KiB chunks afterward.
+Slow S3 preparation therefore does not create a gap within an announced transfer.
+GaoNote continues servicing incoming frames and heartbeats during preparation.
+Transfer chunks and final commit gaps retain their 10-second inactivity deadline.
+Heartbeats and unrelated messages do not extend transfer progress deadlines.
+
 Chunks contain standard padded Base64, at most 65,536 decoded bytes. Offsets are
 contiguous byte offsets beginning at zero. The client accepts one inbound transfer
 at a time, caps JSON frames at 131,072 bytes, and caps event JSON plus all attachment
@@ -126,7 +134,17 @@ object. Only a rejection matching the active outbound event ID and note UUID may
 terminate that transfer; stale notifications cannot block its replacement.
 
 Agent Note sends a Phoenix heartbeat every 30 seconds and uses a 10-second
-connection, ordinary request, heartbeat reply, and stalled-transfer deadline.
+connection, ordinary request, heartbeat reply, and active-blob inactivity deadline.
+For compatibility with senders that fetch attachments between blobs, a verified
+`blob_end` starts a preparation allowance of
+`40 + ceil(largest_unstarted_attachment_bytes / 1 MiB)` seconds when attachments
+remain and all begun blobs are verified. This covers GaoNote's read budget plus
+10 seconds for delivery, capped at 552 seconds under the 512 MiB limit. V1 permits
+any attachment order, so the largest unstarted manifest entry determines the
+allowance. Local verification completes before the timer starts.
+`attachment_begin` restores the 10-second
+blob deadline; metadata and the gap after the final attachment also retain that
+short deadline. Heartbeats and unrelated messages never extend preparation.
 For `transfer_commit`, GaoNote's apply budget in seconds is
 `min(900, 60 + 2 * ceil(total_transfer_bytes / 1 MiB) + 5 * attachment_count)`.
 Total transfer bytes include the encoded event metadata and all declared
