@@ -378,7 +378,8 @@ mod tests {
             serde_json::json!({
                 "category_labels": [],
                 "duplicate_check": {"enabled": false, "rules": []},
-                "search": {"minimum_score": 0.01}
+                "search": {"minimum_score": 0.01},
+                "sync": {"enabled": false, "connection_profile": null, "rules": []}
             })
         );
     }
