@@ -52,6 +52,7 @@ utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
+tokio = { version = "1.52.3", features = ["test-util"] }
 rcgen = { version = "0.14", features = ["pem"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 flate2 = "1.1.5"

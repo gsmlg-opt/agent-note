@@ -36,6 +36,15 @@ const TOPIC: &str = "note_sync:v1";
 const CHUNK: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(10);
 const HEARTBEAT: Duration = Duration::from_secs(30);
+
+// Match GaoNote's bounded apply budget, allowing another 30 seconds for its reply.
+fn commit_wait(total_bytes: u64, attachments: usize) -> Duration {
+    let seconds = 60_u64
+        .saturating_add(total_bytes.div_ceil(1024 * 1024).saturating_mul(2))
+        .saturating_add((attachments as u64).saturating_mul(5))
+        .min(900);
+    Duration::from_secs(seconds + 30)
+}
 pub trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Transport for T {}
 type Socket = WebSocketStream<MaybeTlsStream<Box<dyn Transport>>>;
@@ -566,16 +575,49 @@ impl Session<'_> {
         Ok(())
     }
     async fn request(&mut self, event: &str, payload: Value) -> Result<Value> {
+        let budget = if event == "transfer_commit" {
+            commit_wait(0, 0)
+        } else {
+            DEADLINE
+        };
+        self.request_with_budget(event, payload, budget, None).await
+    }
+    async fn request_with_budget(
+        &mut self,
+        event: &str,
+        payload: Value,
+        budget: Duration,
+        expected_ack: Option<&SyncAck>,
+    ) -> Result<Value> {
         let reference = self.reference();
         self.send(event, payload, Some(&reference)).await?;
-        let deadline = Instant::now() + DEADLINE;
+        self.await_reply(event, &reference, expected_ack, Instant::now() + budget)
+            .await
+    }
+    async fn await_reply(
+        &mut self,
+        event: &str,
+        reference: &str,
+        expected_ack: Option<&SyncAck>,
+        deadline: Instant,
+    ) -> Result<Value> {
         loop {
-            let message = tokio::time::timeout_at(deadline, self.socket.next())
-                .await
-                .context("sync Phoenix reply timed out")?;
+            anyhow::ensure!(Instant::now() < deadline, "sync Phoenix reply timed out");
+            self.check_liveness().await?;
+            let mut wake = self.next_heartbeat;
+            if let Some((_, at)) = &self.heartbeat {
+                wake = *at + DEADLINE;
+            }
+            if let Some(incoming) = &self.incoming {
+                wake = wake.min(incoming.last_activity + DEADLINE);
+            }
+            let message = tokio::select! {
+                message = self.socket.next() => message,
+                _ = tokio::time::sleep_until(wake.min(deadline)) => continue,
+            };
             if let Some(Ok(Message::Text(text))) = &message {
                 let frame = Frame::decode(text).context("invalid sync Phoenix frame")?;
-                if frame.is_current(&self.join, &reference)
+                if frame.is_current(&self.join, reference)
                     && frame.event == "phx_reply"
                     && frame.topic == TOPIC
                 {
@@ -601,9 +643,20 @@ impl Session<'_> {
                     }
                     return Ok(frame.payload["response"].clone());
                 }
+                if frame.topic == TOPIC
+                    && frame.join_ref.as_deref() == Some(&self.join)
+                    && frame.event == "ack"
+                    && expected_ack.is_some_and(|expected| {
+                        serde_json::from_value::<SyncAck>(frame.payload.clone())
+                            .is_ok_and(|actual| &actual == expected)
+                    })
+                {
+                    return Ok(frame.payload.clone());
+                }
             }
+            // Finish an incoming durable commit and its ACK before observing expiry.
+            // Cancelling this handler could leave a published attachment without its note.
             self.handle_message(message).await?;
-            self.check_liveness().await?;
         }
     }
     async fn check_liveness(&mut self) -> Result<()> {
@@ -611,14 +664,14 @@ impl Session<'_> {
         if self
             .heartbeat
             .as_ref()
-            .is_some_and(|(_, at)| now.duration_since(*at) > DEADLINE)
+            .is_some_and(|(_, at)| now.duration_since(*at) >= DEADLINE)
         {
             bail!("sync heartbeat reply timed out");
         }
         if self
             .incoming
             .as_ref()
-            .is_some_and(|i| now.duration_since(i.last_activity) > DEADLINE)
+            .is_some_and(|i| now.duration_since(i.last_activity) >= DEADLINE)
         {
             bail!("sync inbound transfer stalled");
         }
@@ -940,7 +993,7 @@ impl Session<'_> {
         let total = event
             .snapshot
             .as_ref()
-            .map_or(Some(0), |s| {
+            .map_or(Some(metadata.len() as u64), |s| {
                 s.attachments
                     .iter()
                     .try_fold(metadata.len() as u64, |sum, a| {
@@ -1017,8 +1070,15 @@ impl Session<'_> {
                     .await?;
             }
         }
+        let expected_ack = event.acknowledgement();
+        let attachment_count = event.snapshot.as_ref().map_or(0, |s| s.attachments.len());
         let committed = self
-            .request("transfer_commit", json!({"transfer_id":transfer}))
+            .request_with_budget(
+                "transfer_commit",
+                json!({"transfer_id":transfer}),
+                commit_wait(total, attachment_count),
+                Some(&expected_ack),
+            )
             .await;
         let committed = match committed {
             Err(error) if error.downcast_ref::<PeerNoteRejection>().is_some() => {
@@ -1093,6 +1153,426 @@ mod tests {
     use note_embedding::StubEmbedder;
     use note_storage_turso::TursoStorage;
     use tokio_rustls::TlsAcceptor;
+
+    #[test]
+    fn commit_budget_accounts_for_bytes_objects_and_the_hard_cap() {
+        assert_eq!(commit_wait(0, 0), Duration::from_secs(90));
+        assert_eq!(commit_wait(1, 1), Duration::from_secs(97));
+        assert_eq!(commit_wait(1024 * 1024, 2), Duration::from_secs(102));
+        assert_eq!(commit_wait(1024 * 1024 + 1, 2), Duration::from_secs(104));
+        assert_eq!(commit_wait(10_449_995, 1), Duration::from_secs(115));
+        assert_eq!(commit_wait(u64::MAX, usize::MAX), Duration::from_secs(930));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_accepts_a_matching_pushed_ack_after_ten_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let expected = SyncAck {
+            event_id: "event".into(),
+            note_id: "note".into(),
+            generation: Default::default(),
+            control: Default::default(),
+            version: Default::default(),
+            kind: note_core::sync::SyncEventKind::Snapshot,
+            snapshot_hash: "hash".into(),
+        };
+        let payload = serde_json::to_value(&expected).unwrap();
+        let push_payload = payload.clone();
+        let worker = tokio::spawn(async move {
+            let request = peer_frame(&mut peer).await;
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            let stale = Frame::new(
+                Some("old-session"),
+                None,
+                TOPIC,
+                "ack",
+                push_payload.clone(),
+            );
+            peer.send(Message::Text(stale.encode().unwrap().into()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let current = Frame::new(
+                request.join_ref.as_deref(),
+                None,
+                TOPIC,
+                "ack",
+                push_payload,
+            );
+            peer.send(Message::Text(current.encode().unwrap().into()))
+                .await
+                .unwrap();
+        });
+        let started = Instant::now();
+        let response = client
+            .request_with_budget(
+                "transfer_commit",
+                json!({}),
+                commit_wait(0, 0),
+                Some(&expected),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response, payload);
+        assert_eq!(Instant::now() - started, Duration::from_secs(13));
+        worker.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_preserves_matching_pushed_rejection_after_ten_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.outbound = Some(("event".into(), "note".into()));
+        let worker = tokio::spawn(async move {
+            let request = peer_frame(&mut peer).await;
+            tokio::time::sleep(Duration::from_secs(12)).await;
+            let rejection = Frame::new(
+                request.join_ref.as_deref(),
+                None,
+                TOPIC,
+                "note_rejected",
+                json!({"code":"note_rejected","event_id":"event","note_id":"note","reason":"catalog_conflict"}),
+            );
+            peer.send(Message::Text(rejection.encode().unwrap().into()))
+                .await
+                .unwrap();
+        });
+        let error = client
+            .request("transfer_commit", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<PeerNoteRejection>().unwrap().reason,
+            "catalog_conflict"
+        );
+        assert!(client.outbound.is_none());
+        worker.await.unwrap();
+    }
+
+    async fn local_context(dir: &std::path::Path) -> Context {
+        Context::new(
+            Arc::new(TursoStorage::open(dir.join("db")).await.unwrap()),
+            Arc::new(StubEmbedder),
+            Arc::new(FilesystemAttachmentStore::new(dir.join("attachments"))),
+        )
+    }
+
+    async fn local_sockets() -> (Socket, WebSocketStream<tokio::io::DuplexStream>) {
+        let (client, peer) = tokio::io::duplex(1024 * 1024);
+        let client: Box<dyn Transport> = Box::new(client);
+        (
+            WebSocketStream::from_raw_socket(
+                MaybeTlsStream::Plain(client),
+                tokio_tungstenite::tungstenite::protocol::Role::Client,
+                None,
+            )
+            .await,
+            WebSocketStream::from_raw_socket(
+                peer,
+                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await,
+        )
+    }
+
+    fn local_session<'a>(
+        ctx: &'a Context,
+        runtime: &'a SyncRuntime,
+        socket: Socket,
+    ) -> Session<'a> {
+        Session {
+            ctx,
+            runtime,
+            socket,
+            join: "local-session".into(),
+            counter: 0,
+            limit: DEFAULT_MAX_BLOB_BYTES,
+            incoming: None,
+            heartbeat: None,
+            next_heartbeat: Instant::now() + HEARTBEAT,
+            outbound: None,
+        }
+    }
+
+    async fn peer_frame(socket: &mut WebSocketStream<tokio::io::DuplexStream>) -> Frame {
+        Frame::decode(&socket.next().await.unwrap().unwrap().into_text().unwrap()).unwrap()
+    }
+
+    async fn peer_reply(socket: &mut WebSocketStream<tokio::io::DuplexStream>, request: &Frame) {
+        let reply = Frame::new(
+            request.join_ref.as_deref(),
+            request.reference.as_deref(),
+            &request.topic,
+            "phx_reply",
+            json!({"status":"ok","response":{}}),
+        );
+        socket
+            .send(Message::Text(reply.encode().unwrap().into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_waits_beyond_ten_seconds_and_drives_heartbeats_without_other_traffic() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let worker = tokio::spawn(async move {
+            let commit = peer_frame(&mut peer).await;
+            assert_eq!(commit.event, "transfer_commit");
+            let heartbeat = peer_frame(&mut peer).await;
+            assert_eq!(heartbeat.event, "heartbeat");
+            peer_reply(&mut peer, &heartbeat).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            peer_reply(&mut peer, &commit).await;
+        });
+        let started = Instant::now();
+        client.request("transfer_commit", json!({})).await.unwrap();
+        assert_eq!(Instant::now() - started, Duration::from_secs(35));
+        worker.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_fails_when_an_idle_peer_ignores_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let started = Instant::now();
+        let error = client
+            .request("transfer_commit", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "sync heartbeat reply timed out");
+        assert_eq!(Instant::now() - started, HEARTBEAT + DEADLINE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrelated_frames_do_not_extend_commit_deadline_and_ordinary_requests_stay_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let worker = tokio::spawn(async move {
+            let request = peer_frame(&mut peer).await;
+            assert_eq!(request.event, "transfer_commit");
+            let unrelated = Frame::new(
+                request.join_ref.as_deref(),
+                None,
+                TOPIC,
+                "inventory_complete",
+                json!({}),
+            );
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        peer.send(Message::Text(unrelated.encode().unwrap().into())).await.unwrap();
+                    }
+                    message = peer.next() => {
+                        let Some(Ok(message)) = message else { break };
+                        let frame = Frame::decode(&message.into_text().unwrap()).unwrap();
+                        assert_eq!(frame.event, "heartbeat");
+                        peer_reply(&mut peer, &frame).await;
+                    }
+                }
+            }
+        });
+        let started = Instant::now();
+        let error = client
+            .request("transfer_commit", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "sync Phoenix reply timed out");
+        assert_eq!(Instant::now() - started, Duration::from_secs(90));
+        worker.abort();
+        let _ = worker.await;
+
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let started = Instant::now();
+        assert_eq!(
+            client
+                .request("inventory_start", json!({}))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "sync Phoenix reply timed out"
+        );
+        assert_eq!(Instant::now() - started, DEADLINE);
+    }
+
+    #[tokio::test]
+    async fn ordinary_request_deadline_does_not_cancel_an_incoming_durable_commit() {
+        use note_attachments::{AttachmentStore, PutObjectRequest, StoredObject};
+        use note_core::sync::{Hlc, SyncAttachment, SyncEventKind, SyncLabel, SyncSnapshot};
+
+        struct DelayedStore {
+            files: FilesystemAttachmentStore,
+            started: Notify,
+            release: Notify,
+        }
+        #[async_trait::async_trait]
+        impl AttachmentStore for DelayedStore {
+            async fn put_immutable(&self, request: PutObjectRequest) -> Result<StoredObject> {
+                self.started.notify_one();
+                self.release.notified().await;
+                self.files.put_immutable(request).await
+            }
+            async fn read_legacy(&self, note_id: &str, path: &str) -> Result<Vec<u8>> {
+                self.files.read_legacy(note_id, path).await
+            }
+            fn info(&self) -> note_attachments::AttachmentStoreInfo {
+                self.files.info()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DelayedStore {
+            files: FilesystemAttachmentStore::new(dir.path().join("attachments")),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let ctx = Context::new(
+            Arc::new(TursoStorage::open(dir.path().join("db")).await.unwrap()),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        );
+        note_pipelines::update_system_config(
+            &ctx,
+            &note_core::SystemConfig {
+                sync: note_core::sync::SyncConfig {
+                    enabled: true,
+                    connection_profile: Some("local".into()),
+                    rules: vec![note_core::sync::SyncRule {
+                        id: "project".into(),
+                        enabled: true,
+                        selector: "project=bear_note".into(),
+                    }],
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sync::initialize_sync(&ctx).await.unwrap();
+        let bytes = b"incoming attachment";
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let snapshot = SyncSnapshot {
+            title: "Incoming".into(),
+            content: "Durable incoming note".into(),
+            labels: vec![SyncLabel {
+                key: "project".into(),
+                value: "bear_note".into(),
+                description: String::new(),
+                value_type: "text".into(),
+            }],
+            created_at: 1,
+            updated_at: 1,
+            deleted_at: None,
+            attachments: vec![SyncAttachment {
+                id: uuid::Uuid::new_v4().to_string(),
+                path: "incoming.txt".into(),
+                mime: "text/plain".into(),
+                description: String::new(),
+                size_bytes: bytes.len() as u64,
+                checksum_sha256: checksum.clone(),
+            }],
+        };
+        let stamp = Hlc {
+            millis: 1,
+            counter: 0,
+            node_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let event = SyncEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            note_id: uuid::Uuid::new_v4().to_string(),
+            generation: stamp.clone(),
+            control: stamp.clone(),
+            version: stamp,
+            kind: SyncEventKind::Attach,
+            snapshot_hash: sync::canonical_snapshot_hash(Some(&snapshot)).unwrap(),
+            snapshot: Some(snapshot),
+        };
+        let mut blob = StagedBlob::new(bytes.len() as u64, &checksum, 100).unwrap();
+        blob.append(0, bytes).await.unwrap();
+        blob.finish().await.unwrap();
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        client.incoming = Some(Incoming {
+            id: transfer_id.clone(),
+            metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100).unwrap(),
+            event: Some(event.clone()),
+            blobs: HashMap::from([(
+                format!(
+                    "attachment:{}",
+                    event.snapshot.as_ref().unwrap().attachments[0].id
+                ),
+                blob,
+            )]),
+            last_activity: Instant::now(),
+        });
+        let delayed_store = store.clone();
+        let worker = tokio::spawn(async move {
+            let request = peer_frame(&mut peer).await;
+            let commit = Frame::new(
+                request.join_ref.as_deref(),
+                Some("incoming-commit"),
+                TOPIC,
+                "transfer_commit",
+                json!({"transfer_id":transfer_id}),
+            );
+            peer.send(Message::Text(commit.encode().unwrap().into()))
+                .await
+                .unwrap();
+            // The ordinary request reply is already queued behind the incoming commit.
+            peer_reply(&mut peer, &request).await;
+            timeout(Duration::from_secs(5), delayed_store.started.notified())
+                .await
+                .expect("incoming commit did not start publishing its attachment");
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(12)).await;
+            delayed_store.release.notify_one();
+            peer
+        });
+        let result = client.request("inventory_start", json!({})).await;
+        let mut peer = worker.await.unwrap();
+        tokio::time::resume();
+        // The expired request must leave both the durable note and its attachment intact.
+        let note = note_pipelines::get_note_metadata(&ctx, &event.note_id)
+            .await
+            .unwrap()
+            .expect("incoming durable commit was cancelled by the request deadline");
+        assert_eq!(note.content, "Durable incoming note");
+        let object_key = &note.attachments[0].storage.as_ref().unwrap().object_key;
+        assert_eq!(store.files.read_object(object_key).await.unwrap(), bytes);
+        let ack = timeout(Duration::from_secs(1), peer_frame(&mut peer))
+            .await
+            .unwrap();
+        assert_eq!(ack.event, "ack");
+        assert_eq!(
+            ack.payload,
+            serde_json::to_value(event.acknowledgement()).unwrap()
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "sync Phoenix reply timed out"
+        );
+    }
 
     #[tokio::test]
     async fn replacing_a_profile_cancels_a_blocked_join_and_preserves_pending_notes() {

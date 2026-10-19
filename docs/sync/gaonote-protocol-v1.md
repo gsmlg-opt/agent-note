@@ -125,9 +125,19 @@ If the commit has no request ref, push `note_rejected` with that same response
 object. Only a rejection matching the active outbound event ID and note UUID may
 terminate that transfer; stale notifications cannot block its replacement.
 
-Agent Note sends a Phoenix heartbeat every 30 seconds, uses a 10-second
-connection/request/stalled-transfer deadline, and reconnects with jittered
-backoff bounded by 60 seconds. Manual retry wakes the worker. Configuration
+Agent Note sends a Phoenix heartbeat every 30 seconds and uses a 10-second
+connection, ordinary request, heartbeat reply, and stalled-transfer deadline.
+For `transfer_commit`, GaoNote's apply budget in seconds is
+`min(900, 60 + 2 * ceil(total_transfer_bytes / 1 MiB) + 5 * attachment_count)`.
+Total transfer bytes include the encoded event metadata and all declared
+attachment bytes. The sender waits for that budget plus 30 seconds for the
+commit response. This is an absolute deadline; unrelated messages do not extend
+it. An incoming handler already in progress completes, including its durable
+commit and ACK, before expiry is reported; only that handler's remaining work
+can delay observing the deadline. Scheduled heartbeat sends and liveness checks
+continue between handlers while waiting, even when no other messages arrive.
+Agent Note reconnects with jittered backoff
+bounded by 60 seconds. Manual retry wakes the worker. Configuration
 changes are checked every 125 milliseconds; once read, they cancel the entire
 session, including inventory and chunk transmission.
 Pausing retains pending snapshots; scope changes rejoin with the updated
