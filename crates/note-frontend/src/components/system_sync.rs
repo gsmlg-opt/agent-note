@@ -127,6 +127,10 @@ fn note_phase(phase: &str) -> &str {
 fn direction_progress(title: &str, progress: &SyncDirectionProgress, connected: bool) -> Html {
     let checking = progress.phase == "checking";
     let discovering = progress.manager.as_ref().is_some_and(|m| !m.scan_complete);
+    let comparing = progress
+        .manager
+        .as_ref()
+        .is_some_and(|m| m.pages_checked < m.pages_scanned);
     let notes_total = progress.notes_total.filter(|_| !discovering);
     let resolved = progress
         .notes_equal
@@ -208,6 +212,7 @@ fn direction_progress(title: &str, progress: &SyncDirectionProgress, connected: 
                 <li>{ format!("{} superseded", progress.notes_superseded) }</li>
                 <li>{ match progress.notes_remaining {
                     Some(remaining) if discovering => format!("{remaining} known remaining · scan in progress"),
+                    Some(remaining) if comparing => format!("{remaining} known remaining · comparison in progress"),
                     Some(remaining) => format!("{remaining} remaining"),
                     None if checking => "Remaining being checked".to_string(),
                     None => "Remaining unknown".to_string(),

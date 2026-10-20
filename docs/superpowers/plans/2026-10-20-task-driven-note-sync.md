@@ -40,7 +40,7 @@ owns socket dispatch and background task handles.
 - [x] Move complete inbound commit ownership to a worker which cannot be aborted
   between publication and transaction cleanup; drain before lease reclamation.
 - [x] Report direction task state and receiver-confirmed attachment progress.
-- [ ] Run `cargo test -p note-server sync_client` and native all-target checking.
+- [x] Run `cargo test -p note-server sync_client` and native all-target checking.
 
 ## 3. GaoNote task transport (receiver worker, parallel with 2)
 
@@ -56,7 +56,7 @@ inventory progress callback in `engine.ex`, and scoped tests.
 - [x] Confirm chunk received offsets and isolate task failures with scoped
   staging/lease cleanup. Do not discard pending events.
 - [x] Make guard/resource cleanup wait for durable apply settlement.
-- [ ] Run scoped sync domain/channel/socket tests using only the disposable
+- [x] Run scoped sync domain/channel/socket tests using only the disposable
   PostgreSQL fixture, then strict compile and changed-file formatting.
 
 ## 4. UI and protocol documentation (parent, parallel)
@@ -99,7 +99,7 @@ pending-page APIs and related domain/channel tests. No storage schema changes.
 - [x] Run isolated real GaoNote interop with task negotiation, slow inventory,
   chunk receipts, task failure followed by next-note success, and lost ACK retry.
 - [x] Review final diffs, exact ACK/fences, cancellation and status size bounds.
-- [ ] Commit/push qualified scoped changes on main; verify remote SHA matches.
+- [x] Commit/push qualified scoped changes on main; verify remote SHA matches.
 - [ ] Reload only GaoNote application after qualification. If Agent Note changes,
   follow deploy skill: local build, direct ms04 load, publish same image, inspect
   manifest, restart only Agent Note, verify exact running image and HTTP.
@@ -117,11 +117,38 @@ pending-page APIs and related domain/channel tests. No storage schema changes.
   runtime contract opt-ins require pgvector, unavailable in this fixture.
 - Frontend: 310 native tests passed, Wasm check passed, 12 browser scenarios
   passed with desktop/mobile captures and sanitized task/manager failures.
+- GaoNote: 130 sync domain tests and 96 admin sync tests passed against the
+  disposable PostgreSQL fixture, including the final Styx prerequisite. Strict
+  receiver compilation, changed-file formatting and scoped Credo passed.
 - Real GaoNote + Styx loopback interoperability: passed with more than 64 notes
   each way, paged discovery/comparison, chunked metadata and attachments, exact
   pending drain, reconnect without blob reads, same-socket changes and membership
   repair. An initial 30-second test wait failed; the clean-fixture rerun passed
   without changing production code or that test limit.
 
-Final workspace checks, publication, database migration and live acceptance are
-recorded below when completed.
+Native workspace qualification passed: 1,453 tests passed, 0 failed, 7 ignored;
+all-target checking passed. PostgreSQL opt-in cases and early-return test wrappers
+did not establish live PostgreSQL coverage without `TEST_DATABASE_URL`.
+
+Publication and live acceptance are recorded below after the rollout follow-ups.
+
+## Rollout follow-up regressions
+
+- The first deployed task session stayed connected while pending uploads fell
+  from 445 to fewer than 200. One CSV attachment failed before durable apply.
+  GaoNote sampled 4,096 bytes across a UTF-8 character boundary, so finalization
+  disagreed with the complete valid CSV despite its exact size and SHA-256.
+- GaoNote main `d6943ff5` validates text through EOF with bounded reads and a
+  UTF-8 carry. Storage regressions: 39 passed; existing sync staging/attachment
+  tests: 19 passed. Malformed bytes after the header still fail; checksum and
+  declared MIME guards remain. Strict compile, format and Credo passed.
+- Agent Note now retains validated task failure codes after cleanup and the
+  next successful note; diagnostics retain operation and task identity. The
+  same-socket two-note regression failed before repair; 90 sync tests then
+  passed, with four opt-in cases ignored.
+- During unfinished page comparison, the UI identifies remaining work as
+  currently known work. The new browser assertion failed against the previous
+  assets; the final build passed all 13 browser scenarios. Frontend native
+  tests: 310 passed; Wasm and native all-target checks passed.
+- GaoNote runtime acceptance uses the local `devenv` application only. No
+  GaoNote production deployment is part of this rollout.

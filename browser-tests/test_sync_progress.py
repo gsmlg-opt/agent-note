@@ -178,6 +178,11 @@ async def qualify(browser, base_url, output):
     up["manager"]["scan_complete"] = True
     up["notes_total"] = 64
     await expect(upload.get_by_text("Comparing note pages", exact=True)).to_be_visible(timeout=6000)
+    await expect(upload).to_contain_text("0 known remaining · comparison in progress")
+    up.update(phase="transferring", notes_remaining=1)
+    await expect(upload).to_contain_text("1 known remaining · comparison in progress", timeout=6000)
+    up.update(phase="idle", notes_remaining=0)
+    await expect(upload.get_by_text("Comparing note pages", exact=True)).to_be_visible(timeout=6000)
     assert await progress_time.get_attribute("datetime") == previous_time
     await expect(upload.get_by_text("Round complete", exact=True)).to_have_count(0)
     assert await upload.locator("img").count() == 0
@@ -212,7 +217,8 @@ async def qualify(browser, base_url, output):
     return {"legacy": "PASS", "stages": "PASS", "bidirectional_unknown_totals": "PASS", "blocked_reconnect": "PASS",
             "escaped_responsive": "PASS", "durable_completion": "PASS", "poll_failure_recovery_overlap": "PASS", "save_retry": "PASS",
             "task_state_independent_of_connection": "PASS", "unknown_commit_outcome": "PASS",
-            "paged_discovery_progress": "PASS", "progress_time_independent_of_heartbeat": "PASS"}
+            "paged_discovery_progress": "PASS", "progress_time_independent_of_heartbeat": "PASS",
+            "remaining_is_partial_until_all_pages_are_compared": "PASS"}
 
 
 async def main(args):

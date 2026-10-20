@@ -780,6 +780,17 @@ impl Session<'_> {
         self.send("task_error", json!({"task_id":id,"code":code}), None)
             .await
     }
+    async fn record_remote_task_failure(&mut self, id: &str, operation: &str, code: &str) {
+        // Identity and code have passed wire validation; operation is locally owned.
+        let message = format!(
+            "Remote synchronization task {id} ({operation}) failed ({code}); connection remains available and pending notes are preserved."
+        );
+        let mut state = self.runtime.status.write().await;
+        SyncRuntime::record(
+            &mut state,
+            Failure::new("task", "sync_task_failed", &message).event("error"),
+        );
+    }
     async fn submit_task(
         &mut self,
         operation: &str,
@@ -1018,8 +1029,12 @@ impl Session<'_> {
                 task.status = Some(status.clone());
                 self.show_task(&status, &operation, true).await;
                 if status.state == "failed" {
-                    let mut state = self.runtime.status.write().await;
-                    SyncRuntime::record(&mut state, Failure::new("task", "sync_task_failed", "A remote synchronization task failed; connection remains available and pending notes are preserved.").event("error"));
+                    self.record_remote_task_failure(
+                        &status.task_id,
+                        &operation,
+                        &status.error.as_ref().unwrap().code,
+                    )
+                    .await;
                 }
                 if detach {
                     if status.state != "succeeded" {
@@ -1051,7 +1066,10 @@ impl Session<'_> {
                     "invalid task error identity"
                 );
                 if let Some(task) = self.outgoing_tasks.get_mut(&error.task_id) {
-                    task.error = Some(error.code);
+                    let operation = task.operation.clone();
+                    task.error = Some(error.code.clone());
+                    self.record_remote_task_failure(&error.task_id, &operation, &error.code)
+                        .await;
                 }
             }
             "task_submit" => {
@@ -3152,8 +3170,8 @@ impl std::fmt::Display for PeerNoteRejection {
 }
 impl std::error::Error for PeerNoteRejection {}
 fn blocked_reason(error: &anyhow::Error) -> Option<&str> {
-    if error.downcast_ref::<RemoteTaskFailure>().is_some() {
-        Some("remote_task_failed")
+    if let Some(failure) = error.downcast_ref::<RemoteTaskFailure>() {
+        Some(&failure.0)
     } else if error.downcast_ref::<PreparationError>().is_some() {
         Some("local_preparation_failed")
     } else {
@@ -3744,6 +3762,129 @@ mod tests {
         assert_eq!(upload.notes_completed, 2);
         assert_eq!(upload.notes_remaining, Some(0));
         assert_eq!(status.progress.as_ref().unwrap().tracked_notes, Some(2));
+    }
+
+    #[tokio::test]
+    async fn remote_task_rejection_details_survive_the_next_note_on_the_same_socket() {
+        for (code, task_error) in [("catalog_conflict", false), ("validation_failed", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let ctx = local_context(dir.path()).await;
+            enable_test_notes(&ctx).await;
+            let runtime = SyncRuntime::default();
+            runtime.connected(uuid::Uuid::new_v4().to_string()).await;
+            let (socket, mut peer) = local_sockets().await;
+            let mut client = local_session(&ctx, &runtime, socket);
+            client.task_sync = true;
+            client.state_query = true;
+            let worker = tokio::spawn(async move {
+                let mut metadata = Vec::new();
+                let mut event = None;
+                let mut rejected = None;
+                let mut completed = 0;
+                loop {
+                    let request = peer_frame(&mut peer).await;
+                    assert_eq!(request.join_ref.as_deref(), Some("local-session"));
+                    if request.event == "sync_manager_status" {
+                        continue;
+                    }
+                    assert_eq!(request.event, "task_submit");
+                    let payload = &request.payload["payload"];
+                    let operation = request.payload["operation"].as_str().unwrap();
+                    let result = match operation {
+                        "state_query" => json!({
+                            "query_id":payload["query_id"],
+                            "items":payload["items"].as_array().unwrap().iter().map(|item|json!({
+                                "requested":item,"association":"attached","member":item,
+                                "head":{"version":item["version"],"snapshot_hash":item["snapshot_hash"],"attachments_available":true}
+                            })).collect::<Vec<_>>()
+                        }),
+                        "transfer_begin" => {
+                            metadata.clear();
+                            json!({})
+                        }
+                        "blob_chunk" => {
+                            let bytes = BASE64.decode(payload["data"].as_str().unwrap()).unwrap();
+                            metadata.extend_from_slice(&bytes);
+                            json!({"transfer_id":payload["transfer_id"],"blob_id":payload["blob_id"],
+                                "received_bytes":payload["offset"].as_u64().unwrap()+bytes.len() as u64})
+                        }
+                        "blob_end" => {
+                            event = Some(serde_json::from_slice::<SyncEvent>(&metadata).unwrap());
+                            json!({})
+                        }
+                        "transfer_commit" if rejected.is_none() => {
+                            let failed = event.as_ref().unwrap();
+                            rejected = Some((
+                                failed.note_id.clone(),
+                                failed.event_id.clone(),
+                                request.payload["task_id"].as_str().unwrap().to_owned(),
+                            ));
+                            if task_error {
+                                let frame = Frame::new(
+                                    request.join_ref.as_deref(),
+                                    None,
+                                    TOPIC,
+                                    "task_error",
+                                    json!({"task_id":request.payload["task_id"],"code":code}),
+                                );
+                                peer.send(Message::Text(frame.encode().unwrap().into()))
+                                    .await
+                                    .unwrap();
+                            } else {
+                                task_status_peer(&mut peer, &request, "failed", None, Some(code))
+                                    .await;
+                            }
+                            continue;
+                        }
+                        "transfer_commit" => {
+                            completed += 1;
+                            serde_json::to_value(event.as_ref().unwrap().acknowledgement()).unwrap()
+                        }
+                        "transfer_abort" => json!({}),
+                        "inventory_complete" => {
+                            assert_eq!(completed, 1);
+                            task_status_peer(
+                                &mut peer,
+                                &request,
+                                "succeeded",
+                                Some(json!({})),
+                                None,
+                            )
+                            .await;
+                            return rejected.unwrap();
+                        }
+                        _ => panic!("unexpected operation {operation}"),
+                    };
+                    task_status_peer(&mut peer, &request, "succeeded", Some(result), None).await;
+                }
+            });
+            client.reconcile_round(true).await.unwrap();
+            let (note_id, event_id, task_id) = worker.await.unwrap();
+            let status = runtime.status(&ctx).await.unwrap();
+            assert_eq!(status.state, "connected");
+            assert_eq!(status.pending_notes, 1);
+            assert_eq!(status.blocked_notes.len(), 1);
+            assert_eq!(status.blocked_notes[0].note_id, note_id);
+            assert_eq!(status.blocked_notes[0].event_id, event_id);
+            assert_eq!(status.blocked_notes[0].reason, code);
+            assert!(status.last_error.as_ref().unwrap().contains(code));
+            assert!(
+                status.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "sync_task_failed"
+                        && diagnostic.message.contains(code)
+                        && diagnostic.message.contains("transfer_commit")
+                        && diagnostic.message.contains(&task_id)
+                }),
+                "the original failure must remain diagnostic after cleanup and the next note"
+            );
+            let upload = &status.progress.as_ref().unwrap().upload;
+            assert_eq!(upload.active_task.as_ref().unwrap().state, "succeeded");
+            assert_eq!(upload.notes_completed, 1);
+            assert_eq!(upload.blocked_notes, 1);
+            assert!(!client.has_pending_work().await.unwrap());
+            runtime.retry();
+            assert!(client.has_pending_work().await.unwrap());
+        }
     }
 
     #[tokio::test]
