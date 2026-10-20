@@ -51,6 +51,27 @@ impl SettingsRepository for PgSession {
         sqlx::query_as("SELECT record_key,value FROM sync_records WHERE namespace=$1 AND record_key>$2 ORDER BY record_key LIMIT $3").bind(namespace).bind(after_key.unwrap_or("")).bind(limit.min(1000) as i64).fetch_all(&mut *conn).await.map_err(|e|map_sqlx_error("scan sync records",e))
     }
 
+    async fn list_sync_audit_records(
+        &self,
+        after_key: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<(String, serde_json::Value)>> {
+        let mut conn = self.connection().await?;
+        sqlx::query_as(
+            "SELECT m.record_key,m.value FROM sync_records m
+             WHERE m.namespace='member' AND m.record_key>$1
+             AND NOT EXISTS (SELECT 1 FROM sync_records p
+               WHERE p.namespace='pending' AND p.record_key=m.record_key
+               AND p.value->'event'=m.value->'event')
+             ORDER BY m.record_key LIMIT $2",
+        )
+        .bind(after_key.unwrap_or(""))
+        .bind(limit.min(1000) as i64)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| map_sqlx_error("scan sync audit records", e))
+    }
+
     async fn get_system_config(&self) -> StorageResult<SystemConfig> {
         let mut connection = self.connection().await?;
         let value: Option<Value> =

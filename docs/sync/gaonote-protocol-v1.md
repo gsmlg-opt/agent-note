@@ -59,10 +59,111 @@ registration it is fixed for this database. Keep the profile selected when pause
 ## Phoenix frames and transfers
 
 Frames are JSON arrays `[join_ref, ref, topic, event, payload]`. References are
-strings or null; payloads are objects. Request replies use `phx_reply` with
+strings or null; payloads are objects. Join/negotiation replies use `phx_reply` with
 `{"status":"ok","response":{...}}`. Server pushes must carry the current join
-reference. Old join frames cannot complete a current request. Channel close/error
-and WebSocket disconnect trigger reconnect.
+reference. Old join frames cannot complete current work. Actual transport loss
+or heartbeat expiry causes reconnect. Business operation duration never declares
+a task-mode connection failed. Explicit pause, revocation and unsafe protocol
+rejection have separate lifecycle reasons.
+
+### Task transport (`task_sync_v1`)
+
+Both upgraded peers advertise and negotiate `task_sync_v1` and `state_query_v1`.
+After raw WebSocket establishment, the independent socket pump services Phoenix
+heartbeats during join/negotiation and all business work. There is no business
+reply deadline. A receiver without task capability remains connected with
+"Receiver upgrade required" and does not enter a reconnect loop.
+
+Send each business operation as `task_submit` with exactly these fields:
+
+```json
+{"task_id":"aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa:1","operation":"inventory_start","payload":{}}
+```
+
+The origin UUID is the authenticated node. Its task sequence starts at one,
+increases contiguously and is scoped to the current join reference. Operations
+reuse the payload codecs in the table below, including `blob_chunk`; additionally
+`state_query` uses its existing query codec and `transfer_abort` carries only
+`transfer_id`. No business `phx_reply` is required. Executors push task state:
+
+```json
+{"task_id":"aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa:1","status_seq":2,"state":"running","phase":"checking","progress":{"checked_notes":32,"total_notes":1761},"result":null,"error":null}
+```
+
+States are `queued`, `running`, `succeeded`, `failed`, or `cancelled`. Status
+sequence increases on changes; terminal status is immutable. `result` is the
+existing operation result on success, otherwise null. Failed `error` is
+`{"code":"<bounded stable code>","retryable":false}`; it contains no raw storage
+errors, paths or note content. Inventory succeeds after the finite scan finishes;
+admission permits independent local checking. Task errors remain visible while
+the same healthy socket handles other work.
+
+Both peers retain a session manager. Discovery begins with SQL keyset pages of
+at most 32 records, and comparison creates work from the first available page.
+A local snapshot producer publishes lightweight descriptor/ID pages to a
+session-owned temporary disk spool, independently of network transfer. This
+freezes the finite initial cohort without holding a database snapshot through
+network waits or collecting the library into an in-memory list. Classification,
+pending enumeration and live task queues are paged as well. After the initial
+comparison, consume durable changes; no periodic full scan runs on a healthy
+idle task session. Reconnect or explicit retry can start a new finite scan.
+
+Manager progress continues independently after the source inventory task's
+immutable success. In task mode, push `sync_manager_status`:
+
+```json
+{"round_id":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","status_seq":3,"progress":{"mode":"initial_scan","page_size":32,"pages_scanned":2,"pages_checked":1,"notes_scanned":64,"scan_complete":false,"source_cursor":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","last_progress_at":1792454400000,"checked_notes":32,"total_notes":null}}
+```
+
+The envelope has exactly these three keys. The first valid push on the current
+join establishes the peer's outbound round; sequence is positive u64, increasing
+across all of that session's rounds. Ignore older sequences; equal sequences
+must repeat identical content. Old producers cannot publish after manager
+replacement. New sessions never accept old join-reference progress. These
+messages describe activity and cannot acknowledge notes or authorize data.
+Modes are `initial_scan` and `changes`; optional comparison counters are
+`planned_notes`, `equal_notes`, `superseded_notes` and `blocked_notes`.
+Optional `state` is `running`, `idle` or `failed`; nullable `error` has the same
+sanitized `{code,retryable}` shape as a task error. Manager failure can thus be
+reported after the source task has completed, without altering its terminal
+result or disconnecting the socket.
+Emit actual changes at most every 250 ms or completed page, plus final state.
+Keep total null until enumeration establishes it, and advance
+`last_progress_at` only for actual work, never heartbeats or API sampling.
+
+`task_get {task_id}` replays the latest state; `task_cancel {task_id}` requests
+safe cancellation. These use state/error pushes too. `task_error {task_id,code}`
+reports unknown, retired, invalid, or conflicting identity without failing the
+connection. Keep at most four active operation slots and 64 terminal snapshots
+with request digests. Retain a high-water sequence for the whole session: exact
+duplicate submissions replay state, conflicting duplicates are rejected, and
+evicted old IDs can never execute again.
+
+Large metadata and attachments use at most 64 KiB raw chunks and the existing
+contiguous offsets and hashes. Keep exactly one unconfirmed chunk per direction.
+A successful chunk result is `{transfer_id,blob_id,received_bytes}` and must
+confirm `offset + decoded_length`. Advance sender byte progress from this receipt,
+not socket writes. Complete blobs still require size/hash verification; a note
+counts as delivered only when `transfer_commit` succeeds with its exact durable
+ACK. Task wrappers and responses must also fit the 128 KiB frame limit.
+
+No elapsed note, scan, chunk, preparation or commit deadline closes the task-mode
+session. Database/object-store errors fail the affected task after safe cleanup;
+durable pending work is retained. Apply runs outside the socket pump and settles
+before its files or session leases are reclaimed. Once publication/apply starts,
+cancellation cannot assert rollback. An uncertain commit remains running with
+phase `outcome_unknown` until durable reconciliation establishes the result.
+
+On disconnect a new join gets a new task namespace and reconciles durable events.
+Lost ACKs recover through exact idempotent event replay; partial blob bytes restart
+with their note. This version does not promise cross-session chunk resumption.
+See the [task design](../superpowers/specs/2026-10-20-task-driven-note-sync-design.md)
+for ownership, cancellation and acceptance requirements.
+
+### Operation codecs and legacy direct transport
+
+The operation payloads below are also the existing legacy direct-event transport.
+Their legacy reply/deadline behavior does not apply inside `task_sync_v1`.
 
 | Event | Payload | Successful response |
 | --- | --- | --- |
@@ -89,7 +190,7 @@ GaoNote stages these verified bytes in session-owned temporary files, bounded
 by the negotiated aggregate limit, and sends local 64 KiB chunks afterward.
 Slow S3 preparation therefore does not create a gap within an announced transfer.
 GaoNote continues servicing incoming frames and heartbeats during preparation.
-Transfer chunks and final commit gaps retain their 10-second inactivity deadline.
+Legacy transfer chunks and final commit gaps retain their 10-second inactivity deadline.
 Heartbeats and unrelated messages do not extend transfer progress deadlines.
 
 Chunks contain standard padded Base64, at most 65,536 decoded bytes. Offsets are
@@ -178,13 +279,14 @@ queues a fresh Attach event ID with its existing generation, control, version,
 hash and attachments. This also covers an unchanged pending Snapshot. Recovery
 cannot overwrite a newer pending event or invent a generation to bypass a fence.
 
-Each sender captures a finite descriptor cohort consistently before opening attachment data,
-checks it in pages, then services pending work before audit differences with an
-8:1 bound. Revalidate each slot before skipping or reserving it. Concurrent edits
+Each sender captures a finite cohort consistently before opening attachment data,
+compares and schedules it page by page, then services pending work before audit
+differences with an 8:1 bound. Revalidate each slot before skipping or reserving it. Concurrent edits
 supersede that slot and remain eligible in the next round. Local preparation or
 definitive note rejection blocks that version and yields to the next note. Normal
-completion keeps the socket open; pending work is serviced while idle and a full
-audit runs every five minutes. Legacy peers use pending priority with bounded
+completion keeps the socket open; task-mode pending work is serviced in pages
+while idle. The older non-task client performs a full audit every five minutes.
+Legacy peers use pending priority with bounded
 audit replay, without claiming freshly verified equality.
 
 For negotiated sessions, `inventory_complete` carries
@@ -217,12 +319,15 @@ The only remote reasons are `validation_failed` and `catalog_conflict`. These ar
 definitive per-note rejections: preserve pending work, show the affected note, and
 continue the inventory and other pending notes. Cache rejected event IDs across
 reconnects; a new event version or manual retry makes them eligible again. Do not
-echo arbitrary receiver error text to System. Storage failures, malformed replies
-and uncertain commits remain session errors and retry after reconnect.
+echo arbitrary receiver error text to System. In task mode, proven storage
+failures settle only their task and uncertain commits remain unresolved until
+durable reconciliation. Legacy direct-mode failures may reconnect.
 If the commit has no request ref, push `note_rejected` with that same response
 object. Only a rejection matching the active outbound event ID and note UUID may
 terminate that transfer; stale notifications cannot block its replacement.
 
+The following deadline details describe legacy direct mode only; task mode
+retains connection/heartbeat limits without business-operation deadlines.
 Agent Note sends a Phoenix heartbeat every 30 seconds and uses a 10-second
 connection, ordinary request, heartbeat reply, and active-blob inactivity deadline.
 For compatibility with senders that fetch attachments between blobs, a verified

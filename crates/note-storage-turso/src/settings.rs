@@ -87,6 +87,47 @@ impl SettingsRepository for TursoSession {
         Ok(records)
     }
 
+    async fn list_sync_audit_records(
+        &self,
+        after_key: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<(String, serde_json::Value)>> {
+        let _guard = self.operation_guard().await;
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT m.record_key,m.value FROM sync_records m
+             WHERE m.namespace='member' AND m.record_key>?1
+             AND NOT EXISTS (SELECT 1 FROM sync_records p
+               WHERE p.namespace='pending' AND p.record_key=m.record_key
+               AND json_extract(p.value,'$.event')=json_extract(m.value,'$.event'))
+             ORDER BY m.record_key LIMIT ?2",
+                turso::params![after_key.unwrap_or(""), limit.min(1000) as i64],
+            )
+            .await
+            .map_err(|e| map_turso_error("scan sync audit records", e))?;
+        let mut records = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| map_turso_error("read sync audit records", e))?
+        {
+            let key = row
+                .get::<String>(0)
+                .map_err(|e| map_turso_error("decode sync key", e))?;
+            let value = row
+                .get::<String>(1)
+                .map_err(|e| map_turso_error("decode sync value", e))?;
+            records.push((
+                key,
+                serde_json::from_str(&value).map_err(|e| {
+                    StorageError::with_source(StorageErrorKind::Corrupt, "decode sync JSON", e)
+                })?,
+            ));
+        }
+        Ok(records)
+    }
+
     async fn get_system_config(&self) -> StorageResult<SystemConfig> {
         let _operation_guard = self.operation_guard().await;
         let mut rows = self

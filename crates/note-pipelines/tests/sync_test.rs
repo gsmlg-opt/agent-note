@@ -2341,3 +2341,213 @@ async fn postgres_mutation_families_capture_snapshots() {
     .unwrap();
     admin.close().await;
 }
+
+#[tokio::test]
+async fn replay_after_lost_ack_does_not_publish_attachments_again() {
+    use ::note_attachments::{
+        AttachmentStore, FilesystemAttachmentStore, PutObjectRequest, StoredObject,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counted {
+        files: FilesystemAttachmentStore,
+        writes: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl AttachmentStore for Counted {
+        async fn put_immutable(&self, request: PutObjectRequest) -> anyhow::Result<StoredObject> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.files.put_immutable(request).await
+        }
+        async fn read_legacy(&self, id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+            self.files.read_legacy(id, path).await
+        }
+        fn info(&self) -> ::note_attachments::AttachmentStoreInfo {
+            self.files.info()
+        }
+    }
+    let (sender, _, _sender_dir) = support::test_context().await;
+    let (_, backend, receiver_dir) = support::test_context().await;
+    let store = Arc::new(Counted {
+        files: FilesystemAttachmentStore::new(receiver_dir.path().join("counted")),
+        writes: AtomicUsize::new(0),
+    });
+    let receiver = Context::new(
+        backend,
+        Arc::new(note_embedding::StubEmbedder),
+        store.clone(),
+    );
+    enabled(&sender).await;
+    enabled(&receiver).await;
+    let bytes = b"one immutable publication".to_vec();
+    let mut value = input("Lost ACK replay");
+    value.attachments.push(NoteAttachment {
+        id: "file".into(),
+        path: "file.txt".into(),
+        mime: "text/plain".into(),
+        description: String::new(),
+        content: bytes.clone(),
+        storage: None,
+    });
+    save_note(&sender, value).await.unwrap();
+    let event = next_sync_event(&sender).await.unwrap().unwrap();
+    let objects = HashMap::from([("file".into(), bytes)]);
+    assert_eq!(
+        apply_sync_event(&receiver, &event, &objects).await.unwrap(),
+        SyncApplyResult::Applied
+    );
+    assert_eq!(
+        apply_sync_event(&receiver, &event, &objects).await.unwrap(),
+        SyncApplyResult::Duplicate
+    );
+    assert_eq!(
+        store.writes.load(Ordering::SeqCst),
+        1,
+        "a lost acknowledgement must not republish immutable data"
+    );
+}
+
+#[tokio::test]
+async fn first_source_page_does_not_wait_for_the_all_pending_audit_lane() {
+    let (ctx, backend, _dir) = support::test_context().await;
+    enabled(&ctx).await;
+    for index in 0..80 {
+        save_note(&ctx, input(&format!("pending {index}")))
+            .await
+            .unwrap();
+    }
+    let traced = Arc::new(support::EventStorageBackend::new(
+        backend,
+        support::event_log(),
+    ));
+    let traced_ctx = Context::new(
+        traced.clone(),
+        Arc::new(note_embedding::StubEmbedder),
+        Arc::new(::note_attachments::FilesystemAttachmentStore::new(
+            _dir.path().join("traced-attachments"),
+        )),
+    );
+    let mut scan = start_sync_candidate_scan(&traced_ctx, false).await.unwrap();
+    let first = scan.next_page(32).await.unwrap();
+    assert!(!first.is_empty());
+    assert!(first.iter().all(|candidate| candidate.pending));
+    assert_eq!(
+        traced.repository_call_count("list_sync_records"),
+        1,
+        "the first pending page must be published without walking member/audit pages"
+    );
+    assert_eq!(
+        traced.repository_call_count("list_sync_audit_records"),
+        0,
+        "publish available changes before probing an audit lane that may need a database scan"
+    );
+    let mut total = first.len();
+    loop {
+        let page = scan.next_page(32).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 32);
+        total += page.len();
+    }
+    assert_eq!(total, 80);
+}
+
+#[tokio::test]
+async fn source_pages_preserve_finite_snapshot_and_prioritize_high_uuid_pending_eight_to_one() {
+    let (ctx, _backend, _dir) = support::test_context().await;
+    enabled(&ctx).await;
+    let mut notes = Vec::new();
+    for index in 0..80 {
+        notes.push(
+            save_note(&ctx, input(&format!("cohort {index}")))
+                .await
+                .unwrap(),
+        );
+    }
+    notes.sort_by(|left, right| left.id.cmp(&right.id));
+    for note in notes.iter().take(64) {
+        let candidate = sync_current_candidate(&ctx, &note.id)
+            .await
+            .unwrap()
+            .unwrap();
+        acknowledge_sync_event(&ctx, &candidate.descriptor)
+            .await
+            .unwrap();
+    }
+    let original_pending = sync_current_candidate(&ctx, &notes[79].id)
+        .await
+        .unwrap()
+        .unwrap()
+        .descriptor;
+    let mut scan = start_sync_candidate_scan(&ctx, false).await.unwrap();
+    let mut first = scan.next_page(32).await.unwrap();
+    assert!(first.len() <= 32);
+    if first.len() < 9 {
+        first.extend(scan.next_page(32).await.unwrap());
+    }
+    assert!(first[..8].iter().all(|candidate| candidate.pending));
+    assert!(
+        !first[8].pending,
+        "audit gets its turn after eight queued changes"
+    );
+    assert!(first
+        .iter()
+        .take(8)
+        .all(|candidate| candidate.descriptor.note_id >= notes[64].id));
+    let late = save_note(&ctx, input("outside captured cohort"))
+        .await
+        .unwrap();
+    let original = &notes[79];
+    update_note_fields(
+        &ctx,
+        &original.id,
+        UpdateNoteFieldsInput {
+            expected_revision: original.revision,
+            title: original.title.clone(),
+            content: "next round change".into(),
+            labels: vec![("project".into(), "bear_note".into())],
+        },
+    )
+    .await
+    .unwrap();
+    let mut captured = first;
+    loop {
+        let page = scan.next_page(32).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 32);
+        captured.extend(page);
+    }
+    assert_eq!(captured.len(), 80);
+    let ids: std::collections::HashSet<_> = captured
+        .iter()
+        .map(|candidate| candidate.descriptor.note_id.clone())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        80,
+        "pending and audit cursors cannot duplicate cohort members"
+    );
+    assert!(!ids.contains(&late.id));
+    assert!(captured
+        .iter()
+        .any(|candidate| candidate.descriptor == original_pending));
+    let mut changes = start_sync_candidate_scan(&ctx, true).await.unwrap();
+    let mut next = Vec::new();
+    loop {
+        let page = changes.next_page(32).await.unwrap();
+        if page.is_empty() {
+            break;
+        }
+        next.extend(page);
+    }
+    assert_eq!(next.len(), 17);
+    assert!(next
+        .iter()
+        .any(|candidate| candidate.descriptor.note_id == late.id));
+    assert!(next
+        .iter()
+        .any(|candidate| candidate.descriptor.note_id == original.id
+            && candidate.descriptor != original_pending));
+}

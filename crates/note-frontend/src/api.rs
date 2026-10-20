@@ -275,6 +275,30 @@ pub struct SyncCurrentNote {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncTaskProgress {
+    pub id: String,
+    pub operation: String,
+    pub state: String,
+    pub phase: String,
+    pub updated_at: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SyncManagerProgress {
+    pub mode: String,
+    pub page_size: u64,
+    pub pages_scanned: u64,
+    pub pages_checked: u64,
+    pub notes_scanned: u64,
+    pub scan_complete: bool,
+    pub source_cursor: Option<String>,
+    pub last_progress_at: i64,
+    pub state: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SyncDirectionProgress {
     pub run_id: String,
     pub phase: String,
@@ -288,6 +312,10 @@ pub struct SyncDirectionProgress {
     pub notes_remaining: Option<u64>,
     pub blocked_notes: u64,
     pub current_note: Option<SyncCurrentNote>,
+    #[serde(default)]
+    pub active_task: Option<SyncTaskProgress>,
+    #[serde(default)]
+    pub manager: Option<SyncManagerProgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -314,6 +342,8 @@ pub struct SyncStatus {
     pub peer_node_id: Option<String>,
     #[serde(default)]
     pub blocked_notes: Vec<SyncBlockedNote>,
+    #[serde(default)]
+    pub blocked_notes_total: u64,
     #[serde(default)]
     pub progress: Option<SyncProgress>,
 }
@@ -1097,6 +1127,12 @@ mod tests {
         download["notes_total"] = serde_json::Value::Null;
         download["notes_remaining"] = serde_json::Value::Null;
         download["current_note"] = serde_json::Value::Null;
+        download["manager"] = serde_json::json!({
+            "mode": "initial_scan", "page_size": 32, "pages_scanned": 2,
+            "pages_checked": 1, "notes_scanned": 64, "scan_complete": false,
+            "source_cursor": "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",
+            "last_progress_at": 1_699_999_000_000_i64
+        });
         let progress: SyncProgress = serde_json::from_value(serde_json::json!({
             "updated_at": 1_700_000_000_000_i64, "tracked_notes": 1761,
             "upload": direction, "download": download
@@ -1111,6 +1147,12 @@ mod tests {
         assert_eq!(progress.download.notes_total, None);
         assert_eq!(progress.download.notes_remaining, None);
         assert_eq!(progress.download.run_id, "download-1");
+        assert!(progress.upload.manager.is_none());
+        let manager = progress.download.manager.unwrap();
+        assert_eq!(manager.pages_scanned, 2);
+        assert_eq!(manager.pages_checked, 1);
+        assert!(!manager.scan_complete);
+        assert!(manager.last_progress_at < progress.updated_at);
     }
 
     #[test]
@@ -1155,11 +1197,13 @@ mod tests {
         let legacy: SyncStatus = serde_json::from_value(response.clone()).unwrap();
         assert!(legacy.diagnostics.is_empty());
         assert!(legacy.progress.is_none());
+        assert_eq!(legacy.blocked_notes_total, 0);
         assert_eq!(legacy.last_attempt_at, None);
         assert_eq!(legacy.next_retry_at, None);
 
         response["last_attempt_at"] = serde_json::json!(1_700_000_000_000_i64);
         response["next_retry_at"] = serde_json::json!(1_700_000_005_000_i64);
+        response["blocked_notes_total"] = serde_json::json!(65);
         response["diagnostics"] = serde_json::json!([{
             "timestamp": 1_700_000_000_100_i64,
             "level": "error",
@@ -1170,6 +1214,7 @@ mod tests {
         let current: SyncStatus = serde_json::from_value(response).unwrap();
         assert_eq!(current.last_attempt_at, Some(1_700_000_000_000));
         assert_eq!(current.next_retry_at, Some(1_700_000_005_000));
+        assert_eq!(current.blocked_notes_total, 65);
         assert_eq!(
             current.diagnostics,
             vec![SyncDiagnostic {

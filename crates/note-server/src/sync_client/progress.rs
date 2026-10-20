@@ -40,6 +40,8 @@ pub struct SyncDirectionProgress {
     pub notes_remaining: Option<usize>,
     pub blocked_notes: usize,
     pub current_note: Option<SyncCurrentNote>,
+    pub active_task: Option<SyncActiveTask>,
+    pub manager: Option<SyncManagerProgress>,
     #[serde(skip)]
     resolved_ids: BTreeSet<String>,
     #[serde(skip)]
@@ -61,6 +63,8 @@ impl SyncDirectionProgress {
             notes_remaining: None,
             blocked_notes: 0,
             current_note: None,
+            active_task: None,
+            manager: None,
             resolved_ids: BTreeSet::new(),
             blocked_ids: BTreeSet::new(),
         }
@@ -166,10 +170,39 @@ impl SyncDirectionProgress {
         .into();
     }
 
+    /// Task mode keeps exact round membership on disk; page-local sets must not accumulate.
+    pub fn release_page_ids(&mut self) {
+        self.resolved_ids.clear();
+        self.blocked_ids.clear();
+    }
     pub fn suspend(&mut self, phase: &str) {
         self.phase = phase.into();
         self.current_note = None;
     }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SyncManagerProgress {
+    pub state: Option<String>,
+    pub error: Option<String>,
+    pub mode: String,
+    pub page_size: u64,
+    pub pages_scanned: u64,
+    pub pages_checked: u64,
+    pub notes_scanned: u64,
+    pub scan_complete: bool,
+    pub source_cursor: Option<String>,
+    pub last_progress_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SyncActiveTask {
+    pub id: String,
+    pub operation: String,
+    pub state: String,
+    pub phase: String,
+    pub updated_at: i64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]

@@ -3,14 +3,19 @@ use super::{
     connections::Connections,
     diagnostics::{Failure, SyncDiagnostic},
     phoenix::{Frame, FRAME_BYTES},
-    progress::{SyncDirectionProgress, SyncProgress},
+    progress::{SyncActiveTask, SyncDirectionProgress, SyncManagerProgress, SyncProgress},
+    pump::Io,
+    scan::{self, ScanSpool, SourceProgress, PAGE_SIZE},
+    tasks::{self, Admission, Ledger, Status as TaskStatus, Submission},
     tls,
     transfer::{encode_metadata, StagedBlob},
     ConnectionInput, ConnectionMode, ConnectionSummary, SaveError, SyncConnection, SyncProfile,
 };
 use anyhow::{bail, Context as _, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::FutureExt;
+#[cfg(test)]
+use futures::{SinkExt, StreamExt};
 use note_core::sync::{
     SyncAck, SyncAssociation, SyncEvent, SyncEventKind, SyncStateQuery, SyncStateResponse,
 };
@@ -26,7 +31,7 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
-    sync::{watch, Notify, RwLock},
+    sync::{oneshot, watch, Notify, RwLock},
     time::{timeout, Instant},
 };
 use tokio_tungstenite::{
@@ -59,7 +64,7 @@ fn attachment_prepare_wait(size: u64) -> Duration {
 }
 pub trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Transport for T {}
-type Socket = WebSocketStream<MaybeTlsStream<Box<dyn Transport>>>;
+pub(super) type Socket = WebSocketStream<MaybeTlsStream<Box<dyn Transport>>>;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SyncBlockedNote {
@@ -82,6 +87,7 @@ pub struct SyncRuntimeStatus {
     pub node_id: Option<String>,
     pub peer_node_id: Option<String>,
     pub blocked_notes: Vec<SyncBlockedNote>,
+    pub blocked_notes_total: usize,
     pub progress: Option<SyncProgress>,
 }
 impl Default for SyncRuntimeStatus {
@@ -99,6 +105,7 @@ impl Default for SyncRuntimeStatus {
             node_id: None,
             peer_node_id: None,
             blocked_notes: vec![],
+            blocked_notes_total: 0,
             progress: None,
         }
     }
@@ -106,9 +113,13 @@ impl Default for SyncRuntimeStatus {
 #[derive(Default)]
 pub struct SyncRuntime {
     connections: Arc<Connections>,
-    status: RwLock<SyncRuntimeStatus>,
+    status: Arc<RwLock<SyncRuntimeStatus>>,
+    workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     wake: Notify,
     blocked: std::sync::Mutex<BTreeMap<String, SyncBlockedNote>>,
+    retry_epoch: std::sync::atomic::AtomicU64,
+    rejection_directory: std::sync::Mutex<Option<Arc<tempfile::TempDir>>>,
+    rejected_total: std::sync::atomic::AtomicUsize,
 }
 impl SyncRuntime {
     pub fn new(profiles: &[SyncConnection]) -> Arc<Self> {
@@ -128,10 +139,35 @@ impl SyncRuntime {
     fn with_connections(connections: Connections) -> Arc<Self> {
         Arc::new(Self {
             connections: Arc::new(connections),
-            status: RwLock::new(SyncRuntimeStatus::default()),
+            status: Arc::new(RwLock::new(SyncRuntimeStatus::default())),
+            workers: std::sync::Mutex::new(Vec::new()),
             wake: Notify::new(),
             blocked: std::sync::Mutex::new(BTreeMap::new()),
+            retry_epoch: std::sync::atomic::AtomicU64::new(0),
+            rejection_directory: std::sync::Mutex::new(None),
+            rejected_total: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+    fn worker<T: Send + 'static>(
+        &self,
+        future: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> (oneshot::Receiver<T>, tokio::task::AbortHandle) {
+        let (send, receive) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = send.send(future.await);
+        });
+        let mut workers = self.workers.lock().expect("sync worker registry poisoned");
+        workers.retain(|worker| !worker.is_finished());
+        let abort = handle.abort_handle();
+        workers.push(handle);
+        (receive, abort)
+    }
+    async fn drain_workers(&self) {
+        let workers =
+            std::mem::take(&mut *self.workers.lock().expect("sync worker registry poisoned"));
+        for worker in workers {
+            let _ = worker.await;
+        }
     }
     pub fn connections(&self) -> Vec<ConnectionSummary> {
         self.connections
@@ -162,7 +198,17 @@ impl SyncRuntime {
             .values()
             .cloned()
             .collect();
-        if state.state == "connected" {
+        state.blocked_notes_total = self
+            .rejected_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(state.blocked_notes.len());
+        if state.state == "connected"
+            && (!state.blocked_notes.is_empty()
+                || state
+                    .last_error
+                    .as_ref()
+                    .is_some_and(|error| error.starts_with("Note ")))
+        {
             state.last_error = state
                 .blocked_notes
                 .first()
@@ -182,6 +228,10 @@ impl SyncRuntime {
         Ok(state)
     }
     pub fn retry(&self) {
+        self.retry_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.rejected_total
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         self.blocked
             .lock()
             .expect("sync rejection mutex poisoned")
@@ -198,18 +248,19 @@ impl SyncRuntime {
         }
         false
     }
+    fn blocked_sample(&self, note: SyncBlockedNote) {
+        let mut samples = self.blocked.lock().expect("sync rejection mutex poisoned");
+        samples.insert(note.note_id.clone(), note);
+        while samples.len() > 64 {
+            samples.pop_first();
+        }
+    }
     async fn block(&self, event: &SyncEvent, reason: &str) {
-        self.blocked
-            .lock()
-            .expect("sync rejection mutex poisoned")
-            .insert(
-                event.note_id.clone(),
-                SyncBlockedNote {
-                    note_id: event.note_id.clone(),
-                    event_id: event.event_id.clone(),
-                    reason: reason.into(),
-                },
-            );
+        self.blocked_sample(SyncBlockedNote {
+            note_id: event.note_id.clone(),
+            event_id: event.event_id.clone(),
+            reason: reason.into(),
+        });
         self.status.write().await.last_error =
             Some(format!("Note {} cannot sync: {}", event.note_id, reason));
     }
@@ -383,7 +434,7 @@ pub async fn run(
                 _=shutdown.changed()=>break,
                 _=profiles.changed()=>Ok(()),
                 result=watch_config(&ctx,&config)=>result,
-                _=runtime.wake.notified()=>Ok(()),
+
                 result=session(&ctx,profile,&config,&runtime)=>result,
             }
         } else {
@@ -391,6 +442,7 @@ pub async fn run(
                 "selected sync connection profile is unavailable; add it in System settings"
             ))
         };
+        runtime.drain_workers().await;
         // The sole worker has dropped the entire old session before reclaiming
         // all its leases, covering cancellation between DB commit and tracking.
         if let Err(error) = sync::release_abandoned_sync_events(&ctx).await {
@@ -416,6 +468,7 @@ pub async fn run(
             break;
         }
     }
+    runtime.drain_workers().await;
     if let Err(error) = sync::release_abandoned_sync_events(&ctx).await {
         runtime.error(&error).await;
     }
@@ -488,7 +541,7 @@ struct Incoming {
 struct Session<'a> {
     ctx: &'a Context,
     runtime: &'a SyncRuntime,
-    socket: Socket,
+    socket: Io,
     join: String,
     counter: u64,
     limit: u64,
@@ -496,9 +549,32 @@ struct Session<'a> {
     heartbeat: Option<(String, Instant)>,
     next_heartbeat: Instant,
     outbound: Option<(String, String)>,
+    outbound_transfer: Option<String>,
     state_query: bool,
     inbound_query: Option<InboundQuery>,
     remote_inventory_complete: bool,
+    task_sync: bool,
+    task_origin: String,
+    task_sequence: u64,
+    received_tasks: Ledger,
+    outgoing_tasks: HashMap<String, OutgoingTask>,
+    task_jobs: HashMap<String, TaskJob>,
+    manager_failed: bool,
+    scan_progress: Option<watch::Receiver<SourceProgress>>,
+    manager_sequence: u64,
+    remote_manager: Option<(String, u64, Value)>,
+    resolved: Arc<tempfile::TempDir>,
+    deferred_abort: Option<(String, String, Value)>,
+}
+impl Drop for Session<'_> {
+    fn drop(&mut self) {
+        // Disposable work must settle before the runtime drains durable apply and releases leases.
+        for job in self.task_jobs.values() {
+            if !job.durable {
+                job.abort.abort();
+            }
+        }
+    }
 }
 async fn session(
     ctx: &Context,
@@ -525,7 +601,7 @@ async fn session(
     let mut client = Session {
         ctx,
         runtime,
-        socket: connect_socket(profile).await?,
+        socket: Io::start(connect_socket(profile).await?),
         join: uuid::Uuid::new_v4().to_string(),
         counter: 0,
         limit: profile.max_blob_bytes,
@@ -533,9 +609,22 @@ async fn session(
         heartbeat: None,
         next_heartbeat: Instant::now() + HEARTBEAT,
         outbound: None,
+        outbound_transfer: None,
         state_query: false,
         inbound_query: None,
         remote_inventory_complete: false,
+        task_sync: false,
+        task_origin: status.node_id.clone(),
+        task_sequence: 0,
+        received_tasks: Ledger::new(String::new()),
+        outgoing_tasks: HashMap::new(),
+        task_jobs: HashMap::new(),
+        manager_failed: false,
+        scan_progress: None,
+        manager_sequence: 0,
+        remote_manager: None,
+        resolved: Arc::new(tempfile::tempdir()?),
+        deferred_abort: None,
     };
     let peer: PeerHello = serde_json::from_value(
         client
@@ -553,6 +642,7 @@ async fn session(
         "invalid sync capabilities"
     );
     let supports_query = peer.capabilities.iter().any(|c| c == "state_query_v1");
+    let supports_tasks = peer.capabilities.iter().any(|c| c == "task_sync_v1");
     let peer = peer.hello;
     if peer.protocol_version != 1
         || uuid::Uuid::parse_str(&peer.node_id).is_err()
@@ -564,10 +654,15 @@ async fn session(
     }
     client.limit = profile.max_blob_bytes.min(peer.max_blob_bytes);
     sync::pin_sync_peer(ctx, &profile.id, &peer.node_id).await?;
+    client.received_tasks = Ledger::new(peer.node_id.clone());
     runtime.connected(peer.node_id).await;
     if supports_query {
         let selection = Negotiation {
-            capabilities: vec!["state_query_v1".into()],
+            capabilities: if supports_tasks {
+                vec!["state_query_v1".into(), "task_sync_v1".into()]
+            } else {
+                vec!["state_query_v1".into()]
+            },
         };
         let accepted: Negotiation = serde_json::from_value(
             client
@@ -575,8 +670,22 @@ async fn session(
                 .await?,
         )
         .context("invalid sync capability negotiation")?;
-        anyhow::ensure!(accepted == selection, "sync capabilities were not accepted");
+        let accepted_set: HashSet<_> = accepted.capabilities.iter().collect();
+        let selected_set: HashSet<_> = selection.capabilities.iter().collect();
+        anyhow::ensure!(
+            accepted.capabilities.len() == accepted_set.len() && accepted_set == selected_set,
+            "sync capabilities were not accepted"
+        );
         client.state_query = true;
+        client.task_sync = supports_tasks;
+    }
+    if !client.task_sync {
+        runtime.status.write().await.last_error =
+            Some("GaoNote upgrade required: task_sync_v1 is unavailable".into());
+        loop {
+            let message = client.socket.next().await;
+            client.handle_message(message).await?;
+        }
     }
     let basis = if client.state_query {
         "remote_verified"
@@ -585,28 +694,786 @@ async fn session(
     };
     runtime.progress(|p| *p = SyncProgress::new(basis)).await;
     // The query handler is active before GaoNote may begin its outbound pass.
-    client.request("inventory_start", json!({})).await?;
-    client.reconcile_round(true).await?;
-    let mut next_audit = Instant::now() + Duration::from_secs(300);
-    loop {
-        let current = note_pipelines::get_system_config(ctx).await?.sync;
-        if &current != config {
-            return Ok(());
+    if let Err(error) = client.start_inventory().await {
+        if error.downcast_ref::<RemoteTaskFailure>().is_none() {
+            return Err(error);
         }
-        if Instant::now() >= next_audit {
-            client.reconcile_round(true).await?;
-            next_audit = Instant::now() + Duration::from_secs(300);
-        } else if client.has_pending_work().await? {
-            client.reconcile_round(false).await?;
-        } else if let Ok(message) = timeout(Duration::from_millis(250), client.socket.next()).await
-        {
-            client.handle_message(message).await?;
+        runtime.status.write().await.last_error =
+            Some("Remote inventory task failed; connection remains available".into());
+    }
+    client.reconcile_round(true).await?;
+    loop {
+        let retry = runtime.wake.notified().now_or_never().is_some();
+        match client.scheduled_work(config, retry).await? {
+            None => return Ok(()),
+            Some(_) if retry && !client.manager_failed => client.reconcile_round(true).await?,
+            Some(true) => client.reconcile_round(false).await?,
+            Some(false) => {
+                if let Ok(message) = timeout(Duration::from_millis(250), client.socket.next()).await
+                {
+                    client.handle_message(message).await?;
+                }
+            }
         }
         client.check_liveness().await?;
     }
 }
 
 impl Session<'_> {
+    fn transfer_worker(&mut self) -> TransferWorker {
+        TransferWorker {
+            ctx: self.ctx.clone(),
+            runtime: WorkerProgress {
+                status: self.runtime.status.clone(),
+                task_mode: self.task_sync,
+                resolved: self.resolved.clone(),
+            },
+            incoming: self.incoming.take(),
+            limit: self.limit,
+            remote_inventory_complete: self.remote_inventory_complete,
+        }
+    }
+    async fn show_task(&mut self, status: &TaskStatus, operation: &str, upload: bool) {
+        self.runtime
+            .progress(|progress| {
+                let direction = if upload {
+                    &mut progress.upload
+                } else {
+                    &mut progress.download
+                };
+                if direction.active_task.as_ref().is_some_and(|old| {
+                    old.id == status.task_id
+                        && old.state == status.state
+                        && old.phase == status.phase
+                        && old.error
+                            == status
+                                .error
+                                .as_ref()
+                                .map(|error| format!("Synchronization task: {}", error.code))
+                }) {
+                    return;
+                }
+                direction.active_task = Some(SyncActiveTask {
+                    id: status.task_id.clone(),
+                    operation: operation.into(),
+                    state: status.state.clone(),
+                    phase: status.phase.clone(),
+                    updated_at: chrono::Utc::now().timestamp_millis(),
+                    error: status
+                        .error
+                        .as_ref()
+                        .map(|error| format!("Synchronization task: {}", error.code)),
+                });
+            })
+            .await;
+    }
+    async fn publish_task(&mut self, status: TaskStatus, operation: &str) -> Result<()> {
+        if status.state == "failed" {
+            let mut state = self.runtime.status.write().await;
+            SyncRuntime::record(&mut state, Failure::new("task", "sync_task_failed", "An incoming synchronization task failed; connection remains available and pending notes are preserved.").event("error"));
+        }
+        self.show_task(&status, operation, false).await;
+        self.send("task_status", serde_json::to_value(status)?, None)
+            .await
+    }
+    async fn task_error(&mut self, id: &str, code: &str) -> Result<()> {
+        self.send("task_error", json!({"task_id":id,"code":code}), None)
+            .await
+    }
+    async fn submit_task(
+        &mut self,
+        operation: &str,
+        payload: Value,
+        detached: bool,
+    ) -> Result<String> {
+        anyhow::ensure!(
+            self.outgoing_tasks.len() < 4,
+            "outgoing task capacity exceeded"
+        );
+        self.task_sequence = self
+            .task_sequence
+            .checked_add(1)
+            .context("task sequence exhausted")?;
+        let id = format!("{}:{}", self.task_origin, self.task_sequence);
+        let submit = Submission {
+            task_id: id.clone(),
+            operation: operation.into(),
+            payload,
+        };
+        self.outgoing_tasks.insert(
+            id.clone(),
+            OutgoingTask {
+                operation: operation.into(),
+                status: None,
+                error: None,
+                detached,
+            },
+        );
+        self.send("task_submit", serde_json::to_value(submit)?, None)
+            .await?;
+        Ok(id)
+    }
+    async fn start_inventory(&mut self) -> Result<()> {
+        let id = self.submit_task("inventory_start", json!({}), true).await?;
+        // Admission permits our own duplex checking; the remote scan remains a live task.
+        self.wait_remote_task(&id, true).await?;
+        Ok(())
+    }
+    async fn task_request(&mut self, operation: &str, payload: Value) -> Result<Value> {
+        let id = self.submit_task(operation, payload, false).await?;
+        let result = self.wait_remote_task(&id, false).await;
+        self.outgoing_tasks.remove(&id);
+        result
+    }
+    async fn wait_remote_task(&mut self, id: &str, admission: bool) -> Result<Value> {
+        let mut probe = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(task) = self.outgoing_tasks.get(id) {
+                if let Some(error) = &task.error {
+                    return Err(RemoteTaskFailure(error.clone()).into());
+                }
+                if let Some(status) = &task.status {
+                    if status.state == "succeeded" {
+                        return Ok(status.result.clone().unwrap());
+                    }
+                    if status.terminal() {
+                        return Err(RemoteTaskFailure(
+                            status
+                                .error
+                                .as_ref()
+                                .map_or("cancelled", |error| error.code.as_str())
+                                .into(),
+                        )
+                        .into());
+                    }
+                    if admission {
+                        return Ok(json!({}));
+                    }
+                }
+            } else if admission {
+                return Ok(json!({}));
+            }
+            self.check_liveness().await?;
+            if Instant::now() >= probe {
+                self.send("task_get", json!({"task_id":id}), None).await?;
+                probe = Instant::now() + Duration::from_secs(5);
+            }
+            let wake = self.next_wake().min(probe);
+            tokio::select! {
+                message = self.socket.next() => self.handle_message(message).await?,
+                _ = tokio::time::sleep_until(wake) => {},
+            }
+        }
+    }
+    async fn handle_task_frame(&mut self, frame: Frame) -> Result<()> {
+        match frame.event.as_str() {
+            "sync_manager_status" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ManagerWire {
+                    round_id: String,
+                    status_seq: u64,
+                    progress: ManagerData,
+                }
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ManagerData {
+                    #[serde(default)]
+                    state: Option<String>,
+                    #[serde(default)]
+                    error: Option<tasks::TaskError>,
+                    mode: String,
+                    page_size: u64,
+                    pages_scanned: u64,
+                    pages_checked: u64,
+                    notes_scanned: u64,
+                    scan_complete: bool,
+                    source_cursor: Option<String>,
+                    last_progress_at: i64,
+                    checked_notes: usize,
+                    total_notes: Option<usize>,
+                    #[serde(default)]
+                    planned_notes: Option<usize>,
+                    #[serde(default)]
+                    equal_notes: Option<usize>,
+                    #[serde(default)]
+                    superseded_notes: Option<usize>,
+                    #[serde(default)]
+                    blocked_notes: Option<usize>,
+                }
+                let wire: ManagerWire = serde_json::from_value(frame.payload.clone())
+                    .context("invalid sync manager status")?;
+                anyhow::ensure!(
+                    uuid::Uuid::parse_str(&wire.round_id).is_ok()
+                        && wire.status_seq > 0
+                        && matches!(wire.progress.mode.as_str(), "initial_scan" | "changes")
+                        && wire.progress.page_size > 0
+                        && wire.progress.page_size <= 32
+                        && wire.progress.pages_checked <= wire.progress.pages_scanned
+                        && wire.progress.checked_notes as u64 <= wire.progress.notes_scanned
+                        && wire.progress.last_progress_at >= 0
+                        && wire
+                            .progress
+                            .source_cursor
+                            .as_ref()
+                            .is_none_or(|cursor| uuid::Uuid::parse_str(cursor).is_ok()),
+                    "invalid sync manager counters"
+                );
+                if let Some((_, sequence, old)) = &self.remote_manager {
+                    if wire.status_seq < *sequence {
+                        return Ok(());
+                    }
+                    if wire.status_seq == *sequence {
+                        anyhow::ensure!(old == &frame.payload, "conflicting sync manager snapshot");
+                        return Ok(());
+                    }
+                }
+                anyhow::ensure!(
+                    wire.progress.state.as_ref().is_none_or(|state| matches!(
+                        state.as_str(),
+                        "running" | "idle" | "failed"
+                    )) && wire
+                        .progress
+                        .error
+                        .as_ref()
+                        .is_none_or(|error| !error.code.is_empty()
+                            && error.code.len() <= 64
+                            && error.code.bytes().all(|byte| byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || byte == b'_')),
+                    "invalid sync manager outcome"
+                );
+                let new_round = self
+                    .remote_manager
+                    .as_ref()
+                    .is_none_or(|(round, _, _)| round != &wire.round_id);
+                let data = wire.progress;
+                self.runtime
+                    .progress(|p| {
+                        if new_round {
+                            p.download = SyncDirectionProgress::new("remote_verified");
+                            p.download.run_id = wire.round_id.clone();
+                        }
+                        p.download.manager = Some(SyncManagerProgress {
+                            state: data.state,
+                            error: data
+                                .error
+                                .map(|error| format!("Synchronization manager: {}", error.code)),
+                            mode: data.mode,
+                            page_size: data.page_size,
+                            pages_scanned: data.pages_scanned,
+                            pages_checked: data.pages_checked,
+                            notes_scanned: data.notes_scanned,
+                            scan_complete: data.scan_complete,
+                            source_cursor: data.source_cursor,
+                            last_progress_at: data.last_progress_at,
+                        });
+                        p.download.notes_checked = data.checked_notes;
+                        p.download.notes_total = data.total_notes;
+                        if let Some(planned) = data.planned_notes {
+                            p.download.notes_planned = planned;
+                            p.download.notes_remaining =
+                                Some(planned.saturating_sub(p.download.notes_completed));
+                        }
+                        if let Some(equal) = data.equal_notes {
+                            p.download.notes_equal = equal;
+                        }
+                        if let Some(superseded) = data.superseded_notes {
+                            p.download.notes_superseded = superseded;
+                        }
+                        if let Some(blocked) = data.blocked_notes {
+                            p.download.blocked_notes = p.download.blocked_notes.max(blocked);
+                        }
+                    })
+                    .await;
+                if new_round {
+                    self.remote_inventory_complete = false;
+                }
+                self.remote_manager = Some((wire.round_id, wire.status_seq, frame.payload));
+            }
+            "task_status" => {
+                let status: TaskStatus =
+                    serde_json::from_value(frame.payload.clone()).context("invalid task status")?;
+                anyhow::ensure!(
+                    serde_json::to_value(&status)? == frame.payload
+                        && tasks::sequence(&status.task_id, &self.task_origin).is_some(),
+                    "invalid task status identity"
+                );
+                status.validate()?;
+                let Some(task) = self.outgoing_tasks.get_mut(&status.task_id) else {
+                    anyhow::ensure!(
+                        tasks::sequence(&status.task_id, &self.task_origin)
+                            .is_some_and(|seq| seq <= self.task_sequence),
+                        "unsolicited task status"
+                    );
+                    return Ok(());
+                };
+                if let Some(old) = &task.status {
+                    if !old.accept_update(&status)? {
+                        return Ok(());
+                    }
+                }
+                let operation = task.operation.clone();
+                let detach = task.detached && status.terminal();
+                task.status = Some(status.clone());
+                self.show_task(&status, &operation, true).await;
+                if status.state == "failed" {
+                    let mut state = self.runtime.status.write().await;
+                    SyncRuntime::record(&mut state, Failure::new("task", "sync_task_failed", "A remote synchronization task failed; connection remains available and pending notes are preserved.").event("error"));
+                }
+                if detach {
+                    if status.state != "succeeded" {
+                        self.runtime.status.write().await.last_error = Some(
+                            "Remote inventory task failed; queued notes remain pending".into(),
+                        );
+                    }
+                    self.outgoing_tasks.remove(&status.task_id);
+                }
+            }
+            "task_error" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ErrorReply {
+                    task_id: String,
+                    code: String,
+                }
+                let error: ErrorReply =
+                    serde_json::from_value(frame.payload).context("invalid task error")?;
+                anyhow::ensure!(
+                    !error.code.is_empty()
+                        && error.code.len() <= 64
+                        && error
+                            .code
+                            .bytes()
+                            .all(|c| c.is_ascii_lowercase() || c == b'_')
+                        && tasks::sequence(&error.task_id, &self.task_origin)
+                            .is_some_and(|seq| seq <= self.task_sequence),
+                    "invalid task error identity"
+                );
+                if let Some(task) = self.outgoing_tasks.get_mut(&error.task_id) {
+                    task.error = Some(error.code);
+                }
+            }
+            "task_submit" => {
+                let submit: Submission = match serde_json::from_value(frame.payload.clone()) {
+                    Ok(submit) => submit,
+                    Err(_) => {
+                        let id = frame.payload["task_id"]
+                            .as_str()
+                            .filter(|id| id.len() <= 64)
+                            .unwrap_or("");
+                        return self.task_error(id, "invalid_submission").await;
+                    }
+                };
+                let admission = match self.received_tasks.admit(&submit) {
+                    Ok(admission) => admission,
+                    Err(code) => return self.task_error(&submit.task_id, code).await,
+                };
+                let status = match admission {
+                    Admission::Replay(status) => {
+                        return self.publish_task(status, &submit.operation).await
+                    }
+                    Admission::Start(status) => status,
+                };
+                self.publish_task(status, &submit.operation).await?;
+                let status =
+                    self.received_tasks
+                        .update(&submit.task_id, &submit.operation, json!({}));
+                self.publish_task(status, &submit.operation).await?;
+                if submit.operation == "transfer_abort" {
+                    // The ledger also retains quarantined commits after their worker exits.
+                    if let Some(transfer_task) =
+                        self.received_tasks.active_transfer().map(str::to_owned)
+                    {
+                        let status = self.received_tasks.update(
+                            &submit.task_id,
+                            "cancellation_pending",
+                            json!({}),
+                        );
+                        self.publish_task(status, &submit.operation).await?;
+                        self.deferred_abort = Some((submit.task_id, transfer_task, submit.payload));
+                        return Ok(());
+                    }
+                }
+                let ctx = self.ctx.clone();
+                let operation = submit.operation.clone();
+                let payload = submit.payload;
+                let durable = operation == "transfer_commit";
+                let event = if durable {
+                    self.incoming
+                        .as_ref()
+                        .and_then(|incoming| incoming.event.clone())
+                } else {
+                    None
+                };
+                let (receive, abort) = match operation.as_str() {
+                    "state_query" => self.runtime.worker(async move {
+                        let result = async {
+                            let query: SyncStateQuery = serde_json::from_value(payload.clone())?;
+                            anyhow::ensure!(
+                                serde_json::to_value(&query)? == payload,
+                                "invalid sync state query fields"
+                            );
+                            sync::validate_sync_state_query(&query)?;
+                            Ok(serde_json::to_value(
+                                sync::query_sync_state(&ctx, &query).await?,
+                            )?)
+                        }
+                        .await;
+                        TaskCompletion {
+                            worker: None,
+                            result,
+                        }
+                    }),
+                    "inventory_start" => self.runtime.worker(async move {
+                        let result = async {
+                            let mut scan = sync::start_sync_candidate_scan(&ctx, false).await?;
+                            while !scan.next_page(PAGE_SIZE).await?.is_empty() {}
+                            Ok(json!({}))
+                        }
+                        .await;
+                        TaskCompletion {
+                            worker: None,
+                            result,
+                        }
+                    }),
+                    "inventory_complete" => {
+                        let result = self.receive("inventory_complete", payload).await;
+                        self.runtime.worker(async move {
+                            TaskCompletion {
+                                worker: None,
+                                result,
+                            }
+                        })
+                    }
+                    _ => {
+                        let mut worker = self.transfer_worker();
+                        let operation = operation.clone();
+                        self.runtime.worker(async move {
+                            let mut result = worker.receive(&operation, payload.clone()).await;
+                            if result.is_ok() && operation == "blob_chunk" {
+                                result = Ok(json!({"transfer_id":payload["transfer_id"],"blob_id":payload["blob_id"],"received_bytes":payload["offset"].as_u64().unwrap()+BASE64.decode(payload["data"].as_str().unwrap()).unwrap().len() as u64}));
+                            }
+                            TaskCompletion { worker:Some(worker), result }
+                        })
+                    }
+                };
+                self.task_jobs.insert(
+                    submit.task_id,
+                    TaskJob {
+                        operation,
+                        receive,
+                        abort,
+                        cancelled: false,
+                        durable,
+                        event,
+                    },
+                );
+            }
+            "task_get" | "task_cancel" => {
+                anyhow::ensure!(
+                    frame
+                        .payload
+                        .as_object()
+                        .is_some_and(|payload| payload.len() == 1),
+                    "invalid task lookup"
+                );
+                let id = field(&frame.payload, "task_id")?;
+                if frame.event == "task_cancel" {
+                    if let Some(job) = self.task_jobs.get_mut(id) {
+                        job.cancelled = true;
+                        if !job.durable {
+                            job.abort.abort();
+                        }
+                        let operation = job.operation.clone();
+                        let status =
+                            self.received_tasks
+                                .update(id, "cancellation_pending", json!({}));
+                        return self.publish_task(status, &operation).await;
+                    }
+                }
+                match self.received_tasks.get(id) {
+                    Ok(status) => {
+                        self.send("task_status", serde_json::to_value(status)?, None)
+                            .await?
+                    }
+                    Err(code) => self.task_error(id, code).await?,
+                }
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+    async fn poll_task_jobs(&mut self) -> Result<()> {
+        let mut completed = Vec::new();
+        for (id, job) in &mut self.task_jobs {
+            match job.receive.try_recv() {
+                Ok(result) => completed.push((id.clone(), Some(result))),
+                Err(oneshot::error::TryRecvError::Closed) => completed.push((id.clone(), None)),
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        for (id, completion) in completed {
+            let job = self.task_jobs.remove(&id).unwrap();
+            let Some(completion) = completion else {
+                if job.durable {
+                    let status = self.received_tasks.unknown(&id);
+                    self.publish_task(status, &job.operation).await?;
+                    if let Some(event) = job.event {
+                        let ctx = self.ctx.clone();
+                        let progress = WorkerProgress {
+                            status: self.runtime.status.clone(),
+                            task_mode: self.task_sync,
+                            resolved: self.resolved.clone(),
+                        };
+                        let remote_complete = self.remote_inventory_complete;
+                        let (receive, abort) = self.runtime.worker(async move {
+                            let result = match sync::sync_received_event(&ctx, &event).await {
+                                Ok(true) => {
+                                    progress.complete_applied(&event, remote_complete).await;
+                                    Ok(serde_json::to_value(event.acknowledgement()).unwrap())
+                                }
+                                _ => Err(UnknownCommit.into()),
+                            };
+                            TaskCompletion {
+                                worker: None,
+                                result,
+                            }
+                        });
+                        self.task_jobs.insert(
+                            id,
+                            TaskJob {
+                                operation: job.operation,
+                                receive,
+                                abort,
+                                cancelled: job.cancelled,
+                                durable: true,
+                                event: None,
+                            },
+                        );
+                    }
+                } else {
+                    let status = self.received_tasks.finish(
+                        &id,
+                        Err(if job.cancelled {
+                            "cancelled"
+                        } else {
+                            "worker_failed"
+                        }),
+                    );
+                    self.publish_task(status, &job.operation).await?;
+                }
+                continue;
+            };
+            if completion
+                .result
+                .as_ref()
+                .is_err_and(|error| error.downcast_ref::<UnknownCommit>().is_some())
+            {
+                let status = self.received_tasks.unknown(&id);
+                self.publish_task(status, &job.operation).await?;
+                continue;
+            }
+            if job.durable
+                && completion
+                    .result
+                    .as_ref()
+                    .is_err_and(|error| error.downcast_ref::<ApplyAttemptError>().is_some())
+                && job.event.is_some()
+            {
+                let event = job.event.unwrap();
+                let error = completion
+                    .result
+                    .unwrap_err()
+                    .downcast::<ApplyAttemptError>()
+                    .unwrap()
+                    .source;
+                let commit_uncertain = error
+                    .downcast_ref::<sync::SyncCommitOutcomeUnknown>()
+                    .is_some();
+                let status = self.received_tasks.unknown(&id);
+                self.publish_task(status, &job.operation).await?;
+                let ctx = self.ctx.clone();
+                let progress = WorkerProgress {
+                    status: self.runtime.status.clone(),
+                    task_mode: self.task_sync,
+                    resolved: self.resolved.clone(),
+                };
+                let remote_complete = self.remote_inventory_complete;
+                let (receive, abort) = self.runtime.worker(async move {
+                    let result = match sync::sync_received_event(&ctx, &event).await {
+                        Ok(true) => {
+                            progress.complete_applied(&event, remote_complete).await;
+                            Ok(serde_json::to_value(event.acknowledgement()).unwrap())
+                        }
+                        Ok(false) if !commit_uncertain => Err(error),
+                        _ => Err(UnknownCommit.into()),
+                    };
+                    TaskCompletion {
+                        worker: None,
+                        result,
+                    }
+                });
+                self.task_jobs.insert(
+                    id,
+                    TaskJob {
+                        operation: job.operation,
+                        receive,
+                        abort,
+                        cancelled: job.cancelled,
+                        durable: true,
+                        event: None,
+                    },
+                );
+                continue;
+            }
+            let mut result = if job.cancelled && !job.durable {
+                Err("cancelled")
+            } else {
+                completion
+                    .result
+                    .as_ref()
+                    .map(|value| value.clone())
+                    .map_err(|error| {
+                        sync::sync_note_rejection_reason(error).unwrap_or("operation_failed")
+                    })
+            };
+            if let Some(worker) = completion.worker {
+                if result.is_ok() {
+                    self.incoming = worker.incoming;
+                    self.remote_inventory_complete = worker.remote_inventory_complete;
+                }
+                // Failed/cancelled task owns its staging until its worker has settled.
+            }
+            if result.as_ref().is_ok_and(|value| Frame::new(Some(&self.join), None, TOPIC, "task_status", json!({"task_id":id,"status_seq":u64::MAX,"state":"succeeded","phase":job.operation,"progress":{},"result":value,"error":null})).encode().is_err()) {
+                result = Err("result_too_large");
+            }
+            let status = self.received_tasks.finish(&id, result);
+            self.publish_task(status, &job.operation).await?;
+        }
+        if let Some((id, commit_id, payload)) = self.deferred_abort.take() {
+            if self
+                .received_tasks
+                .get(&commit_id)
+                .is_ok_and(|status| status.terminal())
+            {
+                let mut worker = self.transfer_worker();
+                let result = worker.receive("transfer_abort", payload).await;
+                self.incoming = worker.incoming;
+                let status = self
+                    .received_tasks
+                    .finish(&id, result.map_err(|_| "operation_failed"));
+                self.publish_task(status, "transfer_abort").await?;
+            } else {
+                self.deferred_abort = Some((id, commit_id, payload));
+            }
+        }
+        Ok(())
+    }
+    fn rejection_path(&self, descriptor: &SyncAck) -> Result<PathBuf> {
+        uuid::Uuid::parse_str(&descriptor.note_id)?;
+        uuid::Uuid::parse_str(&descriptor.event_id)?;
+        let mut directory = self
+            .runtime
+            .rejection_directory
+            .lock()
+            .expect("sync rejection directory mutex poisoned");
+        if directory.is_none() {
+            *directory = Some(Arc::new(
+                tempfile::tempdir().map_err(|_| LocalManagerFailure)?,
+            ));
+        }
+        let epoch = self
+            .runtime
+            .retry_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Ok(directory
+            .as_ref()
+            .unwrap()
+            .path()
+            .join(format!("{epoch}-{}", descriptor.note_id)))
+    }
+    async fn descriptor_blocked(&mut self, descriptor: &SyncAck) -> Result<bool> {
+        if !self.task_sync {
+            return Ok(self.runtime.is_descriptor_blocked(descriptor));
+        }
+        let path = self.rejection_path(descriptor)?;
+        match tokio::fs::read(&path).await {
+            Ok(event) if event == descriptor.event_id.as_bytes() => Ok(true),
+            Ok(_) => {
+                tokio::fs::remove_file(path)
+                    .await
+                    .map_err(|_| LocalManagerFailure)?;
+                self.runtime
+                    .rejected_total
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |total| Some(total.saturating_sub(1)),
+                    )
+                    .ok();
+                self.runtime
+                    .blocked
+                    .lock()
+                    .expect("sync rejection mutex poisoned")
+                    .remove(&descriptor.note_id);
+                Ok(false)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err(LocalManagerFailure.into()),
+        }
+    }
+    async fn reject_descriptor(&mut self, descriptor: &SyncAck) -> Result<()> {
+        if self.task_sync {
+            let path = self.rejection_path(descriptor)?;
+            let existed = tokio::fs::try_exists(&path)
+                .await
+                .map_err(|_| LocalManagerFailure)?;
+            tokio::fs::write(path, descriptor.event_id.as_bytes())
+                .await
+                .map_err(|_| LocalManagerFailure)?;
+            if !existed {
+                self.runtime
+                    .rejected_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+    // None means configuration changed; a failed manager still services its socket
+    // at the idle poll interval, without repeatedly scanning the pending queue.
+    async fn scheduled_work(
+        &mut self,
+        config: &note_core::sync::SyncConfig,
+        retry: bool,
+    ) -> Result<Option<bool>> {
+        let current = match note_pipelines::get_system_config(self.ctx).await {
+            Ok(current) => current.sync,
+            Err(error) if Self::local_manager_error(&error) => {
+                self.fail_local_manager().await?;
+                return Ok(Some(false));
+            }
+            Err(error) => return Err(error),
+        };
+        if &current != config {
+            return Ok(None);
+        }
+        if retry {
+            self.manager_failed = false;
+        }
+        if self.manager_failed {
+            return Ok(Some(false));
+        }
+        match self.has_pending_work().await {
+            Ok(pending) => Ok(Some(pending)),
+            Err(error) if Self::local_manager_error(&error) => {
+                self.fail_local_manager().await?;
+                Ok(Some(false))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn has_pending_work(&mut self) -> Result<bool> {
         let mut after = None;
         loop {
@@ -614,11 +1481,10 @@ impl Session<'_> {
             if page.is_empty() {
                 return Ok(false);
             }
-            if page
-                .iter()
-                .any(|c| !self.runtime.is_descriptor_blocked(&c.descriptor))
-            {
-                return Ok(true);
+            for candidate in &page {
+                if !self.descriptor_blocked(&candidate.descriptor).await? {
+                    return Ok(true);
+                }
             }
             after = page.last().map(|c| c.descriptor.note_id.clone());
         }
@@ -656,7 +1522,408 @@ impl Session<'_> {
         Ok(response)
     }
 
+    async fn resolve_upload(&mut self, note: &str, kind: &str) -> Result<()> {
+        if !self.task_sync {
+            self.runtime
+                .progress(|p| match kind {
+                    "equal" => p.upload.note_equal(note),
+                    "superseded" => p.upload.supersede_note(note),
+                    "blocked" => p.upload.block_note(note),
+                    _ => p.upload.complete_note(note),
+                })
+                .await;
+            return Ok(());
+        }
+        let run = self
+            .runtime
+            .status
+            .read()
+            .await
+            .progress
+            .as_ref()
+            .unwrap()
+            .upload
+            .run_id
+            .clone();
+        let resolved_path = self.resolved.path().join(format!("{run}-{note}-resolved"));
+        if kind == "blocked" {
+            if tokio::fs::try_exists(resolved_path)
+                .await
+                .map_err(|_| LocalManagerFailure)?
+            {
+                return Ok(());
+            }
+            if scan::mark(self.resolved.path(), &run, note, "blocked")
+                .await
+                .map_err(|_| LocalManagerFailure)?
+            {
+                self.runtime
+                    .progress(|p| {
+                        p.upload.blocked_notes += 1;
+                        p.upload.current_note = None;
+                    })
+                    .await;
+            }
+        } else if scan::mark(self.resolved.path(), &run, note, "resolved")
+            .await
+            .map_err(|_| LocalManagerFailure)?
+        {
+            let was_blocked = scan::unmark(self.resolved.path(), &run, note, "blocked")
+                .await
+                .map_err(|_| LocalManagerFailure)?;
+            self.runtime
+                .progress(|p| {
+                    match kind {
+                        "equal" => p.upload.notes_equal += 1,
+                        "superseded" => p.upload.notes_superseded += 1,
+                        _ => p.upload.notes_completed += 1,
+                    }
+                    if let Some(remaining) = &mut p.upload.notes_remaining {
+                        *remaining = remaining.saturating_sub(1);
+                    }
+                    if was_blocked {
+                        p.upload.blocked_notes = p.upload.blocked_notes.saturating_sub(1);
+                    }
+                    if p.upload
+                        .current_note
+                        .as_ref()
+                        .is_some_and(|current| current.id == note)
+                    {
+                        p.upload.current_note = None;
+                    }
+                })
+                .await;
+        }
+        self.manager_progress().await?;
+        Ok(())
+    }
+    async fn manager_progress(&mut self) -> Result<()> {
+        if !self.task_sync {
+            return Ok(());
+        }
+        self.runtime
+            .progress(|p| {
+                if let Some(manager) = &mut p.upload.manager {
+                    manager.last_progress_at = chrono::Utc::now().timestamp_millis();
+                }
+            })
+            .await;
+        self.publish_manager().await
+    }
+    async fn publish_manager(&mut self) -> Result<()> {
+        if !self.task_sync {
+            return Ok(());
+        }
+        let status = self.runtime.status.read().await;
+        let Some(progress) = &status.progress else {
+            return Ok(());
+        };
+        let upload = &progress.upload;
+        let Some(manager) = &upload.manager else {
+            return Ok(());
+        };
+        let mut data = serde_json::to_value(manager)?;
+        let object = data.as_object_mut().unwrap();
+        object.insert(
+            "error".into(),
+            if manager.error.is_some() {
+                json!({"code":"source_failed","retryable":false})
+            } else {
+                Value::Null
+            },
+        );
+        object.insert("checked_notes".into(), json!(upload.notes_checked));
+        object.insert("total_notes".into(), json!(upload.notes_total));
+        object.insert("planned_notes".into(), json!(upload.notes_planned));
+        object.insert("equal_notes".into(), json!(upload.notes_equal));
+        object.insert("superseded_notes".into(), json!(upload.notes_superseded));
+        object.insert("blocked_notes".into(), json!(upload.blocked_notes));
+        self.manager_sequence += 1;
+        let payload =
+            json!({"round_id":upload.run_id,"status_seq":self.manager_sequence,"progress":data});
+        drop(status);
+        self.send("sync_manager_status", payload, None).await
+    }
+    async fn refresh_scan(&mut self) -> Result<()> {
+        let Some(source) = self
+            .scan_progress
+            .as_ref()
+            .map(|source| source.borrow().clone())
+        else {
+            return Ok(());
+        };
+        let old = self
+            .runtime
+            .status
+            .read()
+            .await
+            .progress
+            .as_ref()
+            .and_then(|p| p.upload.manager.as_ref())
+            .map(|manager| (manager.pages_scanned, manager.scan_complete));
+        if old == Some((source.pages_scanned, source.scan_complete)) {
+            return Ok(());
+        }
+        self.runtime
+            .progress(|p| {
+                if let Some(manager) = &mut p.upload.manager {
+                    manager.pages_scanned = source.pages_scanned;
+                    manager.notes_scanned = source.notes_scanned as u64;
+                    manager.scan_complete = source.scan_complete;
+                    manager.source_cursor = source.source_cursor;
+                    manager.last_progress_at = source.last_progress_at;
+                }
+                if source.scan_complete {
+                    p.upload.notes_total = Some(source.notes_scanned);
+                }
+            })
+            .await;
+        self.publish_manager().await
+    }
+    async fn reconcile_pages(&mut self, full: bool) -> Result<()> {
+        self.runtime
+            .progress(|p| {
+                p.upload = SyncDirectionProgress::new(if full {
+                    "remote_verified"
+                } else {
+                    "local_queue"
+                });
+                p.upload.manager = Some(SyncManagerProgress {
+                    state: Some("running".into()),
+                    error: None,
+                    mode: if full { "initial_scan" } else { "changes" }.into(),
+                    page_size: PAGE_SIZE as u64,
+                    pages_scanned: 0,
+                    pages_checked: 0,
+                    notes_scanned: 0,
+                    scan_complete: false,
+                    source_cursor: None,
+                    last_progress_at: chrono::Utc::now().timestamp_millis(),
+                });
+            })
+            .await;
+        self.local_task("reconcile", "running", "checking").await;
+        let mut spool =
+            ScanSpool::start(self.ctx.clone(), !full).map_err(|_| LocalManagerFailure)?;
+        self.scan_progress = Some(spool.subscribe());
+        self.publish_manager().await?;
+        loop {
+            let (returned, result) = self
+                .wait_task(tokio::spawn(async move {
+                    let result = spool.next().await;
+                    (spool, result)
+                }))
+                .await?;
+            spool = returned;
+            self.refresh_scan().await?;
+            let Some(page) = result.map_err(|_| LocalManagerFailure)? else {
+                break;
+            };
+            let response = if full {
+                match self
+                    .query_state(
+                        page.iter()
+                            .map(|candidate| candidate.descriptor.clone())
+                            .collect(),
+                    )
+                    .await
+                {
+                    Ok(response) => Some(response),
+                    Err(error) if error.downcast_ref::<RemoteTaskFailure>().is_some() => {
+                        for candidate in &page {
+                            let descriptor = &candidate.descriptor;
+                            self.runtime.blocked_sample(SyncBlockedNote {
+                                note_id: descriptor.note_id.clone(),
+                                event_id: descriptor.event_id.clone(),
+                                reason: "remote_state_query_failed".into(),
+                            });
+                            self.reject_descriptor(descriptor).await?;
+                            self.resolve_upload(&descriptor.note_id, "blocked").await?;
+                        }
+                        self.runtime
+                            .progress(|p| {
+                                p.upload.notes_checked += page.len();
+                                if let Some(manager) = &mut p.upload.manager {
+                                    manager.pages_checked += 1;
+                                    manager.last_progress_at =
+                                        chrono::Utc::now().timestamp_millis();
+                                }
+                            })
+                            .await;
+                        self.publish_manager().await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let mut work = Vec::with_capacity(page.len());
+            for (index, mut candidate) in page.iter().cloned().enumerate() {
+                let descriptor = &candidate.descriptor;
+                if !sync::sync_candidate_current(self.ctx, descriptor, false).await? {
+                    self.resolve_upload(&descriptor.note_id, "superseded")
+                        .await?;
+                    continue;
+                }
+                if let Some(item) = response.as_ref().map(|response| &response.items[index]) {
+                    if !candidate.pending
+                        && item.matches_snapshot(descriptor)
+                        && sync::sync_candidate_current(self.ctx, descriptor, true).await?
+                    {
+                        self.resolve_upload(&descriptor.note_id, "equal").await?;
+                        continue;
+                    }
+                    if item.association == SyncAssociation::Missing
+                        && descriptor.kind == SyncEventKind::Snapshot
+                    {
+                        if sync::recover_missing_sync_association(self.ctx, descriptor).await? {
+                            let current =
+                                sync::sync_current_candidate(self.ctx, &descriptor.note_id).await?;
+                            if let Some(current) = current.filter(|current| {
+                                current.descriptor.kind == SyncEventKind::Attach
+                                    && current.descriptor.generation == descriptor.generation
+                                    && current.descriptor.control == descriptor.control
+                                    && current.descriptor.version == descriptor.version
+                                    && current.descriptor.snapshot_hash == descriptor.snapshot_hash
+                            }) {
+                                candidate = current;
+                            } else {
+                                self.resolve_upload(&descriptor.note_id, "superseded")
+                                    .await?;
+                                continue;
+                            }
+                        } else {
+                            self.resolve_upload(&descriptor.note_id, "superseded")
+                                .await?;
+                            continue;
+                        }
+                    }
+                }
+                work.push(candidate);
+            }
+            self.runtime
+                .progress(|p| {
+                    p.upload.notes_checked += page.len();
+                    p.upload.notes_planned += work.len();
+                    p.upload.notes_remaining =
+                        Some(p.upload.notes_remaining.unwrap_or(0) + work.len());
+                    if let Some(manager) = &mut p.upload.manager {
+                        manager.pages_checked += 1;
+                        manager.last_progress_at = chrono::Utc::now().timestamp_millis();
+                    }
+                })
+                .await;
+            self.publish_manager().await?;
+            // Source pages already carry global 8:1 pending/audit fairness.
+            for candidate in work {
+                self.deliver_candidate(candidate).await?;
+            }
+            self.service_ready().await?;
+        }
+        let total = spool.progress().notes_scanned;
+        self.scan_progress = None;
+        self.runtime
+            .progress(|p| {
+                p.upload.finish_check(total);
+                p.upload.finish_round();
+                if let Some(manager) = &mut p.upload.manager {
+                    manager.state = Some("idle".into());
+                    manager.error = None;
+                }
+                if full {
+                    p.tracked_notes = Some(total);
+                }
+            })
+            .await;
+        self.publish_manager().await?;
+        if full {
+            let run_id = self
+                .runtime
+                .status
+                .read()
+                .await
+                .progress
+                .as_ref()
+                .unwrap()
+                .upload
+                .run_id
+                .clone();
+            if let Err(error) = self
+                .task_request(
+                    "inventory_complete",
+                    json!({"inventory_id":run_id,"total_notes":total}),
+                )
+                .await
+            {
+                if error.downcast_ref::<RemoteTaskFailure>().is_none() {
+                    return Err(error);
+                }
+            }
+        }
+        self.local_task("reconcile", "succeeded", "complete").await;
+        Ok(())
+    }
+    async fn local_task(&mut self, operation: &str, state: &str, phase: &str) {
+        self.runtime
+            .progress(|p| {
+                p.upload.active_task = Some(SyncActiveTask {
+                    id: format!("local:{}", operation),
+                    operation: operation.into(),
+                    state: state.into(),
+                    phase: phase.into(),
+                    updated_at: chrono::Utc::now().timestamp_millis(),
+                    error: None,
+                })
+            })
+            .await;
+    }
+    fn local_manager_error(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<LocalManagerFailure>().is_some()
+            || error.downcast_ref::<note_storage::StorageError>().is_some()
+    }
+
+    async fn fail_local_manager(&mut self) -> Result<()> {
+        if self.manager_failed {
+            return Ok(());
+        }
+        self.manager_failed = true;
+        self.scan_progress = None;
+        self.runtime
+            .progress(|p| {
+                p.upload.phase = "blocked".into();
+                if let Some(manager) = &mut p.upload.manager {
+                    manager.state = Some("failed".into());
+                    manager.error = Some(
+                        "Local synchronization scan failed; pending notes are preserved.".into(),
+                    );
+                    manager.last_progress_at = chrono::Utc::now().timestamp_millis();
+                }
+                p.upload.active_task = Some(SyncActiveTask {
+                    id: "local:reconcile".into(),
+                    operation: "reconcile".into(),
+                    state: "failed".into(),
+                    phase: "source_failed".into(),
+                    updated_at: chrono::Utc::now().timestamp_millis(),
+                    error: Some(
+                        "Local synchronization scan failed; pending notes are preserved. Retry to resume.".into(),
+                    ),
+                });
+            })
+            .await;
+        // A transport failure publishing the diagnostic still ends the session.
+        self.publish_manager().await
+    }
+
     async fn reconcile_round(&mut self, full: bool) -> Result<()> {
+        if self.task_sync {
+            let result = self.reconcile_pages(full).await;
+            if result.as_ref().is_err_and(Self::local_manager_error) {
+                self.fail_local_manager().await?;
+                return Ok(());
+            }
+            return result;
+        }
         let basis = if !full {
             "local_queue"
         } else if self.state_query {
@@ -667,12 +1934,14 @@ impl Session<'_> {
         self.runtime
             .progress(|p| p.upload = SyncDirectionProgress::new(basis))
             .await;
+        self.local_task("reconcile", "running", "checking").await;
         let ctx = self.ctx.clone();
         let candidates = self
             .wait_task(tokio::spawn(async move {
                 sync::sync_round_candidates(&ctx, !full).await
             }))
             .await??;
+        self.local_task("reconcile", "succeeded", "checked").await;
         let total = candidates.len();
         self.runtime
             .progress(|p| {
@@ -686,10 +1955,32 @@ impl Session<'_> {
         let mut checked = 0;
         for page in candidates.chunks(32) {
             let response = if self.state_query && full {
-                Some(
-                    self.query_state(page.iter().map(|c| c.descriptor.clone()).collect())
-                        .await?,
-                )
+                match self
+                    .query_state(page.iter().map(|c| c.descriptor.clone()).collect())
+                    .await
+                {
+                    Ok(response) => Some(response),
+                    Err(error) if error.downcast_ref::<RemoteTaskFailure>().is_some() => {
+                        for candidate in page {
+                            let descriptor = &candidate.descriptor;
+                            self.runtime.blocked_sample(SyncBlockedNote {
+                                note_id: descriptor.note_id.clone(),
+                                event_id: descriptor.event_id.clone(),
+                                reason: "remote_state_query_failed".into(),
+                            });
+                            self.runtime
+                                .progress(|p| p.upload.block_note(&descriptor.note_id))
+                                .await;
+                        }
+                        checked += page.len();
+                        self.runtime
+                            .progress(|p| p.upload.notes_checked = checked)
+                            .await;
+                        self.service_ready().await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 None
             };
@@ -787,49 +2078,54 @@ impl Session<'_> {
             } else {
                 json!({})
             };
-            self.request("inventory_complete", payload).await?;
+            if let Err(error) = self.request("inventory_complete", payload).await {
+                if error.downcast_ref::<RemoteTaskFailure>().is_none() {
+                    return Err(error);
+                }
+                self.runtime.status.write().await.last_error =
+                    Some("Inventory completion task failed; connection remains available".into());
+            }
         }
         Ok(())
     }
 
     async fn deliver_candidate(&mut self, candidate: sync::SyncCandidate) -> Result<()> {
         let descriptor = &candidate.descriptor;
-        if self.runtime.is_descriptor_blocked(descriptor) {
-            self.runtime
-                .progress(|p| p.upload.block_note(&descriptor.note_id))
-                .await;
+        if self.descriptor_blocked(descriptor).await? {
+            self.resolve_upload(&descriptor.note_id, "blocked").await?;
             return Ok(());
         }
         let event = sync::sync_candidate_event(self.ctx, descriptor).await?;
         let Some(event) = event else {
-            self.runtime
-                .progress(|p| p.upload.supersede_note(&descriptor.note_id))
-                .await;
+            self.resolve_upload(&descriptor.note_id, "superseded")
+                .await?;
             return Ok(());
         };
         if !sync::reserve_sync_event(self.ctx, &event).await? {
-            self.runtime
-                .progress(|p| p.upload.supersede_note(&event.note_id))
-                .await;
+            self.resolve_upload(&event.note_id, "superseded").await?;
             return Ok(());
         }
         let result = self.send_event(&event).await;
         sync::release_sync_event(self.ctx, &event.event_id).await?;
         match result {
             Ok(()) => {
-                self.runtime
-                    .progress(|p| p.upload.complete_note(&event.note_id))
-                    .await;
+                self.resolve_upload(&event.note_id, "completed").await?;
                 self.runtime.status.write().await.last_success_at =
                     Some(chrono::Utc::now().timestamp_millis());
             }
             Err(error) if blocked_reason(&error).is_some() => {
+                if self.task_sync {
+                    if let Some(transfer) = self.outbound_transfer.take() {
+                        let _ = self
+                            .task_request("transfer_abort", json!({"transfer_id":transfer}))
+                            .await;
+                    }
+                }
                 self.runtime
                     .block(&event, blocked_reason(&error).unwrap())
                     .await;
-                self.runtime
-                    .progress(|p| p.upload.block_note(&event.note_id))
-                    .await;
+                self.reject_descriptor(&event.acknowledgement()).await?;
+                self.resolve_upload(&event.note_id, "blocked").await?;
             }
             Err(error) => return Err(error),
         }
@@ -847,14 +2143,20 @@ impl Session<'_> {
     }
 
     fn next_wake(&self) -> Instant {
-        let mut wake = self.next_heartbeat;
+        let mut wake = if self.socket.pumped() {
+            Instant::now() + Duration::from_millis(250)
+        } else {
+            self.next_heartbeat
+        };
         if let Some((_, at)) = &self.heartbeat {
             wake = (*at + DEADLINE).min(wake);
         }
-        if let Some(incoming) = &self.incoming {
-            wake = wake.min(incoming.idle_deadline);
+        if !self.socket.pumped() {
+            if let Some(incoming) = &self.incoming {
+                wake = wake.min(incoming.idle_deadline);
+            }
         }
-        if self.inbound_query.is_some() {
+        if self.inbound_query.is_some() || !self.task_jobs.is_empty() {
             wake = wake.min(Instant::now() + Duration::from_millis(50));
         }
         wake
@@ -879,16 +2181,26 @@ impl Session<'_> {
     }
     async fn send(&mut self, event: &str, payload: Value, reference: Option<&str>) -> Result<()> {
         let frame = Frame::new(Some(&self.join), reference, TOPIC, event, payload);
-        timeout(
-            DEADLINE,
-            self.socket.send(Message::Text(frame.encode()?.into())),
-        )
-        .await
-        .context("sync socket write timed out")?
-        .context("sync socket write failed")?;
+        if self.socket.pumped() {
+            self.socket
+                .send(Message::Text(frame.encode()?.into()))
+                .await
+                .context("sync socket write failed")?;
+        } else {
+            timeout(
+                DEADLINE,
+                self.socket.send(Message::Text(frame.encode()?.into())),
+            )
+            .await
+            .context("sync socket write timed out")?
+            .context("sync socket write failed")?;
+        }
         Ok(())
     }
     async fn request(&mut self, event: &str, payload: Value) -> Result<Value> {
+        if self.task_sync && tasks::OPERATIONS.contains(&event) {
+            return self.task_request(event, payload).await;
+        }
         let budget = if event == "transfer_commit" {
             commit_wait(0, 0)
         } else {
@@ -903,6 +2215,9 @@ impl Session<'_> {
         budget: Duration,
         expected_ack: Option<&SyncAck>,
     ) -> Result<Value> {
+        if self.task_sync && tasks::OPERATIONS.contains(&event) {
+            return self.task_request(event, payload).await;
+        }
         let reference = self.reference();
         self.send(event, payload, Some(&reference)).await?;
         self.await_reply(event, &reference, expected_ack, Instant::now() + budget)
@@ -916,12 +2231,16 @@ impl Session<'_> {
         deadline: Instant,
     ) -> Result<Value> {
         loop {
-            anyhow::ensure!(Instant::now() < deadline, "sync Phoenix reply timed out");
+            let control = self.socket.pumped() && matches!(event, "phx_join" | "sync_negotiate");
+            anyhow::ensure!(
+                control || Instant::now() < deadline,
+                "sync Phoenix reply timed out"
+            );
             self.check_liveness().await?;
             let wake = self.next_wake();
             let message = tokio::select! {
                 message = self.socket.next() => message,
-                _ = tokio::time::sleep_until(wake.min(deadline)) => continue,
+                _ = tokio::time::sleep_until(if control { wake } else { wake.min(deadline) }) => continue,
             };
             if let Some(Ok(Message::Text(text))) = &message {
                 let frame = Frame::decode(text).context("invalid sync Phoenix frame")?;
@@ -968,6 +2287,11 @@ impl Session<'_> {
         }
     }
     async fn check_liveness(&mut self) -> Result<()> {
+        self.poll_task_jobs().await?;
+        self.refresh_scan().await?;
+        if self.socket.pumped() {
+            return Ok(());
+        }
         let now = Instant::now();
         if self
             .inbound_query
@@ -1062,6 +2386,19 @@ impl Session<'_> {
         if matches!(frame.event.as_str(), "phx_error" | "phx_close") {
             bail!("sync Phoenix channel closed");
         }
+        if self.task_sync
+            && matches!(
+                frame.event.as_str(),
+                "task_submit"
+                    | "task_get"
+                    | "task_cancel"
+                    | "task_status"
+                    | "task_error"
+                    | "sync_manager_status"
+            )
+        {
+            return self.handle_task_frame(frame).await;
+        }
         if frame.event == "phx_reply" {
             return Ok(());
         }
@@ -1111,9 +2448,14 @@ impl Session<'_> {
         let response = match self.receive(&frame.event, frame.payload).await {
             Ok(response) => response,
             Err(error) => {
-                if let (Some((event_id, note_id)), Some(reason)) =
-                    (committing, sync::sync_note_rejection_reason(&error))
-                {
+                if let (Some((event_id, note_id)), Some(reason)) = (
+                    committing,
+                    sync::sync_note_rejection_reason(
+                        error
+                            .downcast_ref::<ApplyAttemptError>()
+                            .map_or(&error, |attempt| &attempt.source),
+                    ),
+                ) {
                     self.runtime
                         .progress(|p| p.download.block_note(&note_id))
                         .await;
@@ -1162,6 +2504,353 @@ impl Session<'_> {
         }
         Ok(())
     }
+    async fn receive(&mut self, event: &str, payload: Value) -> Result<Value> {
+        match event {
+            "transfer_begin" | "blob_chunk" | "blob_end" | "attachment_begin"
+            | "transfer_commit" | "transfer_abort" => {
+                let mut worker = self.transfer_worker();
+                let result = worker.receive(event, payload).await;
+                self.incoming = worker.incoming;
+                self.remote_inventory_complete = worker.remote_inventory_complete;
+                return result;
+            }
+            "note_rejected" => {
+                let rejection: PeerNoteRejection =
+                    serde_json::from_value(payload).context("invalid sync rejection push")?;
+                anyhow::ensure!(
+                    rejection.code == "note_rejected"
+                        && matches!(
+                            rejection.reason.as_str(),
+                            "validation_failed" | "catalog_conflict"
+                        ),
+                    "invalid sync rejection code"
+                );
+                if self.outbound.as_ref().is_some_and(|(event_id, note_id)| {
+                    event_id == &rejection.event_id && note_id == &rejection.note_id
+                }) {
+                    self.outbound = None;
+                    return Err(rejection.into());
+                }
+            }
+            "ack" => {
+                let ack: SyncAck =
+                    serde_json::from_value(payload).context("invalid sync acknowledgement push")?;
+                sync::acknowledge_sync_event(self.ctx, &ack).await?;
+                self.runtime.status.write().await.last_success_at =
+                    Some(chrono::Utc::now().timestamp_millis());
+            }
+            "inventory_complete" => {
+                let complete = if self.state_query {
+                    let complete: InventoryComplete = serde_json::from_value(payload.clone())
+                        .context("invalid remote inventory completion")?;
+                    anyhow::ensure!(
+                        uuid::Uuid::parse_str(&complete.inventory_id).is_ok()
+                            && serde_json::to_value(&complete)? == payload,
+                        "invalid remote inventory completion fields"
+                    );
+                    anyhow::ensure!(
+                        self.incoming.is_none(),
+                        "remote inventory completed during a transfer"
+                    );
+                    if let Some(progress) = &self.runtime.status.read().await.progress {
+                        anyhow::ensure!(
+                            complete.total_notes
+                                >= progress
+                                    .download
+                                    .notes_completed
+                                    .saturating_add(progress.download.blocked_notes),
+                            "remote inventory total is smaller than its observed cohort"
+                        );
+                    }
+                    Some(complete)
+                } else {
+                    anyhow::ensure!(payload == json!({}), "invalid legacy inventory completion");
+                    None
+                };
+                self.remote_inventory_complete = true;
+                self.runtime
+                    .progress(|p| {
+                        if let Some(complete) = complete {
+                            p.download.run_id = complete.inventory_id;
+                            p.download.notes_total = Some(complete.total_notes);
+                        }
+                        // Enumeration does not reveal the sender's unresolved work.
+                        if p.download.manager.is_none() {
+                            p.download.notes_remaining = None;
+                        }
+                        p.download.phase = if p.download.blocked_notes > 0 {
+                            "blocked"
+                        } else {
+                            "idle"
+                        }
+                        .into();
+                    })
+                    .await;
+            }
+            _ => bail!("unknown sync Phoenix event"),
+        }
+        Ok(json!({}))
+    }
+    async fn send_blob(&mut self, transfer: &str, id: &str, bytes: &[u8]) -> Result<()> {
+        for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
+            let payload = json!({"transfer_id":transfer,"blob_id":id,"offset":index*CHUNK,"data":BASE64.encode(chunk)});
+            if self.task_sync {
+                let result = self.task_request("blob_chunk", payload).await?;
+                anyhow::ensure!(
+                    result
+                        == json!({"transfer_id":transfer,"blob_id":id,"received_bytes":index*CHUNK+chunk.len()}),
+                    "invalid sync chunk receipt"
+                );
+            } else {
+                self.send("blob_chunk", payload, None).await?;
+            }
+            if id != "event" {
+                self.runtime
+                    .progress(|p| {
+                        if let Some(note) = &mut p.upload.current_note {
+                            note.attachment_bytes_done = note
+                                .attachment_bytes_done
+                                .saturating_add(chunk.len() as u64)
+                                .min(note.attachment_bytes_total);
+                        }
+                    })
+                    .await;
+            }
+            self.manager_progress().await?;
+            // Read while writing so simultaneous inventories and heartbeats do
+            // not deadlock behind a large outgoing blob.
+            while let Some(message) = self.socket.next().now_or_never() {
+                self.handle_message(message).await?;
+            }
+            self.check_liveness().await?;
+        }
+        self.request("blob_end", json!({"transfer_id":transfer,"blob_id":id}))
+            .await?;
+        Ok(())
+    }
+    async fn send_event(&mut self, event: &SyncEvent) -> Result<()> {
+        self.runtime.progress(|p| p.upload.begin_note(event)).await;
+        let metadata = encode_metadata(event, self.limit)
+            .map_err(|_| PreparationError("metadata exceeds negotiated limit".into()))?;
+        let total = event
+            .snapshot
+            .as_ref()
+            .map_or(Some(metadata.len() as u64), |s| {
+                s.attachments
+                    .iter()
+                    .try_fold(metadata.len() as u64, |sum, a| {
+                        sum.checked_add(a.size_bytes)
+                    })
+            })
+            .context("sync attachment sizes overflow")?;
+        if total > self.limit || metadata.len() as u64 > self.limit {
+            return Err(PreparationError(
+                "event exceeds negotiated blob limit; adjust profile/server limit".into(),
+            )
+            .into());
+        }
+        let ctx = self.ctx.clone();
+        let source = event.clone();
+        let limit = self.limit;
+        self.local_task("preparation", "running", "preparing").await;
+        let prepared = self
+            .wait_task(tokio::spawn(async move {
+                let event = source;
+
+                let mut prepared = HashMap::new();
+                if let Some(snapshot) = &event.snapshot {
+                    for attachment in &snapshot.attachments {
+                        let bytes = sync::read_sync_attachment(&ctx, &event, &attachment.id, limit)
+                            .await
+                            .map_err(|_| {
+                                anyhow::anyhow!("source attachment cannot be read or verified")
+                            })?;
+                        anyhow::ensure!(
+                            bytes.len() as u64 == attachment.size_bytes
+                                && format!("{:x}", Sha256::digest(&bytes))
+                                    == attachment.checksum_sha256,
+                            "source attachment changed"
+                        );
+                        prepared.insert(attachment.id.clone(), bytes);
+                    }
+                }
+                sync::validate_sync_event(&event, &prepared).map_err(|_| {
+                    anyhow::anyhow!("local note contains invalid synchronization metadata")
+                })?;
+                if let Some(snapshot) = &event.snapshot {
+                    for attachment in &snapshot.attachments {
+                        let encoded_id = attachment
+                            .id
+                            .chars()
+                            .try_fold(13usize, |len, ch| {
+                                len.checked_add(match ch {
+                                    '\"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+                                    '\u{0}'..='\u{1f}' => 6,
+                                    _ => ch.len_utf8(),
+                                })
+                            })
+                            .context("attachment identifier length overflow")?;
+                        anyhow::ensure!(
+                            encoded_id <= FRAME_BYTES - 4 * CHUNK.div_ceil(3) - 2048,
+                            "attachment identifier exceeds sync frame limit"
+                        );
+                    }
+                }
+                Ok::<_, anyhow::Error>(prepared)
+            }))
+            .await?
+            .map_err(|error| PreparationError(error.to_string()))?;
+        self.local_task("preparation", "succeeded", "prepared")
+            .await;
+        self.runtime
+            .progress(|p| {
+                if let Some(note) = &mut p.upload.current_note {
+                    note.phase = "metadata".into();
+                }
+            })
+            .await;
+        self.outbound = Some((event.event_id.clone(), event.note_id.clone()));
+        let transfer = uuid::Uuid::new_v4().to_string();
+        self.outbound_transfer = Some(transfer.clone());
+        self.request("transfer_begin",json!({"transfer_id":transfer,"size_bytes":metadata.len(),"checksum_sha256":format!("{:x}",Sha256::digest(&metadata))})).await?;
+        self.send_blob(&transfer, "event", &metadata).await?;
+        if let Some(snapshot) = &event.snapshot {
+            for attachment in &snapshot.attachments {
+                self.runtime
+                    .progress(|p| {
+                        if let Some(note) = &mut p.upload.current_note {
+                            note.phase = "attachments".into();
+                        }
+                    })
+                    .await;
+                let bytes = prepared
+                    .get(&attachment.id)
+                    .context("prepared sync attachment missing")?;
+                self.request(
+                    "attachment_begin",
+                    json!({"transfer_id":transfer,"blob_id":format!("attachment:{}",attachment.id)}),
+                )
+                .await?;
+                self.send_blob(&transfer, &format!("attachment:{}", attachment.id), &bytes)
+                    .await?;
+                self.runtime
+                    .progress(|p| {
+                        if let Some(note) = &mut p.upload.current_note {
+                            note.attachments_completed += 1;
+                        }
+                    })
+                    .await;
+            }
+        }
+        self.runtime
+            .progress(|p| {
+                if let Some(note) = &mut p.upload.current_note {
+                    note.phase = "awaiting_commit".into();
+                }
+            })
+            .await;
+        let expected_ack = event.acknowledgement();
+        let attachment_count = event.snapshot.as_ref().map_or(0, |s| s.attachments.len());
+        let committed = self
+            .request_with_budget(
+                "transfer_commit",
+                json!({"transfer_id":transfer}),
+                commit_wait(total, attachment_count),
+                Some(&expected_ack),
+            )
+            .await;
+        let committed = match committed {
+            Err(error) if error.downcast_ref::<PeerNoteRejection>().is_some() => {
+                let rejection = error
+                    .downcast_ref::<PeerNoteRejection>()
+                    .expect("guarded rejection");
+                anyhow::ensure!(
+                    rejection.event_id == event.event_id && rejection.note_id == event.note_id,
+                    "sync rejection does not match sent version"
+                );
+                self.outbound = None;
+                return Err(error);
+            }
+            other => other?,
+        };
+        let ack: SyncAck = serde_json::from_value(committed)
+            .context("sync peer returned invalid acknowledgement")?;
+        anyhow::ensure!(
+            ack == event.acknowledgement(),
+            "sync acknowledgement does not match sent version"
+        );
+        sync::acknowledge_sync_event(self.ctx, &ack).await?;
+        self.outbound = None;
+        self.outbound_transfer = None;
+        Ok(())
+    }
+}
+
+struct WorkerProgress {
+    status: Arc<RwLock<SyncRuntimeStatus>>,
+    task_mode: bool,
+    resolved: Arc<tempfile::TempDir>,
+}
+impl WorkerProgress {
+    async fn progress(&self, update: impl FnOnce(&mut SyncProgress)) {
+        let mut state = self.status.write().await;
+        let progress = state
+            .progress
+            .get_or_insert_with(|| SyncProgress::new("remote_verified"));
+        update(progress);
+        progress.touch();
+    }
+}
+impl WorkerProgress {
+    async fn complete_applied(&self, event: &SyncEvent, remote_complete: bool) {
+        let fresh = if self.task_mode {
+            let run = self
+                .status
+                .read()
+                .await
+                .progress
+                .as_ref()
+                .unwrap()
+                .download
+                .run_id
+                .clone();
+            scan::mark(self.resolved.path(), &run, &event.note_id, "resolved")
+                .await
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        self.progress(|p| {
+            if fresh {
+                if self.task_mode {
+                    p.download.notes_completed += 1;
+                    if let Some(remaining) = &mut p.download.notes_remaining {
+                        *remaining = remaining.saturating_sub(1);
+                    }
+                } else {
+                    p.download.complete_note(&event.note_id);
+                }
+            }
+            if self.task_mode {
+                p.download.release_page_ids();
+            }
+            p.download.current_note = None;
+            if remote_complete {
+                p.download.phase = "idle".into();
+            }
+        })
+        .await;
+        self.status.write().await.last_success_at = Some(chrono::Utc::now().timestamp_millis());
+    }
+}
+struct TransferWorker {
+    ctx: Context,
+    runtime: WorkerProgress,
+    incoming: Option<Incoming>,
+    limit: u64,
+    remote_inventory_complete: bool,
+}
+impl TransferWorker {
     async fn receive(&mut self, event: &str, payload: Value) -> Result<Value> {
         match event {
             "transfer_begin" => {
@@ -1258,8 +2947,10 @@ impl Session<'_> {
                     if self.remote_inventory_complete {
                         self.runtime
                             .progress(|p| {
-                                let basis = p.download.basis.clone();
-                                p.download = SyncDirectionProgress::new(&basis);
+                                if p.download.manager.is_none() {
+                                    let basis = p.download.basis.clone();
+                                    p.download = SyncDirectionProgress::new(&basis);
+                                }
                             })
                             .await;
                         self.remote_inventory_complete = false;
@@ -1385,272 +3076,66 @@ impl Session<'_> {
                     }
                 }
                 // ACK is constructed only after the business transaction commits successfully.
-                sync::apply_sync_event(self.ctx, &event, &attachments).await?;
-                self.runtime
-                    .progress(|p| {
-                        p.download.complete_note(&event.note_id);
-                        p.download.current_note = None;
-                        if self.remote_inventory_complete {
-                            p.download.phase = "idle".into();
+                sync::apply_sync_event(&self.ctx, &event, &attachments)
+                    .await
+                    .map_err(|source| {
+                        if sync::sync_note_rejection_reason(&source).is_some() {
+                            source
+                        } else {
+                            ApplyAttemptError { source }.into()
                         }
-                    })
+                    })?;
+                self.runtime
+                    .complete_applied(&event, self.remote_inventory_complete)
                     .await;
-                self.runtime.status.write().await.last_success_at =
-                    Some(chrono::Utc::now().timestamp_millis());
                 return Ok(serde_json::to_value(event.acknowledgement())?);
             }
-            "note_rejected" => {
-                let rejection: PeerNoteRejection =
-                    serde_json::from_value(payload).context("invalid sync rejection push")?;
+            "transfer_abort" => {
+                let id = field(&payload, "transfer_id")?;
                 anyhow::ensure!(
-                    rejection.code == "note_rejected"
-                        && matches!(
-                            rejection.reason.as_str(),
-                            "validation_failed" | "catalog_conflict"
-                        ),
-                    "invalid sync rejection code"
+                    self.incoming
+                        .as_ref()
+                        .is_none_or(|incoming| incoming.id == id),
+                    "sync transfer ID mismatch"
                 );
-                if self.outbound.as_ref().is_some_and(|(event_id, note_id)| {
-                    event_id == &rejection.event_id && note_id == &rejection.note_id
-                }) {
-                    self.outbound = None;
-                    return Err(rejection.into());
-                }
+                self.incoming = None;
             }
-            "ack" => {
-                let ack: SyncAck =
-                    serde_json::from_value(payload).context("invalid sync acknowledgement push")?;
-                sync::acknowledge_sync_event(self.ctx, &ack).await?;
-                self.runtime.status.write().await.last_success_at =
-                    Some(chrono::Utc::now().timestamp_millis());
-            }
-            "inventory_complete" => {
-                let complete = if self.state_query {
-                    let complete: InventoryComplete = serde_json::from_value(payload.clone())
-                        .context("invalid remote inventory completion")?;
-                    anyhow::ensure!(
-                        uuid::Uuid::parse_str(&complete.inventory_id).is_ok()
-                            && serde_json::to_value(&complete)? == payload,
-                        "invalid remote inventory completion fields"
-                    );
-                    anyhow::ensure!(
-                        self.incoming.is_none(),
-                        "remote inventory completed during a transfer"
-                    );
-                    if let Some(progress) = &self.runtime.status.read().await.progress {
-                        anyhow::ensure!(
-                            complete.total_notes
-                                >= progress
-                                    .download
-                                    .notes_completed
-                                    .saturating_add(progress.download.blocked_notes),
-                            "remote inventory total is smaller than its observed cohort"
-                        );
-                    }
-                    Some(complete)
-                } else {
-                    anyhow::ensure!(payload == json!({}), "invalid legacy inventory completion");
-                    None
-                };
-                self.remote_inventory_complete = true;
-                self.runtime
-                    .progress(|p| {
-                        if let Some(complete) = complete {
-                            p.download.run_id = complete.inventory_id;
-                            p.download.notes_total = Some(complete.total_notes);
-                        }
-                        // Enumeration does not reveal the sender's unresolved work.
-                        p.download.notes_remaining = None;
-                        p.download.phase = if p.download.blocked_notes > 0 {
-                            "blocked"
-                        } else {
-                            "idle"
-                        }
-                        .into();
-                    })
-                    .await;
-            }
-            _ => bail!("unknown sync Phoenix event"),
+            _ => bail!("invalid transfer operation"),
         }
         Ok(json!({}))
     }
-    async fn send_blob(&mut self, transfer: &str, id: &str, bytes: &[u8]) -> Result<()> {
-        for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
-            self.send("blob_chunk",json!({"transfer_id":transfer,"blob_id":id,"offset":index*CHUNK,"data":BASE64.encode(chunk)}),None).await?;
-            if id != "event" {
-                self.runtime
-                    .progress(|p| {
-                        if let Some(note) = &mut p.upload.current_note {
-                            note.attachment_bytes_done = note
-                                .attachment_bytes_done
-                                .saturating_add(chunk.len() as u64)
-                                .min(note.attachment_bytes_total);
-                        }
-                    })
-                    .await;
-            }
-            // Read while writing so simultaneous inventories and heartbeats do
-            // not deadlock behind a large outgoing blob.
-            while let Some(message) = self.socket.next().now_or_never() {
-                self.handle_message(message).await?;
-            }
-            self.check_liveness().await?;
-        }
-        self.request("blob_end", json!({"transfer_id":transfer,"blob_id":id}))
-            .await?;
-        Ok(())
+}
+#[derive(Debug)]
+struct ApplyAttemptError {
+    source: anyhow::Error,
+}
+impl std::fmt::Display for ApplyAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("sync durable apply attempt failed")
     }
-    async fn send_event(&mut self, event: &SyncEvent) -> Result<()> {
-        self.runtime.progress(|p| p.upload.begin_note(event)).await;
-        let metadata = encode_metadata(event, self.limit)
-            .map_err(|_| PreparationError("metadata exceeds negotiated limit".into()))?;
-        let total = event
-            .snapshot
-            .as_ref()
-            .map_or(Some(metadata.len() as u64), |s| {
-                s.attachments
-                    .iter()
-                    .try_fold(metadata.len() as u64, |sum, a| {
-                        sum.checked_add(a.size_bytes)
-                    })
-            })
-            .context("sync attachment sizes overflow")?;
-        if total > self.limit || metadata.len() as u64 > self.limit {
-            return Err(PreparationError(
-                "event exceeds negotiated blob limit; adjust profile/server limit".into(),
-            )
-            .into());
-        }
-        let ctx = self.ctx.clone();
-        let source = event.clone();
-        let limit = self.limit;
-        let prepared = self
-            .wait_task(tokio::spawn(async move {
-                let event = source;
-
-                let mut prepared = HashMap::new();
-                if let Some(snapshot) = &event.snapshot {
-                    for attachment in &snapshot.attachments {
-                        let bytes = sync::read_sync_attachment(&ctx, &event, &attachment.id, limit)
-                            .await
-                            .map_err(|_| {
-                                anyhow::anyhow!("source attachment cannot be read or verified")
-                            })?;
-                        anyhow::ensure!(
-                            bytes.len() as u64 == attachment.size_bytes
-                                && format!("{:x}", Sha256::digest(&bytes))
-                                    == attachment.checksum_sha256,
-                            "source attachment changed"
-                        );
-                        prepared.insert(attachment.id.clone(), bytes);
-                    }
-                }
-                sync::validate_sync_event(&event, &prepared).map_err(|_| {
-                    anyhow::anyhow!("local note contains invalid synchronization metadata")
-                })?;
-                if let Some(snapshot) = &event.snapshot {
-                    for attachment in &snapshot.attachments {
-                        let encoded_id = attachment
-                            .id
-                            .chars()
-                            .try_fold(13usize, |len, ch| {
-                                len.checked_add(match ch {
-                                    '\"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
-                                    '\u{0}'..='\u{1f}' => 6,
-                                    _ => ch.len_utf8(),
-                                })
-                            })
-                            .context("attachment identifier length overflow")?;
-                        anyhow::ensure!(
-                            encoded_id <= FRAME_BYTES - 4 * CHUNK.div_ceil(3) - 2048,
-                            "attachment identifier exceeds sync frame limit"
-                        );
-                    }
-                }
-                Ok::<_, anyhow::Error>(prepared)
-            }))
-            .await?
-            .map_err(|error| PreparationError(error.to_string()))?;
-        self.runtime
-            .progress(|p| {
-                if let Some(note) = &mut p.upload.current_note {
-                    note.phase = "metadata".into();
-                }
-            })
-            .await;
-        self.outbound = Some((event.event_id.clone(), event.note_id.clone()));
-        let transfer = uuid::Uuid::new_v4().to_string();
-        self.request("transfer_begin",json!({"transfer_id":transfer,"size_bytes":metadata.len(),"checksum_sha256":format!("{:x}",Sha256::digest(&metadata))})).await?;
-        self.send_blob(&transfer, "event", &metadata).await?;
-        if let Some(snapshot) = &event.snapshot {
-            for attachment in &snapshot.attachments {
-                self.runtime
-                    .progress(|p| {
-                        if let Some(note) = &mut p.upload.current_note {
-                            note.phase = "attachments".into();
-                        }
-                    })
-                    .await;
-                let bytes = prepared
-                    .get(&attachment.id)
-                    .context("prepared sync attachment missing")?;
-                self.request(
-                    "attachment_begin",
-                    json!({"transfer_id":transfer,"blob_id":format!("attachment:{}",attachment.id)}),
-                )
-                .await?;
-                self.send_blob(&transfer, &format!("attachment:{}", attachment.id), &bytes)
-                    .await?;
-                self.runtime
-                    .progress(|p| {
-                        if let Some(note) = &mut p.upload.current_note {
-                            note.attachments_completed += 1;
-                        }
-                    })
-                    .await;
-            }
-        }
-        self.runtime
-            .progress(|p| {
-                if let Some(note) = &mut p.upload.current_note {
-                    note.phase = "awaiting_commit".into();
-                }
-            })
-            .await;
-        let expected_ack = event.acknowledgement();
-        let attachment_count = event.snapshot.as_ref().map_or(0, |s| s.attachments.len());
-        let committed = self
-            .request_with_budget(
-                "transfer_commit",
-                json!({"transfer_id":transfer}),
-                commit_wait(total, attachment_count),
-                Some(&expected_ack),
-            )
-            .await;
-        let committed = match committed {
-            Err(error) if error.downcast_ref::<PeerNoteRejection>().is_some() => {
-                let rejection = error
-                    .downcast_ref::<PeerNoteRejection>()
-                    .expect("guarded rejection");
-                anyhow::ensure!(
-                    rejection.event_id == event.event_id && rejection.note_id == event.note_id,
-                    "sync rejection does not match sent version"
-                );
-                self.outbound = None;
-                return Err(error);
-            }
-            other => other?,
-        };
-        let ack: SyncAck = serde_json::from_value(committed)
-            .context("sync peer returned invalid acknowledgement")?;
-        anyhow::ensure!(
-            ack == event.acknowledgement(),
-            "sync acknowledgement does not match sent version"
-        );
-        sync::acknowledge_sync_event(self.ctx, &ack).await?;
-        self.outbound = None;
-        Ok(())
+}
+impl std::error::Error for ApplyAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
     }
+}
+struct TaskCompletion {
+    worker: Option<TransferWorker>,
+    result: Result<Value>,
+}
+struct TaskJob {
+    operation: String,
+    receive: oneshot::Receiver<TaskCompletion>,
+    abort: tokio::task::AbortHandle,
+    cancelled: bool,
+    durable: bool,
+    event: Option<SyncEvent>,
+}
+struct OutgoingTask {
+    operation: String,
+    error: Option<String>,
+    detached: bool,
+    status: Option<TaskStatus>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1667,7 +3152,9 @@ impl std::fmt::Display for PeerNoteRejection {
 }
 impl std::error::Error for PeerNoteRejection {}
 fn blocked_reason(error: &anyhow::Error) -> Option<&str> {
-    if error.downcast_ref::<PreparationError>().is_some() {
+    if error.downcast_ref::<RemoteTaskFailure>().is_some() {
+        Some("remote_task_failed")
+    } else if error.downcast_ref::<PreparationError>().is_some() {
         Some("local_preparation_failed")
     } else {
         error
@@ -1675,6 +3162,37 @@ fn blocked_reason(error: &anyhow::Error) -> Option<&str> {
             .map(|r| r.reason.as_str())
     }
 }
+
+#[derive(Debug)]
+struct LocalManagerFailure;
+impl std::fmt::Display for LocalManagerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Local synchronization scan failed; pending notes remain queued")
+    }
+}
+impl std::error::Error for LocalManagerFailure {}
+
+#[derive(Debug)]
+struct UnknownCommit;
+impl std::fmt::Display for UnknownCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Durable outcome requires reconciliation")
+    }
+}
+impl std::error::Error for UnknownCommit {}
+
+#[derive(Debug)]
+struct RemoteTaskFailure(String);
+impl std::fmt::Display for RemoteTaskFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Remote synchronization task failed ({}); note remains pending",
+            self.0
+        )
+    }
+}
+impl std::error::Error for RemoteTaskFailure {}
 
 #[derive(Debug)]
 struct PreparationError(String);
@@ -1693,6 +3211,11 @@ fn number(payload: &Value, name: &str) -> Result<u64> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../note-pipelines/tests/support/events.rs"]
+mod commit_test_events;
+
+#[cfg(test)]
 #[path = "incremental_interop_test.rs"]
 mod interop_tests;
 
@@ -1705,6 +3228,422 @@ mod tests {
     use note_storage_turso::TursoStorage;
     use tokio_rustls::TlsAcceptor;
 
+    #[tokio::test]
+    async fn scheduler_storage_failure_keeps_socket_pending_and_recovers_on_retry() {
+        for failed_call in ["get_system_config", "list_sync_records"] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Arc::new(TursoStorage::open(dir.path().join("db")).await.unwrap());
+            let setup = Context::new(
+                storage.clone(),
+                Arc::new(StubEmbedder),
+                Arc::new(FilesystemAttachmentStore::new(
+                    dir.path().join("attachments"),
+                )),
+            );
+            enable_test_notes(&setup).await;
+            let config = note_pipelines::get_system_config(&setup)
+                .await
+                .unwrap()
+                .sync;
+            let backend = Arc::new(commit_test_events::EventStorageBackend::new(
+                storage,
+                commit_test_events::event_log(),
+            ));
+            let ctx = Context::new(
+                backend.clone(),
+                Arc::new(StubEmbedder),
+                Arc::new(FilesystemAttachmentStore::new(
+                    dir.path().join("attachments"),
+                )),
+            );
+            let runtime = SyncRuntime::default();
+            runtime.connected(uuid::Uuid::new_v4().to_string()).await;
+            runtime
+                .progress(|p| {
+                    *p = SyncProgress::new("remote_verified");
+                    p.upload.manager = Some(SyncManagerProgress {
+                        state: Some("idle".into()),
+                        error: None,
+                        mode: "changes".into(),
+                        page_size: 32,
+                        pages_scanned: 0,
+                        pages_checked: 0,
+                        notes_scanned: 0,
+                        scan_complete: true,
+                        source_cursor: None,
+                        last_progress_at: 0,
+                    });
+                })
+                .await;
+            let (socket, mut peer) = local_sockets().await;
+            let mut client = local_session(&ctx, &runtime, socket);
+            client.task_sync = true;
+            client.socket.start_pump();
+            backend.fail_next_repository_call(failed_call);
+            assert_eq!(
+                client.scheduled_work(&config, false).await.unwrap(),
+                Some(false)
+            );
+            assert!(client.manager_failed);
+            let status = runtime.status.read().await;
+            assert_eq!(status.state, "connected");
+            let upload = &status.progress.as_ref().unwrap().upload;
+            assert_eq!(
+                upload.manager.as_ref().unwrap().state.as_deref(),
+                Some("failed")
+            );
+            assert_eq!(upload.active_task.as_ref().unwrap().state, "failed");
+            drop(status);
+            let failure = peer_frame(&mut peer).await;
+            assert_eq!(failure.event, "sync_manager_status");
+            assert_eq!(failure.payload["progress"]["state"], "failed");
+            let pending_calls = backend.repository_call_count("list_sync_records");
+            assert_eq!(
+                client.scheduled_work(&config, false).await.unwrap(),
+                Some(false)
+            );
+            assert_eq!(
+                backend.repository_call_count("list_sync_records"),
+                pending_calls
+            );
+            // A real pump heartbeat still completes on this exact socket.
+            tokio::time::pause();
+            let heartbeat = peer_frame(&mut peer).await;
+            assert_eq!(heartbeat.event, "heartbeat");
+            peer_reply(&mut peer, &heartbeat).await;
+            tokio::task::yield_now().await;
+            client.check_liveness().await.unwrap();
+            tokio::time::resume();
+            runtime.retry();
+            let retry = runtime.wake.notified().now_or_never().is_some();
+            assert!(retry);
+            assert_eq!(
+                client.scheduled_work(&config, retry).await.unwrap(),
+                Some(true)
+            );
+            assert!(!client.manager_failed);
+            assert_eq!(sync::sync_status(&ctx).await.unwrap().pending_notes, 2);
+            let worker = tokio::spawn(async move {
+                let request = peer_frame(&mut peer).await;
+                assert_eq!(request.join_ref.as_deref(), Some("local-session"));
+                task_status_peer(&mut peer, &request, "succeeded", Some(json!({})), None).await;
+                peer
+            });
+            client
+                .task_request("inventory_complete", json!({}))
+                .await
+                .unwrap();
+            let _peer = worker.await.unwrap();
+            // A pause/config change still terminates scheduling while a manager is failed.
+            client.manager_failed = true;
+            let mut changed = config;
+            changed.enabled = false;
+            assert_eq!(client.scheduled_work(&changed, false).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_manager_failure_is_visible_without_reconnecting_or_trusting_stale_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        runtime
+            .progress(|p| *p = SyncProgress::new("remote_verified"))
+            .await;
+        client.remote_inventory_complete = true;
+        let round = uuid::Uuid::new_v4().to_string();
+        let payload = json!({"round_id":round,"status_seq":2,"progress":{"mode":"initial_scan","state":"failed","error":{"code":"source_failed","retryable":false},"page_size":32,"pages_scanned":1,"pages_checked":1,"notes_scanned":3,"scan_complete":false,"source_cursor":null,"last_progress_at":100,"checked_notes":3,"total_notes":null}});
+        client
+            .handle_task_frame(Frame::new(
+                Some("local-session"),
+                None,
+                TOPIC,
+                "sync_manager_status",
+                payload.clone(),
+            ))
+            .await
+            .unwrap();
+        assert!(!client.remote_inventory_complete);
+        let status = runtime.status.read().await;
+        let manager = status
+            .progress
+            .as_ref()
+            .unwrap()
+            .download
+            .manager
+            .as_ref()
+            .unwrap();
+        assert_eq!(manager.state.as_deref(), Some("failed"));
+        assert_eq!(
+            manager.error.as_deref(),
+            Some("Synchronization manager: source_failed")
+        );
+        drop(status);
+        client
+            .handle_task_frame(Frame::new(
+                Some("local-session"),
+                None,
+                TOPIC,
+                "sync_manager_status",
+                payload.clone(),
+            ))
+            .await
+            .unwrap();
+        let mut stale = payload.clone();
+        stale["status_seq"] = json!(1);
+        stale["round_id"] = json!(uuid::Uuid::new_v4().to_string());
+        client
+            .handle_task_frame(Frame::new(
+                Some("local-session"),
+                None,
+                TOPIC,
+                "sync_manager_status",
+                stale,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .status
+                .read()
+                .await
+                .progress
+                .as_ref()
+                .unwrap()
+                .download
+                .run_id,
+            round
+        );
+        let mut conflict = payload;
+        conflict["progress"]["checked_notes"] = json!(2);
+        assert!(client
+            .handle_task_frame(Frame::new(
+                Some("local-session"),
+                None,
+                TOPIC,
+                "sync_manager_status",
+                conflict
+            ))
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn session_drop_cancels_disposable_work_before_runtime_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let (receive, abort) =
+            runtime.worker(async { std::future::pending::<TaskCompletion>().await });
+        client.task_jobs.insert(
+            "task".into(),
+            TaskJob {
+                operation: "state_query".into(),
+                receive,
+                abort,
+                cancelled: false,
+                durable: false,
+                event: None,
+            },
+        );
+        drop(client);
+        timeout(Duration::from_secs(1), runtime.drain_workers())
+            .await
+            .expect("disposable worker cannot hold reconnect or shutdown open");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn missing_task_capability_keeps_one_healthy_socket_and_reports_upgrade_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        enable_test_notes(&ctx).await;
+        let config = note_pipelines::get_system_config(&ctx).await.unwrap().sync;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut profile = certificates().profile;
+        profile.mode = super::super::ConnectionMode::Direct;
+        profile.id = "test".into();
+        profile.url = format!(
+            "ws://{}/note-sync/websocket?vsn=2.0.0",
+            listener.local_addr().unwrap()
+        );
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let join =
+                Frame::decode(&socket.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            assert_eq!(join.event, "phx_join");
+            let hello = json!({"protocol_version":1,"node_id":uuid::Uuid::new_v4().to_string(),"selectors":join.payload["selectors"],"max_blob_bytes":DEFAULT_MAX_BLOB_BYTES,"capabilities":["state_query_v1"]});
+            socket
+                .send(Message::Text(
+                    Frame::new(
+                        join.join_ref.as_deref(),
+                        join.reference.as_deref(),
+                        TOPIC,
+                        "phx_reply",
+                        json!({"status":"ok","response":hello}),
+                    )
+                    .encode()
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let negotiate =
+                Frame::decode(&socket.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            assert_eq!(negotiate.event, "sync_negotiate");
+            socket
+                .send(Message::Text(
+                    Frame::new(
+                        negotiate.join_ref.as_deref(),
+                        negotiate.reference.as_deref(),
+                        TOPIC,
+                        "phx_reply",
+                        json!({"status":"ok","response":negotiate.payload}),
+                    )
+                    .encode()
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let heartbeat =
+                    Frame::decode(&socket.next().await.unwrap().unwrap().into_text().unwrap())
+                        .unwrap();
+                assert_eq!(
+                    heartbeat.event, "heartbeat",
+                    "no inventory or business task may start without task capability"
+                );
+                socket
+                    .send(Message::Text(
+                        Frame::new(
+                            None,
+                            heartbeat.reference.as_deref(),
+                            "phoenix",
+                            "phx_reply",
+                            json!({"status":"ok","response":{}}),
+                        )
+                        .encode()
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            socket
+        });
+        let runtime = SyncRuntime::default();
+        let session = session(&ctx, &profile, &config, &runtime);
+        tokio::pin!(session);
+        let socket = tokio::select! {result=&mut session=>panic!("healthy session ended: {result:?}"),result=peer=>result.unwrap()};
+        let status = runtime.status(&ctx).await.unwrap();
+        assert_eq!(status.state, "connected");
+        assert!(status.last_error.unwrap().contains("upgrade required"));
+        assert_eq!(sync::sync_status(&ctx).await.unwrap().pending_notes, 2);
+        drop(socket);
+    }
+    #[tokio::test]
+    async fn rejection_cache_is_exact_bounded_and_survives_reconnection_until_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        let mut rejected = Vec::new();
+        for _ in 0..80 {
+            let mut event = incoming_event(&[]);
+            event.note_id = uuid::Uuid::new_v4().to_string();
+            event.event_id = uuid::Uuid::new_v4().to_string();
+            let descriptor = event.acknowledgement();
+            client.reject_descriptor(&descriptor).await.unwrap();
+            runtime.block(&event, "operation_failed").await;
+            rejected.push(descriptor);
+        }
+        assert_eq!(runtime.blocked.lock().unwrap().len(), 64);
+        assert_eq!(
+            runtime
+                .rejected_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            80
+        );
+        drop(client);
+        let (socket, _peer) = local_sockets().await;
+        let mut replacement = local_session(&ctx, &runtime, socket);
+        replacement.task_sync = true;
+        for descriptor in &rejected {
+            assert!(replacement.descriptor_blocked(descriptor).await.unwrap());
+        }
+        let mut changed = rejected[0].clone();
+        changed.event_id = uuid::Uuid::new_v4().to_string();
+        assert!(!replacement.descriptor_blocked(&changed).await.unwrap());
+        assert_eq!(
+            runtime
+                .rejected_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            79
+        );
+        runtime.retry();
+        for descriptor in rejected {
+            assert!(!replacement.descriptor_blocked(&descriptor).await.unwrap());
+        }
+        assert_eq!(
+            runtime
+                .rejected_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+    #[tokio::test]
+    async fn disk_progress_deduplicates_more_than_two_pages_and_a_fresh_round_counts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        runtime
+            .progress(|p| *p = SyncProgress::new("remote_verified"))
+            .await;
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        let ids: Vec<_> = (0..80).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        for id in &ids {
+            client.resolve_upload(id, "completed").await.unwrap();
+        }
+        for id in &ids {
+            client.resolve_upload(id, "completed").await.unwrap();
+        }
+        assert_eq!(
+            runtime
+                .status
+                .read()
+                .await
+                .progress
+                .as_ref()
+                .unwrap()
+                .upload
+                .notes_completed,
+            80
+        );
+        runtime
+            .progress(|p| p.upload = SyncDirectionProgress::new("remote_verified"))
+            .await;
+        client.resolve_upload(&ids[0], "completed").await.unwrap();
+        assert_eq!(
+            runtime
+                .status
+                .read()
+                .await
+                .progress
+                .as_ref()
+                .unwrap()
+                .upload
+                .notes_completed,
+            1
+        );
+    }
     async fn enable_test_notes(ctx: &Context) -> Vec<SyncEvent> {
         use note_core::{
             sync::{SyncConfig, SyncRule},
@@ -1939,6 +3878,761 @@ mod tests {
         peer.send(Message::Text(reply.encode().unwrap().into()))
             .await
             .unwrap();
+    }
+
+    async fn task_status_peer(
+        peer: &mut WebSocketStream<tokio::io::DuplexStream>,
+        request: &Frame,
+        state: &str,
+        result: Option<Value>,
+        error: Option<&str>,
+    ) {
+        let status = TaskStatus {
+            task_id: request.payload["task_id"].as_str().unwrap().into(),
+            status_seq: if state == "queued" { 1 } else { 2 },
+            state: state.into(),
+            phase: request.payload["operation"]
+                .as_str()
+                .unwrap_or("working")
+                .into(),
+            progress: json!({}),
+            result,
+            error: error.map(|code| tasks::TaskError {
+                code: code.into(),
+                retryable: false,
+            }),
+        };
+        let frame = Frame::new(
+            request.join_ref.as_deref(),
+            None,
+            TOPIC,
+            "task_status",
+            serde_json::to_value(status).unwrap(),
+        );
+        peer.send(Message::Text(frame.encode().unwrap().into()))
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn negotiated_tasks_have_no_business_deadline_while_heartbeat_is_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        client.socket.start_pump();
+        tokio::time::pause();
+        let worker = tokio::spawn(async move {
+            let request = peer_frame(&mut peer).await;
+            assert_eq!(request.event, "task_submit");
+            task_status_peer(&mut peer, &request, "queued", None, None).await;
+            let mut beats = 0;
+            while beats < 33 {
+                let frame = peer_frame(&mut peer).await;
+                if frame.event == "heartbeat" {
+                    beats += 1;
+                    peer_reply(&mut peer, &frame).await;
+                } else {
+                    assert_eq!(frame.event, "task_get");
+                }
+            }
+            task_status_peer(
+                &mut peer,
+                &request,
+                "succeeded",
+                Some(json!({"finished":true})),
+                None,
+            )
+            .await;
+            // Keep the transport alive until the result has reached its consumer.
+            peer
+        });
+        let started = Instant::now();
+        assert_eq!(
+            client.task_request("state_query", json!({})).await.unwrap(),
+            json!({"finished":true})
+        );
+        assert!(Instant::now() - started > Duration::from_secs(930));
+        let _peer = worker.await.unwrap();
+        tokio::time::resume();
+    }
+    #[tokio::test]
+    async fn join_control_waits_for_reply_without_business_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.socket.start_pump();
+        tokio::time::pause();
+        let worker = tokio::spawn(async move {
+            for operation in ["phx_join", "sync_negotiate"] {
+                let request = peer_frame(&mut peer).await;
+                assert_eq!(request.event, operation);
+                let beat = peer_frame(&mut peer).await;
+                assert_eq!(beat.event, "heartbeat");
+                peer_reply(&mut peer, &beat).await;
+                peer_reply(&mut peer, &request).await;
+            }
+            peer
+        });
+        client.request("phx_join", json!({})).await.unwrap();
+        client.request("sync_negotiate", json!({})).await.unwrap();
+        let _peer = worker.await.unwrap();
+        tokio::time::resume();
+    }
+    #[tokio::test]
+    async fn failed_task_does_not_reconnect_and_the_next_task_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        let worker = tokio::spawn(async move {
+            let first = peer_frame(&mut peer).await;
+            task_status_peer(&mut peer, &first, "failed", None, Some("validation_failed")).await;
+            let second = peer_frame(&mut peer).await;
+            assert_eq!(first.join_ref, second.join_ref);
+            task_status_peer(&mut peer, &second, "succeeded", Some(json!({})), None).await;
+            peer
+        });
+        let error = client
+            .task_request("transfer_begin", json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<RemoteTaskFailure>().is_some());
+        assert_eq!(
+            client
+                .task_request("inventory_complete", json!({}))
+                .await
+                .unwrap(),
+            json!({})
+        );
+        let _peer = worker.await.unwrap();
+    }
+    #[tokio::test]
+    async fn chunk_progress_advances_only_after_exact_receiver_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = Arc::new(SyncRuntime::default());
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        let event = incoming_event(&[(CHUNK + 17) as u64]);
+        runtime.progress(|p| p.upload.begin_note(&event)).await;
+        let observed = runtime.clone();
+        let worker = tokio::spawn(async move {
+            for expected in [0, CHUNK] {
+                let request = peer_frame(&mut peer).await;
+                assert_eq!(request.payload["operation"], "blob_chunk");
+                assert_eq!(request.payload["payload"]["offset"], expected);
+                let state = observed.status.read().await;
+                assert_eq!(
+                    state
+                        .progress
+                        .as_ref()
+                        .unwrap()
+                        .upload
+                        .current_note
+                        .as_ref()
+                        .unwrap()
+                        .attachment_bytes_done,
+                    expected as u64
+                );
+                drop(state);
+                task_status_peer(&mut peer, &request, "queued", None, None).await;
+                // Stop-and-wait means no second chunk can exist before our receipt.
+                assert!(timeout(Duration::from_millis(10), peer.next())
+                    .await
+                    .is_err());
+                let payload = &request.payload["payload"];
+                let length = BASE64
+                    .decode(payload["data"].as_str().unwrap())
+                    .unwrap()
+                    .len();
+                task_status_peer(&mut peer, &request, "succeeded", Some(json!({"transfer_id":payload["transfer_id"],"blob_id":payload["blob_id"],"received_bytes":expected+length})), None).await;
+            }
+            let end = peer_frame(&mut peer).await;
+            assert_eq!(end.payload["operation"], "blob_end");
+            task_status_peer(&mut peer, &end, "succeeded", Some(json!({})), None).await;
+            peer
+        });
+        client
+            .send_blob("test-transfer", "attachment:file", &vec![42; CHUNK + 17])
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .status
+                .read()
+                .await
+                .progress
+                .as_ref()
+                .unwrap()
+                .upload
+                .current_note
+                .as_ref()
+                .unwrap()
+                .attachment_bytes_done,
+            (CHUNK + 17) as u64
+        );
+        let _peer = worker.await.unwrap();
+    }
+    #[tokio::test]
+    async fn durable_commit_errors_reconcile_exact_receipts_and_quarantine_unknown_outcomes() {
+        use note_storage::{
+            BackendInfo, StorageBackend, StorageResult, StorageSession, StorageTransaction,
+            TransactionMode,
+        };
+        struct FailApplyReply {
+            inner: Arc<commit_test_events::EventStorageBackend>,
+            armed: std::sync::atomic::AtomicBool,
+            receipt_persisted: bool,
+        }
+        #[async_trait::async_trait]
+        impl StorageBackend for FailApplyReply {
+            async fn session(&self) -> StorageResult<Box<dyn StorageSession>> {
+                self.inner.session().await
+            }
+            async fn begin(
+                &self,
+                mode: TransactionMode,
+            ) -> StorageResult<Box<dyn StorageTransaction>> {
+                if mode == TransactionMode::Immediate
+                    && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    if self.receipt_persisted {
+                        self.inner.fail_next_commit_acknowledgement();
+                    } else {
+                        self.inner.fail_next_commit();
+                    }
+                }
+                self.inner.begin(mode).await
+            }
+            async fn info(&self) -> StorageResult<BackendInfo> {
+                self.inner.info().await
+            }
+        }
+        for kind in [SyncEventKind::Attach, SyncEventKind::Fence] {
+            for receipt_persisted in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let log = commit_test_events::event_log();
+                let storage = Arc::new(TursoStorage::open(dir.path().join("db")).await.unwrap());
+                let attachments = Arc::new(FilesystemAttachmentStore::new(
+                    dir.path().join("attachments"),
+                ));
+                let setup =
+                    Context::new(storage.clone(), Arc::new(StubEmbedder), attachments.clone());
+                let mut event = enable_test_notes(&setup).await.remove(0);
+                let backend = Arc::new(FailApplyReply {
+                    inner: Arc::new(commit_test_events::EventStorageBackend::new(
+                        storage,
+                        log.clone(),
+                    )),
+                    armed: std::sync::atomic::AtomicBool::new(false),
+                    receipt_persisted,
+                });
+                let ctx = Context::new(backend.clone(), Arc::new(StubEmbedder), attachments);
+                event.note_id = uuid::Uuid::new_v4().to_string();
+                event.event_id = uuid::Uuid::new_v4().to_string();
+                let mut stamp = event.version.clone();
+                stamp.millis += 1;
+                stamp.node_id = uuid::Uuid::new_v4().to_string();
+                event.generation = stamp.clone();
+                event.control = stamp.clone();
+                event.version = stamp;
+                event.kind = kind;
+                if kind == SyncEventKind::Fence {
+                    event.snapshot = None;
+                    event.control.counter += 1;
+                }
+                sync::validate_sync_event(&event, &HashMap::new()).unwrap();
+                // Both apply paths must identify COMMIT uncertainty, even when a later
+                // exact-receipt query cannot establish whether the commit persisted.
+                let mut probe = event.clone();
+                probe.note_id = uuid::Uuid::new_v4().to_string();
+                probe.event_id = uuid::Uuid::new_v4().to_string();
+                backend
+                    .armed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let error = sync::apply_sync_event(&ctx, &probe, &HashMap::new())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .downcast_ref::<sync::SyncCommitOutcomeUnknown>()
+                        .is_some(),
+                    "{kind:?}: COMMIT error must preserve its uncertain-outcome marker: {error:?}"
+                );
+                assert_eq!(
+                    sync::sync_received_event(&ctx, &probe).await.unwrap(),
+                    receipt_persisted
+                );
+                let runtime = SyncRuntime::default();
+                let (socket, _peer) = local_sockets().await;
+                let mut client = local_session(&ctx, &runtime, socket);
+                client.task_sync = true;
+                let transfer = uuid::Uuid::new_v4().to_string();
+                client.incoming = Some(Incoming {
+                    id: transfer.clone(),
+                    metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100)
+                        .unwrap(),
+                    event: Some(event.clone()),
+                    blobs: HashMap::new(),
+                    idle_deadline: Instant::now() + DEADLINE,
+                });
+                backend
+                    .armed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let id = format!("{}:1", uuid::Uuid::nil());
+                client.handle_task_frame(Frame::new(Some("local-session"),None,TOPIC,"task_submit",json!({"task_id":id,"operation":"transfer_commit","payload":{"transfer_id":transfer}}))).await.unwrap();
+                timeout(Duration::from_secs(10), async {
+                    while !client.task_jobs.is_empty() {
+                        tokio::task::yield_now().await;
+                        client.poll_task_jobs().await.unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+                let failure = if receipt_persisted {
+                    "commit_ack_failed"
+                } else {
+                    "commit_failed"
+                };
+                assert_eq!(
+                    log.lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|entry| entry.as_str() == failure)
+                        .count(),
+                    2,
+                    "{kind:?}: fixture must exercise both the direct and runtime COMMIT failures"
+                );
+                let status = client.received_tasks.get(&id).unwrap();
+                if receipt_persisted {
+                    assert_eq!(status.state, "succeeded", "{kind:?}");
+                    assert_eq!(
+                        status.result,
+                        Some(serde_json::to_value(event.acknowledgement()).unwrap())
+                    );
+                    assert!(status.error.is_none());
+                } else {
+                    assert!(
+                        !status.terminal(),
+                        "{kind:?}: missing receipt cannot settle COMMIT uncertainty"
+                    );
+                    assert_eq!(status.phase, "outcome_unknown");
+                    assert!(status.result.is_none());
+                    assert!(client.received_tasks.active_transfer().is_some());
+                    assert_eq!(sync::sync_status(&ctx).await.unwrap().pending_notes, 2);
+                }
+                status.validate().unwrap();
+                assert_eq!(
+                    sync::sync_received_event(&ctx, &event).await.unwrap(),
+                    receipt_persisted
+                );
+                assert_eq!(
+                    note_pipelines::get_note(&ctx, &event.note_id)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    receipt_persisted && kind == SyncEventKind::Attach
+                );
+                runtime.drain_workers().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preapply_event_validation_rejection_fails_without_uncertain_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let mut event = enable_test_notes(&ctx).await.remove(0);
+        event.snapshot_hash = "0".repeat(64);
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        let transfer = uuid::Uuid::new_v4().to_string();
+        client.incoming = Some(Incoming {
+            id: transfer.clone(),
+            metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100).unwrap(),
+            event: Some(event),
+            blobs: HashMap::new(),
+            idle_deadline: Instant::now() + DEADLINE,
+        });
+        let id = format!("{}:1", uuid::Uuid::nil());
+        client.handle_task_frame(Frame::new(Some("local-session"),None,TOPIC,"task_submit",json!({"task_id":id,"operation":"transfer_commit","payload":{"transfer_id":transfer}}))).await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !client.received_tasks.get(&id).unwrap().terminal() {
+                tokio::task::yield_now().await;
+                client.poll_task_jobs().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let status = client.received_tasks.get(&id).unwrap();
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.error.unwrap().code, "validation_failed");
+        assert!(status.result.is_none());
+        runtime.drain_workers().await;
+    }
+
+    #[tokio::test]
+    async fn preapply_wrong_transfer_id_fails_even_when_the_staged_event_has_a_durable_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let mut event = enable_test_notes(&ctx).await.remove(0);
+        event.note_id = uuid::Uuid::new_v4().to_string();
+        event.event_id = uuid::Uuid::new_v4().to_string();
+        let mut stamp = event.version.clone();
+        stamp.millis += 1;
+        stamp.node_id = uuid::Uuid::new_v4().to_string();
+        event.generation = stamp.clone();
+        event.control = stamp.clone();
+        event.version = stamp;
+        sync::apply_sync_event(&ctx, &event, &HashMap::new())
+            .await
+            .unwrap();
+        assert!(sync::sync_received_event(&ctx, &event).await.unwrap());
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        client.incoming = Some(Incoming {
+            id: uuid::Uuid::new_v4().to_string(),
+            metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100).unwrap(),
+            event: Some(event),
+            blobs: HashMap::new(),
+            idle_deadline: Instant::now() + DEADLINE,
+        });
+        let id = format!("{}:1", uuid::Uuid::nil());
+        client.handle_task_frame(Frame::new(Some("local-session"),None,TOPIC,"task_submit",json!({"task_id":id,"operation":"transfer_commit","payload":{"transfer_id":uuid::Uuid::new_v4().to_string()}}))).await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !client.received_tasks.get(&id).unwrap().terminal() {
+                tokio::task::yield_now().await;
+                client.poll_task_jobs().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let status = client.received_tasks.get(&id).unwrap();
+        assert_eq!(status.state, "failed");
+        assert!(status.result.is_none());
+        assert_eq!(status.error.unwrap().code, "operation_failed");
+        runtime.drain_workers().await;
+    }
+
+    #[tokio::test]
+    async fn confirmed_rollback_without_receipt_fails_and_releases_transfer_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let events = enable_test_notes(&ctx).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        let id = format!("{}:1", uuid::Uuid::nil());
+        let submit = Submission {
+            task_id: id.clone(),
+            operation: "transfer_commit".into(),
+            payload: json!({"transfer_id":uuid::Uuid::new_v4().to_string()}),
+        };
+        assert!(matches!(
+            client.received_tasks.admit(&submit),
+            Ok(Admission::Start(_))
+        ));
+        let (receive, abort) = runtime.worker(async {
+            TaskCompletion {
+                worker: None,
+                result: Err(ApplyAttemptError {
+                    source: note_storage::StorageError::new(
+                        note_storage::StorageErrorKind::Unavailable,
+                        "operation failed before commit; transaction rolled back",
+                    )
+                    .into(),
+                }
+                .into()),
+            }
+        });
+        client.task_jobs.insert(
+            id.clone(),
+            TaskJob {
+                operation: "transfer_commit".into(),
+                receive,
+                abort,
+                cancelled: false,
+                durable: true,
+                event: Some(events[0].clone()),
+            },
+        );
+        timeout(Duration::from_secs(3), async {
+            while !client.received_tasks.get(&id).unwrap().terminal() {
+                tokio::task::yield_now().await;
+                client.poll_task_jobs().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let status = client.received_tasks.get(&id).unwrap();
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.error.as_ref().unwrap().code, "operation_failed");
+        assert!(status.result.is_none());
+        assert!(client.received_tasks.active_transfer().is_none());
+        assert_eq!(sync::sync_status(&ctx).await.unwrap().pending_notes, 2);
+        client
+            .receive(
+                "transfer_begin",
+                json!({
+                    "transfer_id":uuid::Uuid::new_v4().to_string(), "size_bytes":0,
+                    "checksum_sha256":format!("{:x}",Sha256::digest([])),
+                }),
+            )
+            .await
+            .unwrap();
+        runtime.drain_workers().await;
+    }
+
+    #[tokio::test]
+    async fn uncertain_commit_without_receipt_and_its_abort_remain_nonterminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let events = enable_test_notes(&ctx).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        let id = format!("{}:1", uuid::Uuid::nil());
+        let transfer = uuid::Uuid::new_v4().to_string();
+        let submit = Submission {
+            task_id: id.clone(),
+            operation: "transfer_commit".into(),
+            payload: json!({"transfer_id":transfer}),
+        };
+        assert!(matches!(
+            client.received_tasks.admit(&submit),
+            Ok(Admission::Start(_))
+        ));
+        let (receive, abort) = runtime.worker(async {
+            TaskCompletion {
+                worker: None,
+                result: Err(ApplyAttemptError {
+                    source: sync::SyncCommitOutcomeUnknown(note_storage::StorageError::new(
+                        note_storage::StorageErrorKind::Unavailable,
+                        "uncertain commit acknowledgement",
+                    ))
+                    .into(),
+                }
+                .into()),
+            }
+        });
+        client.task_jobs.insert(
+            id.clone(),
+            TaskJob {
+                operation: "transfer_commit".into(),
+                receive,
+                abort,
+                cancelled: false,
+                durable: true,
+                event: Some(events[0].clone()),
+            },
+        );
+        timeout(Duration::from_secs(3), async {
+            while !client.task_jobs.is_empty() {
+                tokio::task::yield_now().await;
+                client.poll_task_jobs().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let status = client.received_tasks.get(&id).unwrap();
+        assert!(!status.terminal());
+        assert_eq!(status.phase, "outcome_unknown");
+        assert!(status.result.is_none());
+        let abort_id = format!("{}:2", uuid::Uuid::nil());
+        client.handle_task_frame(Frame::new(Some("local-session"),None,TOPIC,"task_submit",json!({"task_id":abort_id,"operation":"transfer_abort","payload":{"transfer_id":transfer}}))).await.unwrap();
+        client.poll_task_jobs().await.unwrap();
+        assert!(
+            !client.received_tasks.get(&abort_id).unwrap().terminal(),
+            "cleanup cannot settle an unresolved durable commit"
+        );
+        assert_eq!(sync::sync_status(&ctx).await.unwrap().pending_notes, 2);
+        runtime.drain_workers().await;
+    }
+    #[tokio::test]
+    async fn transfer_abort_waits_for_delayed_chunk_then_cleans_staging_before_next_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        let transfer = uuid::Uuid::new_v4().to_string();
+        client.receive("transfer_begin",json!({"transfer_id":transfer,"size_bytes":1,"checksum_sha256":format!("{:x}",Sha256::digest(b"a"))})).await.unwrap();
+        let submission = Submission {
+            task_id: format!("{}:1", uuid::Uuid::nil()),
+            operation: "blob_chunk".into(),
+            payload: json!({"transfer_id":transfer,"blob_id":"event","offset":0,"data":"YQ=="}),
+        };
+        assert!(matches!(
+            client.received_tasks.admit(&submission),
+            Ok(Admission::Start(_))
+        ));
+        let mut staged = client.transfer_worker();
+        let release = Arc::new(Notify::new());
+        let delayed = release.clone();
+        let payload = submission.payload;
+        let (receive, abort) = runtime.worker(async move {
+            delayed.notified().await;
+            let result = staged.receive("blob_chunk", payload).await;
+            TaskCompletion {
+                worker: Some(staged),
+                result,
+            }
+        });
+        client.task_jobs.insert(
+            submission.task_id.clone(),
+            TaskJob {
+                operation: "blob_chunk".into(),
+                receive,
+                abort,
+                cancelled: false,
+                durable: false,
+                event: None,
+            },
+        );
+        let abort_id = format!("{}:2", uuid::Uuid::nil());
+        client.handle_task_frame(Frame::new(Some("local-session"),None,TOPIC,"task_submit",json!({"task_id":abort_id,"operation":"transfer_abort","payload":{"transfer_id":transfer}}))).await.unwrap();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+            client.poll_task_jobs().await.unwrap();
+        }
+        assert!(
+            !client.received_tasks.get(&abort_id).unwrap().terminal(),
+            "abort cannot claim cleanup while the chunk worker owns staging"
+        );
+        release.notify_one();
+        timeout(Duration::from_secs(3), async {
+            while !client.received_tasks.get(&abort_id).unwrap().terminal() {
+                tokio::task::yield_now().await;
+                client.poll_task_jobs().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            client.received_tasks.get(&abort_id).unwrap().state,
+            "succeeded"
+        );
+        assert!(
+            client.incoming.is_none(),
+            "the completed old chunk cannot restore staging after abort"
+        );
+        let next_id = format!("{}:3", uuid::Uuid::nil());
+        client.handle_task_frame(Frame::new(Some("local-session"),None,TOPIC,"task_submit",json!({"task_id":next_id,"operation":"transfer_begin","payload":{"transfer_id":uuid::Uuid::new_v4().to_string(),"size_bytes":0,"checksum_sha256":format!("{:x}",Sha256::digest([]))}}))).await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !client.received_tasks.get(&next_id).unwrap().terminal() {
+                tokio::task::yield_now().await;
+                client.poll_task_jobs().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            client.received_tasks.get(&next_id).unwrap().state,
+            "succeeded"
+        );
+        runtime.drain_workers().await;
+    }
+    #[tokio::test]
+    async fn cancelling_disposable_task_emits_canonical_cancelled_wire_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        let id = format!("{}:1", uuid::Uuid::nil());
+        let submit = Submission {
+            task_id: id.clone(),
+            operation: "state_query".into(),
+            payload: json!({}),
+        };
+        assert!(matches!(
+            client.received_tasks.admit(&submit),
+            Ok(Admission::Start(_))
+        ));
+        let (receive, abort) =
+            runtime.worker(async { std::future::pending::<TaskCompletion>().await });
+        client.task_jobs.insert(
+            id.clone(),
+            TaskJob {
+                operation: "state_query".into(),
+                receive,
+                abort,
+                cancelled: false,
+                durable: false,
+                event: None,
+            },
+        );
+        client
+            .handle_task_frame(Frame::new(
+                Some("local-session"),
+                None,
+                TOPIC,
+                "task_cancel",
+                json!({"task_id":id}),
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !client.received_tasks.get(&id).unwrap().terminal() {
+                tokio::task::yield_now().await;
+                client.poll_task_jobs().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let pending = peer_frame(&mut peer).await;
+        assert_eq!(pending.payload["phase"], "cancellation_pending");
+        let terminal = peer_frame(&mut peer).await;
+        assert_eq!(terminal.payload["state"], "cancelled");
+        assert_eq!(terminal.payload["result"], Value::Null);
+        assert_eq!(terminal.payload["error"], Value::Null);
+        let status: TaskStatus = serde_json::from_value(terminal.payload).unwrap();
+        status.validate().unwrap();
+        runtime.drain_workers().await;
+    }
+
+    #[tokio::test]
+    async fn task_submission_is_admitted_and_chunk_failure_is_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.state_query = true;
+        client.task_sync = true;
+        let submit = Frame::new(
+            Some("local-session"),
+            None,
+            TOPIC,
+            "task_submit",
+            json!({
+                "task_id":format!("{}:1", uuid::Uuid::nil()),
+                "operation":"blob_chunk",
+                "payload":{"transfer_id":uuid::Uuid::new_v4().to_string(),"blob_id":"event","offset":0,"data":"YQ=="}
+            }),
+        );
+        let result = client
+            .handle_message(Some(Ok(Message::Text(submit.encode().unwrap().into()))))
+            .await;
+        assert!(
+            result.is_ok(),
+            "task failure must preserve the socket: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -2764,7 +5458,7 @@ mod tests {
         Session {
             ctx,
             runtime,
-            socket,
+            socket: Io::raw(socket),
             join: "local-session".into(),
             counter: 0,
             limit: DEFAULT_MAX_BLOB_BYTES,
@@ -2772,9 +5466,22 @@ mod tests {
             heartbeat: None,
             next_heartbeat: Instant::now() + HEARTBEAT,
             outbound: None,
+            outbound_transfer: None,
             state_query: false,
             inbound_query: None,
             remote_inventory_complete: false,
+            task_sync: false,
+            task_origin: uuid::Uuid::nil().to_string(),
+            task_sequence: 0,
+            received_tasks: Ledger::new(uuid::Uuid::nil().to_string()),
+            outgoing_tasks: HashMap::new(),
+            task_jobs: HashMap::new(),
+            manager_failed: false,
+            scan_progress: None,
+            manager_sequence: 0,
+            remote_manager: None,
+            resolved: Arc::new(tempfile::tempdir().unwrap()),
+            deferred_abort: None,
         }
     }
 
@@ -3207,6 +5914,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_durable_apply_keeps_heartbeat_live_and_ack_waits_for_commit() {
+        use note_attachments::{AttachmentStore, PutObjectRequest, StoredObject};
+        use note_core::sync::{Hlc, SyncAttachment, SyncEventKind, SyncLabel, SyncSnapshot};
+
+        struct DelayedStore {
+            files: FilesystemAttachmentStore,
+            started: Notify,
+            release: Notify,
+        }
+        #[async_trait::async_trait]
+        impl AttachmentStore for DelayedStore {
+            async fn put_immutable(&self, request: PutObjectRequest) -> Result<StoredObject> {
+                self.started.notify_one();
+                self.release.notified().await;
+                self.files.put_immutable(request).await
+            }
+            async fn read_legacy(&self, note_id: &str, path: &str) -> Result<Vec<u8>> {
+                self.files.read_legacy(note_id, path).await
+            }
+            fn info(&self) -> note_attachments::AttachmentStoreInfo {
+                self.files.info()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DelayedStore {
+            files: FilesystemAttachmentStore::new(dir.path().join("attachments")),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let ctx = Context::new(
+            Arc::new(TursoStorage::open(dir.path().join("db")).await.unwrap()),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        );
+        note_pipelines::update_system_config(
+            &ctx,
+            &note_core::SystemConfig {
+                sync: note_core::sync::SyncConfig {
+                    enabled: true,
+                    connection_profile: Some("local".into()),
+                    rules: vec![note_core::sync::SyncRule {
+                        id: "project".into(),
+                        enabled: true,
+                        selector: "project=bear_note".into(),
+                    }],
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        sync::initialize_sync(&ctx).await.unwrap();
+        let bytes = b"incoming attachment";
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let snapshot = SyncSnapshot {
+            title: "Incoming".into(),
+            content: "Durable incoming note".into(),
+            labels: vec![SyncLabel {
+                key: "project".into(),
+                value: "bear_note".into(),
+                description: String::new(),
+                value_type: "text".into(),
+            }],
+            created_at: 1,
+            updated_at: 1,
+            deleted_at: None,
+            attachments: vec![SyncAttachment {
+                id: uuid::Uuid::new_v4().to_string(),
+                path: "incoming.txt".into(),
+                mime: "text/plain".into(),
+                description: String::new(),
+                size_bytes: bytes.len() as u64,
+                checksum_sha256: checksum.clone(),
+            }],
+        };
+        let stamp = Hlc {
+            millis: 1,
+            counter: 0,
+            node_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let event = SyncEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            note_id: uuid::Uuid::new_v4().to_string(),
+            generation: stamp.clone(),
+            control: stamp.clone(),
+            version: stamp,
+            kind: SyncEventKind::Attach,
+            snapshot_hash: sync::canonical_snapshot_hash(Some(&snapshot)).unwrap(),
+            snapshot: Some(snapshot),
+        };
+        let mut blob = StagedBlob::new(bytes.len() as u64, &checksum, 100).unwrap();
+        blob.append(0, bytes).await.unwrap();
+        blob.finish().await.unwrap();
+        let runtime = SyncRuntime::default();
+        let (socket, mut peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        client.incoming = Some(Incoming {
+            id: transfer_id.clone(),
+            metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100).unwrap(),
+            event: Some(event.clone()),
+            blobs: HashMap::from([(
+                format!(
+                    "attachment:{}",
+                    event.snapshot.as_ref().unwrap().attachments[0].id
+                ),
+                blob,
+            )]),
+            idle_deadline: Instant::now() + DEADLINE,
+        });
+        client.task_sync = true;
+        client.socket.start_pump();
+        let task_id = format!("{}:1", uuid::Uuid::nil());
+        let request = Frame::new(
+            Some("local-session"),
+            None,
+            TOPIC,
+            "task_submit",
+            json!({"task_id":task_id,"operation":"transfer_commit","payload":{"transfer_id":transfer_id}}),
+        );
+        client
+            .handle_message(Some(Ok(Message::Text(request.encode().unwrap().into()))))
+            .await
+            .unwrap();
+        store.started.notified().await;
+        tokio::time::pause();
+        let delayed_store = store.clone();
+        let worker = tokio::spawn(async move {
+            let mut beats = 0;
+            while beats < 2 {
+                let frame = peer_frame(&mut peer).await;
+                if frame.event == "heartbeat" {
+                    beats += 1;
+                    peer_reply(&mut peer, &frame).await;
+                } else {
+                    assert_eq!(frame.event, "task_status");
+                    assert_ne!(
+                        frame.payload["state"], "succeeded",
+                        "no ACK before durable publication"
+                    );
+                }
+            }
+            delayed_store.release.notify_one();
+            peer
+        });
+        loop {
+            client.check_liveness().await.unwrap();
+            if client.received_tasks.get(&task_id).unwrap().terminal() {
+                break;
+            }
+            let wake = client.next_wake();
+            tokio::select! {
+                message=client.socket.next()=>client.handle_message(message).await.unwrap(),
+                _=tokio::time::sleep_until(wake)=>{},
+            }
+        }
+        let mut peer = worker.await.unwrap();
+        tokio::time::resume();
+        let status = peer_frame(&mut peer).await;
+        assert_eq!(status.event, "task_status");
+        assert_eq!(status.payload["state"], "succeeded");
+        assert_eq!(
+            status.payload["result"],
+            serde_json::to_value(event.acknowledgement()).unwrap()
+        );
+        assert!(sync::sync_received_event(&ctx, &event).await.unwrap());
+        runtime.drain_workers().await;
+    }
+
+    #[tokio::test]
     async fn replacing_a_profile_cancels_a_blocked_join_and_preserves_pending_notes() {
         let mut certs = certificates();
         let old_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3427,7 +6305,7 @@ mod tests {
         let mut client = Session {
             ctx: &ctx,
             runtime: &runtime,
-            socket: connect_socket(&certs.profile).await.unwrap(),
+            socket: Io::raw(connect_socket(&certs.profile).await.unwrap()),
             join: "current-session".into(),
             counter: 0,
             limit: 1000,
@@ -3435,9 +6313,22 @@ mod tests {
             heartbeat: None,
             next_heartbeat: Instant::now(),
             outbound: None,
+            outbound_transfer: None,
             state_query: false,
             inbound_query: None,
             remote_inventory_complete: false,
+            task_sync: false,
+            task_origin: uuid::Uuid::nil().to_string(),
+            task_sequence: 0,
+            received_tasks: Ledger::new(uuid::Uuid::nil().to_string()),
+            outgoing_tasks: HashMap::new(),
+            task_jobs: HashMap::new(),
+            manager_failed: false,
+            scan_progress: None,
+            manager_sequence: 0,
+            remote_manager: None,
+            resolved: Arc::new(tempfile::tempdir().unwrap()),
+            deferred_abort: None,
         };
         assert_eq!(
             client.request("phx_join", json!({})).await.unwrap(),

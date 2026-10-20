@@ -43,17 +43,73 @@ fn sync_timestamp(timestamp: i64) -> Html {
 }
 
 fn direction_phase(progress: &SyncDirectionProgress) -> &str {
+    if let Some(task) = &progress.active_task {
+        match task.state.as_str() {
+            "failed" => return "Task failed",
+            "cancelled" => return "Task cancelled",
+            "queued" | "running" if progress.phase == "idle" => return "Processing task",
+            _ => {}
+        }
+    }
+    if let Some(manager) = &progress.manager {
+        if manager.state.as_deref() == Some("failed") {
+            return "Sync manager failed";
+        }
+        if matches!(progress.phase.as_str(), "idle" | "checking") && !manager.scan_complete {
+            return "Discovering notes";
+        }
+        if progress.phase == "idle" && manager.pages_checked < manager.pages_scanned {
+            return "Comparing note pages";
+        }
+        if progress.phase == "idle"
+            && manager.mode == "changes"
+            && progress.notes_remaining == Some(0)
+            && progress.blocked_notes == 0
+        {
+            return "Watching for changes";
+        }
+    }
     match progress.phase.as_str() {
         "checking" => "Checking notes",
         "transferring" => "Transferring notes",
         "blocked" => "Needs attention",
         "reconnecting" => "Reconnecting",
         "paused" => "Paused",
+        "upgrade_required" => "Receiver upgrade required",
         "idle" if progress.notes_remaining == Some(0) && progress.blocked_notes == 0 => {
             "Round complete"
         }
         "idle" => "Waiting for notes",
         _ => "Waiting for progress",
+    }
+}
+
+fn task_operation(operation: &str) -> &str {
+    match operation {
+        "inventory_start" => "Checking note inventory",
+        "state_query" => "Comparing note versions",
+        "prepare" | "preparation" => "Preparing attachments",
+        "transfer_begin" => "Starting note transfer",
+        "attachment_begin" => "Starting attachment transfer",
+        "blob_chunk" => "Transferring data chunk",
+        "blob_end" => "Verifying received data",
+        "transfer_commit" => "Saving received note",
+        "inventory_complete" => "Completing inventory check",
+        "transfer_abort" => "Cleaning up transfer",
+        _ => "Synchronizing notes",
+    }
+}
+
+fn task_state(state: &str, phase: &str) -> &'static str {
+    match (state, phase) {
+        ("running", "outcome_unknown") => "Checking commit outcome",
+        ("running", "cancellation_pending") => "Finishing current write",
+        ("queued", _) => "Queued",
+        ("running", _) => "Running",
+        ("succeeded", _) => "Complete",
+        ("failed", _) => "Failed",
+        ("cancelled", _) => "Cancelled",
+        _ => "Awaiting task status",
     }
 }
 
@@ -70,6 +126,8 @@ fn note_phase(phase: &str) -> &str {
 
 fn direction_progress(title: &str, progress: &SyncDirectionProgress, connected: bool) -> Html {
     let checking = progress.phase == "checking";
+    let discovering = progress.manager.as_ref().is_some_and(|m| !m.scan_complete);
+    let notes_total = progress.notes_total.filter(|_| !discovering);
     let resolved = progress
         .notes_equal
         .saturating_add(progress.notes_completed)
@@ -80,8 +138,8 @@ fn direction_progress(title: &str, progress: &SyncDirectionProgress, connected: 
         resolved
     };
     // A known zero-work round is complete; native progress requires a positive max.
-    let maximum = progress.notes_total.map(|total| total.max(1));
-    let value = progress.notes_total.map(|total| {
+    let maximum = notes_total.map(|total| total.max(1));
+    let value = notes_total.map(|total| {
         if total == 0 && progress.phase == "idle" {
             1
         } else {
@@ -96,6 +154,38 @@ fn direction_progress(title: &str, progress: &SyncDirectionProgress, connected: 
         <section class="sync-progress-direction" aria-label={title.to_string()}>
             <h4>{ title }</h4>
             <p class="sync-progress-phase" role="status">{ direction_phase(progress) }</p>
+            if let Some(task) = &progress.active_task {
+                <div class="sync-progress-note" aria-label={format!("{title} task")}>
+                    <p role="status">{ format!("{} · {}", task_operation(&task.operation),
+                        task_state(&task.state, &task.phase)) }</p>
+                    <p class="system-score-help">{ "Last task update: " }{ sync_timestamp(task.updated_at) }</p>
+                    if let Some(error) = &task.error {
+                        <p class="error" role="alert">{ error.chars().take(240).collect::<String>() }</p>
+                    }
+                    <details class="sync-progress-round">
+                        <summary>{ "Task details" }</summary><code>{ &task.id }</code>
+                    </details>
+                </div>
+            }
+            if let Some(manager) = &progress.manager {
+                <div class="sync-progress-note" aria-label={format!("{title} scan")}>
+                    <p>{ if manager.mode == "changes" { "Durable changes" } else { "Initial comparison" } }</p>
+                    <p>{ format!("{} {} discovered · {} {} compared",
+                        manager.pages_scanned, if manager.pages_scanned == 1 { "page" } else { "pages" },
+                        manager.pages_checked, if manager.pages_checked == 1 { "page" } else { "pages" }) }</p>
+                    <p>{ format!("{} notes discovered · up to {} notes per page", manager.notes_scanned, manager.page_size) }</p>
+                    <p>{ if manager.scan_complete { "Source discovery complete" } else { "Total being counted" } }</p>
+                    <p class="system-score-help">{ "Last sync progress: " }{ sync_timestamp(manager.last_progress_at) }</p>
+                    if let Some(error) = &manager.error {
+                        <p class="error" role="alert">{ error.chars().take(240).collect::<String>() }</p>
+                    }
+                    if let Some(cursor) = &manager.source_cursor {
+                        <details class="sync-progress-round">
+                            <summary>{ "Scan details" }</summary><code>{ cursor }</code>
+                        </details>
+                    }
+                </div>
+            }
             <p class="system-score-help">{
                 match progress.basis.as_str() {
                     "remote_verified" => "Compared with GaoNote in this round",
@@ -105,9 +195,10 @@ fn direction_progress(title: &str, progress: &SyncDirectionProgress, connected: 
             }</p>
             <progress aria-label={format!("{title} round progress")}
                 max={maximum.map(|value| value.to_string())} value={value.map(|value| value.to_string())} />
-            <p>{ match progress.notes_total {
+            <p>{ match notes_total {
                 Some(total) if checking => format!("{} of {total} checked", progress.notes_checked),
                 Some(total) => format!("{total} notes in this round"),
+                None if discovering => format!("Total being counted · {} checked", progress.notes_checked),
                 None => format!("Total unknown · {} checked", progress.notes_checked),
             } }</p>
             <ul class="sync-progress-counts">
@@ -116,6 +207,7 @@ fn direction_progress(title: &str, progress: &SyncDirectionProgress, connected: 
                 <li>{ format!("{} delivered", progress.notes_completed) }</li>
                 <li>{ format!("{} superseded", progress.notes_superseded) }</li>
                 <li>{ match progress.notes_remaining {
+                    Some(remaining) if discovering => format!("{remaining} known remaining · scan in progress"),
                     Some(remaining) => format!("{remaining} remaining"),
                     None if checking => "Remaining being checked".to_string(),
                     None => "Remaining unknown".to_string(),
@@ -538,6 +630,9 @@ pub fn system_sync(props: &SystemSyncProps) -> Html {
                 if !current.blocked_notes.is_empty() {
                     <div class="system-score-error" role="status">
                         <p>{ "These notes need attention. Other notes can continue syncing." }</p>
+                        if current.blocked_notes_total > current.blocked_notes.len() as u64 {
+                            <p>{ format!("Showing {} of {} notes needing attention.", current.blocked_notes.len(), current.blocked_notes_total) }</p>
+                        }
                         <ul>
                             { for current.blocked_notes.iter().map(|note| {
                                 let message = match note.reason.as_str() {
@@ -588,7 +683,35 @@ mod progress_tests {
             notes_remaining: remaining,
             blocked_notes: 0,
             current_note: None,
+            active_task: None,
+            manager: None,
         }
+    }
+
+    #[test]
+    fn scan_and_uncompared_pages_prevent_false_round_completion() {
+        let mut current = progress("idle", Some(0));
+        current.manager = Some(crate::api::SyncManagerProgress {
+            mode: "initial_scan".into(),
+            page_size: 32,
+            pages_scanned: 2,
+            pages_checked: 1,
+            notes_scanned: 64,
+            scan_complete: false,
+            source_cursor: None,
+            last_progress_at: 1_700_000_000_000,
+            state: None,
+            error: None,
+        });
+        assert_eq!(direction_phase(&current), "Discovering notes");
+        current.manager.as_mut().unwrap().scan_complete = true;
+        assert_eq!(direction_phase(&current), "Comparing note pages");
+        current.manager.as_mut().unwrap().pages_checked = 2;
+        assert_eq!(direction_phase(&current), "Round complete");
+        current.manager.as_mut().unwrap().mode = "changes".into();
+        assert_eq!(direction_phase(&current), "Watching for changes");
+        current.manager.as_mut().unwrap().state = Some("failed".into());
+        assert_eq!(direction_phase(&current), "Sync manager failed");
     }
 
     #[test]
@@ -622,5 +745,36 @@ mod progress_tests {
     fn awaiting_commit_is_distinct_from_attachment_transfer() {
         assert_eq!(note_phase("awaiting_commit"), "Awaiting confirmation");
         assert_eq!(note_phase("attachments"), "Transferring attachments");
+    }
+
+    #[test]
+    fn task_failure_is_visible_without_reporting_a_disconnected_round() {
+        let direction: SyncDirectionProgress = serde_json::from_value(serde_json::json!({
+            "run_id": "round-1", "phase": "transferring", "basis": "remote_verified",
+            "notes_total": 2, "notes_checked": 2, "notes_equal": 0,
+            "notes_planned": 2, "notes_completed": 0, "notes_superseded": 0,
+            "notes_remaining": 2, "blocked_notes": 1, "current_note": null,
+            "active_task": {"id": "node:1", "operation": "blob_end", "state": "failed",
+                "phase": "verifying", "updated_at": 1700000000000_i64,
+                "error": "Attachment checksum did not match"}
+        }))
+        .unwrap();
+        assert_eq!(direction_phase(&direction), "Task failed");
+        assert_eq!(direction.phase, "transferring");
+        assert_eq!(direction.notes_completed, 0);
+    }
+
+    #[test]
+    fn a_running_task_prevents_a_false_round_complete_label() {
+        let direction: SyncDirectionProgress = serde_json::from_value(serde_json::json!({
+            "run_id": "round-1", "phase": "idle", "basis": "remote_verified",
+            "notes_total": 0, "notes_checked": 0, "notes_equal": 0,
+            "notes_planned": 0, "notes_completed": 0, "notes_superseded": 0,
+            "notes_remaining": 0, "blocked_notes": 0, "current_note": null,
+            "active_task": {"id": "node:2", "operation": "inventory_start", "state": "running",
+                "phase": "checking", "updated_at": 1700000000000_i64, "error": null}
+        }))
+        .unwrap();
+        assert_eq!(direction_phase(&direction), "Processing task");
     }
 }

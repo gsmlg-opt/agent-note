@@ -30,7 +30,7 @@ async fn peer<'a>(ctx: &'a Context, runtime: &'a SyncRuntime, url: &str) -> Sess
     let mut session = Session {
         ctx,
         runtime,
-        socket: connect_socket(&profile).await.unwrap(),
+        socket: Io::start(connect_socket(&profile).await.unwrap()),
         join: uuid::Uuid::new_v4().to_string(),
         counter: 0,
         limit: profile.max_blob_bytes,
@@ -38,9 +38,22 @@ async fn peer<'a>(ctx: &'a Context, runtime: &'a SyncRuntime, url: &str) -> Sess
         heartbeat: None,
         next_heartbeat: Instant::now() + HEARTBEAT,
         outbound: None,
+        outbound_transfer: None,
         state_query: false,
         inbound_query: None,
         remote_inventory_complete: false,
+        task_sync: false,
+        task_origin: sync::sync_status(ctx).await.unwrap().node_id,
+        task_sequence: 0,
+        received_tasks: Ledger::new(String::new()),
+        outgoing_tasks: HashMap::new(),
+        task_jobs: HashMap::new(),
+        manager_failed: false,
+        scan_progress: None,
+        manager_sequence: 0,
+        remote_manager: None,
+        resolved: Arc::new(tempfile::tempdir().unwrap()),
+        deferred_abort: None,
     };
     let hello = Hello {
         protocol_version: 1,
@@ -62,7 +75,9 @@ async fn peer<'a>(ctx: &'a Context, runtime: &'a SyncRuntime, url: &str) -> Sess
         .await
         .unwrap();
     session.limit = profile.max_blob_bytes.min(response.hello.max_blob_bytes);
-    let selection = json!({"capabilities":["state_query_v1"]});
+    assert!(response.capabilities.iter().any(|c| c == "task_sync_v1"));
+    session.received_tasks = Ledger::new(response.hello.node_id.clone());
+    let selection = json!({"capabilities":["state_query_v1", "task_sync_v1"]});
     assert_eq!(
         session
             .request("sync_negotiate", selection.clone())
@@ -71,6 +86,7 @@ async fn peer<'a>(ctx: &'a Context, runtime: &'a SyncRuntime, url: &str) -> Sess
         selection
     );
     session.state_query = true;
+    session.task_sync = true;
     runtime
         .progress(|p| *p = SyncProgress::new("remote_verified"))
         .await;
@@ -78,7 +94,7 @@ async fn peer<'a>(ctx: &'a Context, runtime: &'a SyncRuntime, url: &str) -> Sess
 }
 
 async fn finish_remote_inventory(session: &mut Session<'_>) {
-    timeout(Duration::from_secs(30), async {
+    let result = timeout(Duration::from_secs(30), async {
         while !session.remote_inventory_complete {
             session.check_liveness().await.unwrap();
             let wake = session.next_wake();
@@ -88,8 +104,14 @@ async fn finish_remote_inventory(session: &mut Session<'_>) {
             }
         }
     })
-    .await
-    .expect("GaoNote inventory did not finish");
+    .await;
+    assert!(
+        result.is_ok(),
+        "GaoNote inventory did not finish: {:?}; active jobs: {}; outgoing tasks: {}",
+        session.runtime.status.read().await.progress,
+        session.task_jobs.len(),
+        session.outgoing_tasks.len(),
+    );
 }
 
 #[tokio::test]
@@ -113,6 +135,17 @@ async fn real_gaonote_reconnect_skips_blobs_transfers_changes_and_restores_membe
     )
     .await;
     let seed_id = seed["note_id"].as_str().unwrap();
+    let mut remote_page_ids = Vec::new();
+    for index in 0..65 {
+        let note = control(
+            &http_client,
+            &http,
+            json!({"op":"create_note","title":format!("GaoNote page note {index}"),
+                "content":format!("Remote page body {index}")}),
+        )
+        .await;
+        remote_page_ids.push((note["note_id"].as_str().unwrap().to_owned(), index));
+    }
     let dir = tempfile::tempdir().unwrap();
     let ctx = Context::new(
         Arc::new(
@@ -142,18 +175,34 @@ async fn real_gaonote_reconnect_skips_blobs_transfers_changes_and_restores_membe
     )
     .await
     .unwrap();
+    let mut local_page_ids = Vec::new();
+    for index in 0..65 {
+        let note = note_pipelines::save_note(
+            &ctx,
+            note_pipelines::SaveNoteInput {
+                title: format!("Agent Note page note {index}"),
+                content: format!("Local page body {index}"),
+                labels: vec![("project".into(), "bear_note".into())],
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        local_page_ids.push((note.id, index));
+    }
+    let initial_body = format!("Initial body\n{}", "paged synchronization ".repeat(6_000));
     let local = note_pipelines::save_note(
         &ctx,
         note_pipelines::SaveNoteInput {
             title: "Agent Note interop file".into(),
-            content: "Initial body".into(),
+            content: initial_body.clone(),
             labels: vec![("project".into(), "bear_note".into())],
             attachments: vec![note_core::NoteAttachment {
                 id: "event".into(),
                 path: "file.bin".into(),
                 mime: "application/octet-stream".into(),
                 description: String::new(),
-                content: vec![42; CHUNK + 13],
+                content: vec![42; 3 * CHUNK + 13],
                 storage: None,
             }],
         },
@@ -162,13 +211,31 @@ async fn real_gaonote_reconnect_skips_blobs_transfers_changes_and_restores_membe
     .unwrap();
     let runtime = SyncRuntime::default();
     let mut connection = peer(&ctx, &runtime, &ws).await;
-    connection
-        .request("inventory_start", json!({}))
-        .await
-        .unwrap();
+    connection.start_inventory().await.unwrap();
     connection.reconcile_round(true).await.unwrap();
     finish_remote_inventory(&mut connection).await;
+    {
+        let status = runtime.status.read().await;
+        let progress = status.progress.as_ref().unwrap();
+        for direction in [&progress.upload, &progress.download] {
+            let manager = direction.manager.as_ref().expect("paged peer manager");
+            assert!(manager.scan_complete, "{direction:?}");
+            assert!(manager.pages_scanned >= 3, "{direction:?}");
+            assert!(manager.pages_checked >= 3, "{direction:?}");
+        }
+    }
     assert_eq!(sync::sync_status(&ctx).await.unwrap().pending_notes, 0);
+    for (id, index) in &remote_page_ids {
+        let note = note_pipelines::get_note_metadata(&ctx, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.content, format!("Remote page body {index}"));
+    }
+    for (id, index) in &local_page_ids {
+        let note = control(&http_client, &http, json!({"op":"get_note","note_id":id})).await;
+        assert_eq!(note["note"]["content"], format!("Local page body {index}"));
+    }
     assert_eq!(
         note_pipelines::get_note_metadata(&ctx, seed_id)
             .await
@@ -183,15 +250,12 @@ async fn real_gaonote_reconnect_skips_blobs_transfers_changes_and_restores_membe
         json!({"op":"get_note","note_id":local.id}),
     )
     .await;
-    assert_eq!(received["note"]["content"], "Initial body");
+    assert_eq!(received["note"]["content"], initial_body);
     drop(connection);
 
     control(&http_client, &http, json!({"op":"reset_storage_requests"})).await;
     let mut connection = peer(&ctx, &runtime, &ws).await;
-    connection
-        .request("inventory_start", json!({}))
-        .await
-        .unwrap();
+    connection.start_inventory().await.unwrap();
     connection.reconcile_round(true).await.unwrap();
     finish_remote_inventory(&mut connection).await;
     {
@@ -308,5 +372,5 @@ async fn real_gaonote_reconnect_skips_blobs_transfers_changes_and_restores_membe
         .unwrap();
     assert!(restored.items[0].matches_snapshot(&after.descriptor));
     assert_eq!(sync::sync_status(&ctx).await.unwrap().pending_notes, 0);
-    eprintln!("GaoNote interop PASS: duplex inventory, reconnect no blobs, one changed note on same socket, missing membership restored");
+    eprintln!("GaoNote interop PASS: duplex paged inventory (>64 notes each), chunked metadata/attachment, reconnect no blobs, one changed note on same socket, missing membership restored");
 }

@@ -1,10 +1,10 @@
 //! Durable snapshot replication. All state transitions share the note writer transaction.
 use crate::{save_note::finish_transaction, Context};
 use note_core::{normalize_attachment_path, sync::*, Note, NoteAttachment};
-use note_storage::{NewNote, StorageSession, TransactionMode};
+use note_storage::{NewNote, StorageSession, StorageTransaction, TransactionMode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub const DEFAULT_SYNC_MAX_BLOB_BYTES: u64 = 512 * 1024 * 1024;
 const PAGE: usize = 128;
@@ -32,6 +32,21 @@ impl std::fmt::Display for SyncNoteRejection {
     }
 }
 impl std::error::Error for SyncNoteRejection {}
+
+/// COMMIT may have persisted even when the storage acknowledgement was lost.
+/// Callers must reconcile the exact receipt before reporting a terminal outcome.
+#[derive(Debug)]
+pub struct SyncCommitOutcomeUnknown(pub note_storage::StorageError);
+impl std::fmt::Display for SyncCommitOutcomeUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("sync commit outcome is unknown")
+    }
+}
+impl std::error::Error for SyncCommitOutcomeUnknown {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 /// Additional failure context (for example failed cleanup) makes a rejection retryable.
 pub fn sync_note_rejection_reason(error: &anyhow::Error) -> Option<&'static str> {
     let top: &(dyn std::error::Error + Send + Sync + 'static) = error.as_ref();
@@ -563,7 +578,7 @@ pub async fn sync_inventory(
 }
 
 /// A round captures only descriptors, never complete note bodies or file bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncCandidate {
     pub descriptor: SyncAck,
     pub pending: bool,
@@ -599,6 +614,158 @@ async fn sync_candidate_page(
         }
     }
     Ok(result)
+}
+
+/// A finite source snapshot consumed page by page by a local spool producer.
+/// The producer must exhaust this locally; never retain this read transaction across network waits.
+pub struct SyncCandidateScan {
+    transaction: Option<Box<dyn StorageTransaction>>,
+    pending_after: Option<String>,
+    audit_after: Option<String>,
+    pending: VecDeque<SyncCandidate>,
+    audit: VecDeque<SyncCandidate>,
+    pending_done: bool,
+    audit_done: bool,
+    pending_only: bool,
+    pending_streak: usize,
+}
+impl SyncCandidateScan {
+    async fn fill(&mut self, pending: bool) -> anyhow::Result<()> {
+        loop {
+            let (buffer, done, after) = if pending {
+                (&self.pending, self.pending_done, &self.pending_after)
+            } else {
+                (&self.audit, self.audit_done, &self.audit_after)
+            };
+            if !buffer.is_empty() || done {
+                return Ok(());
+            }
+            let transaction = self.transaction.as_ref().expect("active scan");
+            let page = if pending {
+                sync_candidate_page(transaction.as_ref(), after.as_deref(), 32, true).await?
+            } else {
+                transaction
+                    .list_sync_audit_records(after.as_deref(), 32)
+                    .await?
+                    .into_iter()
+                    .map(|(_, value)| {
+                        let member: Member = serde_json::from_value(value)?;
+                        Ok(SyncCandidate {
+                            descriptor: member.event.acknowledgement(),
+                            pending: false,
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            };
+            let cursor = page
+                .last()
+                .map(|candidate| candidate.descriptor.note_id.clone());
+            if page.is_empty() {
+                if pending {
+                    self.pending_done = true;
+                } else {
+                    self.audit_done = true;
+                }
+                return Ok(());
+            }
+            let mut selected = VecDeque::new();
+            for candidate in page {
+                if pending && !self.pending_only {
+                    // Pending and audit partitions come from the same finite member snapshot.
+                    // A queued event absent from this cohort cannot enlarge the round.
+                    let member = get::<Member>(
+                        transaction.as_ref(),
+                        "member",
+                        &candidate.descriptor.note_id,
+                    )
+                    .await?;
+                    if member.is_some_and(|member| {
+                        member.event.acknowledgement() == candidate.descriptor
+                    }) {
+                        selected.push_back(candidate);
+                    }
+                } else if pending || !candidate.pending {
+                    selected.push_back(candidate);
+                }
+            }
+            if pending {
+                self.pending_after = cursor;
+                self.pending = selected;
+            } else {
+                self.audit_after = cursor;
+                self.audit = selected;
+            }
+        }
+    }
+    pub async fn next_page(&mut self, limit: usize) -> anyhow::Result<Vec<SyncCandidate>> {
+        if self.transaction.is_none() {
+            return Ok(Vec::new());
+        }
+        let result = async {
+            let mut page = Vec::with_capacity(limit.clamp(1, 32));
+            while page.len() < limit.clamp(1, 32) {
+                self.fill(true).await?;
+                if !self.pending_only
+                    && self.audit.is_empty()
+                    && !self.audit_done
+                    && (self.pending.is_empty() || self.pending_streak >= 8)
+                {
+                    // Publish available work before probing another source lane.
+                    if !page.is_empty() {
+                        break;
+                    }
+                    self.fill(false).await?;
+                }
+                let candidate =
+                    if !self.pending.is_empty() && (self.pending_streak < 8 || self.audit_done) {
+                        self.pending_streak += 1;
+                        self.pending.pop_front()
+                    } else if let Some(candidate) = self.audit.pop_front() {
+                        self.pending_streak = 0;
+                        Some(candidate)
+                    } else {
+                        None
+                    };
+                let Some(candidate) = candidate else {
+                    break;
+                };
+                page.push(candidate);
+            }
+            Ok::<_, anyhow::Error>(page)
+        }
+        .await;
+        match result {
+            Ok(page) => {
+                if page.is_empty() {
+                    self.transaction.take().unwrap().commit().await?;
+                }
+                Ok(page)
+            }
+            Err(error) => {
+                self.transaction.take().unwrap().rollback().await?;
+                Err(error)
+            }
+        }
+    }
+}
+pub async fn start_sync_candidate_scan(
+    ctx: &Context,
+    pending_only: bool,
+) -> anyhow::Result<SyncCandidateScan> {
+    let transaction = ctx.storage().begin(TransactionMode::Snapshot).await?;
+    // Establish the read snapshot now, before a concurrent note can enter this cohort.
+    let _ = transaction.get_system_config().await?;
+    Ok(SyncCandidateScan {
+        transaction: Some(transaction),
+        pending_after: None,
+        audit_after: None,
+        pending: VecDeque::new(),
+        audit: VecDeque::new(),
+        pending_done: false,
+        audit_done: pending_only,
+        pending_only,
+        pending_streak: 0,
+    })
 }
 
 /// Captures a finite round of lightweight descriptors from one database snapshot.
@@ -1094,6 +1261,24 @@ pub fn validate_sync_event(
     anyhow::ensure!(bytes.len() == ids.len(), "unexpected sync attachment bytes");
     Ok(())
 }
+/// Establishes only an exact durable inbound receipt, never content equality.
+/// A same-ID/different-event replay is rejected before any external publication.
+pub async fn sync_received_event(ctx: &Context, event: &SyncEvent) -> anyhow::Result<bool> {
+    let tx = ctx.storage().begin(TransactionMode::Snapshot).await?;
+    let result = async {
+        anyhow::ensure!(tx.get_system_config().await?.sync.enabled, "sync is paused");
+        match get::<SyncEvent>(tx.as_ref(), "received", &event.event_id).await? {
+            Some(received) => {
+                anyhow::ensure!(received == *event, "event ID reused with different payload");
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+    .await;
+    finish_transaction(tx, result).await
+}
+
 pub async fn apply_sync_event(
     ctx: &Context,
     event: &SyncEvent,
@@ -1101,6 +1286,9 @@ pub async fn apply_sync_event(
 ) -> anyhow::Result<SyncApplyResult> {
     validate_sync_event(event, attachment_bytes)
         .map_err(|error| SyncNoteRejection::ValidationFailed(error.to_string()))?;
+    if sync_received_event(ctx, event).await? {
+        return Ok(SyncApplyResult::Duplicate);
+    }
     if event.kind == SyncEventKind::Fence {
         return apply_fence(ctx, event).await;
     }
@@ -1359,7 +1547,7 @@ pub async fn apply_sync_event(
     .await;
     match result {
         Ok(result) => {
-            tx.commit().await?;
+            tx.commit().await.map_err(SyncCommitOutcomeUnknown)?;
             if result != SyncApplyResult::Applied {
                 published.cleanup_best_effort(ctx.attachments()).await;
             }
@@ -1554,7 +1742,13 @@ async fn apply_fence(ctx: &Context, event: &SyncEvent) -> anyhow::Result<SyncApp
         Ok(SyncApplyResult::Applied)
     }
     .await;
-    finish_transaction(tx, result).await
+    match result {
+        Ok(result) => {
+            tx.commit().await.map_err(SyncCommitOutcomeUnknown)?;
+            Ok(result)
+        }
+        Err(error) => finish_transaction(tx, Err(error)).await,
+    }
 }
 /// Call only when the sole synchronization worker has no active session: at startup
 /// or after dropping a session on retry, reconfiguration, failure, or shutdown.

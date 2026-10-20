@@ -82,4 +82,43 @@ pub async fn run_sync_records(storage: Arc<dyn StorageBackend>) {
         .await
         .unwrap()
         .is_none());
+
+    let tx = storage.begin(TransactionMode::Immediate).await.unwrap();
+    for index in 0..96 {
+        let key = format!("audit-contract-{index:03}");
+        let value = serde_json::json!({"event":{"event_id":key,"version":1}});
+        tx.put_sync_record("member", &key, &value).await.unwrap();
+        if index % 3 == 0 {
+            tx.put_sync_record("pending", &key, &value).await.unwrap();
+        }
+    }
+    // A different pending event must not hide the captured member from audit.
+    tx.put_sync_record(
+        "pending",
+        "audit-contract-001",
+        &serde_json::json!({"event":{"event_id":"later-event","version":2}}),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let mut after = None;
+    let mut audit = Vec::new();
+    loop {
+        let page = session
+            .list_sync_audit_records(after.as_deref(), 7)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 7);
+        after = page.last().map(|row| row.0.clone());
+        audit.extend(page.into_iter().map(|row| row.0));
+    }
+    assert_eq!(audit.len(), 64);
+    assert!(audit.contains(&"audit-contract-001".into()));
+    assert!(audit
+        .iter()
+        .all(|key| key.rsplit('-').next().unwrap().parse::<usize>().unwrap() % 3 != 0));
+    assert!(audit.windows(2).all(|pair| pair[0] < pair[1]));
 }

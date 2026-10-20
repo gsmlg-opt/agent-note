@@ -111,6 +111,10 @@ async def qualify(browser, base_url, output):
     up.update(phase="blocked", blocked_notes=1, notes_completed=1, notes_remaining=1, current_note=None)
     await expect(upload.get_by_text("Needs attention", exact=True)).to_be_visible(timeout=6000)
     await expect(upload).to_contain_text("1 blocked")
+    api.status.update(blocked_notes=[{"note_id": NOTE["id"], "event_id": "event-1",
+                                     "reason": "catalog_conflict"}], blocked_notes_total=65)
+    await expect(page.get_by_text("Showing 1 of 65 notes needing attention.", exact=True)).to_be_visible(timeout=6000)
+    api.status.update(blocked_notes=[], blocked_notes_total=0)
     await expect(upload.get_by_text(NOTE["title"][:240], exact=True)).to_have_count(0)
 
     up.update(phase="idle", blocked_notes=0, notes_completed=1, notes_superseded=1, notes_remaining=0)
@@ -138,6 +142,56 @@ async def qualify(browser, base_url, output):
     await expect(upload.get_by_role("progressbar", name="Sending to GaoNote round progress", exact=True)).to_have_attribute("value", "1")
     await expect(upload.get_by_role("progressbar", name="Sending to GaoNote round progress", exact=True)).to_have_attribute("max", "1")
 
+    up["active_task"] = {"id": "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa:42",
+                         "operation": "inventory_start", "state": "running", "phase": "checking",
+                         "updated_at": FAILURE["timestamp"], "error": None}
+    await expect(upload.get_by_text("Processing task", exact=True)).to_be_visible(timeout=6000)
+    await expect(upload.get_by_text("Checking note inventory · Running", exact=True)).to_be_visible()
+    await expect(upload.get_by_text("Round complete", exact=True)).to_have_count(0)
+    task = up["active_task"]
+    task.update(operation="transfer_commit", phase="outcome_unknown")
+    await expect(upload.get_by_text("Saving received note · Checking commit outcome", exact=True)).to_be_visible(timeout=6000)
+    task.update(state="failed", phase="verifying", operation="blob_end",
+                error="Checksum mismatch <img src=x onerror=alert(1)>")
+    await expect(upload.get_by_text("Task failed", exact=True)).to_be_visible(timeout=6000)
+    await expect(upload.get_by_role("alert")).to_contain_text(task["error"])
+    assert api.status["state"] == "connected"
+    assert await upload.locator("img").count() == 0
+    await page.screenshot(path=str(output / "task-failure-mobile.png"), full_page=True)
+    assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    up["active_task"] = None
+    await expect(upload.get_by_text("Round complete", exact=True)).to_be_visible(timeout=6000)
+
+    up["manager"] = {"mode": "initial_scan", "page_size": 32, "pages_scanned": 2,
+                     "pages_checked": 1, "notes_scanned": 64, "scan_complete": False,
+                     "source_cursor": "<img src=x onerror=alert(1)>",
+                     "last_progress_at": FAILURE["timestamp"]}
+    await expect(upload.get_by_text("Discovering notes", exact=True)).to_be_visible(timeout=6000)
+    await expect(upload).to_contain_text("2 pages discovered · 1 page compared")
+    await expect(upload).to_contain_text("64 notes discovered · up to 32 notes per page")
+    await expect(upload).to_contain_text("Total being counted")
+    await expect(upload.get_by_text("Round complete", exact=True)).to_have_count(0)
+    assert await upload.get_by_role("progressbar", name="Sending to GaoNote round progress", exact=True).evaluate("el => !el.hasAttribute('value')")
+    progress_time = upload.get_by_label("Sending to GaoNote scan").locator("time")
+    previous_time = await progress_time.get_attribute("datetime")
+    api.status["progress"]["updated_at"] += 60_000
+    up["manager"]["scan_complete"] = True
+    up["notes_total"] = 64
+    await expect(upload.get_by_text("Comparing note pages", exact=True)).to_be_visible(timeout=6000)
+    assert await progress_time.get_attribute("datetime") == previous_time
+    await expect(upload.get_by_text("Round complete", exact=True)).to_have_count(0)
+    assert await upload.locator("img").count() == 0
+    await page.screenshot(path=str(output / "paged-scan-mobile.png"), full_page=True)
+    assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    up["manager"].update(state="failed", error="Page comparison failed <img src=x onerror=alert(1)>")
+    await expect(upload.get_by_text("Sync manager failed", exact=True)).to_be_visible(timeout=6000)
+    await expect(upload.get_by_role("alert")).to_contain_text(up["manager"]["error"])
+    assert await upload.locator("img").count() == 0
+    up["manager"].update(mode="changes", pages_checked=2, state="idle", error=None)
+    await expect(upload.get_by_text("Watching for changes", exact=True)).to_be_visible(timeout=6000)
+    await expect(upload).to_contain_text("Durable changes")
+    up["manager"] = None
+
     api.unavailable = True
     await expect(page.get_by_text("server error 503: Sync status temporarily unavailable", exact=True)).to_be_visible(timeout=6000)
     await expect(upload).to_be_visible()
@@ -156,7 +210,9 @@ async def qualify(browser, base_url, output):
     assert not errors, errors
     await context.close()
     return {"legacy": "PASS", "stages": "PASS", "bidirectional_unknown_totals": "PASS", "blocked_reconnect": "PASS",
-            "escaped_responsive": "PASS", "durable_completion": "PASS", "poll_failure_recovery_overlap": "PASS", "save_retry": "PASS"}
+            "escaped_responsive": "PASS", "durable_completion": "PASS", "poll_failure_recovery_overlap": "PASS", "save_retry": "PASS",
+            "task_state_independent_of_connection": "PASS", "unknown_commit_outcome": "PASS",
+            "paged_discovery_progress": "PASS", "progress_time_independent_of_heartbeat": "PASS"}
 
 
 async def main(args):

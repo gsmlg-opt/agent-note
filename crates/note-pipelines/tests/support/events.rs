@@ -273,6 +273,10 @@ macro_rules! impl_forward_repository {
 
 impl_forward_repository! {
     NotesRepository {
+        fn get_sync_note(id: &str) -> Option<note_core::Note>;
+        fn list_sync_note_ids(after: Option<&str>, limit: usize) -> Vec<String>;
+        fn put_sync_note(note: NewNote<'_>) -> ();
+        fn purge_sync_note(id: &str) -> ();
         fn insert_note(note: NewNote<'_>) -> ();
         fn get_note_revision(id: &str) -> Option<i64>;
         fn note_exists(id: &str) -> bool;
@@ -471,6 +475,11 @@ impl_forward_repository! {
 
 impl_forward_repository! {
     SettingsRepository {
+        fn get_sync_record(namespace: &str, key: &str) -> Option<serde_json::Value>;
+        fn put_sync_record(namespace: &str, key: &str, value: &serde_json::Value) -> ();
+        fn delete_sync_record(namespace: &str, key: &str) -> ();
+        fn list_sync_records(namespace: &str, after_key: Option<&str>, limit: usize) -> Vec<(String, serde_json::Value)>;
+        fn list_sync_audit_records(after_key: Option<&str>, limit: usize) -> Vec<(String, serde_json::Value)>;
         fn get_system_config() -> note_core::SystemConfig;
         fn set_system_config(config: &note_core::SystemConfig) -> ();
         fn get_embedding_fingerprint() -> Option<String>;

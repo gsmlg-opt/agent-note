@@ -604,6 +604,20 @@ pub trait SettingsRepository: Send + Sync {
         ))
     }
 
+    /// Member records whose exact event is not already in the pending lane.
+    /// Apply the exclusion before LIMIT so audit discovery never walks pending pages in memory.
+    async fn list_sync_audit_records(
+        &self,
+        after_key: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<(String, serde_json::Value)>> {
+        let _ = (after_key, limit);
+        Err(StorageError::new(
+            StorageErrorKind::UnsupportedSchema,
+            "sync audit pagination unsupported",
+        ))
+    }
+
     async fn get_system_config(&self) -> StorageResult<note_core::SystemConfig>;
     async fn set_system_config(&self, config: &note_core::SystemConfig) -> StorageResult<()>;
     async fn get_embedding_fingerprint(&self) -> StorageResult<Option<String>>;
