@@ -46,6 +46,8 @@ pub struct SyncDirectionProgress {
     resolved_ids: BTreeSet<String>,
     #[serde(skip)]
     blocked_ids: BTreeSet<String>,
+    #[serde(skip)]
+    remote_blocked_notes: usize,
 }
 
 impl SyncDirectionProgress {
@@ -67,6 +69,7 @@ impl SyncDirectionProgress {
             manager: None,
             resolved_ids: BTreeSet::new(),
             blocked_ids: BTreeSet::new(),
+            remote_blocked_notes: 0,
         }
     }
 
@@ -135,7 +138,7 @@ impl SyncDirectionProgress {
             *remaining = remaining.saturating_sub(1);
         }
         self.blocked_ids.remove(note_id);
-        self.blocked_notes = self.blocked_ids.len();
+        self.blocked_notes = self.remote_blocked_notes.max(self.blocked_ids.len());
         self.clear_current(note_id);
         true
     }
@@ -143,9 +146,14 @@ impl SyncDirectionProgress {
     pub fn block_note(&mut self, note_id: &str) {
         if !self.resolved_ids.contains(note_id) {
             self.blocked_ids.insert(note_id.into());
-            self.blocked_notes = self.blocked_ids.len();
+            self.blocked_notes = self.remote_blocked_notes.max(self.blocked_ids.len());
         }
         self.clear_current(note_id);
+    }
+
+    pub fn update_remote_blocked(&mut self, blocked: usize) {
+        self.remote_blocked_notes = blocked;
+        self.blocked_notes = blocked.max(self.blocked_ids.len());
     }
 
     fn clear_current(&mut self, note_id: &str) {
@@ -170,10 +178,12 @@ impl SyncDirectionProgress {
         .into();
     }
 
-    /// Task mode keeps exact round membership on disk; page-local sets must not accumulate.
-    pub fn release_page_ids(&mut self) {
+    /// Task mode keeps successful round membership on disk. Unresolved local
+    /// rejections survive other notes' confirmations until their own success.
+    pub fn release_page_ids(&mut self, completed_note: &str) {
         self.resolved_ids.clear();
-        self.blocked_ids.clear();
+        self.blocked_ids.remove(completed_note);
+        self.blocked_notes = self.remote_blocked_notes.max(self.blocked_ids.len());
     }
     pub fn suspend(&mut self, phase: &str) {
         self.phase = phase.into();
@@ -331,6 +341,18 @@ mod tests {
         progress.finish_round();
         assert_eq!(progress.phase, "idle");
         assert_partition(&progress);
+    }
+
+    #[test]
+    fn remote_blocks_survive_local_resolution_and_accept_recovery() {
+        let mut progress = SyncDirectionProgress::new("remote_verified");
+        progress.update_remote_blocked(2);
+        progress.block_note("local");
+        assert_eq!(progress.blocked_notes, 2);
+        progress.complete_note("local");
+        assert_eq!(progress.blocked_notes, 2);
+        progress.update_remote_blocked(0);
+        assert_eq!(progress.blocked_notes, 0);
     }
 
     #[test]

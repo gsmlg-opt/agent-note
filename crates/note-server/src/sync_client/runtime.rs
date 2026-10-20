@@ -914,6 +914,12 @@ impl Session<'_> {
                 }
                 let wire: ManagerWire = serde_json::from_value(frame.payload.clone())
                     .context("invalid sync manager status")?;
+                let compared_limit = if wire.progress.scan_complete {
+                    wire.progress.total_notes.map(|total| total as u64)
+                } else {
+                    None
+                }
+                .unwrap_or(wire.progress.notes_scanned);
                 anyhow::ensure!(
                     uuid::Uuid::parse_str(&wire.round_id).is_ok()
                         && wire.status_seq > 0
@@ -921,7 +927,11 @@ impl Session<'_> {
                         && wire.progress.page_size > 0
                         && wire.progress.page_size <= 32
                         && wire.progress.pages_checked <= wire.progress.pages_scanned
-                        && wire.progress.checked_notes as u64 <= wire.progress.notes_scanned
+                        && wire.progress.checked_notes as u64 <= compared_limit
+                        && wire
+                            .progress
+                            .total_notes
+                            .is_none_or(|total| wire.progress.checked_notes <= total)
                         && wire.progress.last_progress_at >= 0
                         && wire
                             .progress
@@ -993,7 +1003,7 @@ impl Session<'_> {
                             p.download.notes_superseded = superseded;
                         }
                         if let Some(blocked) = data.blocked_notes {
-                            p.download.blocked_notes = p.download.blocked_notes.max(blocked);
+                            p.download.update_remote_blocked(blocked);
                         }
                     })
                     .await;
@@ -2850,7 +2860,7 @@ impl WorkerProgress {
                 }
             }
             if self.task_mode {
-                p.download.release_page_ids();
+                p.download.release_page_ids(&event.note_id);
             }
             p.download.current_note = None;
             if remote_complete {
@@ -3448,6 +3458,167 @@ mod tests {
             .await
             .is_err());
     }
+    #[tokio::test]
+    async fn task_completion_preserves_other_local_rejections_until_their_own_success() {
+        let runtime = SyncRuntime::default();
+        let rejected = incoming_event(&[]);
+        let other = incoming_event(&[]);
+        runtime
+            .progress(|p| {
+                *p = SyncProgress::new("remote_verified");
+                p.download.finish_check(2);
+                p.download.block_note(&rejected.note_id);
+                p.download.update_remote_blocked(1);
+            })
+            .await;
+        let worker = WorkerProgress {
+            status: runtime.status.clone(),
+            task_mode: true,
+            resolved: Arc::new(tempfile::tempdir().unwrap()),
+        };
+
+        worker.complete_applied(&other, false).await;
+        runtime
+            .progress(|p| p.download.update_remote_blocked(0))
+            .await;
+        {
+            let status = runtime.status.read().await;
+            let progress = &status.progress.as_ref().unwrap().download;
+            assert_eq!(progress.blocked_notes, 1);
+            assert_eq!(progress.notes_completed, 1);
+            assert_eq!(progress.notes_remaining, Some(1));
+        }
+
+        // Replaying a different note cannot clear the rejection or count a
+        // second delivery; exact confirmations remain deduplicated on disk.
+        worker.complete_applied(&other, false).await;
+        worker.complete_applied(&rejected, false).await;
+        worker.complete_applied(&rejected, false).await;
+        let status = runtime.status.read().await;
+        let progress = &status.progress.as_ref().unwrap().download;
+        assert_eq!(progress.blocked_notes, 0);
+        assert_eq!(progress.notes_completed, 2);
+        assert_eq!(progress.notes_remaining, Some(0));
+    }
+
+    #[tokio::test]
+    async fn remote_manager_counts_recover_without_hiding_local_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        runtime
+            .progress(|p| *p = SyncProgress::new("remote_verified"))
+            .await;
+        let round = uuid::Uuid::new_v4().to_string();
+        for sequence in 1..=4 {
+            if sequence == 3 {
+                runtime
+                    .progress(|p| p.download.block_note("local-rejection"))
+                    .await;
+            } else if sequence == 4 {
+                runtime
+                    .progress(|p| p.download.complete_note("local-rejection"))
+                    .await;
+            }
+            let blocked = usize::from(sequence == 1);
+            let equal = usize::from(sequence > 1);
+            let payload = json!({
+                "round_id": round, "status_seq": sequence,
+                "progress": {
+                    "mode": "initial_scan", "state": "running", "error": null,
+                    "page_size": 32, "pages_scanned": 1, "pages_checked": 1,
+                    "notes_scanned": 2, "scan_complete": true, "source_cursor": null,
+                    "last_progress_at": sequence, "checked_notes": 2, "total_notes": 2,
+                    "planned_notes": 2 - equal, "equal_notes": equal,
+                    "superseded_notes": 0, "blocked_notes": blocked
+                }
+            });
+            client
+                .handle_task_frame(Frame::new(
+                    Some("local-session"),
+                    None,
+                    TOPIC,
+                    "sync_manager_status",
+                    payload,
+                ))
+                .await
+                .unwrap();
+            let status = runtime.status.read().await;
+            let direction = &status.progress.as_ref().unwrap().download;
+            assert_eq!(direction.notes_equal, equal);
+            assert_eq!(direction.notes_planned, 2 - equal);
+            assert_eq!(
+                direction.blocked_notes,
+                usize::from(sequence == 1 || sequence == 3)
+            );
+            assert_eq!(
+                direction.notes_remaining,
+                Some(if sequence == 4 { 0 } else { 2 - equal })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_manager_counts_include_notes_after_the_source_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = local_context(dir.path()).await;
+        let runtime = SyncRuntime::default();
+        let (socket, _peer) = local_sockets().await;
+        let mut client = local_session(&ctx, &runtime, socket);
+        client.task_sync = true;
+        runtime
+            .progress(|p| *p = SyncProgress::new("remote_verified"))
+            .await;
+        let round = uuid::Uuid::new_v4().to_string();
+        for (index, (mode, complete, total, valid)) in [
+            ("changes", true, Some(3), true),
+            ("initial_scan", true, Some(3), true),
+            ("initial_scan", false, Some(3), false),
+            ("changes", false, Some(3), false),
+            ("changes", true, Some(2), false),
+            ("changes", true, None, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let payload = json!({
+                "round_id": round, "status_seq": index + 1,
+                "progress": {
+                    "mode": mode, "page_size": 32, "pages_scanned": 1, "pages_checked": 1,
+                    "notes_scanned": 2, "scan_complete": complete, "source_cursor": null,
+                    "last_progress_at": index, "checked_notes": 3, "total_notes": total,
+                    "planned_notes": 2, "equal_notes": 1, "superseded_notes": 0,
+                    "blocked_notes": 0
+                }
+            });
+            let result = client
+                .handle_task_frame(Frame::new(
+                    Some("local-session"),
+                    None,
+                    TOPIC,
+                    "sync_manager_status",
+                    payload,
+                ))
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                valid,
+                "mode={mode}, complete={complete}, total={total:?}: {result:?}"
+            );
+        }
+        let status = runtime.status.read().await;
+        let direction = &status.progress.as_ref().unwrap().download;
+        assert_eq!(direction.notes_total, Some(3));
+        assert_eq!(direction.notes_checked, 3);
+        assert_eq!(direction.notes_equal, 1);
+        assert_eq!(direction.notes_planned, 2);
+        assert_eq!(direction.notes_remaining, Some(2));
+        assert_eq!(direction.manager.as_ref().unwrap().notes_scanned, 2);
+    }
+
     #[tokio::test]
     async fn session_drop_cancels_disposable_work_before_runtime_drain() {
         let dir = tempfile::tempdir().unwrap();

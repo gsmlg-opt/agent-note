@@ -123,6 +123,15 @@ replacement. New sessions never accept old join-reference progress. These
 messages describe activity and cannot acknowledge notes or authorize data.
 Modes are `initial_scan` and `changes`; optional comparison counters are
 `planned_notes`, `equal_notes`, `superseded_notes` and `blocked_notes`.
+Classifications count distinct notes in the round, with blocked notes included
+in planned work. Repeated polls and overlapping inventory pages do not add a
+second classification. A delivered note remains planned after later equal audit
+results, because its exact ACK already contributes to the receiver's confirmed
+count. A later failed change must still be visible as blocked. During changes,
+total and checked counts cover newly classified notes as well as the original
+scan; source discovery counters continue to describe that original scan.
+Sequenced blocked counts replace the previous remote count, including recovery
+to zero, while preserving locally observed rejections.
 Optional `state` is `running`, `idle` or `failed`; nullable `error` has the same
 sanitized `{code,retryable}` shape as a task error. Manager failure can thus be
 reported after the source task has completed, without altering its terminal
@@ -259,7 +268,14 @@ null member and head. Detached associations retain the frozen control descriptor
 and return null head, so later private edits are not disclosed. An attached head
 may be null when its committed state is unavailable. Availability is true, false
 or null (unknown); true requires actual committed objects with matching metadata,
-including storage references. Old ACK records or manifests alone are insufficient.
+including storage references. A legacy attachment without immutable storage
+metadata can instead be verified by reading its committed note/path file with
+the descriptor's size as a hard bound and checking its exact length and SHA-256.
+Reject legacy descriptors above 512 MiB before reading. Missing, oversized,
+truncated or checksum-mismatched files are unavailable; unsupported or transient
+storage access remains unknown. These probes do not migrate attachment metadata
+or alter heads, memberships, pending events, clocks, receipts or ACKs.
+Old ACK records or manifests alone are insufficient.
 Validate descriptors, clocks, hashes, association coherence and exact echoes.
 Malformed responses and equal versions with conflicting hashes fail the session.
 

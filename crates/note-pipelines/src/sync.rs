@@ -971,8 +971,40 @@ pub async fn query_sync_state(
                             break;
                         };
                         let Some(storage) = &attachment.storage else {
-                            available = None;
-                            break;
+                            if descriptor.size_bytes > DEFAULT_SYNC_MAX_BLOB_BYTES {
+                                available = Some(false);
+                                break;
+                            }
+                            // Legacy heads retain note/path references. Verify their
+                            // actual bytes without migrating metadata during a probe.
+                            available = match ctx
+                                .attachments()
+                                .read_legacy_bounded(
+                                    &requested.note_id,
+                                    &attachment.path,
+                                    descriptor.size_bytes,
+                                )
+                                .await
+                            {
+                                Ok(bytes) => Some(
+                                    bytes.len() as u64 == descriptor.size_bytes
+                                        && format!("{:x}", Sha256::digest(&bytes))
+                                            == descriptor.checksum_sha256,
+                                ),
+                                Err(error) => match error
+                                    .downcast_ref::<note_attachments::BoundedReadError>()
+                                {
+                                    Some(
+                                        note_attachments::BoundedReadError::Missing
+                                        | note_attachments::BoundedReadError::LimitExceeded,
+                                    ) => Some(false),
+                                    _ => None,
+                                },
+                            };
+                            if available != Some(true) {
+                                break;
+                            }
+                            continue;
                         };
                         if storage.size_bytes != descriptor.size_bytes
                             || storage.checksum_sha256 != descriptor.checksum_sha256

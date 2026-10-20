@@ -192,6 +192,242 @@ async fn probe_checks_actual_attachment_objects_and_stale_candidates_cannot_reco
     assert_eq!(sync_status(&ctx).await.unwrap().pending_notes, 1);
 }
 
+async fn legacy_probe_fixture(
+    bytes: &[u8],
+) -> (Context, Arc<dyn StorageBackend>, tempfile::TempDir, SyncAck) {
+    let (ctx, backend, dir) = support::test_context().await;
+    enabled(&ctx).await;
+    let mut value = input("legacy attachment probe");
+    value.attachments.push(NoteAttachment {
+        id: "file".into(),
+        path: "file.txt".into(),
+        mime: "text/plain".into(),
+        description: String::new(),
+        content: bytes.to_vec(),
+        storage: None,
+    });
+    let note = save_note(&ctx, value).await.unwrap();
+    let event = next_sync_event(&ctx).await.unwrap().unwrap();
+    acknowledge_sync_event(&ctx, &event.acknowledgement())
+        .await
+        .unwrap();
+    let session = backend.session().await.unwrap();
+    for namespace in ["head", "member"] {
+        let mut record = session
+            .get_sync_record(namespace, &note.id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Original persisted heads and members omitted immutable storage metadata.
+        record["attachments"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("storage");
+        session
+            .put_sync_record(namespace, &note.id, &record)
+            .await
+            .unwrap();
+    }
+    let directory = dir.path().join("attachments").join(&note.id);
+    tokio::fs::create_dir_all(&directory).await.unwrap();
+    tokio::fs::write(directory.join("file.txt"), bytes)
+        .await
+        .unwrap();
+    let descriptor = sync_current_candidate(&ctx, &note.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .descriptor;
+    (ctx, backend, dir, descriptor)
+}
+
+#[tokio::test]
+async fn legacy_probe_verifies_bytes_and_preserves_sync_records() {
+    for bytes in [b"legacy attachment".as_slice(), b"".as_slice()] {
+        let (ctx, backend, _dir, descriptor) = legacy_probe_fixture(bytes).await;
+        let before = records(&backend).await;
+        let query = SyncStateQuery {
+            query_id: uuid::Uuid::new_v4().to_string(),
+            items: vec![descriptor.clone()],
+        };
+        let response = query_sync_state(&ctx, &query).await.unwrap();
+        assert_eq!(
+            response.items[0]
+                .head
+                .as_ref()
+                .unwrap()
+                .attachments_available,
+            Some(true),
+            "verified legacy bytes, including empty files, must permit equality"
+        );
+        assert!(response.items[0].matches_snapshot(&descriptor));
+        assert_eq!(records(&backend).await, before);
+    }
+}
+
+#[tokio::test]
+async fn legacy_probe_does_not_skip_missing_truncated_corrupt_or_oversized_files() {
+    let bytes = b"legacy attachment";
+    let (ctx, backend, dir, descriptor) = legacy_probe_fixture(bytes).await;
+    let path = dir
+        .path()
+        .join("attachments")
+        .join(&descriptor.note_id)
+        .join("file.txt");
+    let query = SyncStateQuery {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        items: vec![descriptor.clone()],
+    };
+    let before = records(&backend).await;
+    for actual in [
+        None,
+        Some(b"legacy".as_slice()),
+        Some(b"legacy attachmenX".as_slice()),
+        Some(b"legacy attachment!".as_slice()),
+    ] {
+        if let Some(actual) = actual {
+            tokio::fs::write(&path, actual).await.unwrap();
+        } else {
+            tokio::fs::remove_file(&path).await.unwrap();
+        }
+        let response = query_sync_state(&ctx, &query).await.unwrap();
+        assert_eq!(
+            response.items[0]
+                .head
+                .as_ref()
+                .unwrap()
+                .attachments_available,
+            Some(false)
+        );
+        assert!(!response.items[0].matches_snapshot(&descriptor));
+        assert_eq!(records(&backend).await, before);
+    }
+}
+
+#[tokio::test]
+async fn legacy_probe_bounds_reads_and_keeps_storage_failures_unknown() {
+    use ::note_attachments::{AttachmentStore, AttachmentStoreInfo, BoundedReadError};
+    use std::sync::Mutex;
+
+    struct LegacyStore {
+        limits: Mutex<Vec<u64>>,
+        error: Option<BoundedReadError>,
+    }
+    #[async_trait::async_trait]
+    impl AttachmentStore for LegacyStore {
+        async fn read_legacy(&self, _id: &str, _path: &str) -> anyhow::Result<Vec<u8>> {
+            panic!("a sync probe must not read legacy files without a bound")
+        }
+        async fn read_legacy_bounded(
+            &self,
+            _id: &str,
+            _path: &str,
+            max_bytes: u64,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.limits.lock().unwrap().push(max_bytes);
+            match self.error {
+                Some(error) => Err(error.into()),
+                None => Ok(b"legacy attachment".to_vec()),
+            }
+        }
+        fn info(&self) -> AttachmentStoreInfo {
+            AttachmentStoreInfo {
+                engine: "bounded-legacy-probe".into(),
+                location: None,
+            }
+        }
+    }
+    let bytes = b"legacy attachment";
+    let (_, backend, _dir, descriptor) = legacy_probe_fixture(bytes).await;
+    let before = records(&backend).await;
+    let query = SyncStateQuery {
+        query_id: uuid::Uuid::new_v4().to_string(),
+        items: vec![descriptor],
+    };
+    for (error, expected) in [
+        (None, Some(true)),
+        (Some(BoundedReadError::Missing), Some(false)),
+        (Some(BoundedReadError::LimitExceeded), Some(false)),
+        (Some(BoundedReadError::Unsupported), None),
+        (Some(BoundedReadError::StorageFailure), None),
+    ] {
+        let store = Arc::new(LegacyStore {
+            limits: Mutex::new(Vec::new()),
+            error,
+        });
+        let ctx = Context::new(
+            backend.clone(),
+            Arc::new(note_embedding::StubEmbedder),
+            store.clone(),
+        );
+        let response = query_sync_state(&ctx, &query).await.unwrap();
+        assert_eq!(
+            response.items[0]
+                .head
+                .as_ref()
+                .unwrap()
+                .attachments_available,
+            expected
+        );
+        assert_eq!(*store.limits.lock().unwrap(), [bytes.len() as u64]);
+        assert_eq!(records(&backend).await, before);
+    }
+
+    let session = backend.session().await.unwrap();
+    let note_id = &query.items[0].note_id;
+    let mut head = session
+        .get_sync_record("head", note_id)
+        .await
+        .unwrap()
+        .unwrap();
+    head["snapshot"]["attachments"][0]["size_bytes"] =
+        serde_json::json!(DEFAULT_SYNC_MAX_BLOB_BYTES + 1);
+    let snapshot: SyncSnapshot = serde_json::from_value(head["snapshot"].clone()).unwrap();
+    let hash = canonical_snapshot_hash(Some(&snapshot)).unwrap();
+    head["hash"] = serde_json::json!(hash);
+    session
+        .put_sync_record("head", note_id, &head)
+        .await
+        .unwrap();
+    let mut member = session
+        .get_sync_record("member", note_id)
+        .await
+        .unwrap()
+        .unwrap();
+    member["event"]["snapshot"] = head["snapshot"].clone();
+    member["event"]["snapshot_hash"] = head["hash"].clone();
+    session
+        .put_sync_record("member", note_id, &member)
+        .await
+        .unwrap();
+    let mut query = query;
+    query.items[0].snapshot_hash = hash;
+    let before = records(&backend).await;
+    let store = Arc::new(LegacyStore {
+        limits: Mutex::new(Vec::new()),
+        error: None,
+    });
+    let ctx = Context::new(
+        backend.clone(),
+        Arc::new(note_embedding::StubEmbedder),
+        store.clone(),
+    );
+    let response = query_sync_state(&ctx, &query).await.unwrap();
+    assert_eq!(
+        response.items[0]
+            .head
+            .as_ref()
+            .unwrap()
+            .attachments_available,
+        Some(false)
+    );
+    assert!(
+        store.limits.lock().unwrap().is_empty(),
+        "oversized descriptors must be rejected before reading"
+    );
+    assert_eq!(records(&backend).await, before);
+}
+
 #[tokio::test]
 async fn detached_state_probe_does_not_disclose_independent_private_edits() {
     let (ctx, _backend, _dir) = support::test_context().await;
