@@ -100,10 +100,10 @@ pending-page APIs and related domain/channel tests. No storage schema changes.
   chunk receipts, task failure followed by next-note success, and lost ACK retry.
 - [x] Review final diffs, exact ACK/fences, cancellation and status size bounds.
 - [x] Commit/push qualified scoped changes on main; verify remote SHA matches.
-- [ ] Reload only GaoNote application after qualification. If Agent Note changes,
-  follow deploy skill: local build, direct ms04 load, publish same image, inspect
-  manifest, restart only Agent Note, verify exact running image and HTTP.
-- [ ] Observe one persistent connection advancing scans and note/attachment
+- [x] Restart only the local GaoNote application after qualification. If Agent
+  Note changes, follow deploy skill: local build, direct ms04 load, publish same
+  image, inspect manifest, restart only Agent Note, verify exact image and HTTP.
+- [x] Observe one persistent connection advancing scans and note/attachment
   confirmations; record pending/remaining/blocked counts without equating an
   active socket or green HTTP response with completed synchronization.
 
@@ -152,3 +152,48 @@ Publication and live acceptance are recorded below after the rollout follow-ups.
   tests: 310 passed; Wasm and native all-target checks passed.
 - GaoNote runtime acceptance uses the local `devenv` application only. No
   GaoNote production deployment is part of this rollout.
+
+## Published artifacts and runtime acceptance
+
+- Agent Note task implementation `8374bee` and follow-up `bd2496d` are on remote
+  main. GaoNote task implementation `5efe3566`, approved Styx prerequisite
+  `785df7d7`, and storage follow-up `d6943ff5` are on its remote main.
+- Local GaoNote was stopped and started with named `devenv processes` commands.
+  The old BEAM exited; replacement PID 17533 owns ports 4110/4111. PostgreSQL
+  PID 2919577 remained running. Runtime modules come from the qualified local
+  dev build.
+- Agent Note `bd2496d` was built locally, loaded into ms04, and published before
+  restarting only `podman-agent-note.service`. Local, staged, registry config,
+  and running image IDs match
+  `sha256:5b19be59914597f44e3c4022c9b95cc70d6a38083b28ba01661f20566aa02bc0`.
+  Published manifest:
+  `sha256:d32d8ac04a47429c11c1d01f4cce7706e32d8ea036ce02071d69d21ea0fd591f`.
+  The replacement started at 2026-10-20 13:50:47 Asia/Shanghai; service active,
+  host HTTP 200, and public `/system/sync` HTTP 200 were verified.
+- Exact GaoNote receipt `b1998088-532a-4ca7-9466-121f27b66f44` committed at
+  05:45:34 UTC with all three CSV-note attachments. Receipt
+  `32529d9a-7406-4a34-bb09-e56fb99b7360` committed at 05:45:54 UTC with all
+  eleven attachments after the interrupted development reload was recovered.
+  Both receipts retain valid event hashes.
+- During the final observation, 05:51:29–05:55:42 UTC, pending uploads fell
+  84 to 0, with zero blocked notes or connection/synchronization task errors.
+  Connection attempt `1792475447236` remained unchanged. Upload confirmations advanced
+  36 to 120; download confirmations advanced 7 to 39. Upload comparison
+  advanced 3 to 6 pages; download comparison advanced 1 to 3 pages.
+- The initial library audit was still running at that sample: 6 of 57 upload
+  source pages and 3 of 52 download source pages compared. Zero durable pending
+  uploads is not full duplex audit completion; remaining work stays qualified
+  as known work until comparison finishes.
+- At 05:56:30 UTC, GaoNote had 3,098 durable receipts, zero pending records
+  and zero leases; both target receipts and their attachments remained present.
+  Four separate background `StorageFilePurgeWorker` Postgrex lock-wait errors
+  were observed. The zero-error statement above applies to synchronization
+  tasks and their connection, not all background application logs.
+- Public browser acceptance sampled eight times over 44 seconds. The new
+  remaining-work wording, task progress, save/retry controls, and desktop/mobile
+  layout passed; no page/console errors, failed requests, HTTP errors or overflow.
+
+Local evidence is retained in `/tmp/agent-note-task-followup-deployment-evidence.json`,
+`/tmp/agent-note-task-live-final-deploy.jsonlog`,
+`/tmp/gaonote-csv-local-runtime-acceptance.json`, and
+`/tmp/agent-note-task-live-browser-bd2496d-20261020T055127Z/`.
