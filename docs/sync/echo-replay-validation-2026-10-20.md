@@ -78,5 +78,55 @@ repair and passed afterward. An earlier concurrent client-suite run exceeded
 wall-clock waits in two existing connection tests during release compilation;
 the complete final serialized suite passed without changing their deadlines.
 
-Live Direct WebSocket acceptance is recorded separately after image deployment
-and the named local GaoNote application restart.
+## Runtime deployment
+
+Both fixes are committed on `main` and pushed:
+
+- Agent Note: `950901f82c2fde80d2c914943ae08437750727eb`.
+- GaoNote: `483f0750fb6063dd9bec7c3bb11190f624fa91ba`.
+
+Agent Note's local build, image staged on ms04, published manifest config and
+running container all match image ID
+`sha256:021182dec86ee507194560547aa7df2e04494ae0e0e54bbce07fe4f1b6b3fb1e`.
+The published manifest digest is
+`sha256:858092cccca8a0a49b3146ebce6d5f56470cc71c9d926b2650f12883f0ee4788`.
+Only `podman-agent-note.service` was restarted on ms04; its unit is active and
+both the host and public HTTP checks returned 200.
+
+Only the named local `gsmlg-umbrella` devenv application was stopped and started.
+Its BEAM PID changed from 17533 to 481976, while the original PostgreSQL PID
+2919577 was preserved. No GaoNote production restart was performed.
+
+## Live Direct WebSocket acceptance
+
+PASS after both full reconciliation scans completed and a further 72.1 seconds
+of connected, error-free idle observation, spanning two 30-second heartbeat
+periods. All 219 samples used the same connection attempt
+(`last_attempt_at = 1792493179004`); none reported pending work, blocked notes,
+errors or completed transfers.
+
+| Final counter | Sending to GaoNote | Receiving from GaoNote |
+| --- | ---: | ---: |
+| Notes discovered / checked / already equal | 1,761 / 1,761 / 1,761 | 1,761 / 1,761 / 1,761 |
+| Pages discovered / checked | 56 / 56 | 56 / 56 |
+| Planned / delivered / remaining / blocked | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| Manager | Idle; initial scan complete | Idle; watching durable changes |
+
+Initial attachment verification is still slow: the observer recorded full
+convergence after approximately 17.4 minutes. Read-only runtime inspection
+showed object-storage metadata requests temporarily holding the GaoNote peer
+row lock while the other comparison direction waited. Queue/counter movement
+confirmed continuing progress. The observer's initial 15-minute observation
+budget was extended without restarting or resetting the WebSocket. No storage
+or connection deadlines were changed by this correction.
+
+A real Chromium visit to `https://agent-note.gsmlg.net/system/sync` returned
+HTTP 200 and displayed these same counts. Both 1440-pixel desktop and 390-pixel
+mobile layouts had no horizontal overflow. There were no page errors or failed
+requests. The receiving panel displayed "Watching for changes" with zero
+delivered notes.
+
+Runtime evidence was captured in
+`/tmp/agent-note-sync-echo-acceptance/{result.json,samples.jsonl,latest-status.json}`
+and `/tmp/agent-note-sync-echo-browser-after/{result.json,counts.png,desktop.png,mobile.png}`.
+These files are local validation artifacts and are not committed.
