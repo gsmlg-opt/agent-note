@@ -1,9 +1,13 @@
 use crate::embedder::{DenseVector, Embedder};
+use ort::environment::Environment;
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
+
+// ort permits one environment per process; retain it across repeated model loads.
+static ORT_ENVIRONMENT: Mutex<Option<Environment>> = Mutex::new(None);
 
 pub struct OrtEmbedder {
     session: Arc<Mutex<Session>>,
@@ -22,11 +26,18 @@ impl OrtEmbedder {
         let tok_path = model_dir.join("tokenizer.json");
         let tokenizer = Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tok_path.display()))?;
+        let environment = {
+            let mut environment = ORT_ENVIRONMENT.lock().unwrap();
+            if environment.is_none() {
+                *environment = Some(ort::init().build()?);
+            }
+            environment.as_ref().unwrap().clone()
+        };
         // The `ort` builder methods return `Error<SessionBuilder>` (the builder is carried in the
         // error for retry), which is not `Send` and so cannot cross the `?` into `anyhow::Error`.
         // Flatten those to string-backed errors; only the final `commit_from_file` yields a plain
         // `Send` error.
-        let mut builder = Session::builder()
+        let mut builder = Session::builder(&environment)
             .map_err(|e| anyhow::anyhow!("create ort session builder: {e}"))?
             .with_intra_threads(intra_threads)
             .map_err(|e| anyhow::anyhow!("configure ort session: {e}"))?;

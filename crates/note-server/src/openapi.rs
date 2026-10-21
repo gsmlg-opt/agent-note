@@ -1035,11 +1035,13 @@ fn normalize_org_success_schemas(mut openapi: OpenApi) -> OpenApi {
                     continue;
                 }
                 if let RefOr::T(response) = response {
-                    response
+                    if let RefOr::T(content) = response
                         .content
                         .get_mut("application/json")
                         .expect("Org JSON success response")
-                        .schema = Some(Ref::from_schema_name(schema_name).into());
+                    {
+                        content.schema = Some(Ref::from_schema_name(schema_name).into());
+                    }
                 }
             }
         }
@@ -1059,6 +1061,9 @@ fn normalize_org_query_parameters(mut openapi: OpenApi) -> OpenApi {
             continue;
         };
         for parameter in parameters {
+            let RefOr::T(parameter) = parameter else {
+                continue;
+            };
             let name = parameter.name.clone();
             if path.contains(&format!("{{{name}}}")) {
                 continue;

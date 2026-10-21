@@ -75,7 +75,7 @@ async fn import_publishes_generated_objects_before_begin_without_user_key_compon
     let note = get_note(&ctx, note_id).await.unwrap().unwrap();
     assert_eq!(note.attachments[0].content, bytes);
     let storage = note.attachments[0].storage.as_ref().unwrap();
-    let namespace = format!("{:x}", Sha256::digest(note_id.as_bytes()));
+    let namespace = base16ct::lower::encode_string(&Sha256::digest(note_id.as_bytes()));
     assert!(storage
         .object_key
         .starts_with(&format!("notes/{namespace}/objects/")));
@@ -201,8 +201,8 @@ async fn import_race_deletes_only_the_skipped_notes_objects_after_commit() {
 
     assert_eq!(stats.notes_added, 1);
     assert_eq!(stats.notes_skipped, 1);
-    let race_namespace = format!("{:x}", Sha256::digest(b"race-note"));
-    let inserted_namespace = format!("{:x}", Sha256::digest(b"inserted-note"));
+    let race_namespace = base16ct::lower::encode_string(&Sha256::digest(b"race-note"));
+    let inserted_namespace = base16ct::lower::encode_string(&Sha256::digest(b"inserted-note"));
     let events = events.lock().unwrap().clone();
     let race_key = events
         .iter()

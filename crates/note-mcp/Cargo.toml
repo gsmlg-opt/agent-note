@@ -4,27 +4,27 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 axum = "0.8"
 note-core = { version = "0.1.0", path = "../note-core" }
 note-pipelines = { version = "0.1.0", path = "../note-pipelines" }
-rmcp = { version = "3.4.0", features = [
+rmcp = { version = "3.6.0", features = [
     "server",
     "macros",
     "transport-streamable-http-server",
     "schemars",
 ] }
-schemars = "1.2.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 [dev-dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 note-attachments = { path = "../note-attachments" }
 note-embedding = { path = "../note-embedding" }
 note-storage = { path = "../note-storage" }
 note-storage-turso = { path = "../note-storage-turso" }
-rmcp = { version = "3.4.0", features = ["client", "transport-io"] }
+rmcp = { version = "3.6.0", features = ["client", "transport-io"] }
 tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.54.0", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }

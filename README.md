@@ -749,6 +749,10 @@ twelve Markdown-note tools: `bulk_update_note_labels`, `save_note`, `get_note`, 
 exposes the separate forty Org tools; a tool is unavailable on the other endpoint. Explicit label-key
 catalog management remains REST/UI-only.
 
+For well-formed MCP requests, application errors such as unavailable tool names are JSON-RPC
+errors carried in HTTP 200 responses; clients must inspect the `error` field. Missing required
+protocol metadata and mismatched routing headers return HTTP 400.
+
 Read `get_note.revision` before either note mutation: it is the write guard for both `replace_note`
 and `patch_note`. `read_note_lines` is optional inspection only; its tag and line numbers are not
 write preconditions. On `revision_conflict`, re-read the note and recompute the mutation, rather than

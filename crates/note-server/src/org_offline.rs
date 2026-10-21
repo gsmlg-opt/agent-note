@@ -1101,7 +1101,10 @@ fn validate_content_hash(value: &str) -> Result<(), String> {
 }
 
 fn content_hash(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!(
+        "sha256:{}",
+        base16ct::lower::encode_string(&Sha256::digest(bytes))
+    )
 }
 
 fn parse_id<T>(value: &str, kind: &str) -> anyhow::Result<T>

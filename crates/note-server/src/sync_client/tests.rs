@@ -230,7 +230,7 @@ async fn real_phoenix_mtls_inventory_transfers_and_durable_ack() {
             mime: "application/octet-stream".into(),
             description: "remote blob".into(),
             size_bytes: remote_blob.len() as u64,
-            checksum_sha256: format!("{:x}", sha2::Sha256::digest(&remote_blob)),
+            checksum_sha256: base16ct::lower::encode_string(&sha2::Sha256::digest(&remote_blob)),
         }],
     };
     let incoming = SyncEvent {
@@ -447,7 +447,7 @@ async fn real_phoenix_mtls_inventory_transfers_and_durable_ack() {
     .unwrap();
     assert_eq!(received_blob, vec![42u8; 150_000]);
     assert_eq!(
-        format!("{:x}", sha2::Sha256::digest(&received_blob)),
+        base16ct::lower::encode_string(&sha2::Sha256::digest(&received_blob)),
         outbound.attachments[0].checksum_sha256
     );
     let returned: SyncAck = serde_json::from_slice(&std::fs::read(ack).unwrap()).unwrap();

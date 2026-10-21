@@ -2695,7 +2695,7 @@ impl Session<'_> {
                             })?;
                         anyhow::ensure!(
                             bytes.len() as u64 == attachment.size_bytes
-                                && format!("{:x}", Sha256::digest(&bytes))
+                                && base16ct::lower::encode_string(&Sha256::digest(&bytes))
                                     == attachment.checksum_sha256,
                             "source attachment changed"
                         );
@@ -2740,7 +2740,7 @@ impl Session<'_> {
         self.outbound = Some((event.event_id.clone(), event.note_id.clone()));
         let transfer = uuid::Uuid::new_v4().to_string();
         self.outbound_transfer = Some(transfer.clone());
-        self.request("transfer_begin",json!({"transfer_id":transfer,"size_bytes":metadata.len(),"checksum_sha256":format!("{:x}",Sha256::digest(&metadata))})).await?;
+        self.request("transfer_begin",json!({"transfer_id":transfer,"size_bytes":metadata.len(),"checksum_sha256":base16ct::lower::encode_string(&Sha256::digest(&metadata))})).await?;
         self.send_blob(&transfer, "event", &metadata).await?;
         if let Some(snapshot) = &event.snapshot {
             for attachment in &snapshot.attachments {
@@ -4489,8 +4489,12 @@ mod tests {
                 let transfer = uuid::Uuid::new_v4().to_string();
                 client.incoming = Some(Incoming {
                     id: transfer.clone(),
-                    metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100)
-                        .unwrap(),
+                    metadata: StagedBlob::new(
+                        0,
+                        &base16ct::lower::encode_string(&Sha256::digest([])),
+                        100,
+                    )
+                    .unwrap(),
                     event: Some(event.clone()),
                     blobs: HashMap::new(),
                     idle_deadline: Instant::now() + DEADLINE,
@@ -4570,7 +4574,8 @@ mod tests {
         let transfer = uuid::Uuid::new_v4().to_string();
         client.incoming = Some(Incoming {
             id: transfer.clone(),
-            metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100).unwrap(),
+            metadata: StagedBlob::new(0, &base16ct::lower::encode_string(&Sha256::digest([])), 100)
+                .unwrap(),
             event: Some(event),
             blobs: HashMap::new(),
             idle_deadline: Instant::now() + DEADLINE,
@@ -4615,7 +4620,8 @@ mod tests {
         client.task_sync = true;
         client.incoming = Some(Incoming {
             id: uuid::Uuid::new_v4().to_string(),
-            metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100).unwrap(),
+            metadata: StagedBlob::new(0, &base16ct::lower::encode_string(&Sha256::digest([])), 100)
+                .unwrap(),
             event: Some(event),
             blobs: HashMap::new(),
             idle_deadline: Instant::now() + DEADLINE,
@@ -4699,7 +4705,7 @@ mod tests {
                 "transfer_begin",
                 json!({
                     "transfer_id":uuid::Uuid::new_v4().to_string(), "size_bytes":0,
-                    "checksum_sha256":format!("{:x}",Sha256::digest([])),
+                    "checksum_sha256":base16ct::lower::encode_string(&Sha256::digest([])),
                 }),
             )
             .await
@@ -4782,7 +4788,7 @@ mod tests {
         let mut client = local_session(&ctx, &runtime, socket);
         client.task_sync = true;
         let transfer = uuid::Uuid::new_v4().to_string();
-        client.receive("transfer_begin",json!({"transfer_id":transfer,"size_bytes":1,"checksum_sha256":format!("{:x}",Sha256::digest(b"a"))})).await.unwrap();
+        client.receive("transfer_begin",json!({"transfer_id":transfer,"size_bytes":1,"checksum_sha256":base16ct::lower::encode_string(&Sha256::digest(b"a"))})).await.unwrap();
         let submission = Submission {
             task_id: format!("{}:1", uuid::Uuid::nil()),
             operation: "blob_chunk".into(),
@@ -4843,7 +4849,7 @@ mod tests {
             "the completed old chunk cannot restore staging after abort"
         );
         let next_id = format!("{}:3", uuid::Uuid::nil());
-        client.handle_task_frame(Frame::new(Some("local-session"),None,TOPIC,"task_submit",json!({"task_id":next_id,"operation":"transfer_begin","payload":{"transfer_id":uuid::Uuid::new_v4().to_string(),"size_bytes":0,"checksum_sha256":format!("{:x}",Sha256::digest([]))}}))).await.unwrap();
+        client.handle_task_frame(Frame::new(Some("local-session"),None,TOPIC,"task_submit",json!({"task_id":next_id,"operation":"transfer_begin","payload":{"transfer_id":uuid::Uuid::new_v4().to_string(),"size_bytes":0,"checksum_sha256":base16ct::lower::encode_string(&Sha256::digest([]))}}))).await.unwrap();
         timeout(Duration::from_secs(3), async {
             while !client.received_tasks.get(&next_id).unwrap().terminal() {
                 tokio::task::yield_now().await;
@@ -5120,7 +5126,7 @@ mod tests {
                     }
                     assert_eq!(bytes.len() as u64, attachment.size_bytes);
                     assert_eq!(
-                        format!("{:x}", Sha256::digest(&bytes)),
+                        base16ct::lower::encode_string(&Sha256::digest(&bytes)),
                         attachment.checksum_sha256
                     );
                 }
@@ -5329,7 +5335,9 @@ mod tests {
                         mime: "text/plain".into(),
                         description: String::new(),
                         size_bytes: *size,
-                        checksum_sha256: format!("{:x}", Sha256::digest(vec![0; *size as usize])),
+                        checksum_sha256: base16ct::lower::encode_string(&Sha256::digest(
+                            vec![0; *size as usize],
+                        )),
                     })
                     .collect(),
             }),
@@ -5344,7 +5352,7 @@ mod tests {
                 "transfer_begin",
                 json!({
                     "transfer_id":transfer,"size_bytes":metadata.len(),
-                    "checksum_sha256":format!("{:x}", Sha256::digest(&metadata)),
+                    "checksum_sha256":base16ct::lower::encode_string(&Sha256::digest(&metadata)),
                 }),
             )
             .await
@@ -5836,7 +5844,7 @@ mod tests {
                 Some("incoming-begin"),
                 "transfer_begin",
                 json!({"transfer_id":transfer,"size_bytes":metadata.len(),
-                    "checksum_sha256":format!("{:x}",Sha256::digest(&metadata))}),
+                    "checksum_sha256":base16ct::lower::encode_string(&Sha256::digest(&metadata))}),
             ),
             frame(
                 None,
@@ -6120,7 +6128,7 @@ mod tests {
         .unwrap();
         sync::initialize_sync(&ctx).await.unwrap();
         let bytes = b"incoming attachment";
-        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let checksum = base16ct::lower::encode_string(&Sha256::digest(bytes));
         let snapshot = SyncSnapshot {
             title: "Incoming".into(),
             content: "Durable incoming note".into(),
@@ -6166,7 +6174,8 @@ mod tests {
         let transfer_id = uuid::Uuid::new_v4().to_string();
         client.incoming = Some(Incoming {
             id: transfer_id.clone(),
-            metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100).unwrap(),
+            metadata: StagedBlob::new(0, &base16ct::lower::encode_string(&Sha256::digest([])), 100)
+                .unwrap(),
             event: Some(event.clone()),
             blobs: HashMap::from([(
                 format!(
@@ -6280,7 +6289,7 @@ mod tests {
         .unwrap();
         sync::initialize_sync(&ctx).await.unwrap();
         let bytes = b"incoming attachment";
-        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let checksum = base16ct::lower::encode_string(&Sha256::digest(bytes));
         let snapshot = SyncSnapshot {
             title: "Incoming".into(),
             content: "Durable incoming note".into(),
@@ -6326,7 +6335,8 @@ mod tests {
         let transfer_id = uuid::Uuid::new_v4().to_string();
         client.incoming = Some(Incoming {
             id: transfer_id.clone(),
-            metadata: StagedBlob::new(0, &format!("{:x}", Sha256::digest([])), 100).unwrap(),
+            metadata: StagedBlob::new(0, &base16ct::lower::encode_string(&Sha256::digest([])), 100)
+                .unwrap(),
             event: Some(event.clone()),
             blobs: HashMap::from([(
                 format!(

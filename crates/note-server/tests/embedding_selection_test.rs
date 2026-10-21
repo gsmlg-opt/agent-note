@@ -104,7 +104,10 @@ async fn run_offline_args(dir: &Path, config_path: &Path, args: &[&str], input: 
 }
 
 fn snapshot_hash(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!(
+        "sha256:{}",
+        base16ct::lower::encode_string(&Sha256::digest(bytes))
+    )
 }
 
 fn write_org_snapshot(dir: &Path) -> std::path::PathBuf {

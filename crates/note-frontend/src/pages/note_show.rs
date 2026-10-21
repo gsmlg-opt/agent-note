@@ -1031,7 +1031,8 @@ fn rewrite_attachment_urls(markdown: &str, attachment_base: &str) -> String {
     });
 
     let mut rewritten = String::from(front_matter);
-    cmark(events, &mut rewritten).expect("parsed Markdown events must serialize");
+    cmark(events, &mut rewritten, markdown_options())
+        .expect("parsed Markdown events must serialize");
     rewritten
 }
 

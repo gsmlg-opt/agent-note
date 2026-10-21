@@ -495,7 +495,7 @@ async fn progress_is_proof_only_event_and_replays_without_touching_execution_sta
 #[tokio::test]
 async fn progress_rejects_fencing_material_in_public_payload_without_side_effects() {
     let raw_token = "public-payload-progress-token";
-    let token_digest = format!("{:x}", Sha256::digest(raw_token.as_bytes()));
+    let token_digest = base16ct::lower::encode_string(&Sha256::digest(raw_token.as_bytes()));
     let (context, backend, _dir, lease_id, fencing_token) =
         claimed_execution_fixture(false, raw_token).await;
     assert_eq!(fencing_token, raw_token);
@@ -1190,7 +1190,7 @@ async fn submit_result_completes_direct_work_and_persists_the_attempt_payload() 
 #[tokio::test]
 async fn submit_result_rejects_fencing_material_in_every_attempt_payload_field() {
     let raw_token = "public-payload-result-token";
-    let token_digest = format!("{:x}", Sha256::digest(raw_token.as_bytes()));
+    let token_digest = base16ct::lower::encode_string(&Sha256::digest(raw_token.as_bytes()));
     let (context, backend, _dir, lease_id, fencing_token) =
         claimed_execution_fixture(false, raw_token).await;
     let before = workflow_snapshot(&backend).await;
@@ -1612,7 +1612,7 @@ async fn approval_completes_the_submitted_attempt_and_preserves_result_context()
 #[tokio::test]
 async fn approval_rejects_fencing_digest_before_review_updates() {
     let (context, backend, _dir, lease_id, fencing_token) = submitted_review_claim().await;
-    let token_digest = format!("{:x}", Sha256::digest(fencing_token.as_bytes()));
+    let token_digest = base16ct::lower::encode_string(&Sha256::digest(fencing_token.as_bytes()));
     let before = workflow_snapshot(&backend).await;
     let operation_id = "reject-approval-payload";
 

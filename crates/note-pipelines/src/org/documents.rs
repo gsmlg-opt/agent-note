@@ -2208,7 +2208,10 @@ fn validate_import_shape_inner(
 }
 
 fn content_hash(source: &str) -> String {
-    format!("sha256:{:x}", Sha256::digest(source.as_bytes()))
+    format!(
+        "sha256:{}",
+        base16ct::lower::encode_string(&Sha256::digest(source.as_bytes()))
+    )
 }
 
 fn import_fingerprint(request: &ImportDocumentsRequest) -> serde_json::Value {

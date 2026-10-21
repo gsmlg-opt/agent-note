@@ -48,7 +48,7 @@ pub(crate) fn query_fingerprint(
     let normalized = query.normalized_fingerprint_value(family)?;
     let bytes = serde_json::to_vec(&normalized)
         .map_err(|_| OrgError::invalid_input("Org operational query is invalid"))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(base16ct::lower::encode_string(&Sha256::digest(bytes)))
 }
 
 pub(crate) fn encode_cursor(
@@ -160,7 +160,7 @@ pub(crate) fn read_fingerprint(
         "scope": scope,
         "include_archived": include_archived,
     });
-    format!("{:x}", Sha256::digest(serde_json::to_vec(&value).unwrap()))
+    base16ct::lower::encode_string(&Sha256::digest(serde_json::to_vec(&value).unwrap()))
 }
 
 pub(crate) fn read_fingerprint_with_discriminator(
@@ -173,7 +173,7 @@ pub(crate) fn read_fingerprint_with_discriminator(
         "scope": scope,
         "filter": discriminator,
     });
-    format!("{:x}", Sha256::digest(serde_json::to_vec(&value).unwrap()))
+    base16ct::lower::encode_string(&Sha256::digest(serde_json::to_vec(&value).unwrap()))
 }
 
 pub(crate) fn encode_read_cursor(

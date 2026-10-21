@@ -524,7 +524,7 @@ pub async fn hydrate_note_export(
                     destination: planned.destination.clone(),
                 });
             }
-            if format!("{:x}", Sha256::digest(&bytes)) != storage.checksum_sha256 {
+            if base16ct::lower::encode_string(&Sha256::digest(&bytes)) != storage.checksum_sha256 {
                 confirm_snapshot(ctx, &captured.note).await?;
                 return Err(NoteExportError::AssetChecksumMismatch {
                     destination: planned.destination.clone(),

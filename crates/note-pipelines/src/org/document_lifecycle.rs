@@ -469,7 +469,10 @@ fn validate_expected_revision(revision: i64) -> Result<(), OrgError> {
 }
 
 fn content_hash(source: &str) -> String {
-    format!("sha256:{:x}", Sha256::digest(source.as_bytes()))
+    format!(
+        "sha256:{}",
+        base16ct::lower::encode_string(&Sha256::digest(source.as_bytes()))
+    )
 }
 
 fn map_path_constraint(error: StorageError, path: &str) -> OrgError {

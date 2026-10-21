@@ -28,10 +28,10 @@ pub(crate) async fn publish_generated_attachments(
         metadata: Vec::with_capacity(attachments.len()),
         object_keys: Vec::with_capacity(attachments.len()),
     };
-    let note_namespace = format!("{:x}", Sha256::digest(note_id.as_bytes()));
+    let note_namespace = base16ct::lower::encode_string(&Sha256::digest(note_id.as_bytes()));
 
     for attachment in attachments {
-        let checksum_sha256 = format!("{:x}", Sha256::digest(&attachment.content));
+        let checksum_sha256 = base16ct::lower::encode_string(&Sha256::digest(&attachment.content));
         let storage_generation = uuid::Uuid::new_v4().to_string();
         let object_key = format!(
             "notes/{note_namespace}/objects/{storage_generation}-{}",

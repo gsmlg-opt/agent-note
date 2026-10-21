@@ -177,7 +177,9 @@ pub fn build_export_document(
                     destination: hydrated.destination.clone(),
                 });
             }
-            if format!("{:x}", Sha256::digest(&hydrated.bytes)) != storage.checksum_sha256 {
+            if base16ct::lower::encode_string(&Sha256::digest(&hydrated.bytes))
+                != storage.checksum_sha256
+            {
                 return Err(ExportDocumentError::AssetChecksumMismatch {
                     destination: hydrated.destination.clone(),
                 });

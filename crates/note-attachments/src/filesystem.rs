@@ -281,7 +281,7 @@ fn validate_sha256(value: &str) -> anyhow::Result<String> {
 fn object_metadata(bytes: &[u8]) -> ObjectMetadata {
     ObjectMetadata {
         size_bytes: bytes.len() as u64,
-        checksum_sha256: format!("{:x}", Sha256::digest(bytes)),
+        checksum_sha256: base16ct::lower::encode_string(&Sha256::digest(bytes)),
     }
 }
 

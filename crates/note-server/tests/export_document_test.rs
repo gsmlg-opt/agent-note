@@ -611,7 +611,7 @@ fn rejects_size_mismatch_unsupported_mime_and_malformed_raster() {
         object_key: "immutable/a".into(),
         storage_generation: "1".into(),
         size_bytes: wrong_size.bytes.len() as u64 + 1,
-        checksum_sha256: format!("{:x}", sha2::Sha256::digest(&wrong_size.bytes)),
+        checksum_sha256: base16ct::lower::encode_string(&sha2::Sha256::digest(&wrong_size.bytes)),
     });
     assert!(matches!(
         build_export_document(

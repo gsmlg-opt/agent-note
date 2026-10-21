@@ -862,7 +862,10 @@ pub(crate) async fn write_claim_state(
         .collect::<Vec<_>>();
     candidate.extend(projected_document.iter().cloned());
     validate_projected_items_for_policy(&candidate, &workspace.policy)?;
-    let hash = format!("sha256:{:x}", Sha256::digest(source.as_bytes()));
+    let hash = format!(
+        "sha256:{}",
+        base16ct::lower::encode_string(&Sha256::digest(source.as_bytes()))
+    );
     let updated = resolve_cas(
         transaction
             .compare_and_swap_org_document(OrgDocumentUpdate {
@@ -1041,7 +1044,7 @@ fn validate_token_request(lease_id: &str, token: &str) -> Result<(), OrgError> {
 }
 
 pub(crate) fn token_hash(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
+    base16ct::lower::encode_string(&Sha256::digest(token.as_bytes()))
 }
 
 fn lease_proof<'a>(

@@ -9,7 +9,10 @@ pub(crate) fn request_fingerprint<T: Serialize + ?Sized>(value: &T) -> Result<St
     let canonical = canonicalize(value);
     let bytes = serde_json::to_vec(&canonical)
         .map_err(|_| OrgError::invalid_input("Org command cannot be serialized"))?;
-    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    Ok(format!(
+        "sha256:{}",
+        base16ct::lower::encode_string(&Sha256::digest(bytes))
+    ))
 }
 
 fn canonicalize(value: Value) -> Value {

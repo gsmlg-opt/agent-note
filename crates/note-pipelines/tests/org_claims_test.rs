@@ -179,7 +179,11 @@ async fn execution_claim_is_atomic_context_complete_and_replays_exact_token() {
         .unwrap();
     let stored_debug = format!("{stored_operation:?}");
     assert!(!stored_debug.contains("raw-token-one"));
-    assert!(!stored_debug.contains(&format!("{:x}", Sha256::digest(b"raw-token-one"))));
+    assert!(
+        !stored_debug.contains(&base16ct::lower::encode_string(&Sha256::digest(
+            b"raw-token-one"
+        )))
+    );
     assert_eq!(session.count_org_attempts(item).await.unwrap(), 1);
     let events = session
         .list_org_subject_events(workspace_id(), "work_item", &item.to_string(), None, 20)
@@ -1462,7 +1466,7 @@ async fn execution_release_revalidates_dependencies_before_entering_ready() {
     .await
     .unwrap();
     let raw_token = "dependency-release-token";
-    let token_hash = format!("{:x}", Sha256::digest(raw_token.as_bytes()));
+    let token_hash = base16ct::lower::encode_string(&Sha256::digest(raw_token.as_bytes()));
     let transaction = backend.begin(TransactionMode::Immediate).await.unwrap();
     let attempt = transaction
         .allocate_next_org_attempt(NewOrgAttemptAllocation {

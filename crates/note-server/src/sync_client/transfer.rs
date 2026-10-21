@@ -60,7 +60,7 @@ impl StagedBlob {
             "sync blob is incomplete"
         );
         anyhow::ensure!(
-            format!("{:x}", self.hasher.clone().finalize()) == self.expected_hash,
+            base16ct::lower::encode_string(&self.hasher.clone().finalize()) == self.expected_hash,
             "sync blob SHA-256 mismatch"
         );
         self.file.flush().await?;
@@ -88,7 +88,7 @@ mod tests {
     #[tokio::test]
     async fn staged_blob_checks_offsets_limit_and_hash_before_reading() {
         let content = b"complete snapshot";
-        let checksum = format!("{:x}", Sha256::digest(content));
+        let checksum = base16ct::lower::encode_string(&Sha256::digest(content));
         let mut blob = StagedBlob::new(content.len() as u64, &checksum, 100).unwrap();
         assert!(blob.append(1, b"x").await.is_err());
         blob.append(0, &content[..8]).await.unwrap();

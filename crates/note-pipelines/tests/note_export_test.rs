@@ -234,7 +234,7 @@ fn generated(id: &str, path: &str, key: &str, bytes: &[u8]) -> NoteAttachment {
             object_key: key.into(),
             storage_generation: format!("generation-{id}"),
             size_bytes: bytes.len() as u64,
-            checksum_sha256: format!("{:x}", Sha256::digest(bytes)),
+            checksum_sha256: base16ct::lower::encode_string(&Sha256::digest(bytes)),
         }),
     }
 }

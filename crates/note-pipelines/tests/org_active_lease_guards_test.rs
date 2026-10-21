@@ -1897,7 +1897,7 @@ async fn active_note_link_rejects_fencing_material_before_source_or_event_writes
         })
         .await
         .unwrap();
-    let digest = format!("{:x}", Sha256::digest(claim.fencing_token.as_bytes()));
+    let digest = base16ct::lower::encode_string(&Sha256::digest(claim.fencing_token.as_bytes()));
     let before = public_payload_snapshot(&backend, workspace_id).await;
 
     for (operation_id, purpose, description) in [
@@ -2002,7 +2002,7 @@ async fn raw_put_and_import_reject_fencing_material_before_fingerprint_or_writes
         .await
         .unwrap()
         .unwrap();
-    let digest = format!("{:x}", Sha256::digest(claim.fencing_token.as_bytes()));
+    let digest = base16ct::lower::encode_string(&Sha256::digest(claim.fencing_token.as_bytes()));
     let proof = LeaseProofInput {
         lease_id: claim.lease_id.clone(),
         kind: OrgClaimKind::Execution,
@@ -2118,7 +2118,7 @@ async fn workspace_snapshot_rejects_fencing_material_before_fingerprint_or_write
         lease_proofs: BTreeMap::from([(item_id(), proof)]),
     };
 
-    let digest = format!("{:x}", Sha256::digest(claim.fencing_token.as_bytes()));
+    let digest = base16ct::lower::encode_string(&Sha256::digest(claim.fencing_token.as_bytes()));
     for (payload_case, request) in [
         {
             let mut request = base.clone();

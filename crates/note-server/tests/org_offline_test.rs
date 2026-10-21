@@ -278,7 +278,10 @@ fn copy_snapshot(source: &Path, target: &Path) {
 }
 
 fn hash(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!(
+        "sha256:{}",
+        base16ct::lower::encode_string(&Sha256::digest(bytes))
+    )
 }
 
 async fn call_org_mcp(

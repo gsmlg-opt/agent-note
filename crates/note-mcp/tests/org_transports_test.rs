@@ -861,7 +861,8 @@ async fn modern_org_http_rejects_custom_note_mutations_without_mutating_storage(
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {rejected}");
+        // rmcp keeps handler errors in JSON-RPC responses for well-formed requests.
+        assert_eq!(status, StatusCode::OK, "{name}: {rejected}");
         assert_eq!(rejected["jsonrpc"], "2.0", "{name}: {rejected}");
         assert_eq!(rejected["id"], id, "{name}: {rejected}");
         assert_eq!(

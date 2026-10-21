@@ -1562,7 +1562,10 @@ async fn require_workspace(
 }
 
 fn content_hash(source: &str) -> String {
-    format!("sha256:{:x}", Sha256::digest(source.as_bytes()))
+    format!(
+        "sha256:{}",
+        base16ct::lower::encode_string(&Sha256::digest(source.as_bytes()))
+    )
 }
 
 fn lease_fingerprint(proof: &LeaseProofInput) -> serde_json::Value {

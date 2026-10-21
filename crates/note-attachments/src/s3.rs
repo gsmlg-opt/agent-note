@@ -101,7 +101,7 @@ impl S3AttachmentStore {
         if !valid_sha256(&request.checksum_sha256) {
             anyhow::bail!("invalid expected SHA-256 checksum");
         }
-        let actual_checksum = format!("{:x}", Sha256::digest(&request.bytes));
+        let actual_checksum = base16ct::lower::encode_string(&Sha256::digest(&request.bytes));
         if actual_checksum != request.checksum_sha256 {
             anyhow::bail!("attachment object checksum does not match expected SHA-256");
         }
@@ -152,7 +152,7 @@ impl S3AttachmentStore {
             .await?
             .ok_or_else(|| anyhow::anyhow!("S3 put object verification failed (missing object)"))?;
         let bytes = self.read_key(key).await?;
-        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let checksum = base16ct::lower::encode_string(&Sha256::digest(&bytes));
         if metadata != *expected
             || bytes.len() as u64 != expected.size_bytes
             || checksum != expected.checksum_sha256

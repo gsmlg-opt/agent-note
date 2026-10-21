@@ -241,7 +241,7 @@ fn one_attachment() -> Vec<NoteAttachment> {
 async fn save_uploads_generated_objects_before_begin_and_persists_verified_metadata() {
     let (ctx, backend, attachments, events, _dir) = controlled_context(true).await;
     let bytes = vec![0, 159, 146, 150, 255];
-    let checksum = format!("{:x}", Sha256::digest(&bytes));
+    let checksum = base16ct::lower::encode_string(&Sha256::digest(&bytes));
 
     let note = save_note(
         &ctx,
@@ -263,7 +263,7 @@ async fn save_uploads_generated_objects_before_begin_and_persists_verified_metad
     .unwrap();
 
     let storage = note.attachments[0].storage.as_ref().unwrap();
-    let note_namespace = format!("{:x}", Sha256::digest(note.id.as_bytes()));
+    let note_namespace = base16ct::lower::encode_string(&Sha256::digest(note.id.as_bytes()));
     assert!(storage
         .object_key
         .starts_with(&format!("notes/{note_namespace}/objects/")));

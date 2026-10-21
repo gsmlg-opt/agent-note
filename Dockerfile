@@ -10,7 +10,7 @@ ENV CARGO_HTTP_TIMEOUT=600 \
 RUN mkdir -p /usr/local/cargo \
     && printf '[source.crates-io]\nreplace-with = "rsproxy"\n\n[source.rsproxy]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[net]\nretry = 5\n' > /usr/local/cargo/config.toml
 RUN rustup target add wasm32-unknown-unknown \
-    && cargo install --locked wasm-bindgen-cli --version 0.2.126 \
+    && cargo install --locked wasm-bindgen-cli --version 0.2.129 \
     && cargo install --locked trunk
 WORKDIR /build
 COPY . .
@@ -31,7 +31,7 @@ RUN cargo build --release -p note-server --bins
 # -> /build/target/release/note-server
 
 # ---- Stage 2b: fetch the ONNX Runtime shared library (CPU) ----
-# ort 2.0.0-rc.12 targets ONNX Runtime 1.24.x and loads it at runtime via ORT_DYLIB_PATH
+# ort 2.0.0-rc.15 uses api-24 for ONNX Runtime 1.24.x, loaded at runtime via ORT_DYLIB_PATH
 # (load-dynamic). Baked in so the real OrtEmbedder works as soon as NOTE_MODEL_PATH is set.
 FROM debian:bookworm-slim AS onnxruntime
 ARG ORT_VERSION=1.24.2

@@ -159,7 +159,7 @@ pub fn canonical_snapshot_hash(snapshot: Option<&SyncSnapshot>) -> anyhow::Resul
     let value = serde_json::to_value(snapshot)?;
     let mut bytes = Vec::new();
     write_canonical_json(&value, &mut bytes)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(base16ct::lower::encode_string(&Sha256::digest(bytes)))
 }
 fn write_canonical_json(value: &serde_json::Value, out: &mut Vec<u8>) -> anyhow::Result<()> {
     match value {
@@ -216,7 +216,10 @@ async fn snapshot(ctx: &Context, note: &Note) -> anyhow::Result<SyncSnapshot> {
                         .read_legacy_bounded(&note.id, &a.path, DEFAULT_SYNC_MAX_BLOB_BYTES)
                         .await?
                 };
-                (bytes.len() as u64, format!("{:x}", Sha256::digest(&bytes)))
+                (
+                    bytes.len() as u64,
+                    base16ct::lower::encode_string(&Sha256::digest(&bytes)),
+                )
             }
         };
         total = total
@@ -988,7 +991,7 @@ pub async fn query_sync_state(
                             {
                                 Ok(bytes) => Some(
                                     bytes.len() as u64 == descriptor.size_bytes
-                                        && format!("{:x}", Sha256::digest(&bytes))
+                                        && base16ct::lower::encode_string(&Sha256::digest(&bytes))
                                             == descriptor.checksum_sha256,
                                 ),
                                 Err(error) => match error
@@ -1166,7 +1169,8 @@ pub async fn read_sync_attachment(
     };
     anyhow::ensure!(
         bytes.len() as u64 == descriptor.size_bytes
-            && format!("{:x}", Sha256::digest(&bytes)) == descriptor.checksum_sha256,
+            && base16ct::lower::encode_string(&Sha256::digest(&bytes))
+                == descriptor.checksum_sha256,
         "sync attachment integrity mismatch"
     );
     Ok(bytes)
@@ -1286,7 +1290,7 @@ pub fn validate_sync_event(
             .ok_or_else(|| anyhow::anyhow!("sync attachment bytes missing"))?;
         anyhow::ensure!(
             content.len() as u64 == a.size_bytes
-                && format!("{:x}", Sha256::digest(content)) == a.checksum_sha256,
+                && base16ct::lower::encode_string(&Sha256::digest(content)) == a.checksum_sha256,
             "sync attachment integrity mismatch"
         );
     }
@@ -1907,7 +1911,7 @@ mod tests {
         assert_eq!(captured.attachments[0].size_bytes, 14);
         assert_eq!(
             captured.attachments[0].checksum_sha256,
-            format!("{:x}", Sha256::digest(b"bounded legacy"))
+            base16ct::lower::encode_string(&Sha256::digest(b"bounded legacy"))
         );
     }
 
