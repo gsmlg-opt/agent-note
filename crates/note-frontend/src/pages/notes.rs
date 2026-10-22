@@ -2,7 +2,7 @@ use std::{collections::HashSet, ops::Deref, rc::Rc};
 
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
-use yew_duskmoon::{Alert, Button};
+use yew_duskmoon::{Alert, Button, NativeButtonType};
 use yew_router::components::LinkProps;
 use yew_router::prelude::*;
 
@@ -1934,7 +1934,7 @@ pub fn notes_page() -> Html {
                         value={(*query).clone()}
                         oninput={on_query_input}
                     />
-                    <Button variant={Some("primary".to_string())}>
+                    <Button native_type={NativeButtonType::Submit} variant={Some("primary".to_string())}>
                         <>{ RETRIEVE_BUTTON_LABEL }</>
                     </Button>
                     if results.is_some() || !(*label_filters).is_empty() || !(*query).is_empty() {

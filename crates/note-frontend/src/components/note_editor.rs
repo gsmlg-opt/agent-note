@@ -4,7 +4,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 use yew::virtual_dom::AttrValue;
-use yew_duskmoon::{Button, Card, Chip, MarkdownInput};
+use yew_duskmoon::{Button, Card, Chip, MarkdownInput, NativeButtonType};
 
 use crate::{
     api::attachment_url,
@@ -286,6 +286,7 @@ pub fn note_editor(props: &NoteEditorProps) -> Html {
             <form class="stack" onsubmit={on_submit}>
                 <div class="note-page-actions">
                     <Button
+                        native_type={NativeButtonType::Submit}
                         variant={Some("primary".to_string())}
                         disabled={submit_disabled}
                         loading={props.submitting || *submit_debounce || *attachment_file_reading}

@@ -1,6 +1,6 @@
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
-use yew_duskmoon::{Alert, Button};
+use yew_duskmoon::{Alert, Button, NativeButtonType};
 
 use crate::api;
 use crate::components::Modal;
@@ -140,7 +140,7 @@ pub fn labels_page() -> Html {
                             <span>{ "Type" }</span>
                             { value_type_select((*form_type).as_str(), on_type_change.clone()) }
                         </label>
-                        { modal_actions(&close, html! { <Button variant={Some("primary".to_string())}>{ "Create label" }</Button> }) }
+                        { modal_actions(&close, html! { <Button native_type={NativeButtonType::Submit} variant={Some("primary".to_string())}>{ "Create label" }</Button> }) }
                     </form>
                 </Modal>
             }
@@ -189,7 +189,7 @@ pub fn labels_page() -> Html {
                             <span>{ "Type" }</span>
                             { value_type_select((*form_type).as_str(), on_type_change.clone()) }
                         </label>
-                        { modal_actions(&close, html! { <Button variant={Some("primary".to_string())}>{ "Save changes" }</Button> }) }
+                        { modal_actions(&close, html! { <Button native_type={NativeButtonType::Submit} variant={Some("primary".to_string())}>{ "Save changes" }</Button> }) }
                     </form>
                 </Modal>
             }

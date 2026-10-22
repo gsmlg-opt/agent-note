@@ -43,3 +43,12 @@ uv run --no-project --with playwright==1.59.0 python browser-tests/test_sync_dia
 ```
 
 Use `--base-url` for a different local port and `--executable` for a system Chromium installation. Screenshots and results default to `/tmp/agent-note-sync-diagnostics-browser`.
+
+Form submission checks click the real new-note, edit-note, label create/edit, and Notes retrieval buttons, asserting their requests and saved UI state. Every API request is intercepted; no backend writes occur. Run against current compiled frontend assets on a loopback URL:
+
+```sh
+uv run --no-project --with playwright==1.59.0 python browser-tests/test_note_form_submit.py \
+  --base-url http://127.0.0.1:6221 --executable /run/current-system/sw/bin/chromium
+```
+
+Omit `--executable` when using Playwright's matching browser installation. `--case new_note` runs one case; screenshots of failures and `browser-result.json` default to `/tmp/agent-note-form-submit-browser`.
