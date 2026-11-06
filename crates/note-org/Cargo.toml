@@ -8,4 +8,4 @@ chrono = { version = "0.4.45", default-features = false, features = ["serde", "s
 chrono-tz = "0.10"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2"
-uuid = { version = "1.28.0", features = ["serde"] }
+uuid = { version = "1.29.0", features = ["serde"] }

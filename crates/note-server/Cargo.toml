@@ -9,14 +9,14 @@ note-org = { path = "../note-org" }
 note-mcp = { path = "../note-mcp" }
 note-attachments = { path = "../note-attachments" }
 axum = "0.8.9"
-tokio = { version = "1.54.0", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 base16ct = { version = "1.0.0", features = ["alloc"] }
 sha2 = "0.11"
 cap-std = "4.0.3"
 cap-fs-ext = "4.0.3"
-uuid = { version = "1.28.0", features = ["v4"] }
+uuid = { version = "1.29.0", features = ["v4"] }
 note-core = { path = "../note-core" }
 note-embedding = { version = "0.1.0", path = "../note-embedding" }
 note-storage = { version = "0.1.0", path = "../note-storage" }
@@ -25,18 +25,18 @@ note-storage-turso = { version = "0.1.0", path = "../note-storage-turso" }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 chrono = "0.4.45"
-toml = "1.1.8"
-toml_edit = "0.25.17"
+toml = "1.2.1"
+toml_edit = "0.25.19"
 tempfile = "3.27.0"
 tower-http = { version = "0.7.1", features = ["fs"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
-yew-duskmoon = "0.11.1"
+yew-duskmoon = "0.11.2"
 base64 = "0.23.1"
-html5ever = "0.39"
+html5ever = "0.40.1"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
-markup5ever_rcdom = "0.39.0"
+markup5ever_rcdom = "0.40.1"
 percent-encoding = "2.3.2"
 futures = "0.3"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
@@ -44,19 +44,19 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pemfile = "2.2"
 rustls-native-certs = "0.8"
 reqwest = { version = "0.13.5", default-features = false, features = ["multipart", "rustls", "stream"] }
-roxmltree = "0.21.1"
+roxmltree = "0.21.2"
 utoipa = { version = "6", features = ["axum_extras"] }
 utoipa-axum = "0.3"
 utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
-rustix = { version = "1.1.5", features = ["fs"] }
+rustix = { version = "1.1.6", features = ["fs"] }
 
 [dev-dependencies]
-tokio = { version = "1.54.0", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 rcgen = { version = "0.14", features = ["pem"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-flate2 = "1.1.10"
+flate2 = "1.1.11"
 http-body-util = "0.1.5"
 tar = "0.4.46"
 tarpc = { version = "0.38.0", features = ["serde1", "tokio1", "serde-transport", "serde-transport-bincode"] }

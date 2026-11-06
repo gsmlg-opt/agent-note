@@ -1392,16 +1392,16 @@ fn collect_dom_image_sources(node: &Handle, sources: &mut Vec<Option<String>>) {
     while let Some(node) = stack.pop() {
         if let NodeData::Element { name, attrs, .. } = &node.data {
             if matches!(
-                name.local.as_ref(),
+                name.local.as_str(),
                 "script" | "style" | "template" | "noscript" | "object"
             ) {
                 continue;
             }
-            if name.local.as_ref() == "img" {
+            if name.local.as_str() == "img" {
                 let source = attrs
                     .borrow()
                     .iter()
-                    .find(|attribute| attribute.name.local.as_ref() == "src")
+                    .find(|attribute| attribute.name.local.as_str() == "src")
                     .map(|source| source.value.to_string());
                 sources.push(source);
             }
@@ -1436,7 +1436,7 @@ fn validate_html_tree(root: &Handle) -> Result<(), ExportDocumentError> {
         let element_depth = if let NodeData::Element { name, .. } = &node.data {
             // html5ever inserts one synthetic `html` container for fragments. It is not
             // author-controlled nesting and is excluded from the documented depth limit.
-            if parent_element_depth == 0 && name.local.as_ref() == "html" {
+            if parent_element_depth == 0 && name.local.as_str() == "html" {
                 0
             } else {
                 let depth = parent_element_depth
@@ -1513,7 +1513,7 @@ fn collect_author_ids(node: &Handle, footnote_marker: &str, ids: &mut HashSet<St
             if generated_footnote_marker(&attrs, footnote_marker).is_none() {
                 if let Some(id) = attrs
                     .iter()
-                    .find(|attribute| attribute.name.local.as_ref() == "id")
+                    .find(|attribute| attribute.name.local.as_str() == "id")
                 {
                     ids.insert(id.value.to_string());
                 }
@@ -1564,14 +1564,14 @@ fn generated_footnote_marker<'a>(
     expected_marker: &str,
 ) -> Option<GeneratedFootnoteMarker<'a>> {
     if !attrs.iter().any(|attribute| {
-        attribute.name.local.as_ref() == "data-export-footnote-marker"
+        attribute.name.local.as_str() == "data-export-footnote-marker"
             && attribute.value.as_ref() == expected_marker
     }) {
         return None;
     }
     attrs.iter().find_map(|attribute| {
         let value = attribute.value.as_ref();
-        match attribute.name.local.as_ref() {
+        match attribute.name.local.as_str() {
             "data-export-footnote-definition" => Some(GeneratedFootnoteMarker::Definition(value)),
             "data-export-footnote-reference" => Some(GeneratedFootnoteMarker::Reference(value)),
             "data-export-footnote-target" => Some(GeneratedFootnoteMarker::Target(value)),
@@ -1613,7 +1613,7 @@ impl HtmlSanitizer<'_> {
                 Ok(())
             }
             NodeData::Element { name, attrs, .. } => {
-                let tag = name.local.as_ref();
+                let tag = name.local.as_str();
                 if name.ns == ns!(svg) {
                     self.svg_elements += 1;
                     self.svg_attributes += attrs.borrow().len();
@@ -1688,7 +1688,7 @@ impl HtmlSanitizer<'_> {
                 let generated_marker =
                     generated_footnote_marker(&attrs, self.policy.footnote_marker);
                 for attribute in attrs.iter() {
-                    let attribute_name = attribute.name.local.as_ref();
+                    let attribute_name = attribute.name.local.as_str();
                     if attribute_name.starts_with("data-export-footnote-")
                         || (generated_marker.is_some() && matches!(attribute_name, "id" | "href"))
                     {
@@ -1735,7 +1735,7 @@ impl HtmlSanitizer<'_> {
         let attrs = attrs.borrow();
         let rendered_src = attrs
             .iter()
-            .find(|attr| attr.name.local.as_ref() == "src")
+            .find(|attr| attr.name.local.as_str() == "src")
             .map(|attr| attr.value.to_string())
             .unwrap_or_default();
         let original_src = self.image_sources.pop_front().flatten();
@@ -1746,7 +1746,7 @@ impl HtmlSanitizer<'_> {
         };
         let alt = attrs
             .iter()
-            .find(|attr| attr.name.local.as_ref() == "alt")
+            .find(|attr| attr.name.local.as_str() == "alt")
             .map(|attr| attr.value.as_ref())
             .unwrap_or("image");
         if let Some(filename) = self
@@ -1793,14 +1793,14 @@ impl HtmlSanitizer<'_> {
     ) -> Result<(), ExportDocumentError> {
         let attrs = attrs.borrow();
         let is_checkbox = attrs.iter().any(|attribute| {
-            attribute.name.local.as_ref() == "type"
+            attribute.name.local.as_str() == "type"
                 && attribute.value.as_ref().eq_ignore_ascii_case("checkbox")
         });
         let is_disabled = attrs
             .iter()
-            .any(|attribute| attribute.name.local.as_ref() == "disabled");
+            .any(|attribute| attribute.name.local.as_str() == "disabled");
         let has_unsafe_attribute = attrs.iter().any(|attribute| {
-            let name = attribute.name.local.as_ref().to_ascii_lowercase();
+            let name = attribute.name.local.as_str().to_ascii_lowercase();
             name.starts_with("on") || !matches!(name.as_str(), "type" | "disabled" | "checked")
         });
         if !is_checkbox || !is_disabled || has_unsafe_attribute {
@@ -1811,7 +1811,7 @@ impl HtmlSanitizer<'_> {
             .push_str("<input type=\"checkbox\" disabled=\"\"");
         if attrs
             .iter()
-            .any(|attribute| attribute.name.local.as_ref() == "checked")
+            .any(|attribute| attribute.name.local.as_str() == "checked")
         {
             self.output.push_str(" checked=\"\"");
         }
@@ -1831,7 +1831,7 @@ impl HtmlSanitizer<'_> {
         {
             self.output.push_str("<a");
             for attribute in attrs.iter() {
-                let name = attribute.name.local.as_ref();
+                let name = attribute.name.local.as_str();
                 if name.starts_with("data-export-footnote-") || name == "href" {
                     continue;
                 }
@@ -1845,7 +1845,7 @@ impl HtmlSanitizer<'_> {
         }
         let href = attrs
             .iter()
-            .find(|attribute| attribute.name.local.as_ref() == "href")
+            .find(|attribute| attribute.name.local.as_str() == "href")
             .map(|attribute| attribute.value.to_string())
             .unwrap_or_default();
         if is_app_relative(&href) && !href.starts_with('#') {
@@ -1861,7 +1861,7 @@ impl HtmlSanitizer<'_> {
         }
         self.output.push_str("<a");
         for attribute in attrs.iter() {
-            self.write_attribute("a", attribute.name.local.as_ref(), attribute.value.as_ref())?;
+            self.write_attribute("a", attribute.name.local.as_str(), attribute.value.as_ref())?;
         }
         self.output.push('>');
         self.write_children(node)?;
@@ -1951,9 +1951,9 @@ fn contains_unrendered_mermaid(node: &Handle) -> bool {
         let NodeData::Element { name, attrs, .. } = &child.data else {
             return false;
         };
-        name.local.as_ref() == "code"
+        name.local.as_str() == "code"
             && attrs.borrow().iter().any(|attribute| {
-                attribute.name.local.as_ref() == "class"
+                attribute.name.local.as_str() == "class"
                     && attribute
                         .value
                         .split_ascii_whitespace()
@@ -1980,7 +1980,7 @@ fn svg_dimensions_from_html_attrs(
     let attribute = |name: &str| {
         attrs
             .iter()
-            .find(|attribute| attribute.name.local.as_ref().eq_ignore_ascii_case(name))
+            .find(|attribute| attribute.name.local.as_str().eq_ignore_ascii_case(name))
             .map(|attribute| attribute.value.to_string())
     };
     let parse = |value: &str| value.trim_end_matches("px").parse::<f64>().ok();

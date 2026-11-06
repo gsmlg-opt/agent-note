@@ -8,7 +8,7 @@ anyhow = "1.0.104"
 axum = "0.8"
 note-core = { version = "0.1.0", path = "../note-core" }
 note-pipelines = { version = "0.1.0", path = "../note-pipelines" }
-rmcp = { version = "3.6.0", features = [
+rmcp = { version = "3.9.0", features = [
     "server",
     "macros",
     "transport-streamable-http-server",
@@ -24,7 +24,7 @@ note-attachments = { path = "../note-attachments" }
 note-embedding = { path = "../note-embedding" }
 note-storage = { path = "../note-storage" }
 note-storage-turso = { path = "../note-storage-turso" }
-rmcp = { version = "3.6.0", features = ["client", "transport-io"] }
+rmcp = { version = "3.9.0", features = ["client", "transport-io"] }
 tempfile = "3.27.0"
-tokio = { version = "1.54.0", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }

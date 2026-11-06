@@ -364,11 +364,11 @@ fn html_image_sources(fragment: &str) -> Vec<String> {
 
         fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
             if let TagToken(tag) = token {
-                if tag.kind == StartTag && tag.name.as_ref() == "img" {
+                if tag.kind == StartTag && tag.name.as_str() == "img" {
                     if let Some(src) = tag
                         .attrs
                         .iter()
-                        .find(|attribute| attribute.name.local.as_ref() == "src")
+                        .find(|attribute| attribute.name.local.as_str() == "src")
                     {
                         self.0.borrow_mut().push(src.value.to_string());
                     }
