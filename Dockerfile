@@ -9,6 +9,7 @@ ENV CARGO_HTTP_TIMEOUT=600 \
     CARGO_NET_RETRY=5
 RUN mkdir -p /usr/local/cargo \
     && printf '[source.crates-io]\nreplace-with = "rsproxy"\n\n[source.rsproxy]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[net]\nretry = 5\n' > /usr/local/cargo/config.toml
+ARG CARGO_BUILD_JOBS=4
 RUN rustup target add wasm32-unknown-unknown \
     && cargo install --locked wasm-bindgen-cli --version 0.2.130 \
     && cargo install --locked trunk
@@ -27,6 +28,7 @@ RUN mkdir -p /usr/local/cargo \
 WORKDIR /build
 COPY . .
 # ort uses load-dynamic, so no ONNX Runtime lib is needed at build time.
+ARG CARGO_BUILD_JOBS=4
 RUN cargo build --release -p note-server --bins
 # -> /build/target/release/note-server
 
