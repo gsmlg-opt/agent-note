@@ -405,6 +405,7 @@ impl_forward_label_repository! {
         value_type: note_core::LabelValueType,
     ) -> ();
     fn delete_label_key(key: &str) -> ();
+    fn delete_unused_label_keys(protected_keys: &[String]) -> u64;
     fn attach_label(note_id: &str, key: &str, value: &str) -> ();
     fn remove_note_label(note_id: &str, key: &str) -> bool;
     fn labels_for_note(note_id: &str) -> Vec<note_core::Label>;

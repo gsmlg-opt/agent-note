@@ -114,6 +114,22 @@ impl LabelRepository for PgSession {
         Ok(())
     }
 
+    async fn delete_unused_label_keys(&self, protected_keys: &[String]) -> StorageResult<u64> {
+        let mut connection = self.connection().await?;
+        let result = sqlx::query(
+            "DELETE FROM label_keys
+             WHERE key <> ALL($1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM note_labels WHERE label_key_id = label_keys.id
+               )",
+        )
+        .bind(protected_keys)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| map_sqlx_error("delete unused label keys", error))?;
+        Ok(result.rows_affected())
+    }
+
     async fn attach_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<()> {
         let mut connection = self.connection().await?;
         let result = sqlx::query(

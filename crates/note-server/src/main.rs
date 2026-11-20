@@ -770,8 +770,9 @@ mod tests {
             })
             .sum::<usize>();
 
-        assert_eq!(paths.len(), 60);
-        assert_eq!(operation_count, 72);
+        assert_eq!(paths.len(), 61);
+        assert_eq!(operation_count, 73);
+        assert!(paths["/api/labels/actions/clear-unused"]["post"].is_object());
         let connections = paths["/api/system/sync/connections"]
             .as_object()
             .expect("sync connection configuration path");

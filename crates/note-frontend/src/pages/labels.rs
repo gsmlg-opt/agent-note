@@ -4,7 +4,6 @@ use yew_duskmoon::{Alert, Button, NativeButtonType};
 
 use crate::api;
 use crate::components::Modal;
-use crate::state::LabelKey;
 
 #[derive(Clone, PartialEq)]
 enum ModalState {
@@ -12,14 +11,17 @@ enum ModalState {
     Create,
     Edit(String), // holds the (immutable) key being edited
     Delete(String),
+    ClearUnused,
 }
 
-/// Labels management: list the catalog, create/edit via a modal form, delete via a confirm modal.
+/// Manage label keys and see how many active notes use each key.
 #[function_component(LabelsPage)]
 pub fn labels_page() -> Html {
-    let labels = use_state(Vec::<LabelKey>::new);
+    let labels = use_state(Vec::<api::LabelUsage>::new);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
+    let cleanup_notice = use_state(|| None::<String>);
+    let clearing = use_state(|| false);
     let modal = use_state(|| ModalState::Closed);
     // Shared form fields for the create/edit modal.
     let form_key = use_state(String::new);
@@ -36,8 +38,9 @@ pub fn labels_page() -> Html {
             let loading = loading.clone();
             let error = error.clone();
             loading.set(true);
+            error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
-                match api::list_labels().await {
+                match api::list_label_usage().await {
                     Ok(l) => labels.set(l),
                     Err(e) => error.set(Some(e)),
                 }
@@ -56,7 +59,17 @@ pub fn labels_page() -> Html {
 
     let close = {
         let modal = modal.clone();
-        Callback::from(move |_: ()| modal.set(ModalState::Closed))
+        let clearing = clearing.clone();
+        Callback::from(move |_: ()| {
+            if !*clearing {
+                modal.set(ModalState::Closed);
+            }
+        })
+    };
+
+    let open_clear_unused = {
+        let modal = modal.clone();
+        Callback::from(move |_| modal.set(ModalState::ClearUnused))
     };
 
     let open_create = {
@@ -226,13 +239,65 @@ pub fn labels_page() -> Html {
                 </Modal>
             }
         }
+        ModalState::ClearUnused => {
+            let on_confirm = {
+                let modal = modal.clone();
+                let reload = reload.clone();
+                let error = error.clone();
+                let cleanup_notice = cleanup_notice.clone();
+                let clearing = clearing.clone();
+                Callback::from(move |_| {
+                    clearing.set(true);
+                    error.set(None);
+                    cleanup_notice.set(None);
+                    let modal = modal.clone();
+                    let reload = reload.clone();
+                    let error = error.clone();
+                    let cleanup_notice = cleanup_notice.clone();
+                    let clearing = clearing.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match api::clear_unused_labels().await {
+                            Ok(count) => {
+                                let message = match count {
+                                    0 => "No unused labels to clear.".to_string(),
+                                    1 => "Cleared 1 unused label.".to_string(),
+                                    _ => format!("Cleared {count} unused labels."),
+                                };
+                                cleanup_notice.set(Some(message));
+                                reload.emit(());
+                            }
+                            Err(err) => error.set(Some(err)),
+                        }
+                        clearing.set(false);
+                        modal.set(ModalState::Closed);
+                    });
+                })
+            };
+
+            html! {
+                <Modal title="Clear unused labels" on_close={close.clone()}>
+                    <p>{ "Remove label keys with no notes? Labels used by notes in Trash or configured as dashboard categories are kept." }</p>
+                    { modal_actions(&close, html! {
+                        <button type="button" class="btn btn-error" disabled={*clearing} onclick={on_confirm}>
+                            { if *clearing { "Clearing…" } else { "Clear unused labels" } }
+                        </button>
+                    }) }
+                </Modal>
+            }
+        }
     };
 
     html! {
         <section class="stack">
             <div class="page-head">
                 <h2 class="page-title">{ "Labels" }</h2>
-                <Button variant={Some("primary".to_string())} onclick={open_create}>{ "New label" }</Button>
+                <div class="label-page-actions">
+                    <button type="button" class="btn btn-outline" onclick={open_clear_unused}
+                        disabled={*loading || *clearing || !labels.iter().any(|label| label.note_count == Some(0))}>
+                        { "Clear unused labels" }
+                    </button>
+                    <Button variant={Some("primary".to_string())} onclick={open_create}>{ "New label" }</Button>
+                </div>
             </div>
             <p class="page-hint">{ "Labels are reusable key = value tags. Descriptions explain what each key is for." }</p>
 
@@ -240,50 +305,71 @@ pub fn labels_page() -> Html {
                 <Alert variant={Some("error".to_string())}><span>{ err.clone() }</span></Alert>
             }
 
+            if let Some(message) = &*cleanup_notice {
+                <Alert variant={Some("success".to_string())}><span role="status">{ message.clone() }</span></Alert>
+            }
+
             if *loading {
                 <p class="loading">{ "Loading…" }</p>
-            } else if labels.is_empty() {
-                <p class="empty">{ "No labels yet. Create one, or just type a new key when writing a note." }</p>
-            } else {
-                <ul class="label-list">
-                    { for labels.iter().map(|label| {
-                        let key = label.key.clone();
-                        let desc = label.description.clone();
-                        let on_edit = {
-                            let modal = modal.clone();
-                            let form_desc = form_desc.clone();
-                            let form_type = form_type.clone();
-                            let key = key.clone();
-                            let desc = desc.clone();
-                            let value_type = label.value_type.clone();
-                            Callback::from(move |_| {
-                                form_desc.set(desc.clone());
-                                form_type.set(value_type.clone());
-                                modal.set(ModalState::Edit(key.clone()));
-                            })
-                        };
-                        let on_delete = {
-                            let modal = modal.clone();
-                            let key = key.clone();
-                            Callback::from(move |_| modal.set(ModalState::Delete(key.clone())))
-                        };
-                        html! {
-                            <li class="label-row" key={label.key.clone()}>
-                                <div class="label-row-main">
-                                    <span class="label-key">{ label.key.clone() }</span>
-                                    <span class="label-type">{ label.value_type.clone() }</span>
-                                    <span class="label-desc">{
-                                        if label.description.is_empty() { "—".to_string() } else { label.description.clone() }
-                                    }</span>
-                                </div>
-                                <div class="label-row-actions">
-                                    <button type="button" class="btn btn-ghost btn-sm" onclick={on_edit}>{ "Edit" }</button>
-                                    <button type="button" class="btn btn-ghost btn-sm" onclick={on_delete}>{ "Delete" }</button>
-                                </div>
-                            </li>
-                        }
-                    }) }
-                </ul>
+            } else if error.is_none() || !labels.is_empty() {
+                <div class="table-scroll">
+                    <table class="table table-compact label-table" aria-label="Label keys">
+                        <thead>
+                            <tr>
+                                <th scope="col">{ "Key" }</th>
+                                <th scope="col">{ "Type" }</th>
+                                <th scope="col">{ "Description" }</th>
+                                <th scope="col" class="label-note-count">{ "Active notes" }</th>
+                                <th scope="col">{ "Actions" }</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            if labels.is_empty() {
+                                <tr><td colspan="5">{ "No labels yet. Create one, or type a new key when writing a note." }</td></tr>
+                            }
+                            { for labels.iter().map(|label| {
+                                let key = label.key.clone();
+                                let desc = label.description.clone();
+                                let on_edit = {
+                                    let modal = modal.clone();
+                                    let form_desc = form_desc.clone();
+                                    let form_type = form_type.clone();
+                                    let key = key.clone();
+                                    let desc = desc.clone();
+                                    let value_type = label.value_type.clone();
+                                    Callback::from(move |_| {
+                                        form_desc.set(desc.clone());
+                                        form_type.set(value_type.clone());
+                                        modal.set(ModalState::Edit(key.clone()));
+                                    })
+                                };
+                                let on_delete = {
+                                    let modal = modal.clone();
+                                    let key = key.clone();
+                                    Callback::from(move |_| modal.set(ModalState::Delete(key.clone())))
+                                };
+                                html! {
+                                    <tr class="label-row" key={label.key.clone()}>
+                                        <th scope="row" class="label-key">{ label.key.clone() }</th>
+                                        <td><span class="label-type">{ label.value_type.clone() }</span></td>
+                                        <td class="label-desc">{
+                                            if label.description.is_empty() { "—".to_string() } else { label.description.clone() }
+                                        }</td>
+                                        <td class="label-note-count">{
+                                            label.note_count.map_or_else(|| "—".to_string(), |count| count.to_string())
+                                        }</td>
+                                        <td>
+                                            <div class="label-row-actions">
+                                                <button type="button" class="btn btn-ghost btn-sm" onclick={on_edit}>{ "Edit" }</button>
+                                                <button type="button" class="btn btn-ghost btn-sm" onclick={on_delete}>{ "Delete" }</button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                }
+                            }) }
+                        </tbody>
+                    </table>
+                </div>
             }
 
             { modal_view }

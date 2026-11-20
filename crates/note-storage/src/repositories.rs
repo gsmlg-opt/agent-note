@@ -454,6 +454,9 @@ pub trait LabelRepository: Send + Sync {
         value_type: note_core::LabelValueType,
     ) -> StorageResult<()>;
     async fn delete_label_key(&self, key: &str) -> StorageResult<()>;
+    /// Removes unassigned keys, retaining protected keys and assignments to trashed notes.
+    /// Call inside an immediate transaction.
+    async fn delete_unused_label_keys(&self, protected_keys: &[String]) -> StorageResult<u64>;
     async fn attach_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<()>;
     /// Inserts or replaces one note label, returning whether its desired value
     /// changed.

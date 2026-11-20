@@ -1,11 +1,12 @@
 use axum::{
-    extract::{FromRef, Path, State},
+    extract::{FromRef, Path, Query, State},
     Json,
 };
 use note_core::LabelKey;
 use note_pipelines::{
-    define_label_key_with_type, delete_label_key, list_label_keys, parse_label_value_type,
-    update_label_key, update_label_key_with_type, Context,
+    clear_unused_label_keys, define_label_key_with_type, delete_label_key, list_label_keys,
+    list_label_keys_with_counts, parse_label_value_type, update_label_key,
+    update_label_key_with_type, Context,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -37,22 +38,39 @@ pub struct UpdateLabelKeyRequest {
     pub value_type: Option<String>,
 }
 
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct ListLabelKeysQuery {
+    /// Include the number of active notes using each key.
+    #[serde(default)]
+    include_usage: bool,
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct LabelKeyDto {
     pub key: String,
     pub description: String,
     #[schema(schema_with = crate::openapi::label_value_type_schema)]
     pub value_type: String,
+    /// Number of active notes with this key; excludes notes in Trash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_count: Option<usize>,
 }
 
-impl From<LabelKey> for LabelKeyDto {
-    fn from(lk: LabelKey) -> Self {
+impl LabelKeyDto {
+    fn new(label: LabelKey, note_count: Option<usize>) -> Self {
         Self {
-            key: lk.key,
-            description: lk.description,
-            value_type: lk.value_type.as_str().to_string(),
+            key: label.key,
+            description: label.description,
+            value_type: label.value_type.as_str().to_string(),
+            note_count,
         }
     }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ClearUnusedLabelsResponse {
+    pub deleted_count: u64,
 }
 
 #[utoipa::path(
@@ -106,6 +124,7 @@ async fn define_label_key_handler(
     get,
     path = "/api/labels",
     tag = "labels",
+    params(ListLabelKeysQuery),
     responses(
         (status = 200, description = "Label keys", body = Vec<LabelKeyDto>),
         (status = 500, description = "Server error", body = String, content_type = "text/plain")
@@ -113,11 +132,26 @@ async fn define_label_key_handler(
 )]
 async fn list_label_keys_handler(
     State(ctx): State<Arc<Context>>,
+    Query(query): Query<ListLabelKeysQuery>,
 ) -> Result<Json<Vec<LabelKeyDto>>, (axum::http::StatusCode, String)> {
-    let keys = list_label_keys(&ctx)
-        .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(keys.into_iter().map(Into::into).collect()))
+    let labels = if query.include_usage {
+        list_label_keys_with_counts(&ctx).await.map(|labels| {
+            labels
+                .into_iter()
+                .map(|(label, count)| LabelKeyDto::new(label, Some(count)))
+                .collect()
+        })
+    } else {
+        list_label_keys(&ctx).await.map(|labels| {
+            labels
+                .into_iter()
+                .map(|label| LabelKeyDto::new(label, None))
+                .collect()
+        })
+    };
+    labels
+        .map(Json)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 #[utoipa::path(
@@ -186,6 +220,27 @@ async fn delete_label_key_handler(
     Ok(())
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/labels/actions/clear-unused",
+    tag = "labels",
+    responses(
+        (status = 200, description = "Unused label keys cleared", body = ClearUnusedLabelsResponse),
+        (status = 500, description = "Server error", body = String, content_type = "text/plain")
+    )
+)]
+async fn clear_unused_label_keys_handler(
+    State(ctx): State<Arc<Context>>,
+) -> Result<Json<ClearUnusedLabelsResponse>, (axum::http::StatusCode, String)> {
+    let deleted_count = clear_unused_label_keys(&ctx)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if deleted_count > 0 {
+        crate::notes_api::invalidate_dashboard_cache();
+    }
+    Ok(Json(ClearUnusedLabelsResponse { deleted_count }))
+}
+
 fn default_label_value_type() -> String {
     "text".to_string()
 }
@@ -205,6 +260,7 @@ where
     OpenApiRouter::new()
         .routes(routes!(define_label_key_handler, list_label_keys_handler))
         .routes(routes!(update_label_key_handler, delete_label_key_handler))
+        .routes(routes!(clear_unused_label_keys_handler))
 }
 
 #[cfg(test)]
@@ -233,6 +289,7 @@ mod tests {
         for (path, methods) in [
             ("/api/labels", &["get", "post"][..]),
             ("/api/labels/{key}", &["put", "delete"][..]),
+            ("/api/labels/actions/clear-unused", &["post"][..]),
         ] {
             for method in methods {
                 assert!(
@@ -335,6 +392,7 @@ mod tests {
         (
             labels_router::<Arc<Context>>()
                 .merge(crate::system_api::system_router::<Arc<Context>>())
+                .merge(crate::notes_api::notes_router::<Arc<Context>>())
                 .with_state(ctx)
                 .into(),
             dir,
@@ -552,6 +610,100 @@ mod tests {
             .expect("array")
             .iter()
             .any(|k| k.get("key").and_then(|v| v.as_str()) == Some("status")));
+    }
+
+    #[tokio::test]
+    async fn label_usage_counts_active_notes_and_cleanup_preserves_assigned_keys() {
+        let (app, _dir) = test_app().await;
+        for key in ["unused", "category"] {
+            let body = serde_json::json!({"key": key, "description": ""});
+            let response = app
+                .clone()
+                .oneshot(post("/api/labels", &body.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(put(
+                "/api/system/config",
+                r#"{"category_labels":["category"],"duplicate_check":{"enabled":false,"rules":[]}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        for (title, key) in [
+            ("First", "used"),
+            ("Second", "used"),
+            ("Trashed", "in-trash"),
+        ] {
+            let note =
+                serde_json::json!({"title": title, "content": title, "labels": [[key, "value"]]});
+            let response = app
+                .clone()
+                .oneshot(post("/api/notes", &note.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if key == "in-trash" {
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let created: Value = serde_json::from_slice(&bytes).unwrap();
+                let id = created["id"].as_str().unwrap();
+                let response = app
+                    .clone()
+                    .oneshot(delete(&format!("/api/notes/{id}?expected_revision=1")))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            }
+        }
+
+        let response = app
+            .clone()
+            .oneshot(get("/api/labels?include_usage=true"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let labels: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        let usage = labels
+            .iter()
+            .map(|label| (label["key"].as_str().unwrap(), label["note_count"].as_u64()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            usage,
+            std::collections::BTreeMap::from([
+                ("category", Some(0)),
+                ("in-trash", Some(0)),
+                ("unused", Some(0)),
+                ("used", Some(2)),
+            ])
+        );
+
+        for expected_count in [1, 0] {
+            let response = app
+                .clone()
+                .oneshot(post("/api/labels/actions/clear-unused", "{}"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let cleared: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(cleared["deleted_count"], expected_count);
+        }
+
+        let response = app.oneshot(get("/api/labels")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let labels: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        let remaining_keys = labels
+            .iter()
+            .map(|label| label["key"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_keys, ["category", "in-trash", "used"]);
     }
 
     #[tokio::test]

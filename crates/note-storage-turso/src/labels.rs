@@ -106,6 +106,22 @@ impl LabelRepository for TursoSession {
         Ok(())
     }
 
+    async fn delete_unused_label_keys(&self, protected_keys: &[String]) -> StorageResult<u64> {
+        let _operation_guard = self.operation_guard().await;
+        let protected_keys = serde_json::json!(protected_keys).to_string();
+        self.connection
+            .execute(
+                "DELETE FROM label_keys
+                 WHERE key NOT IN (SELECT value FROM json_each(?1))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM note_labels WHERE label_key_id = label_keys.id
+                   )",
+                turso::params![protected_keys],
+            )
+            .await
+            .map_err(|error| map_turso_error("delete unused label keys", error))
+    }
+
     async fn attach_label(&self, note_id: &str, key: &str, value: &str) -> StorageResult<()> {
         let _operation_guard = self.operation_guard().await;
         let label_key_id = label_key_id_for_note_label_unlocked(self, key).await?;

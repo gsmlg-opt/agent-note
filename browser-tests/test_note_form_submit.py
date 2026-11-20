@@ -23,6 +23,7 @@ class MockApi:
             "created_at": 1, "updated_at": 2,
         }
         self.labels = [{"key": "project", "description": "Project label", "value_type": "text"}]
+        self.label_counts = {}
         self.writes = []
         self.searches = []
         self.unexpected = []
@@ -33,6 +34,9 @@ class MockApi:
         method = request.method
         if method == "GET" and path == "/api/labels":
             body = self.labels
+            if parse_qs(urlparse(request.url).query).get("include_usage") == ["true"]:
+                body = [dict(label, note_count=self.label_counts.get(label["key"], 0))
+                        for label in self.labels]
         elif method == "GET" and path == "/api/notes/count":
             body = {"total": 1}
         elif method == "GET" and path == "/api/notes":
@@ -65,6 +69,11 @@ class MockApi:
             self.writes.append((method, path, payload))
             self.labels[0].update(payload)
             body = {}
+        elif method == "POST" and path == "/api/labels/actions/clear-unused":
+            self.writes.append((method, path, None))
+            before = len(self.labels)
+            self.labels = [label for label in self.labels if self.label_counts.get(label["key"])]
+            body = {"deleted_count": before - len(self.labels)}
         else:
             self.unexpected.append((method, request.url))
             await route.abort()
@@ -163,7 +172,43 @@ async def search(page, api, base_url):
     assert api.writes == []
 
 
-CASES = {test.__name__: test for test in (new_note, edit_note, create_label, edit_label, search)}
+async def clear_unused_labels(page, api, base_url):
+    api.labels.append({"key": "unused", "description": "", "value_type": "text"})
+    api.label_counts["project"] = 2
+    await page.goto(f"{base_url}/labels")
+    table = page.get_by_role("table", name="Label keys")
+    used = table.get_by_role("row").filter(has=page.get_by_role("rowheader", name="project"))
+    unused = table.get_by_role("row").filter(has=page.get_by_role("rowheader", name="unused"))
+    await expect(used.get_by_role("cell", name="2", exact=True)).to_be_visible()
+    await expect(unused.get_by_role("cell", name="0", exact=True)).to_be_visible()
+
+    clear = page.get_by_role("button", name="Clear unused labels", exact=True)
+    await clear.click()
+    dialog = page.get_by_role("dialog", name="Clear unused labels")
+    await dialog.get_by_role("button", name="Cancel").click()
+    await expect(unused).to_be_visible()
+    assert api.writes == []
+    await clear.click()
+    path = "/api/labels/actions/clear-unused"
+    await click_request(page, dialog.get_by_role("button", name="Clear unused labels"), "POST", path)
+    await expect(page.get_by_role("status")).to_have_text("Cleared 1 unused label.")
+    await expect(used).to_be_visible()
+    await expect(unused).to_have_count(0)
+    await expect(clear).to_be_disabled()
+    assert api.writes == [("POST", path, None)]
+
+
+async def empty_labels(page, api, base_url):
+    api.labels.clear()
+    await page.goto(f"{base_url}/labels")
+    table = page.get_by_role("table", name="Label keys")
+    await expect(table.get_by_role("columnheader", name="Active notes")).to_be_visible()
+    await expect(table).to_contain_text("No labels yet")
+    await expect(page.get_by_role("button", name="Clear unused labels")).to_be_disabled()
+
+
+CASES = {test.__name__: test for test in
+         (new_note, edit_note, create_label, edit_label, clear_unused_labels, empty_labels, search)}
 
 
 async def main(args):

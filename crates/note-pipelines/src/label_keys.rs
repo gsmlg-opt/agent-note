@@ -4,7 +4,7 @@ use note_core::{
     LabelKeyValidationError, LabelValueType,
 };
 use note_storage::TransactionMode;
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 pub async fn define_label_key(ctx: &Context, key: &str, description: &str) -> anyhow::Result<()> {
     define_label_key_with_type(ctx, key, description, LabelValueType::Text).await
@@ -38,6 +38,44 @@ pub async fn list_label_keys(ctx: &Context) -> anyhow::Result<Vec<LabelKey>> {
 pub async fn label_note_counts(ctx: &Context) -> anyhow::Result<Vec<(String, usize)>> {
     let session = ctx.storage().session().await?;
     Ok(session.label_note_counts().await?)
+}
+
+pub async fn list_label_keys_with_counts(ctx: &Context) -> anyhow::Result<Vec<(LabelKey, usize)>> {
+    let transaction = ctx.storage().begin(TransactionMode::Snapshot).await?;
+    let result = async {
+        let keys = transaction.list_label_keys().await?;
+        let counts = transaction
+            .label_note_counts()
+            .await?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        Ok(keys
+            .into_iter()
+            .map(|key| {
+                let count = counts.get(&key.key).copied().unwrap_or_default();
+                (key, count)
+            })
+            .collect())
+    }
+    .await;
+    crate::save_note::finish_transaction(transaction, result).await
+}
+
+pub async fn clear_unused_label_keys(ctx: &Context) -> anyhow::Result<u64> {
+    let transaction = ctx.storage().begin(TransactionMode::Immediate).await?;
+    let result = async {
+        let config = transaction.get_system_config().await?;
+        let protected_keys = config
+            .category_labels
+            .iter()
+            .map(|entry| parse_category_label_expression(entry).key.to_owned())
+            .collect::<Vec<_>>();
+        Ok(transaction
+            .delete_unused_label_keys(&protected_keys)
+            .await?)
+    }
+    .await;
+    crate::save_note::finish_transaction(transaction, result).await
 }
 
 pub async fn update_label_key(ctx: &Context, key: &str, description: &str) -> anyhow::Result<()> {

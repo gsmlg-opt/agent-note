@@ -1046,30 +1046,54 @@ pub async fn restore_deleted_notes(
 // ---- Labels ----
 
 #[derive(Deserialize)]
-struct LabelKeyDto {
-    key: String,
-    description: String,
-    value_type: String,
+pub struct LabelUsage {
+    pub key: String,
+    pub description: String,
+    pub value_type: String,
+    pub note_count: Option<usize>,
+}
+
+pub async fn list_label_usage() -> Result<Vec<LabelUsage>, String> {
+    get_label_catalog("/api/labels?include_usage=true").await
+}
+
+async fn get_label_catalog(url: &str) -> Result<Vec<LabelUsage>, String> {
+    let resp = Request::get(url).send().await.map_err(|e| e.to_string())?;
+    ok_or_body_error(resp)
+        .await?
+        .json()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 pub async fn list_labels() -> Result<Vec<LabelKey>, String> {
-    let resp = Request::get("/api/labels")
+    Ok(get_label_catalog("/api/labels")
+        .await?
+        .into_iter()
+        .map(|label| LabelKey {
+            key: label.key,
+            description: label.description,
+            value_type: label.value_type,
+        })
+        .collect())
+}
+
+pub async fn clear_unused_labels() -> Result<u64, String> {
+    #[derive(Deserialize)]
+    struct ClearUnusedLabelsResponse {
+        deleted_count: u64,
+    }
+
+    let resp = Request::post("/api/labels/actions/clear-unused")
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let dtos: Vec<LabelKeyDto> = ok_or_body_error(resp)
+    let result: ClearUnusedLabelsResponse = ok_or_body_error(resp)
         .await?
         .json()
         .await
         .map_err(|e| e.to_string())?;
-    Ok(dtos
-        .into_iter()
-        .map(|d| LabelKey {
-            key: d.key,
-            description: d.description,
-            value_type: d.value_type,
-        })
-        .collect())
+    Ok(result.deleted_count)
 }
 
 pub async fn create_label(key: &str, description: &str, value_type: &str) -> Result<(), String> {
