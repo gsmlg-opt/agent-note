@@ -7,6 +7,59 @@ use std::str::FromStr as _;
 use support::{configured_url_or_skip, TestDatabase};
 
 #[tokio::test]
+async fn embedding_dimension_migration_preserves_legacy_vectors() {
+    let Some(database) = TestDatabase::provision_with_vector(
+        "embedding_dimension_migration_preserves_legacy_vectors",
+    )
+    .await
+    else {
+        return;
+    };
+    let seed = database.inspect_pool().await;
+    sqlx::migrate!("./migrations")
+        .run_to(7, &seed)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO notes (id, title, content, created_at, updated_at)
+         VALUES ('legacy-vector', 'Legacy', 'body', 1, 1)",
+    )
+    .execute(&seed)
+    .await
+    .unwrap();
+    let original = pgvector::Vector::from(vec![0.125; 1024]);
+    sqlx::query(
+        "INSERT INTO note_chunk_embeddings (note_id, chunk_idx, embedding)
+         VALUES ('legacy-vector', 0, $1)",
+    )
+    .bind(&original)
+    .execute(&seed)
+    .await
+    .unwrap();
+    seed.close().await;
+
+    let storage = PgStorage::connect(&database.url, 2).await.unwrap();
+    let inspection = database.inspect_pool().await;
+    let stored: pgvector::Vector = sqlx::query_scalar(
+        "SELECT embedding FROM note_chunk_embeddings WHERE note_id='legacy-vector'",
+    )
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(stored, original);
+    let column_type: String = sqlx::query_scalar(
+        "SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+         WHERE attrelid='note_chunk_embeddings'::regclass AND attname='embedding'",
+    )
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(column_type, "vector");
+    inspection.close().await;
+    database.cleanup(Some(&storage)).await.unwrap();
+}
+
+#[tokio::test]
 async fn zero_max_connections_is_rejected_before_network_access() {
     let error = PgStorage::connect(
         "postgresql://agent_note:secret-that-must-not-leak@127.0.0.1:1/agent_note",
@@ -505,7 +558,7 @@ async fn ordered_migrations_preserve_existing_notes() {
             .fetch_all(&inspection)
             .await
             .expect("read ordered migration versions");
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     let archived_at_nullable: String = sqlx::query_scalar(
         "SELECT is_nullable
          FROM information_schema.columns

@@ -504,3 +504,76 @@ fn embedding_backend_metadata_uses_trimmed_model_and_stable_fingerprint() {
     );
     assert_eq!(embedding_fingerprint(" bge-m3 "), "bge-m3:1024");
 }
+
+#[tokio::test]
+async fn embeddinggemma2_documents_use_768_components_and_document_prompt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .and(body_json(serde_json::json!({
+            "model": "embeddinggemma-2",
+            "input": ["title: none | text: a note"],
+            "encoding_format": "float"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"index": 0, "embedding": vec![0.1_f32; 768]}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut cfg = config(&server);
+    cfg.model = "embeddinggemma-2".into();
+    let adapter = OpenAiCompatibleEmbedder::new(cfg).unwrap();
+    assert_eq!(adapter.embed("a note").await.unwrap().len(), 768);
+    assert_eq!(
+        embedding_fingerprint("embeddinggemma-2"),
+        "embeddinggemma-2:768"
+    );
+}
+
+#[tokio::test]
+async fn embeddinggemma2_queries_use_search_prompt_through_bounded_adapter() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_json(serde_json::json!({
+            "model": "google/embeddinggemma-2",
+            "input": ["task: search result | query: find a note"],
+            "encoding_format": "float"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"index": 0, "embedding": vec![0.1_f32; 768]}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut cfg = config(&server);
+    cfg.model = "google/embeddinggemma-2".into();
+    let adapter =
+        note_embedding::BoundedEmbedder::new(OpenAiCompatibleEmbedder::new(cfg).unwrap(), 1);
+    assert_eq!(adapter.embed_query("find a note").await.unwrap().len(), 768);
+    assert_eq!(
+        embedding_fingerprint(" google/embeddinggemma-2 "),
+        "google/embeddinggemma-2:768"
+    );
+    assert!(adapter.embed_query("  ").await.is_err());
+}
+
+#[tokio::test]
+async fn embeddinggemma2_rejects_bge_dimensions() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(response(0, 0.1))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut cfg = config(&server);
+    cfg.model = "embeddinggemma-2".into();
+    let error = OpenAiCompatibleEmbedder::new(cfg)
+        .unwrap()
+        .embed("a note")
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("expected 768 components, got 1024"));
+}

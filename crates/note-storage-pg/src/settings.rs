@@ -6,6 +6,26 @@ use serde_json::Value;
 
 const EMBEDDING_FINGERPRINT_KEY: &str = "embedding_fingerprint";
 
+pub(crate) async fn embedding_fingerprint_on_connection(
+    connection: &mut sqlx::PgConnection,
+) -> StorageResult<Option<String>> {
+    let value: Option<Value> = sqlx::query_scalar("SELECT value FROM app_settings WHERE key = $1")
+        .bind(EMBEDDING_FINGERPRINT_KEY)
+        .fetch_optional(connection)
+        .await
+        .map_err(|error| map_sqlx_error("query embedding fingerprint", error))?;
+    value
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                StorageError::new(
+                    StorageErrorKind::Operation,
+                    "decode stored embedding fingerprint",
+                )
+            })
+        })
+        .transpose()
+}
+
 #[async_trait::async_trait]
 impl SettingsRepository for PgSession {
     async fn get_sync_record(
@@ -114,22 +134,7 @@ impl SettingsRepository for PgSession {
 
     async fn get_embedding_fingerprint(&self) -> StorageResult<Option<String>> {
         let mut connection = self.connection().await?;
-        let value: Option<Value> =
-            sqlx::query_scalar("SELECT value FROM app_settings WHERE key = $1")
-                .bind(EMBEDDING_FINGERPRINT_KEY)
-                .fetch_optional(&mut *connection)
-                .await
-                .map_err(|error| map_sqlx_error("query embedding fingerprint", error))?;
-        value
-            .map(|value| {
-                value.as_str().map(str::to_owned).ok_or_else(|| {
-                    StorageError::new(
-                        StorageErrorKind::Operation,
-                        "decode stored embedding fingerprint",
-                    )
-                })
-            })
-            .transpose()
+        embedding_fingerprint_on_connection(&mut connection).await
     }
 
     async fn set_embedding_fingerprint(&self, fingerprint: &str) -> StorageResult<()> {

@@ -5,6 +5,26 @@ use crate::{StorageError, StorageErrorKind};
 
 pub const EMBEDDING_DIMENSION: usize = 1024;
 
+/// Legacy databases without a vector-space fingerprint use BGE-M3's dimension.
+pub fn embedding_dimension_for_fingerprint(
+    fingerprint: Option<&str>,
+) -> crate::StorageResult<usize> {
+    let Some(fingerprint) = fingerprint else {
+        return Ok(EMBEDDING_DIMENSION);
+    };
+    let dimension = fingerprint
+        .rsplit_once(':')
+        .filter(|(model, _)| !model.trim().is_empty())
+        .and_then(|(_, dimension)| dimension.parse::<usize>().ok());
+    match dimension {
+        Some(dimension @ (768 | 1024)) => Ok(dimension),
+        _ => Err(StorageError::new(
+            StorageErrorKind::Corrupt,
+            "stored embedding fingerprint has an unsupported vector dimension",
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentOperationKind {
@@ -1056,6 +1076,33 @@ impl TryFrom<PersistedAttachment> for note_core::NoteAttachment {
 mod attachment_record_tests {
     use super::*;
     use note_core::{AttachmentStorageMetadata, NoteAttachment};
+
+    #[test]
+    fn embedding_dimension_uses_supported_fingerprint_suffix_or_legacy_default() {
+        for (fingerprint, expected) in [
+            (None, 1024),
+            (Some("bge-m3:1024"), 1024),
+            (Some("google/embeddinggemma-2:768"), 768),
+            (Some("model:revision:768"), 768),
+        ] {
+            assert_eq!(
+                embedding_dimension_for_fingerprint(fingerprint).unwrap(),
+                expected
+            );
+        }
+        for invalid in [
+            "",
+            "no-dimension",
+            ":768",
+            " :768",
+            "model:0",
+            "model:512",
+            "model:nan",
+        ] {
+            let error = embedding_dimension_for_fingerprint(Some(invalid)).unwrap_err();
+            assert_eq!(error.kind(), StorageErrorKind::Corrupt);
+        }
+    }
 
     fn generated_attachment() -> NoteAttachment {
         NoteAttachment {

@@ -43,6 +43,9 @@ engine = "local"
 # engine = "openai"
 # base_url = "http://embedding.internal:8000"
 # model = "bge-m3"
+# EmbeddingGemma 2 text retrieval: model = "embeddinggemma-2" (768 components).
+# Requires a service with google/embeddinggemma-2 support. The adapter supplies
+# document/query prompts; do not also configure the service to add them.
 # api_key_env = "EMBEDDING_API_KEY"
 # timeout_secs = 30
 # max_retries = 3

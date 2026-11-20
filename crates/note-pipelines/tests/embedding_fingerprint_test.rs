@@ -60,6 +60,93 @@ async fn snapshot_pending_job(storage: &TursoStorage, now: i64) -> EmbeddingJob 
 }
 
 #[tokio::test]
+async fn switching_to_gemma_and_back_rebuilds_vectors_without_mutating_notes() {
+    let (_dir, storage) = storage().await;
+    seed_embedded_chunk_with_job(&storage).await;
+    let session = storage.session().await.unwrap();
+    session
+        .set_embedding_fingerprint("bge-m3:1024")
+        .await
+        .unwrap();
+    let original = session.get_note("note-1").await.unwrap().unwrap();
+    drop(session);
+
+    assert_eq!(
+        reconcile_embedding_fingerprint(&storage, "embeddinggemma-2:768", 1000)
+            .await
+            .unwrap(),
+        FingerprintReconciliation::Regenerated { queued_jobs: 1 }
+    );
+    let session = storage.session().await.unwrap();
+    assert!(!session.chunk_embedding_exists("note-1", 0).await.unwrap());
+    assert!(session
+        .insert_chunk_embedding("note-1", 0, &vec![0.1; 1024])
+        .await
+        .is_err());
+    session
+        .insert_chunk_embedding("note-1", 0, &vec![0.1; 768])
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .dense_search(&vec![0.1; 768], 10, None)
+            .await
+            .unwrap(),
+        vec!["note-1"]
+    );
+    let note = session.get_note("note-1").await.unwrap().unwrap();
+    assert_eq!(note.revision, original.revision);
+    assert_eq!(note.updated_at, original.updated_at);
+    assert_eq!(note.content, original.content);
+    drop(session);
+
+    assert_eq!(
+        reconcile_embedding_fingerprint(&storage, "bge-m3:1024", 2000)
+            .await
+            .unwrap(),
+        FingerprintReconciliation::Regenerated { queued_jobs: 1 }
+    );
+    let session = storage.session().await.unwrap();
+    assert!(!session.chunk_embedding_exists("note-1", 0).await.unwrap());
+    session
+        .insert_chunk_embedding("note-1", 0, &vec![0.1; 1024])
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .dense_search(&vec![0.1; 1024], 10, None)
+            .await
+            .unwrap(),
+        vec!["note-1"]
+    );
+}
+
+#[tokio::test]
+async fn legacy_vectors_are_rebuilt_when_first_fingerprint_uses_768_dimensions() {
+    let (_dir, storage) = storage().await;
+    seed_embedded_chunk_with_job(&storage).await;
+    assert_eq!(
+        reconcile_embedding_fingerprint(&storage, "embeddinggemma-2:768", 1000)
+            .await
+            .unwrap(),
+        FingerprintReconciliation::Regenerated { queued_jobs: 1 }
+    );
+    let session = storage.session().await.unwrap();
+    assert!(!session.chunk_embedding_exists("note-1", 0).await.unwrap());
+    session
+        .insert_chunk_embedding("note-1", 0, &vec![0.1; 768])
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .dense_search(&vec![0.1; 768], 10, None)
+            .await
+            .unwrap(),
+        vec!["note-1"]
+    );
+}
+
+#[tokio::test]
 async fn missing_fingerprint_is_initialized_without_changing_vectors_or_jobs() {
     let (_dir, storage) = storage().await;
     seed_embedded_chunk_with_job(&storage).await;

@@ -1,7 +1,9 @@
 use crate::connection::map_sqlx_error;
+use crate::settings::embedding_fingerprint_on_connection;
 use crate::PgSession;
 use note_storage::{
-    RetrievalRepository, StorageError, StorageErrorKind, StorageResult, EMBEDDING_DIMENSION,
+    embedding_dimension_for_fingerprint, RetrievalRepository, StorageError, StorageErrorKind,
+    StorageResult,
 };
 use pgvector::Vector;
 
@@ -15,9 +17,11 @@ impl RetrievalRepository for PgSession {
         chunk_idx: i64,
         embedding: &[f32],
     ) -> StorageResult<()> {
-        validate_vector(embedding)?;
-        let embedding = Vector::from(embedding.to_vec());
         let mut connection = self.connection().await?;
+        let fingerprint = embedding_fingerprint_on_connection(&mut connection).await?;
+        let dimension = embedding_dimension_for_fingerprint(fingerprint.as_deref())?;
+        validate_vector(embedding, dimension)?;
+        let embedding = Vector::from(embedding.to_vec());
         sqlx::query(
             "INSERT INTO note_chunk_embeddings (note_id, chunk_idx, embedding)
              VALUES ($1, $2, $3)
@@ -43,14 +47,15 @@ impl RetrievalRepository for PgSession {
         if allowed_note_ids.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
         }
-        validate_vector(query)?;
+        let mut connection = self.connection().await?;
+        let fingerprint = embedding_fingerprint_on_connection(&mut connection).await?;
+        let dimension = embedding_dimension_for_fingerprint(fingerprint.as_deref())?;
+        validate_vector(query, dimension)?;
         let limit = checked_limit(limit, "dense search")?;
         if limit == 0 {
             return Ok(Vec::new());
         }
-
         let query = Vector::from(query.to_vec());
-        let mut connection = self.connection().await?;
         sqlx::query_scalar(
             "SELECT embedding.note_id
              FROM note_chunk_embeddings AS embedding
@@ -98,12 +103,12 @@ impl RetrievalRepository for PgSession {
     }
 }
 
-fn validate_vector(vector: &[f32]) -> StorageResult<()> {
-    if vector.len() != EMBEDDING_DIMENSION {
+fn validate_vector(vector: &[f32], dimension: usize) -> StorageResult<()> {
+    if vector.len() != dimension {
         return Err(StorageError::new(
             StorageErrorKind::Operation,
             format!(
-                "embedding vector must contain exactly {EMBEDDING_DIMENSION} components, got {}",
+                "embedding vector must contain exactly {dimension} components, got {}",
                 vector.len()
             ),
         ));

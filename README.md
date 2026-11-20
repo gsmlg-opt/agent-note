@@ -538,7 +538,7 @@ PostgreSQL `simple` text-search configuration and indexes it with GIN. Dense ret
 exact cosine-distance scan using `<=>` over `vector(1024)` body-chunk embeddings; it creates no ANN
 index. System information reports the `pg` engine but never the PostgreSQL URL or credentials.
 
-### OpenAI-compatible BGE-M3
+### OpenAI-compatible embeddings
 
 Use a self-hosted OpenAI-compatible embeddings service with:
 
@@ -564,17 +564,33 @@ the `v1/embeddings` suffix. The root example above therefore posts to
 `http://embedding.internal:8000/v1/embeddings`; a base URL ending in `/gateway` or `/gateway/`
 would post to `/gateway/v1/embeddings`. Requests use `encoding_format = "float"` and do not send
 `dimensions`. Each response must contain exactly one uniquely indexed, finite 1,024-component
-vector per input. Connection failures, timeouts, HTTP 429, and HTTP 5xx responses are retried with
+vector per input for BGE-M3. Connection failures, timeouts, HTTP 429, and HTTP 5xx responses are retried with
 bounded backoff; other transport errors and HTTP statuses fail immediately. `max_retries` is the
 number of retries after the initial request and must be at most `10`. A successful response body is
 limited to 1 MiB. Unauthenticated HTTP error bodies are limited to 4 KiB, while authenticated
 response bodies are redacted.
 
+For text retrieval with EmbeddingGemma 2, use `model = "embeddinggemma-2"` (or
+`"google/embeddinggemma-2"`) and a compatible service that serves `google/embeddinggemma-2`,
+such as a vLLM release with `EmbeddingGemma2Model` support. This profile requires exactly 768
+components per input. The adapter adds `title: none | text: ` to document chunks and
+`task: search result | query: ` to search queries, following the model's retrieval prompts.
+The service must not add these prompts a second time. Requests still use only the standard
+OpenAI-compatible `model`, `input`, and `encoding_format` fields. Images, audio, and video
+are not indexed or sent to the embedding service.
+
+Changing to this profile changes the fingerprint to `embeddinggemma-2:768` (or the fully
+qualified model name with `:768`) and rebuilds all chunk embeddings through the existing durable
+queue. Back up the database before switching; semantic results are incomplete until regeneration
+finishes. PostgreSQL's forward migration removes the old column's fixed dimension restriction;
+the storage adapter validates vectors against the stored fingerprint. BGE-M3 and the local
+stub remain 1,024-dimensional.
+
 The local engine without `model_path` uses the deterministic stub and reports fingerprint
 `stub:1024`. A local engine with `model_path` and an OpenAI-compatible engine using model `bge-m3`
 share the real vector-space fingerprint `bge-m3:1024`. Reconciliation has three states. A missing
-stored fingerprint, including in a legacy database, adopts the configured fingerprint without
-deleting existing vectors or jobs. An equal stored fingerprint leaves them unchanged. A present
+stored fingerprint, including in a legacy database, adopts a 1,024-dimensional profile without
+deleting existing vectors or jobs; selecting the 768-dimensional profile rebuilds legacy vectors. An equal stored fingerprint leaves them unchanged. A present
 but different fingerprint—including switching from the stub to BGE-M3—atomically deletes old
 vectors, replaces existing embedding jobs, and queues one pending job for every active body chunk
 before the scheduler starts. Import and export still load the mandatory configuration and storage

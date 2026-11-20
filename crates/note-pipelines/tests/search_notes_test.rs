@@ -28,6 +28,39 @@ impl AttachmentStore for PanicAttachmentStore {
 
 struct PanicEmbedder;
 
+struct QueryOnlyEmbedder;
+
+#[async_trait::async_trait]
+impl note_embedding::Embedder for QueryOnlyEmbedder {
+    async fn embed(&self, _text: &str) -> anyhow::Result<note_embedding::DenseVector> {
+        panic!("retrieval must use the query encoder rather than the document encoder")
+    }
+
+    async fn embed_query(&self, text: &str) -> anyhow::Result<note_embedding::DenseVector> {
+        assert_eq!(text, "find my note");
+        Ok(vec![0.1; 1024])
+    }
+}
+
+#[tokio::test]
+async fn nonblank_retrieval_uses_the_query_encoder() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(
+        note_storage_turso::TursoStorage::open(dir.path().join("test.db"))
+            .await
+            .unwrap(),
+    );
+    let ctx = note_pipelines::Context::new(
+        storage,
+        Arc::new(QueryOnlyEmbedder),
+        Arc::new(PanicAttachmentStore),
+    );
+    assert!(search_notes(&ctx, "find my note", 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 #[async_trait::async_trait]
 impl note_embedding::Embedder for PanicEmbedder {
     async fn embed(&self, _text: &str) -> anyhow::Result<note_embedding::DenseVector> {

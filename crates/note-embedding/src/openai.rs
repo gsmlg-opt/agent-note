@@ -1,4 +1,5 @@
-use crate::{DenseVector, Embedder, DEFAULT_EMBEDDING_DIMENSION};
+use crate::embedder::is_embeddinggemma2;
+use crate::{embedding_dimension, DenseVector, Embedder};
 use anyhow::{anyhow, bail, Result};
 use futures::StreamExt;
 use reqwest::header::{HeaderValue, AUTHORIZATION};
@@ -123,7 +124,11 @@ impl OpenAiCompatibleEmbedder {
             match builder.send().await {
                 Ok(response) if response.status().is_success() => {
                     let response = parse_success_response(response).await?;
-                    return validate_response_items(texts.len(), response.data);
+                    return validate_response_items(
+                        texts.len(),
+                        embedding_dimension(&self.model),
+                        response.data,
+                    );
                 }
                 Ok(response) => {
                     if retryable_status(response.status()) && attempt < self.max_retries {
@@ -166,12 +171,37 @@ impl Embedder for OpenAiCompatibleEmbedder {
                 bail!("embedding input {index} is blank");
             }
         }
-        self.send_batch(texts).await
+        if is_embeddinggemma2(&self.model) {
+            let documents = texts
+                .iter()
+                .map(|text| format!("title: none | text: {text}"))
+                .collect::<Vec<_>>();
+            self.send_batch(&documents).await
+        } else {
+            self.send_batch(texts).await
+        }
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<DenseVector> {
+        if text.trim().is_empty() {
+            bail!("embedding query is blank");
+        }
+        if !is_embeddinggemma2(&self.model) {
+            return self.embed(text).await;
+        }
+        let outputs = self
+            .send_batch(&[format!("task: search result | query: {text}")])
+            .await?;
+        outputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("embedding response was empty"))
     }
 }
 
 fn validate_response_items(
     expected: usize,
+    dimension: usize,
     items: Vec<EmbeddingResponseItem>,
 ) -> Result<Vec<DenseVector>> {
     if items.len() != expected {
@@ -192,9 +222,9 @@ fn validate_response_items(
         if ordered[item.index].is_some() {
             bail!("embedding response duplicate response index {}", item.index);
         }
-        if item.embedding.len() != DEFAULT_EMBEDDING_DIMENSION {
+        if item.embedding.len() != dimension {
             bail!(
-                "embedding response expected {DEFAULT_EMBEDDING_DIMENSION} components, got {}",
+                "embedding response expected {dimension} components, got {}",
                 item.embedding.len()
             );
         }
@@ -326,11 +356,13 @@ async fn sleep_before_retry(retry_number: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_EMBEDDING_DIMENSION;
 
     #[test]
     fn rejects_non_finite_components_before_returning_vectors() {
         let error = validate_response_items(
             1,
+            DEFAULT_EMBEDDING_DIMENSION,
             vec![EmbeddingResponseItem {
                 index: 0,
                 embedding: vec![f32::NAN; DEFAULT_EMBEDDING_DIMENSION],

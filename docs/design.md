@@ -169,7 +169,8 @@ therefore produces `http://embedding.internal:8000/v1/embeddings`, while `/gatew
 bearer token; omission means no authentication. Normal remote HTTP and MCP startup resolves that
 variable and rejects a missing or blank value. Import and export do not resolve it and remain
 embedding-service offline. Responses must contain exactly one uniquely indexed, finite
-1,024-component vector per input. The adapter retries connection failures, timeouts, HTTP 429, and
+vector per input: 768 components for `embeddinggemma-2` and
+`google/embeddinggemma-2`, and 1,024 for the existing BGE-M3 profiles. The adapter retries connection failures, timeouts, HTTP 429, and
 HTTP 5xx with bounded backoff. `max_retries` counts retries after the initial request and cannot
 exceed `10`. Successful response bodies are limited to 1 MiB; unauthenticated error bodies are
 limited to 4 KiB and authenticated error bodies are redacted.
@@ -243,7 +244,7 @@ The application verifies the extension but never installs it. Its role needs nor
 run Agent Note's schema migrations and create or update its tables and indexes. The PostgreSQL
 schema stores title search data as
 `to_tsvector('simple'::regconfig, title)` and uses a GIN index. Body-chunk embeddings are
-`vector(1024)`, and dense retrieval orders exact cosine distance with `<=>`; there is no ANN index.
+`vector` with dimensions validated against the stored embedding fingerprint, and dense retrieval orders exact cosine distance with `<=>`; there is no ANN index.
 Backend-neutral System information reports the `pg` engine without the database URL or
 credentials.
 
@@ -277,10 +278,16 @@ non-disposable data before upgrading so recovery or deliberate import remains po
   ```
 
   `api_key_env` is optional; omit it for no authentication.
+- **EmbeddingGemma 2 text profile**: remote model `embeddinggemma-2` or
+  `google/embeddinggemma-2` uses the native 768-dimensional dense output. The adapter prefixes
+  document chunks with `title: none | text: ` and search queries with
+  `task: search result | query: `. The endpoint must not add prompts again. No multimodal
+  payloads are sent. Model output dimensions are validated before persistence.
 - **Fingerprint lifecycle**: local mode without `model_path` identifies the deterministic stub as
   `stub:1024`. Local BGE-M3 with `model_path` and remote model `bge-m3` both identify their real
   vector space as `bge-m3:1024`. A missing stored fingerprint, including in a legacy database,
-  adopts the configured fingerprint without deleting existing vectors or jobs. An equal stored
+  adopts a 1,024-dimensional profile without deleting vectors or jobs; selecting the
+  768-dimensional profile rebuilds the legacy vectors. An equal stored
   fingerprint preserves them unchanged. A present but different fingerprint—including a switch
   from the stub to BGE-M3—causes one storage transaction to remove old vectors and jobs, queue one
   pending job for every active chunk, and record the new fingerprint before the scheduler starts.
@@ -302,7 +309,7 @@ Title retrieval and dense content retrieval are independent queries, each produc
 list. Rust Turso Database FTS ranks title matches with BM25. PostgreSQL title FTS uses its generated
 `simple`-configuration `tsvector` and GIN index. Both adapters perform an exact linear
 cosine-distance scan over body-chunk embeddings, grouping by note and using the closest chunk as
-that note's rank; PostgreSQL uses exact `<=>` over `vector(1024)` with no ANN index. The scores are
+that note's rank; PostgreSQL uses exact `<=>` over `vector` with no ANN index. The scores are
 not directly comparable, so the existing pipeline fuses the title and content-vector rankings by
 weighted rank rather than raw score:
 

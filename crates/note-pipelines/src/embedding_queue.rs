@@ -49,11 +49,13 @@ pub async fn reconcile_embedding_fingerprint(
     if configured_fingerprint.trim().is_empty() {
         anyhow::bail!("embedding fingerprint must not be blank");
     }
+    let configured_dimension =
+        note_storage::embedding_dimension_for_fingerprint(Some(configured_fingerprint))?;
 
     let transaction = storage.begin(TransactionMode::Immediate).await?;
     let result = async {
         match transaction.get_embedding_fingerprint().await? {
-            None => {
+            None if configured_dimension == note_storage::EMBEDDING_DIMENSION => {
                 transaction
                     .set_embedding_fingerprint(configured_fingerprint)
                     .await?;
@@ -62,7 +64,7 @@ pub async fn reconcile_embedding_fingerprint(
             Some(stored) if stored == configured_fingerprint => {
                 anyhow::Ok(FingerprintReconciliation::Unchanged)
             }
-            Some(_) => {
+            None | Some(_) => {
                 let queued_jobs = transaction.reset_embeddings_for_regeneration(now).await?;
                 let queued_jobs = usize::try_from(queued_jobs)
                     .map_err(|_| anyhow::anyhow!("queued embedding job count exceeds usize"))?;

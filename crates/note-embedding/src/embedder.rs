@@ -1,6 +1,18 @@
-pub type DenseVector = Vec<f32>; // 1024-d, L2-normalized
+pub type DenseVector = Vec<f32>;
 
 pub const DEFAULT_BGE_M3_MODEL: &str = "bge-m3";
+
+pub fn embedding_dimension(model: &str) -> usize {
+    if is_embeddinggemma2(model) {
+        768
+    } else {
+        crate::rpc::DEFAULT_EMBEDDING_DIMENSION
+    }
+}
+
+pub(crate) fn is_embeddinggemma2(model: &str) -> bool {
+    matches!(model.trim(), "embeddinggemma-2" | "google/embeddinggemma-2")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingBackendInfo {
@@ -10,11 +22,7 @@ pub struct EmbeddingBackendInfo {
 }
 
 pub fn embedding_fingerprint(model: &str) -> String {
-    format!(
-        "{}:{}",
-        model.trim(),
-        crate::rpc::DEFAULT_EMBEDDING_DIMENSION
-    )
+    format!("{}:{}", model.trim(), embedding_dimension(model))
 }
 
 impl EmbeddingBackendInfo {
@@ -46,7 +54,12 @@ impl EmbeddingBackendInfo {
 
 #[async_trait::async_trait]
 pub trait Embedder: Send + Sync {
+    /// Encode a document. Model-specific retrieval instructions belong in the adapter.
     async fn embed(&self, text: &str) -> anyhow::Result<DenseVector>;
+
+    async fn embed_query(&self, text: &str) -> anyhow::Result<DenseVector> {
+        self.embed(text).await
+    }
 
     async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<DenseVector>> {
         let mut outputs = Vec::with_capacity(texts.len());

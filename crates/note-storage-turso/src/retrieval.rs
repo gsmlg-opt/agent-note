@@ -1,7 +1,8 @@
 use crate::connection::map_turso_error;
 use crate::TursoSession;
 use note_storage::{
-    RetrievalRepository, StorageError, StorageErrorKind, StorageResult, EMBEDDING_DIMENSION,
+    embedding_dimension_for_fingerprint, RetrievalRepository, StorageError, StorageErrorKind,
+    StorageResult,
 };
 use std::{
     cmp::Ordering,
@@ -29,7 +30,9 @@ impl RetrievalRepository for TursoSession {
         embedding: &[f32],
     ) -> StorageResult<()> {
         let _operation_guard = self.operation_guard().await;
-        let json = vector_to_json(embedding)?;
+        let fingerprint = self.embedding_fingerprint_unlocked().await?;
+        let dimension = embedding_dimension_for_fingerprint(fingerprint.as_deref())?;
+        let json = vector_to_json(embedding, dimension)?;
         self.connection
             .execute(
                 "INSERT INTO note_chunk_embeddings (note_id, chunk_idx, embedding)
@@ -51,7 +54,9 @@ impl RetrievalRepository for TursoSession {
         if allowed_note_ids.is_some_and(<[String]>::is_empty) {
             return Ok(Vec::new());
         }
-        let json = vector_to_json(query)?;
+        let fingerprint = self.embedding_fingerprint_unlocked().await?;
+        let dimension = embedding_dimension_for_fingerprint(fingerprint.as_deref())?;
+        let json = vector_to_json(query, dimension)?;
         let limit = checked_limit(limit, "dense search")?;
         let allowed_note_ids = allowed_note_ids
             .map(serde_json::to_string)
@@ -347,18 +352,18 @@ fn title_search_limits(limit: usize) -> (usize, usize) {
     )
 }
 
-fn vector_to_json(vector: &[f32]) -> StorageResult<String> {
-    validate_vector(vector)?;
+fn vector_to_json(vector: &[f32], dimension: usize) -> StorageResult<String> {
+    validate_vector(vector, dimension)?;
     let components = vector.iter().map(ToString::to_string).collect::<Vec<_>>();
     Ok(format!("[{}]", components.join(",")))
 }
 
-fn validate_vector(vector: &[f32]) -> StorageResult<()> {
-    if vector.len() != EMBEDDING_DIMENSION {
+fn validate_vector(vector: &[f32], dimension: usize) -> StorageResult<()> {
+    if vector.len() != dimension {
         return Err(StorageError::new(
             StorageErrorKind::Operation,
             format!(
-                "embedding vector must contain exactly {EMBEDDING_DIMENSION} components, got {}",
+                "embedding vector must contain exactly {dimension} components, got {}",
                 vector.len()
             ),
         ));

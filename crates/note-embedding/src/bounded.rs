@@ -24,6 +24,11 @@ impl<E: Embedder + 'static> Embedder for BoundedEmbedder<E> {
         let _permit = self.semaphore.acquire().await?;
         self.inner.embed(text).await
     }
+
+    async fn embed_query(&self, text: &str) -> anyhow::Result<DenseVector> {
+        let _permit = self.semaphore.acquire().await?;
+        self.inner.embed_query(text).await
+    }
 }
 
 #[cfg(test)]

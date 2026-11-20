@@ -2,8 +2,8 @@
 mod support;
 
 use note_storage::{
-    NewNote, NoteUpdate, NotesRepository, RetrievalRepository, StorageErrorKind,
-    EMBEDDING_DIMENSION,
+    NewNote, NoteUpdate, NotesRepository, RetrievalRepository, SettingsRepository,
+    StorageErrorKind, EMBEDDING_DIMENSION,
 };
 use note_storage_pg::{PgSession, PgStorage};
 use sqlx::AssertSqlSafe;
@@ -12,6 +12,64 @@ use support::{configured_url_or_skip, TestDatabase};
 use tokio::sync::{Mutex, MutexGuard};
 
 const TITLE_SEARCH_SQL: &str = include_str!("../src/title_search.sql");
+
+#[tokio::test]
+async fn embedding_fingerprint_selects_vector_dimension() {
+    let Some(database) =
+        TestDatabase::provision_with_vector("embedding_fingerprint_selects_vector_dimension").await
+    else {
+        return;
+    };
+    let storage = PgStorage::connect(&database.url, 2).await.unwrap();
+    let session = storage.connect_session().await.unwrap();
+    insert_note(&session, "a", "A", "body").await;
+    insert_note(&session, "b", "B", "body").await;
+    let mut first = vec![0.0; 768];
+    first[0] = 1.0;
+    let mut second = vec![0.0; 768];
+    second[1] = 1.0;
+    assert!(session
+        .insert_chunk_embedding("a", 0, &first)
+        .await
+        .is_err());
+    session
+        .set_embedding_fingerprint("embeddinggemma-2:768")
+        .await
+        .unwrap();
+    session
+        .insert_chunk_embedding("a", 0, &first)
+        .await
+        .unwrap();
+    session
+        .insert_chunk_embedding("b", 0, &second)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.dense_search(&first, 2, None).await.unwrap(),
+        vec!["a", "b"]
+    );
+    for wrong in [vec![0.0; 767], unit(0)] {
+        assert!(session
+            .insert_chunk_embedding("a", 1, &wrong)
+            .await
+            .is_err());
+        assert!(session.dense_search(&wrong, 2, None).await.is_err());
+    }
+    first[0] = f32::NAN;
+    assert!(session.dense_search(&first, 2, None).await.is_err());
+    assert!(session
+        .insert_chunk_embedding("a", 1, &first)
+        .await
+        .is_err());
+    session
+        .set_embedding_fingerprint("invalid-dimension")
+        .await
+        .unwrap();
+    let error = session.dense_search(&second, 2, None).await.unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Corrupt);
+    drop(session);
+    database.cleanup(Some(&storage)).await.unwrap();
+}
 
 async fn real_database_test_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();

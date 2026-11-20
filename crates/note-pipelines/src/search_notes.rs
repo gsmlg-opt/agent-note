@@ -47,7 +47,7 @@ pub async fn search_notes_filtered(
         Some(ids)
     };
 
-    let dense = ctx.embedder.embed(query).await?;
+    let dense = ctx.embedder.embed_query(query).await?;
     // Use one session for retrieval and note metadata collection.
     let session = ctx.storage().session().await?;
     let minimum_score = session.get_system_config().await?.search.minimum_score;

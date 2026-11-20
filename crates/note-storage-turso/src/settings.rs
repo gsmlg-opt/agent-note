@@ -6,6 +6,28 @@ use note_storage::{SettingsRepository, StorageError, StorageErrorKind, StorageRe
 const SYSTEM_CONFIG_KEY: &str = "system_config";
 const EMBEDDING_FINGERPRINT_KEY: &str = "embedding_fingerprint";
 
+impl TursoSession {
+    /// The caller holds this session's operation guard.
+    pub(crate) async fn embedding_fingerprint_unlocked(&self) -> StorageResult<Option<String>> {
+        let mut rows = self
+            .connection
+            .query(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                turso::params![EMBEDDING_FINGERPRINT_KEY],
+            )
+            .await
+            .map_err(|error| map_turso_error("query embedding fingerprint", error))?;
+        rows.next()
+            .await
+            .map_err(|error| map_turso_error("read embedding fingerprint", error))?
+            .map(|row| {
+                row.get::<String>(0)
+                    .map_err(|error| map_turso_error("decode embedding fingerprint", error))
+            })
+            .transpose()
+    }
+}
+
 #[async_trait::async_trait]
 impl SettingsRepository for TursoSession {
     async fn get_sync_record(
@@ -179,22 +201,7 @@ impl SettingsRepository for TursoSession {
 
     async fn get_embedding_fingerprint(&self) -> StorageResult<Option<String>> {
         let _operation_guard = self.operation_guard().await;
-        let mut rows = self
-            .connection
-            .query(
-                "SELECT value FROM app_settings WHERE key = ?1",
-                turso::params![EMBEDDING_FINGERPRINT_KEY],
-            )
-            .await
-            .map_err(|error| map_turso_error("query embedding fingerprint", error))?;
-        rows.next()
-            .await
-            .map_err(|error| map_turso_error("read embedding fingerprint", error))?
-            .map(|row| {
-                row.get::<String>(0)
-                    .map_err(|error| map_turso_error("decode embedding fingerprint", error))
-            })
-            .transpose()
+        self.embedding_fingerprint_unlocked().await
     }
 
     async fn set_embedding_fingerprint(&self, fingerprint: &str) -> StorageResult<()> {

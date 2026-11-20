@@ -1,9 +1,73 @@
 mod support;
 
 use note_storage::{
-    EmbeddingRepository, NotesRepository, RetrievalRepository, StorageErrorKind, UpsertNoteChunk,
+    EmbeddingRepository, NotesRepository, RetrievalRepository, SettingsRepository,
+    StorageErrorKind, UpsertNoteChunk,
 };
 use support::{fixture, insert_named_note, insert_test_note, unit};
+
+#[tokio::test]
+async fn embedding_fingerprint_selects_vector_dimension() {
+    let fixture = fixture().await;
+    insert_test_note(&fixture.session, "a").await;
+    insert_test_note(&fixture.session, "b").await;
+    let mut first = vec![0.0; 768];
+    first[0] = 1.0;
+    let mut second = vec![0.0; 768];
+    second[1] = 1.0;
+
+    // Legacy databases without metadata retain their original 1024-component contract.
+    assert!(fixture
+        .session
+        .insert_chunk_embedding("a", 0, &first)
+        .await
+        .is_err());
+    fixture
+        .session
+        .set_embedding_fingerprint("embeddinggemma-2:768")
+        .await
+        .unwrap();
+    fixture
+        .session
+        .insert_chunk_embedding("a", 0, &first)
+        .await
+        .unwrap();
+    fixture
+        .session
+        .insert_chunk_embedding("b", 0, &second)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.session.dense_search(&first, 2, None).await.unwrap(),
+        vec!["a", "b"]
+    );
+    for wrong in [vec![0.0; 767], unit(0)] {
+        assert!(fixture
+            .session
+            .insert_chunk_embedding("a", 1, &wrong)
+            .await
+            .is_err());
+        assert!(fixture.session.dense_search(&wrong, 2, None).await.is_err());
+    }
+    first[0] = f32::NAN;
+    assert!(fixture.session.dense_search(&first, 2, None).await.is_err());
+    assert!(fixture
+        .session
+        .insert_chunk_embedding("a", 1, &first)
+        .await
+        .is_err());
+    fixture
+        .session
+        .set_embedding_fingerprint("invalid-dimension")
+        .await
+        .unwrap();
+    let error = fixture
+        .session
+        .dense_search(&second, 2, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StorageErrorKind::Corrupt);
+}
 
 #[tokio::test]
 async fn title_search_matches_titles_but_not_body_text() {
